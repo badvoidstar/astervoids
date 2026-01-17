@@ -108,7 +108,7 @@
         SHOOT_COOLDOWN: 10,         // Frames between shots
         
         // Asteroid settings
-        ASTEROID_BASE_COUNT: 4,     // Starting astervoids in wave 1
+        ASTEROID_BASE_COUNT: 1,     // Starting astervoids in wave 1
         ASTEROID_BASE_SPEED: 1.5,   // Base asteroid speed
         ASTEROID_SPEED_VARIANCE: 1, // Random speed variation
         ASTEROID_VERTICES: 10,      // Number of vertices per asteroid
@@ -677,7 +677,7 @@
 
     /**
      * Split an asteroid into two smaller pieces
-     * Implements volume conservation with 10% minimum size rule
+     * Implements conservation of area (mass) and energy
      * @param {Asteroid} asteroid - The asteroid to split
      */
     function splitAsteroid(asteroid) {
@@ -689,7 +689,7 @@
             return;  // Asteroid is destroyed, no children spawned
         }
         
-        // Calculate child sizes using volume conservation
+        // Calculate child sizes using area conservation
         // Area ∝ r², so r1² + r2² = R² for conservation
         // We use splitRatio to determine how area is divided
         const splitRatio = randomRange(CONFIG.MIN_SPLIT_RATIO, 1 - CONFIG.MIN_SPLIT_RATIO);
@@ -697,6 +697,11 @@
         // Calculate child radii: r = R * sqrt(ratio)
         const radius1 = asteroid.radius * Math.sqrt(splitRatio);
         const radius2 = asteroid.radius * Math.sqrt(1 - splitRatio);
+        
+        // Calculate parent's kinetic energy (E = 0.5 * mass * v²)
+        // Mass is proportional to area (r²), so E ∝ r² * v²
+        const parentSpeed = Math.sqrt(asteroid.velocityX ** 2 + asteroid.velocityY ** 2);
+        const parentEnergy = asteroid.radius ** 2 * parentSpeed ** 2;
         
         // Only spawn children that are above minimum size
         const children = [];
@@ -708,22 +713,31 @@
             children.push(radius2);
         }
         
-        // Spawn child astervoids
+        // Calculate total mass of surviving children for energy distribution
+        const totalChildMass = children.reduce((sum, r) => sum + r ** 2, 0);
+        
+        // Spawn child astervoids with energy conservation
         children.forEach((childRadius, index) => {
             // Perpendicular direction to original velocity (spreads children apart)
             const spreadAngle = Math.atan2(asteroid.velocityY, asteroid.velocityX) + 
                                (index === 0 ? Math.PI / 2 : -Math.PI / 2);
             
-            // Slightly faster than parent, with some randomness
-            const speed = Math.sqrt(asteroid.velocityX ** 2 + asteroid.velocityY ** 2) * 1.2;
+            // Energy conservation: each piece gets energy proportional to its mass
+            // E_child = E_parent * (r_child² / totalChildMass)
+            // Since E = m * v² and m ∝ r², we have: r² * v² = E_child
+            // Therefore: v = sqrt(E_child / r²)
+            const childMass = childRadius ** 2;
+            const childEnergy = parentEnergy * (childMass / totalChildMass);
+            const childSpeed = Math.sqrt(childEnergy / childMass);
+            
             const angle = spreadAngle + randomRange(-0.5, 0.5);
             
             game.astervoids.push(new Asteroid(
                 asteroid.x,
                 asteroid.y,
                 childRadius,
-                Math.cos(angle) * speed,
-                Math.sin(angle) * speed
+                Math.cos(angle) * childSpeed,
+                Math.sin(angle) * childSpeed
             ));
         });
         
