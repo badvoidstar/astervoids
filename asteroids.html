@@ -255,6 +255,9 @@
         BASE_WIDTH: 800,            // Reference width for scaling
         BASE_HEIGHT: 600,           // Reference height for scaling
         
+        // Timing settings
+        TARGET_FPS: 60,             // Target frame rate for physics
+        
         // Ship settings
         SHIP_SIZE: 20,              // Ship triangle size in pixels
         SHIP_THRUST: 0.15,          // Acceleration when thrusting
@@ -495,16 +498,18 @@
         /**
          * Update ship state based on physics and input
          * @param {object} canvas - Canvas element for wrapping
+         * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
-        update(canvas) {
-            // Apply friction to slow down gradually
-            this.velocityX *= CONFIG.SHIP_FRICTION;
-            this.velocityY *= CONFIG.SHIP_FRICTION;
+        update(canvas, dt = 1) {
+            // Apply friction to slow down gradually (adjust for delta time)
+            const friction = Math.pow(CONFIG.SHIP_FRICTION, dt);
+            this.velocityX *= friction;
+            this.velocityY *= friction;
             
             // Apply thrust in facing direction
             if (this.thrusting) {
-                this.velocityX += Math.cos(this.angle) * CONFIG.SHIP_THRUST;
-                this.velocityY += Math.sin(this.angle) * CONFIG.SHIP_THRUST;
+                this.velocityX += Math.cos(this.angle) * CONFIG.SHIP_THRUST * dt;
+                this.velocityY += Math.sin(this.angle) * CONFIG.SHIP_THRUST * dt;
             }
             
             // Limit to max speed
@@ -515,16 +520,16 @@
             }
             
             // Update position
-            this.x += this.velocityX;
-            this.y += this.velocityY;
+            this.x += this.velocityX * dt;
+            this.y += this.velocityY * dt;
             
             // Wrap around screen edges
             this.x = wrapValue(this.x, canvas.width);
             this.y = wrapValue(this.y, canvas.height);
             
-            // Decrement timers
-            if (this.invulnerable > 0) this.invulnerable--;
-            if (this.shootCooldown > 0) this.shootCooldown--;
+            // Decrement timers (adjusted for delta time)
+            if (this.invulnerable > 0) this.invulnerable -= dt;
+            if (this.shootCooldown > 0) this.shootCooldown -= dt;
         }
 
         /**
@@ -691,14 +696,15 @@
         /**
          * Update asteroid position and rotation
          * @param {object} canvas - Canvas element for wrapping
+         * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
-        update(canvas) {
+        update(canvas, dt = 1) {
             // Move asteroid
-            this.x += this.velocityX;
-            this.y += this.velocityY;
+            this.x += this.velocityX * dt;
+            this.y += this.velocityY * dt;
             
             // Rotate
-            this.angle += this.rotationSpeed;
+            this.angle += this.rotationSpeed * dt;
             
             // Wrap around screen edges
             this.x = wrapValue(this.x, canvas.width);
@@ -753,17 +759,18 @@
         /**
          * Update bullet position and lifetime
          * @param {object} canvas - Canvas element for wrapping
+         * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
-        update(canvas) {
-            this.x += this.velocityX;
-            this.y += this.velocityY;
+        update(canvas, dt = 1) {
+            this.x += this.velocityX * dt;
+            this.y += this.velocityY * dt;
             
             // Wrap around screen edges
             this.x = wrapValue(this.x, canvas.width);
             this.y = wrapValue(this.y, canvas.height);
             
-            // Decrement lifetime
-            this.lifetime--;
+            // Decrement lifetime (adjusted for delta time)
+            this.lifetime -= dt;
         }
 
         /**
@@ -812,7 +819,8 @@
         state: 'playing',     // 'playing', 'respawning', 'gameover', 'waveDelay', 'paused'
         waveDelayTimer: 0,    // Countdown for wave transition
         speedMultiplier: 1,   // Current speed scaling
-        previousState: null   // State before pausing (to resume correctly)
+        previousState: null,  // State before pausing (to resume correctly)
+        lastFrameTime: 0      // Timestamp of last frame for delta time
     };
 
     // Pause menu element reference
@@ -982,6 +990,7 @@
             // Resume game
             game.state = game.previousState || 'playing';
             game.previousState = null;
+            game.lastFrameTime = 0; // Reset to prevent delta time jump
             pauseMenu.classList.remove('visible');
         } else if (game.state === 'playing' || game.state === 'waveDelay') {
             // Pause game
@@ -1137,8 +1146,18 @@
 
     /**
      * Main game loop - called every frame
+     * @param {number} timestamp - Current time from requestAnimationFrame
      */
-    function gameLoop() {
+    function gameLoop(timestamp) {
+        // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
+        if (!game.lastFrameTime) game.lastFrameTime = timestamp;
+        const elapsed = timestamp - game.lastFrameTime;
+        game.lastFrameTime = timestamp;
+        
+        // Calculate delta time multiplier (1.0 = one frame at 60fps = 16.67ms)
+        const targetFrameTime = 1000 / CONFIG.TARGET_FPS;
+        const dt = Math.min(elapsed / targetFrameTime, 3); // Cap at 3x to prevent huge jumps
+        
         // --- UPDATE PHASE ---
         
         // Handle player input
@@ -1147,14 +1166,14 @@
         // Update game state based on current state (skip when paused)
         if ((game.state === 'playing' || game.state === 'waveDelay') && game.state !== 'paused') {
             // Update ship
-            game.ship.update(canvas);
+            game.ship.update(canvas, dt);
             
             // Update astervoids
-            game.astervoids.forEach(asteroid => asteroid.update(canvas));
+            game.astervoids.forEach(asteroid => asteroid.update(canvas, dt));
             
             // Update bullets and remove expired ones
             game.bullets = game.bullets.filter(bullet => {
-                bullet.update(canvas);
+                bullet.update(canvas, dt);
                 return !bullet.isExpired();
             });
             
@@ -1167,9 +1186,9 @@
                 game.waveDelayTimer = CONFIG.WAVE_DELAY;
             }
             
-            // Handle wave delay countdown
+            // Handle wave delay countdown (adjusted for delta time)
             if (game.state === 'waveDelay') {
-                game.waveDelayTimer--;
+                game.waveDelayTimer -= dt;
                 if (game.waveDelayTimer <= 0) {
                     spawnWave();
                     game.state = 'playing';
@@ -1380,7 +1399,7 @@
             requestAnimationFrame(mobileLoop);
         });
     }
-    gameLoop();
+    requestAnimationFrame(gameLoop);  // Use rAF to provide timestamp
 
     </script>
 </body>
