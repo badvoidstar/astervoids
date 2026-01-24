@@ -1538,7 +1538,7 @@
                 const data = localStorage.getItem(this.storageKey);
                 return data ? JSON.parse(data) : [];
             } catch (e) {
-                console.error('Error loading game history:', e);
+                console.error('Failed to load game history from localStorage. This may be due to JSON parsing error or storage access restriction:', e);
                 return [];
             }
         },
@@ -1558,12 +1558,16 @@
             const content = document.getElementById('history-content');
             const history = this.loadHistory();
             
+            // Clear existing content
+            content.innerHTML = '';
+            
             if (history.length === 0) {
-                content.innerHTML = '<div class="no-history">No games played yet. Start a game to see your results here!</div>';
+                // Create empty state message using DOM for consistency
+                const noHistoryDiv = document.createElement('div');
+                noHistoryDiv.className = 'no-history';
+                noHistoryDiv.textContent = 'No games played yet. Start a game to see your results here!';
+                content.appendChild(noHistoryDiv);
             } else {
-                // Clear existing content
-                content.innerHTML = '';
-                
                 // Create entries using DOM manipulation to avoid XSS
                 history.forEach((entry) => {
                     const entryDiv = document.createElement('div');
