@@ -1001,6 +1001,76 @@
             this.velocityY = 0;
             this.invulnerable = CONFIG.INVULNERABILITY_TIME;
         }
+
+        // ============================================
+        // REMOTE CONTROL API
+        // Methods for programmatic/remote ship control
+        // ============================================
+
+        /**
+         * Set ship angle directly (remote control)
+         * @param {number} angle - Angle in radians
+         */
+        setAngle(angle) {
+            this.angle = angle;
+        }
+
+        /**
+         * Rotate ship towards a target angle (remote control)
+         * @param {number} targetAngle - Target angle in radians
+         * @param {number} turnSpeed - Optional turn speed (defaults to CONFIG.SHIP_TURN_SPEED)
+         * @returns {boolean} True if target angle reached
+         */
+        rotateToAngle(targetAngle, turnSpeed = CONFIG.SHIP_TURN_SPEED) {
+            // Normalize angles to [-PI, PI]
+            const normalizeAngle = (a) => {
+                while (a > Math.PI) a -= 2 * Math.PI;
+                while (a < -Math.PI) a += 2 * Math.PI;
+                return a;
+            };
+            
+            const currentAngle = normalizeAngle(this.angle);
+            const target = normalizeAngle(targetAngle);
+            let diff = normalizeAngle(target - currentAngle);
+            
+            // If close enough, snap to target
+            if (Math.abs(diff) < turnSpeed) {
+                this.angle = targetAngle;
+                return true;
+            }
+            
+            // Rotate in shortest direction
+            this.angle += diff > 0 ? turnSpeed : -turnSpeed;
+            return false;
+        }
+
+        /**
+         * Set ship position directly (remote control)
+         * @param {number} x - X coordinate
+         * @param {number} y - Y coordinate
+         */
+        setPosition(x, y) {
+            this.x = x;
+            this.y = y;
+        }
+
+        /**
+         * Set ship velocity directly (remote control)
+         * @param {number} vx - X velocity
+         * @param {number} vy - Y velocity
+         */
+        setVelocity(vx, vy) {
+            this.velocityX = vx;
+            this.velocityY = vy;
+        }
+
+        /**
+         * Enable/disable thrust remotely
+         * @param {boolean} active - Whether thrust should be active
+         */
+        setThrust(active) {
+            this.thrusting = active;
+        }
     }
 
     /**
@@ -1796,8 +1866,22 @@
     // Initial canvas sizing before game starts
     resizeCanvas();
 
+    // Expose game object globally for remote control API access
+    window.game = game;
+
     // Start the game when page loads
     init();
+    
+    // Log remote control API info to console
+    console.log('%c🚀 Asteroids - Remote Control API Available', 'color: #0f0; font-size: 16px; font-weight: bold');
+    console.log('%cAccess the ship via: window.game.ship', 'color: #0ff');
+    console.log('%cRemote Control Methods:', 'color: #0ff; font-weight: bold');
+    console.log('  • game.ship.setAngle(radians) - Set ship rotation');
+    console.log('  • game.ship.rotateToAngle(radians) - Rotate to target angle');
+    console.log('  • game.ship.setPosition(x, y) - Set ship position');
+    console.log('  • game.ship.setVelocity(vx, vy) - Set ship velocity');
+    console.log('  • game.ship.setThrust(bool) - Enable/disable thrust');
+    console.log('%cExample: game.ship.setAngle(0) // Face right', 'color: #ff0');
     if (isTouchDevice) {
         // Use wrapper that updates mobile UI
         requestAnimationFrame(function mobileLoop() {
