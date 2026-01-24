@@ -93,3 +93,34 @@ asteroids/
 **Desktop:** Arrow keys to move, Space to fire, P to pause
 
 **Mobile:** Touch controls appear automatically on touch devices
+
+## Remote Control API
+
+The game exposes a remote control API for programmatic ship control, useful for automated testing, AI control, or demonstrations.
+
+Access the API via the browser console:
+
+```javascript
+// Access the ship
+window.game.ship
+
+// Set ship rotation (angle in radians)
+game.ship.setAngle(0)  // Face right
+game.ship.setAngle(Math.PI / 2)  // Face down
+
+// Smoothly rotate to target angle
+game.ship.rotateToAngle(Math.PI)  // Rotate towards left
+// Returns true when target angle is reached
+
+// Set ship position
+game.ship.setPosition(400, 300)
+
+// Set ship velocity
+game.ship.setVelocity(5, -3)
+
+// Control thrust
+game.ship.setThrust(true)   // Enable
+game.ship.setThrust(false)  // Disable
+```
+
+The API is documented in the browser console when the game loads.
