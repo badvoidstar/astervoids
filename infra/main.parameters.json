@@ -9,10 +9,10 @@
       "value": "${AZURE_LOCATION}"
     },
     "customDomainName": {
-      "value": "${CUSTOM_DOMAIN_NAME=example.com}"
+      "value": "${CUSTOM_DOMAIN_NAME=}"
     },
     "customSubdomain": {
-      "value": "${CUSTOM_SUBDOMAIN=astervoids}"
+      "value": "${CUSTOM_SUBDOMAIN=}"
     }
   }
 }
