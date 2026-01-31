@@ -117,6 +117,19 @@
             color: #fff;
         }
 
+        /* Hide keyboard instructions on touch devices */
+        .touch-enabled #pause-menu .desktop-only {
+            display: none;
+        }
+
+        #pause-menu .touch-only {
+            display: none;
+        }
+
+        .touch-enabled #pause-menu .touch-only {
+            display: block;
+        }
+
         /* Start screen overlay */
         #start-screen {
             position: absolute;
@@ -305,10 +318,12 @@
         <!-- Pause menu overlay -->
         <div id="pause-menu">
             <h1>PAUSED</h1>
-            <div class="menu-item"><span>ESC</span> or <span>P</span> - Resume</div>
-            <div class="menu-item"><span>ENTER</span> - Restart Game</div>
-            <div class="menu-item"><span>Arrow Keys</span> / <span>WASD</span> - Move</div>
-            <div class="menu-item"><span>SPACE</span> - Shoot</div>
+            <div class="menu-item desktop-only"><span>ESC</span> or <span>P</span> - Resume</div>
+            <div class="menu-item desktop-only"><span>ENTER</span> - Restart Game</div>
+            <div class="menu-item desktop-only"><span>Arrow Keys</span> / <span>WASD</span> - Move</div>
+            <div class="menu-item desktop-only"><span>SPACE</span> - Shoot</div>
+            <div class="menu-item touch-only">Tap <span>❚❚</span> to Resume</div>
+            <div class="menu-item touch-only">Tap <span>RESTART</span> to Restart</div>
         </div>
 
         <!-- Start screen overlay -->
@@ -1735,7 +1750,9 @@
         if (game.state === 'gameover') {
             drawCenteredText('GAME OVER', canvas.height / 2 - 40, 48);
             drawCenteredText(`Final Score: ${game.score}`, canvas.height / 2 + 10, 24);
-            drawCenteredText('Press ENTER to restart', canvas.height / 2 + 50, 20);
+            if (!touchControlsEnabled) {
+                drawCenteredText('Press ENTER to restart', canvas.height / 2 + 50, 20);
+            }
         }
         
         // Request next frame
