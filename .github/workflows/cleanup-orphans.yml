@@ -146,3 +146,129 @@ jobs:
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Summary:** Found $ORPHANS_FOUND orphaned deployments, cleaned up $ORPHANS_CLEANED" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup orphaned DNS records and certificates
+        if: ${{ secrets.CUSTOM_DOMAIN_NAME != '' && secrets.CUSTOM_SUBDOMAIN != '' }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧹 Scanning for Orphaned DNS/Certificates" >> $GITHUB_STEP_SUMMARY
+          
+          DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
+          SUBDOMAIN_PREFIX="${{ secrets.CUSTOM_SUBDOMAIN }}"
+          DNS_CLEANED=0
+          CERT_CLEANED=0
+          
+          # Get list of active container apps (excluding production)
+          ACTIVE_APPS=$(az containerapp list \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --query "[?starts_with(name, 'ca-web-') && name != 'ca-web-production'].name" \
+            -o tsv 2>/dev/null || echo "")
+          
+          # Build list of expected subdomain suffixes from active apps
+          ACTIVE_SUFFIXES=""
+          for APP in $ACTIVE_APPS; do
+            SUFFIX="${APP#ca-web-}"
+            ACTIVE_SUFFIXES="$ACTIVE_SUFFIXES $SUFFIX"
+          done
+          echo "Active branch suffixes: $ACTIVE_SUFFIXES"
+          
+          # Scan CNAME records for orphans
+          echo ""
+          echo "Scanning CNAME records..."
+          CNAME_RECORDS=$(az network dns record-set cname list \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --zone-name "$DOMAIN_NAME" \
+            --query "[?starts_with(name, '${SUBDOMAIN_PREFIX}-')].name" \
+            -o tsv 2>/dev/null || echo "")
+          
+          for CNAME in $CNAME_RECORDS; do
+            # Extract suffix (e.g., "astervoids-feature-test" -> "feature-test")
+            SUFFIX="${CNAME#${SUBDOMAIN_PREFIX}-}"
+            
+            # Check if this suffix matches an active container app
+            IS_ACTIVE=false
+            for ACTIVE in $ACTIVE_SUFFIXES; do
+              if [ "$SUFFIX" = "$ACTIVE" ]; then
+                IS_ACTIVE=true
+                break
+              fi
+            done
+            
+            if [ "$IS_ACTIVE" = "false" ]; then
+              echo "  Orphan CNAME: $CNAME"
+              az network dns record-set cname delete \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --zone-name "$DOMAIN_NAME" \
+                --name "$CNAME" \
+                --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
+            fi
+          done
+          
+          # Scan TXT records for orphans
+          echo ""
+          echo "Scanning TXT verification records..."
+          TXT_RECORDS=$(az network dns record-set txt list \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --zone-name "$DOMAIN_NAME" \
+            --query "[?starts_with(name, 'asuid.${SUBDOMAIN_PREFIX}-')].name" \
+            -o tsv 2>/dev/null || echo "")
+          
+          for TXT in $TXT_RECORDS; do
+            # Extract suffix (e.g., "asuid.astervoids-feature-test" -> "feature-test")
+            SUFFIX="${TXT#asuid.${SUBDOMAIN_PREFIX}-}"
+            
+            IS_ACTIVE=false
+            for ACTIVE in $ACTIVE_SUFFIXES; do
+              if [ "$SUFFIX" = "$ACTIVE" ]; then
+                IS_ACTIVE=true
+                break
+              fi
+            done
+            
+            if [ "$IS_ACTIVE" = "false" ]; then
+              echo "  Orphan TXT: $TXT"
+              az network dns record-set txt delete \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --zone-name "$DOMAIN_NAME" \
+                --name "$TXT" \
+                --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
+            fi
+          done
+          
+          # Scan certificates for orphans
+          echo ""
+          echo "Scanning certificates..."
+          CERTS=$(az containerapp env certificate list \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --name "cae-production" \
+            --query "[?starts_with(name, 'cert-${SUBDOMAIN_PREFIX}-') && name != 'cert-${SUBDOMAIN_PREFIX}-${DOMAIN_NAME//./-}'].name" \
+            -o tsv 2>/dev/null || echo "")
+          
+          for CERT in $CERTS; do
+            # Extract suffix from cert name (e.g., "cert-astervoids-feature-test-bootyblocks-com" -> "feature-test")
+            # Remove prefix and domain suffix
+            DOMAIN_SUFFIX="${DOMAIN_NAME//./-}"
+            TEMP="${CERT#cert-${SUBDOMAIN_PREFIX}-}"
+            SUFFIX="${TEMP%-${DOMAIN_SUFFIX}}"
+            
+            IS_ACTIVE=false
+            for ACTIVE in $ACTIVE_SUFFIXES; do
+              if [ "$SUFFIX" = "$ACTIVE" ]; then
+                IS_ACTIVE=true
+                break
+              fi
+            done
+            
+            if [ "$IS_ACTIVE" = "false" ]; then
+              echo "  Orphan certificate: $CERT"
+              az containerapp env certificate delete \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --name "cae-production" \
+                --certificate-name "$CERT" \
+                --yes 2>/dev/null && CERT_CLEANED=$((CERT_CLEANED + 1)) && echo "  -> Deleted"
+            fi
+          done
+          
+          echo ""
+          echo "DNS/Cert cleanup: $DNS_CLEANED DNS records, $CERT_CLEANED certificates"
+          echo "**DNS/Cert cleanup:** $DNS_CLEANED DNS records, $CERT_CLEANED certificates" >> $GITHUB_STEP_SUMMARY
