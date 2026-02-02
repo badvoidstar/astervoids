@@ -1,0 +1,148 @@
+name: Cleanup Orphaned Branch Deployments
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PRODUCTION_RG: 'rg-production'
+
+jobs:
+  cleanup:
+    name: Find and Cleanup Orphaned Deployments
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to list branches
+
+      - name: Log in to Azure using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Find and cleanup orphaned container apps
+        run: |
+          echo "### 🔍 Scanning for Orphaned Deployments" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get all remote branches
+          git fetch --all
+          BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | tr -d ' ')
+          echo "Active branches:"
+          echo "$BRANCHES"
+          
+          # Get all container apps matching our naming pattern (ca-web-*)
+          CONTAINER_APPS=$(az containerapp list \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --query "[?starts_with(name, 'ca-web-')].name" \
+            -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$CONTAINER_APPS" ]; then
+            echo "No container apps found"
+            echo "No container apps found in resource group." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          echo ""
+          echo "Container apps found:"
+          echo "$CONTAINER_APPS"
+          
+          ORPHANS_FOUND=0
+          ORPHANS_CLEANED=0
+          
+          for APP in $CONTAINER_APPS; do
+            echo ""
+            echo "Checking: $APP"
+            
+            # Skip production container app
+            if [ "$APP" = "ca-web-production" ]; then
+              echo "  -> Skipping production"
+              continue
+            fi
+            
+            # Extract the sanitized branch name from container app name
+            # Container app name format: ca-web-{sanitized-branch}
+            SANITIZED_BRANCH="${APP#ca-web-}"
+            
+            # Check if any branch matches this sanitized name
+            BRANCH_EXISTS=false
+            for BRANCH in $BRANCHES; do
+              # Sanitize the branch name the same way deploy workflow does
+              BRANCH_SANITIZED=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[\/]/-/g' | sed 's/[^a-z0-9-]//g' | cut -c1-20 | sed 's/-*$//')
+              
+              if [ "$BRANCH_SANITIZED" = "$SANITIZED_BRANCH" ]; then
+                BRANCH_EXISTS=true
+                echo "  -> Branch exists: $BRANCH"
+                break
+              fi
+            done
+            
+            if [ "$BRANCH_EXISTS" = "false" ]; then
+              echo "  -> ORPHAN DETECTED - No matching branch found"
+              ORPHANS_FOUND=$((ORPHANS_FOUND + 1))
+              
+              # Delete the container app
+              echo "  -> Deleting container app: $APP"
+              if az containerapp delete \
+                --name "$APP" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --yes 2>/dev/null; then
+                echo "  -> Container app deleted"
+                ORPHANS_CLEANED=$((ORPHANS_CLEANED + 1))
+                echo "- ✅ Deleted container app: \`$APP\`" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "  -> Failed to delete container app"
+                echo "- ❌ Failed to delete: \`$APP\`" >> $GITHUB_STEP_SUMMARY
+              fi
+              
+              # Delete DNS records if custom domain is configured
+              if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
+                DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
+                BRANCH_SUBDOMAIN="${{ secrets.CUSTOM_SUBDOMAIN }}-$SANITIZED_BRANCH"
+                
+                echo "  -> Deleting DNS records for: $BRANCH_SUBDOMAIN.$DOMAIN_NAME"
+                
+                # Delete CNAME record
+                az network dns record-set cname delete \
+                  --resource-group "${{ env.PRODUCTION_RG }}" \
+                  --zone-name "$DOMAIN_NAME" \
+                  --name "$BRANCH_SUBDOMAIN" \
+                  --yes 2>/dev/null || echo "  -> CNAME not found"
+                
+                # Delete TXT verification record
+                az network dns record-set txt delete \
+                  --resource-group "${{ env.PRODUCTION_RG }}" \
+                  --zone-name "$DOMAIN_NAME" \
+                  --name "asuid.$BRANCH_SUBDOMAIN" \
+                  --yes 2>/dev/null || echo "  -> TXT not found"
+                
+                # Delete managed certificate
+                CERT_NAME="cert-${BRANCH_SUBDOMAIN}-${DOMAIN_NAME//./-}"
+                az containerapp env certificate delete \
+                  --resource-group "${{ env.PRODUCTION_RG }}" \
+                  --name "cae-production" \
+                  --certificate-name "$CERT_NAME" \
+                  --yes 2>/dev/null || echo "  -> Certificate not found"
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "=== Summary ==="
+          echo "Orphans found: $ORPHANS_FOUND"
+          echo "Orphans cleaned: $ORPHANS_CLEANED"
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Summary:** Found $ORPHANS_FOUND orphaned deployments, cleaned up $ORPHANS_CLEANED" >> $GITHUB_STEP_SUMMARY
