@@ -288,3 +288,5 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "View your deployment in the [Azure Portal](https://portal.azure.com)" >> $GITHUB_STEP_SUMMARY
+
+# Branch test
