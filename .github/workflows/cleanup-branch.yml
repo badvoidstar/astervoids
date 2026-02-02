@@ -2,6 +2,13 @@ name: Cleanup Branch Deployment
 
 on:
   delete:
+  # Manual trigger as fallback
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name to cleanup (e.g., feature/my-branch)'
+        required: true
+        type: string
 
 permissions:
   id-token: write
@@ -14,15 +21,23 @@ jobs:
   cleanup:
     name: Cleanup Branch Resources
     runs-on: ubuntu-latest
-    # Only run for branch deletions (not tag deletions), and not for master
-    if: github.event.ref_type == 'branch' && github.event.ref != 'master'
+    # For delete events: only run for branch deletions (not tag deletions), and not for master
+    # For workflow_dispatch: always run
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.ref_type == 'branch' && github.event.ref != 'master')
     environment: production
     
     steps:
       - name: Set branch variables
         id: vars
         run: |
-          BRANCH_NAME="${{ github.event.ref }}"
+          # Get branch name from event or input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          else
+            BRANCH_NAME="${{ github.event.ref }}"
+          fi
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           
           # Sanitize branch name (same logic as deploy workflow)
