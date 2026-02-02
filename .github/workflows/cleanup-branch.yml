@@ -1,0 +1,98 @@
+name: Cleanup Branch Deployment
+
+on:
+  delete:
+    branches:
+      - '**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PRODUCTION_RG: 'rg-production'
+
+jobs:
+  cleanup:
+    name: Cleanup Branch Resources
+    runs-on: ubuntu-latest
+    # Only run for branch deletions (not tag deletions)
+    if: github.event.ref_type == 'branch' && github.event.ref != 'master'
+    environment: production
+    
+    steps:
+      - name: Set branch variables
+        id: vars
+        run: |
+          BRANCH_NAME="${{ github.event.ref }}"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          
+          # Sanitize branch name (same logic as deploy workflow)
+          SANITIZED=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[\/]/-/g' | sed 's/[^a-z0-9-]//g' | cut -c1-20)
+          echo "sanitized_branch=$SANITIZED" >> $GITHUB_OUTPUT
+          echo "container_app_name=ca-web-$SANITIZED" >> $GITHUB_OUTPUT
+
+      - name: Log in to Azure using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete Container App
+        continue-on-error: true
+        run: |
+          echo "Deleting Container App: ${{ steps.vars.outputs.container_app_name }}"
+          az containerapp delete \
+            --name "${{ steps.vars.outputs.container_app_name }}" \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --yes || echo "Container App not found or already deleted"
+
+      - name: Delete DNS Records
+        if: ${{ secrets.CUSTOM_DOMAIN_NAME != '' && secrets.CUSTOM_SUBDOMAIN != '' }}
+        continue-on-error: true
+        run: |
+          DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
+          BRANCH_SUBDOMAIN="${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}"
+          
+          echo "Deleting DNS records for: $BRANCH_SUBDOMAIN.$DOMAIN_NAME"
+          
+          # Delete CNAME record
+          az network dns record-set cname delete \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --zone-name "$DOMAIN_NAME" \
+            --name "$BRANCH_SUBDOMAIN" \
+            --yes || echo "CNAME record not found"
+          
+          # Delete TXT verification record
+          az network dns record-set txt delete \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --zone-name "$DOMAIN_NAME" \
+            --name "asuid.$BRANCH_SUBDOMAIN" \
+            --yes || echo "TXT record not found"
+
+      - name: Delete Managed Certificate
+        if: ${{ secrets.CUSTOM_DOMAIN_NAME != '' && secrets.CUSTOM_SUBDOMAIN != '' }}
+        continue-on-error: true
+        run: |
+          DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
+          BRANCH_SUBDOMAIN="${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}"
+          CERT_NAME="cert-${BRANCH_SUBDOMAIN//./-}-${DOMAIN_NAME//./-}"
+          
+          echo "Deleting managed certificate: $CERT_NAME"
+          
+          az containerapp env certificate delete \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --name "cae-production" \
+            --certificate-name "$CERT_NAME" \
+            --yes || echo "Certificate not found"
+
+      - name: Cleanup Summary
+        run: |
+          echo "### 🧹 Branch Cleanup Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ steps.vars.outputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Container App:** ${{ steps.vars.outputs.container_app_name }} (deleted)" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+            echo "**DNS Records:** ${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}.${{ secrets.CUSTOM_DOMAIN_NAME }} (deleted)" >> $GITHUB_STEP_SUMMARY
+          fi
