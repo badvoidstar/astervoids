@@ -7,7 +7,9 @@ This document explains how to configure the GitHub Actions workflow for automati
 The CI/CD pipeline automatically:
 - **Builds** the .NET application on every push and pull request
 - **Tests** the application to ensure code quality
-- **Deploys** to Azure Container Apps when code is pushed to the `master` branch
+- **Deploys** to Azure Container Apps when code is pushed to any branch
+- **Creates preview environments** with custom subdomains for feature branches
+- **Cleans up** branch resources automatically when branches are deleted
 
 ## Prerequisites
 
@@ -101,8 +103,9 @@ If the custom domain secrets are configured, the workflow will automatically set
 ### Automatic Trigger
 
 The workflow will automatically run when:
-- Code is pushed to the `master` branch (builds, tests, and deploys)
+- Code is pushed to **any branch** (builds, tests, and deploys)
 - A pull request is opened against `master` (builds and tests only)
+- A branch is deleted (cleanup workflow removes resources)
 
 ### Manual Trigger
 
@@ -110,6 +113,50 @@ You can manually trigger the workflow:
 1. Go to the "Actions" tab in your GitHub repository
 2. Select the "Build and Deploy to Azure" workflow
 3. Click "Run workflow"
+
+## Branch Deployments
+
+### How It Works
+
+When you push to any branch, the workflow automatically:
+1. Builds and tests the application
+2. Deploys to a branch-specific Container App
+3. Creates DNS records for a branch-specific subdomain
+4. Configures HTTPS with a managed certificate
+
+### Subdomain Naming
+
+Branch deployments get subdomains following this pattern:
+- **Production (master):** `{subdomain}.{domain}` (e.g., `app.yourdomain.com`)
+- **Feature branches:** `{subdomain}-{branch}.{domain}` (e.g., `app-feature-login.yourdomain.com`)
+
+Branch names are sanitized for DNS compatibility:
+- Converted to lowercase
+- `/` replaced with `-` (e.g., `feature/login` → `feature-login`)
+- Special characters removed
+- Truncated to 20 characters
+
+### Resource Naming
+
+| Resource | Production | Branch (feature/login) |
+|----------|------------|------------------------|
+| Container App | `ca-web-production` | `ca-web-feature-login` |
+| Subdomain | `app.domain.com` | `app-feature-login.domain.com` |
+
+### Prerequisites for Branch Deployments
+
+1. **Production must be deployed first** - Branch deployments use the shared Container Apps Environment created by the production deployment
+2. **Custom domain secrets configured** - `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must be set
+
+### Automatic Cleanup
+
+When a branch is deleted from GitHub:
+1. The cleanup workflow triggers automatically
+2. Deletes the branch's Container App
+3. Removes DNS records (CNAME and TXT)
+4. Removes the managed certificate
+
+**Note:** The master branch cleanup is blocked to prevent accidental deletion of production.
 
 ## Monitoring Deployments
 
