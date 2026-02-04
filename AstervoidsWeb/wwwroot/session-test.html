@@ -468,6 +468,7 @@
                 updateSessionUI(result.session, result.member);
                 clearSelectedSessionInfo();
                 log(`Joined session "${result.session.name}" as ${result.member.role}`, 'event');
+                await refreshSessions();
             } catch (err) {
                 log('Error joining session: ' + err.message, 'error');
             }
@@ -488,6 +489,7 @@
                 }
                 updateSessionUI(result.session, result.member);
                 log(`Created session "${result.session.name}" as ${result.member.role}`, 'event');
+                await refreshSessions();
             } catch (err) {
                 log('Error creating session: ' + err.message, 'error');
             }
