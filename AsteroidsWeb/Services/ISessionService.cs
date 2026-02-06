@@ -11,8 +11,9 @@ public interface ISessionService
     /// Creates a new session with a randomly generated fruit name.
     /// </summary>
     /// <param name="creatorConnectionId">SignalR connection ID of the creator.</param>
+    /// <param name="aspectRatio">The aspect ratio (width/height) to lock for this session.</param>
     /// <returns>Result indicating success/failure with session and member if successful.</returns>
-    CreateSessionResult CreateSession(string creatorConnectionId);
+    CreateSessionResult CreateSession(string creatorConnectionId, double aspectRatio);
 
     /// <summary>
     /// Joins an existing session as a client.

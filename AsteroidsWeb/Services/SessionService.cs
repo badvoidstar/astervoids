@@ -51,7 +51,7 @@ public class SessionService : ISessionService
         _logger = logger;
     }
 
-    public CreateSessionResult CreateSession(string creatorConnectionId)
+    public CreateSessionResult CreateSession(string creatorConnectionId, double aspectRatio)
     {
         lock (_sessionLock)
         {
@@ -70,9 +70,13 @@ public class SessionService : ISessionService
                 return new CreateSessionResult(false, null, null, $"Maximum number of sessions ({_maxSessions}) has been reached");
             }
 
+            // Validate aspect ratio (reasonable bounds: 0.25 to 4.0)
+            var clampedAspectRatio = Math.Clamp(aspectRatio, 0.25, 4.0);
+
             var session = new Session
             {
-                Name = GenerateUniqueFruitName()
+                Name = GenerateUniqueFruitName(),
+                AspectRatio = clampedAspectRatio
             };
 
             var creator = new Member

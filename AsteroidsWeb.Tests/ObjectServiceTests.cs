@@ -19,7 +19,7 @@ public class ObjectServiceTests
     public void CreateObject_ShouldCreateObjectWithCorrectAffiliation()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
 
@@ -45,7 +45,7 @@ public class ObjectServiceTests
     public void CreateObject_ClientCreatesObject_ShouldHaveClientAffiliation()
     {
         // Arrange
-        var session = _sessionService.CreateSession("connection-1").Session!;
+        var session = _sessionService.CreateSession("connection-1", 1.5).Session!;
         var joinResult = _sessionService.JoinSession(session.Id, "connection-2");
         Assert.True(joinResult.Success);
         var client = joinResult.Member!;
@@ -75,7 +75,7 @@ public class ObjectServiceTests
     public void UpdateObject_ShouldMergeData()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
@@ -103,7 +103,7 @@ public class ObjectServiceTests
     public void UpdateObject_WithExpectedVersion_ShouldSucceed()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
@@ -125,7 +125,7 @@ public class ObjectServiceTests
     public void UpdateObject_WithWrongVersion_ShouldFail()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
@@ -147,7 +147,7 @@ public class ObjectServiceTests
     public void UpdateObjects_ShouldBatchUpdate()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         var obj1 = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?> { ["x"] = 0 });
@@ -172,7 +172,7 @@ public class ObjectServiceTests
     public void DeleteObject_ShouldRemoveObject()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         var obj = _objectService.CreateObject(session.Id, creator.Id);
@@ -189,7 +189,7 @@ public class ObjectServiceTests
     public void DeleteObject_NonExistent_ShouldReturnFalse()
     {
         // Arrange
-        var session = _sessionService.CreateSession("connection-1").Session!;
+        var session = _sessionService.CreateSession("connection-1", 1.5).Session!;
 
         // Act
         var deleted = _objectService.DeleteObject(session.Id, Guid.NewGuid());
@@ -202,7 +202,7 @@ public class ObjectServiceTests
     public void GetSessionObjects_ShouldReturnAllObjects()
     {
         // Arrange
-        var result = _sessionService.CreateSession("connection-1");
+        var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
         _objectService.CreateObject(session.Id, creator.Id);

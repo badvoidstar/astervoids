@@ -35,6 +35,12 @@ public class Session
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
 
     /// <summary>
+    /// The locked aspect ratio (width/height) for this session.
+    /// Set by the creator at session creation time and immutable thereafter.
+    /// </summary>
+    public double AspectRatio { get; init; } = 16.0 / 9.0;
+
+    /// <summary>
     /// Version number for optimistic concurrency control on session-level operations.
     /// Used primarily for server role promotion.
     /// </summary>
