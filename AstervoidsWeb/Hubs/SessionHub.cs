@@ -26,9 +26,10 @@ public class SessionHub : Hub
     /// <summary>
     /// Creates a new session and joins as the server.
     /// </summary>
-    public async Task<CreateSessionResponse?> CreateSession()
+    /// <param name="aspectRatio">The aspect ratio (width/height) to lock for this session.</param>
+    public async Task<CreateSessionResponse?> CreateSession(double aspectRatio)
     {
-        var result = _sessionService.CreateSession(Context.ConnectionId);
+        var result = _sessionService.CreateSession(Context.ConnectionId, aspectRatio);
 
         if (!result.Success)
         {
@@ -49,7 +50,8 @@ public class SessionHub : Hub
             session.Id,
             session.Name,
             creator.Id,
-            creator.Role.ToString()
+            creator.Role.ToString(),
+            session.AspectRatio
         );
     }
 
@@ -92,7 +94,8 @@ public class SessionHub : Hub
             member.Id,
             member.Role.ToString(),
             members,
-            objects
+            objects,
+            session.AspectRatio
         );
     }
 
@@ -245,14 +248,15 @@ public class SessionHub : Hub
 }
 
 // Response DTOs
-public record CreateSessionResponse(Guid SessionId, string SessionName, Guid MemberId, string Role);
+public record CreateSessionResponse(Guid SessionId, string SessionName, Guid MemberId, string Role, double AspectRatio);
 public record JoinSessionResponse(
     Guid SessionId,
     string SessionName,
     Guid MemberId,
     string Role,
     IEnumerable<MemberInfo> Members,
-    IEnumerable<ObjectInfo> Objects
+    IEnumerable<ObjectInfo> Objects,
+    double AspectRatio
 );
 public record MemberInfo(Guid Id, string Role, DateTime JoinedAt);
 public record MemberLeftInfo(Guid MemberId, Guid? PromotedMemberId, string? PromotedRole, IEnumerable<Guid> AffectedObjectIds);

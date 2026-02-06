@@ -179,14 +179,15 @@ const SessionClient = (function() {
 
     /**
      * Create a new session.
+     * @param {number} aspectRatio - The aspect ratio (width/height) to lock for this session.
      */
-    async function createSession() {
+    async function createSession(aspectRatio) {
         if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
             throw new Error('Not connected to session hub');
         }
 
         try {
-            const response = await connection.invoke('CreateSession');
+            const response = await connection.invoke('CreateSession', aspectRatio);
             if (!response) {
                 console.log('[SessionClient] CreateSession failed - server at capacity');
                 return null;
@@ -201,10 +202,11 @@ const SessionClient = (function() {
                 id: response.sessionId,
                 name: response.sessionName,
                 members: [currentMember],
-                objects: []
+                objects: [],
+                aspectRatio: response.aspectRatio
             };
 
-            console.log('[SessionClient] Session created:', currentSession.name);
+            console.log('[SessionClient] Session created:', currentSession.name, 'aspectRatio:', currentSession.aspectRatio);
 
             if (callbacks.onSessionCreated) {
                 callbacks.onSessionCreated(currentSession, currentMember);
@@ -239,14 +241,15 @@ const SessionClient = (function() {
                 id: response.sessionId,
                 name: response.sessionName,
                 members: response.members,
-                objects: response.objects
+                objects: response.objects,
+                aspectRatio: response.aspectRatio
             };
             currentMember = {
                 id: response.memberId,
                 role: response.role
             };
 
-            console.log('[SessionClient] Joined session:', currentSession.name);
+            console.log('[SessionClient] Joined session:', currentSession.name, 'aspectRatio:', currentSession.aspectRatio);
 
             if (callbacks.onSessionJoined) {
                 callbacks.onSessionJoined(currentSession, currentMember);

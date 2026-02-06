@@ -915,25 +915,55 @@
      * Resize the canvas to fill the window while maintaining game state
      * Scales all game entity positions proportionally
      */
-    function resizeCanvas() {
+    function resizeCanvas(forceViewportRecalc = false) {
         const container = document.getElementById('game-container');
         const newWidth = container.clientWidth;
         const newHeight = container.clientHeight;
         
-        // Store old dimensions for scaling
-        const oldWidth = canvas.width || CONFIG.BASE_WIDTH;
-        const oldHeight = canvas.height || CONFIG.BASE_HEIGHT;
+        // Store old gameplay dimensions for scaling entities
+        const oldGameWidth = game.viewport.width || canvas.width || CONFIG.BASE_WIDTH;
+        const oldGameHeight = game.viewport.height || canvas.height || CONFIG.BASE_HEIGHT;
         
-        // Only resize if dimensions actually changed
-        if (newWidth === oldWidth && newHeight === oldHeight) return;
+        // Only resize if dimensions changed, unless forcing viewport recalculation
+        const dimensionsChanged = newWidth !== canvas.width || newHeight !== canvas.height;
+        if (!dimensionsChanged && !forceViewportRecalc) return;
         
-        // Calculate scale factors
-        const scaleX = newWidth / oldWidth;
-        const scaleY = newHeight / oldHeight;
-        
-        // Update canvas dimensions
+        // Update canvas dimensions to fill container
         canvas.width = newWidth;
         canvas.height = newHeight;
+        
+        // Calculate viewport (gameplay area) based on mode
+        if (isSessionMode() && game.sessionInfo && game.sessionInfo.aspectRatio) {
+            // Session mode: constrain to locked aspect ratio
+            const lockedAspectRatio = game.sessionInfo.aspectRatio;
+            const windowAspectRatio = newWidth / newHeight;
+            
+            let viewportWidth, viewportHeight;
+            if (windowAspectRatio > lockedAspectRatio) {
+                // Window is wider than locked ratio - pillarbox (black bars on sides)
+                viewportHeight = newHeight;
+                viewportWidth = newHeight * lockedAspectRatio;
+            } else {
+                // Window is taller than locked ratio - letterbox (black bars top/bottom)
+                viewportWidth = newWidth;
+                viewportHeight = newWidth / lockedAspectRatio;
+            }
+            
+            game.viewport.width = viewportWidth;
+            game.viewport.height = viewportHeight;
+            game.viewport.x = (newWidth - viewportWidth) / 2;
+            game.viewport.y = (newHeight - viewportHeight) / 2;
+        } else {
+            // Solo mode: gameplay area is the entire canvas
+            game.viewport.x = 0;
+            game.viewport.y = 0;
+            game.viewport.width = newWidth;
+            game.viewport.height = newHeight;
+        }
+        
+        // Calculate scale factors based on gameplay area change
+        const scaleX = game.viewport.width / oldGameWidth;
+        const scaleY = game.viewport.height / oldGameHeight;
         
         // Scale all game entity positions if game is initialized
         if (game.ship) {
@@ -958,20 +988,38 @@
 
     /**
      * Get the scale factor relative to base design dimensions
-     * Used for scaling visual elements like ship size
+     * Uses gameplay viewport dimensions, not full canvas
      * @returns {number} Scale factor
      */
     function getScaleFactor() {
-        const scaleX = canvas.width / CONFIG.BASE_WIDTH;
-        const scaleY = canvas.height / CONFIG.BASE_HEIGHT;
+        const gameWidth = game.viewport.width || canvas.width;
+        const gameHeight = game.viewport.height || canvas.height;
+        const scaleX = gameWidth / CONFIG.BASE_WIDTH;
+        const scaleY = gameHeight / CONFIG.BASE_HEIGHT;
         return Math.min(scaleX, scaleY);
     }
 
     /**
-     * Wraps a position to the opposite side of the canvas
+     * Get the gameplay area width (viewport width in session mode, canvas width in solo)
+     * @returns {number} Gameplay width
+     */
+    function getGameWidth() {
+        return game.viewport.width || canvas.width;
+    }
+
+    /**
+     * Get the gameplay area height (viewport height in session mode, canvas height in solo)
+     * @returns {number} Gameplay height
+     */
+    function getGameHeight() {
+        return game.viewport.height || canvas.height;
+    }
+
+    /**
+     * Wraps a position to the opposite side of the gameplay area
      * Creates the classic "wrap-around" effect
-     * @param {number} value - Current position
-     * @param {number} max - Canvas dimension
+     * @param {number} value - Current position (in gameplay coordinates)
+     * @param {number} max - Gameplay dimension
      * @returns {number} Wrapped position
      */
     function wrapValue(value, max) {
@@ -1123,9 +1171,9 @@
             this.x += this.velocityX * dt;
             this.y += this.velocityY * dt;
             
-            // Wrap around screen edges
-            this.x = wrapValue(this.x, canvas.width);
-            this.y = wrapValue(this.y, canvas.height);
+            // Wrap around gameplay area edges
+            this.x = wrapValue(this.x, getGameWidth());
+            this.y = wrapValue(this.y, getGameHeight());
             
             // Decrement timers (adjusted for delta time)
             if (this.invulnerable > 0) this.invulnerable -= dt;
@@ -1233,12 +1281,11 @@
         }
 
         /**
-         * Reset ship to center of screen
-         * @param {object} canvas - Canvas element
+         * Reset ship to center of gameplay area
          */
-        reset(canvas) {
-            this.x = canvas.width / 2;
-            this.y = canvas.height / 2;
+        reset() {
+            this.x = getGameWidth() / 2;
+            this.y = getGameHeight() / 2;
             this.angle = -Math.PI / 2;
             this.velocityX = 0;
             this.velocityY = 0;
@@ -1316,7 +1363,7 @@
          * @param {object} canvas - Canvas element for wrapping
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
-        update(canvas, dt = 1) {
+        update(dt = 1) {
             // Move asteroid
             this.x += this.velocityX * dt;
             this.y += this.velocityY * dt;
@@ -1324,9 +1371,9 @@
             // Rotate
             this.angle += this.rotationSpeed * dt;
             
-            // Wrap around screen edges
-            this.x = wrapValue(this.x, canvas.width);
-            this.y = wrapValue(this.y, canvas.height);
+            // Wrap around gameplay area edges
+            this.x = wrapValue(this.x, getGameWidth());
+            this.y = wrapValue(this.y, getGameHeight());
         }
 
         /**
@@ -1376,16 +1423,15 @@
 
         /**
          * Update bullet position and lifetime
-         * @param {object} canvas - Canvas element for wrapping
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
-        update(canvas, dt = 1) {
+        update(dt = 1) {
             this.x += this.velocityX * dt;
             this.y += this.velocityY * dt;
             
-            // Wrap around screen edges
-            this.x = wrapValue(this.x, canvas.width);
-            this.y = wrapValue(this.y, canvas.height);
+            // Wrap around gameplay area edges
+            this.x = wrapValue(this.x, getGameWidth());
+            this.y = wrapValue(this.y, getGameHeight());
             
             // Decrement lifetime (adjusted for delta time)
             this.lifetime -= dt;
@@ -1440,7 +1486,14 @@
         previousState: null,  // State before pausing (to resume correctly)
         lastFrameTime: 0,     // Timestamp of last frame for delta time
         mode: 'solo',         // 'solo' or 'session'
-        sessionInfo: null     // Current session details when in session mode
+        sessionInfo: null,    // Current session details when in session mode
+        // Viewport for constrained aspect ratio in session mode
+        viewport: {
+            x: 0,             // X offset of gameplay area within canvas
+            y: 0,             // Y offset of gameplay area within canvas
+            width: 0,         // Width of gameplay area (set in resizeCanvas)
+            height: 0         // Height of gameplay area (set in resizeCanvas)
+        }
     };
     
     // Helper to check if in session mode
@@ -1482,7 +1535,7 @@
      * Initialize or reset the game to starting state
      */
     function init() {
-        game.ship = new Ship(canvas.width / 2, canvas.height / 2);
+        game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
         game.astervoids = [];
         game.bullets = [];
         game.score = 0;
@@ -1550,8 +1603,8 @@
         
         // Keep trying until we find a safe spawn point
         do {
-            x = Math.random() * canvas.width;
-            y = Math.random() * canvas.height;
+            x = Math.random() * getGameWidth();
+            y = Math.random() * getGameHeight();
         } while (distance(x, y, game.ship.x, game.ship.y) < CONFIG.SPAWN_MIN_DISTANCE);
         
         // Random velocity direction
@@ -1812,7 +1865,7 @@
             }
         } else {
             // Respawn ship at center with invulnerability
-            game.ship.reset(canvas);
+            game.ship.reset();
         }
     }
 
@@ -1839,15 +1892,16 @@
 
     /**
      * Draw centered text message on screen
+     * Uses gameplay width for centering (works with viewport transform)
      * @param {string} text - Message to display
-     * @param {number} y - Y position
+     * @param {number} y - Y position (in gameplay coordinates)
      * @param {number} size - Font size
      */
     function drawCenteredText(text, y, size = 32) {
         ctx.fillStyle = CONFIG.STROKE_COLOR;
         ctx.font = `${size}px 'Courier New', monospace`;
         ctx.textAlign = 'center';
-        ctx.fillText(text, canvas.width / 2, y);
+        ctx.fillText(text, getGameWidth() / 2, y);
     }
 
     // ============================================
@@ -1876,20 +1930,20 @@
         
         // Update astervoids during start screen for visual effect
         if (game.state === 'start') {
-            game.astervoids.forEach(asteroid => asteroid.update(canvas, dt));
+            game.astervoids.forEach(asteroid => asteroid.update(dt));
         }
         
         // Update game state based on current state
         if (game.state === 'playing' || game.state === 'waveDelay') {
             // Update ship
-            game.ship.update(canvas, dt);
+            game.ship.update(dt);
             
             // Update astervoids
-            game.astervoids.forEach(asteroid => asteroid.update(canvas, dt));
+            game.astervoids.forEach(asteroid => asteroid.update(dt));
             
             // Update bullets and remove expired ones
             game.bullets = game.bullets.filter(bullet => {
-                bullet.update(canvas, dt);
+                bullet.update(dt);
                 return !bullet.isExpired();
             });
             
@@ -1921,33 +1975,57 @@
         
         // --- RENDER PHASE ---
         
-        // Clear canvas
+        // Clear entire canvas with black
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         
-        // Draw game entities
+        // In session mode with constrained viewport, apply transform and clipping
+        const hasViewportOffset = game.viewport.x > 0 || game.viewport.y > 0;
+        if (hasViewportOffset) {
+            ctx.save();
+            
+            // Clip to viewport area
+            ctx.beginPath();
+            ctx.rect(game.viewport.x, game.viewport.y, game.viewport.width, game.viewport.height);
+            ctx.clip();
+            
+            // Translate so gameplay coordinates (0,0) start at viewport origin
+            ctx.translate(game.viewport.x, game.viewport.y);
+        }
+        
+        // Draw game entities (now in gameplay coordinates)
         game.astervoids.forEach(asteroid => asteroid.draw(ctx));
         game.bullets.forEach(bullet => bullet.draw(ctx));
         if (game.state !== 'start') {
             game.ship.draw(ctx);
         }
         
-        // Draw state-specific overlays
+        // Draw state-specific overlays (in gameplay coordinates)
         if (game.state === 'waveDelay') {
-            drawCenteredText(`WAVE ${game.wave + 1}`, canvas.height / 2, 48);
+            drawCenteredText(`WAVE ${game.wave + 1}`, getGameHeight() / 2, 48);
         }
         
         if (game.state === 'gameover') {
-            drawCenteredText('GAME OVER', canvas.height / 2 - 40, 48);
-            drawCenteredText(`Final Score: ${game.score}`, canvas.height / 2 + 10, 24);
+            drawCenteredText('GAME OVER', getGameHeight() / 2 - 40, 48);
+            drawCenteredText(`Final Score: ${game.score}`, getGameHeight() / 2 + 10, 24);
             if (!touchControlsEnabled) {
                 // Show different message based on mode
                 if (isSessionMode()) {
-                    drawCenteredText('Press ENTER for menu', canvas.height / 2 + 50, 20);
+                    drawCenteredText('Press ENTER for menu', getGameHeight() / 2 + 50, 20);
                 } else {
-                    drawCenteredText('Press ENTER to restart', canvas.height / 2 + 50, 20);
+                    drawCenteredText('Press ENTER to restart', getGameHeight() / 2 + 50, 20);
                 }
             }
+        }
+        
+        // Restore context if we applied viewport transform
+        if (hasViewportOffset) {
+            ctx.restore();
+            
+            // Draw white border around viewport (outside the clipping region)
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(game.viewport.x, game.viewport.y, game.viewport.width, game.viewport.height);
         }
         
         // Request next frame
@@ -2165,7 +2243,7 @@
     resizeCanvas();
 
     // Initialize game objects for start screen display (but don't start playing)
-    game.ship = new Ship(canvas.width / 2, canvas.height / 2);
+    game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
     game.astervoids = [];
     game.bullets = [];
     // Spawn some astervoids for visual effect on start screen
@@ -2173,8 +2251,8 @@
         const angle = Math.random() * Math.PI * 2;
         const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
         game.astervoids.push(new Asteroid(
-            Math.random() * canvas.width,
-            Math.random() * canvas.height,
+            Math.random() * getGameWidth(),
+            Math.random() * getGameHeight(),
             CONFIG.INITIAL_ASTEROID_RADIUS,
             Math.cos(angle) * speed,
             Math.sin(angle) * speed
@@ -2360,7 +2438,8 @@
                     id: result.session.id,
                     name: result.session.name,
                     memberId: result.member.id,
-                    role: result.member.role
+                    role: result.member.role,
+                    aspectRatio: result.session.aspectRatio
                 };
                 stopSessionRefresh();
                 startGameFromPicker();
@@ -2383,14 +2462,17 @@
         sessionPicker.btnCreate.disabled = true;
 
         try {
-            const result = await SessionClient.createSession();
+            // Capture the current aspect ratio at the moment of session creation
+            const currentAspectRatio = canvas.width / canvas.height;
+            const result = await SessionClient.createSession(currentAspectRatio);
             if (result) {
                 game.mode = 'session';
                 game.sessionInfo = {
                     id: result.session.id,
                     name: result.session.name,
                     memberId: result.member.id,
-                    role: result.member.role
+                    role: result.member.role,
+                    aspectRatio: result.session.aspectRatio
                 };
                 stopSessionRefresh();
                 startGameFromPicker();
@@ -2416,6 +2498,8 @@
     // Start game from picker (replaces old startGame for picker context)
     function startGameFromPicker() {
         if (game.state === 'start') {
+            // Recalculate viewport with new session aspect ratio before initializing (force recalc)
+            resizeCanvas(true);
             init();
         }
     }
@@ -2443,16 +2527,19 @@
         AudioSystem.beat.stop();
         AudioSystem.thrustSound.stop();
 
+        // Recalculate viewport now that we're back in solo mode (force recalc even if window size unchanged)
+        resizeCanvas(true);
+
         // Reinitialize start screen visuals
-        game.ship = new Ship(canvas.width / 2, canvas.height / 2);
+        game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
         game.astervoids = [];
         game.bullets = [];
         for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
             const angle = Math.random() * Math.PI * 2;
             const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
             game.astervoids.push(new Asteroid(
-                Math.random() * canvas.width,
-                Math.random() * canvas.height,
+                Math.random() * getGameWidth(),
+                Math.random() * getGameHeight(),
                 CONFIG.INITIAL_ASTEROID_RADIUS,
                 Math.cos(angle) * speed,
                 Math.sin(angle) * speed
