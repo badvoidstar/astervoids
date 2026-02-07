@@ -845,46 +845,45 @@
     // ============================================
     // SECTION 1: CONFIGURATION
     // All tunable game parameters in one place
+    // All positions are normalized (0-1), sizes relative to shorter dimension
     // ============================================
     const CONFIG = {
-        // Base design dimensions (used for scaling)
-        BASE_WIDTH: 800,            // Reference width for scaling
-        BASE_HEIGHT: 600,           // Reference height for scaling
-        
         // Timing settings
         TARGET_FPS: 60,             // Target frame rate for physics
         
-        // Ship settings
-        SHIP_SIZE: 15,              // Ship triangle size in pixels
-        SHIP_THRUST: 0.15,          // Acceleration when thrusting
+        // Ship settings (normalized: sizes relative to shorter dimension)
+        SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
+        SHIP_THRUST: 0.009,         // Acceleration per frame (normalized, ~0.15/600*60)
         SHIP_FRICTION: 0.99,        // Velocity decay (1 = no friction)
         SHIP_TURN_SPEED: 0.08,      // Rotation speed in radians per frame
-        SHIP_MAX_SPEED: 8,          // Maximum velocity magnitude
+        SHIP_MAX_SPEED: 0.8,        // Maximum velocity per second (normalized)
         
-        // Bullet settings
-        BULLET_SPEED: 10,           // Bullet travel speed
+        // Bullet settings (normalized)
+        BULLET_SPEED: 1.0,          // Bullet speed per second (normalized)
         BULLET_LIFETIME: 60,        // Frames before bullet expires
-        BULLET_RADIUS: 2,           // Bullet size for collision
+        BULLET_RADIUS: 0.0033,      // Bullet size (normalized)
         MAX_BULLETS: 10,            // Maximum bullets on screen
         SHOOT_COOLDOWN: 10,         // Frames between shots
         
-        // Asteroid settings
+        // Asteroid settings (normalized)
         ASTEROID_BASE_COUNT: 1,     // Starting asteroids in wave 1
-        ASTEROID_BASE_SPEED: 1.5,   // Base asteroid speed
-        ASTEROID_SPEED_VARIANCE: 1, // Random speed variation
+        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed per second (normalized)
+        ASTEROID_SPEED_VARIANCE: 0.1, // Random speed variation (normalized)
         ASTEROID_VERTICES: 10,      // Number of vertices per asteroid
         ASTEROID_JAGGEDNESS: 0.4,   // Shape irregularity (0-1)
-        MIN_ASTEROID_RADIUS: 15,    // Asteroids smaller than this won't split
-        INITIAL_ASTEROID_RADIUS: 50,// Starting asteroid size
+        MIN_ASTEROID_RADIUS: 0.025, // Min radius before no split (normalized)
+        INITIAL_ASTEROID_RADIUS: 0.083, // Starting asteroid size (normalized)
         
         // Asteroid splitting
         SPLIT_COUNT: 2,             // Always split into 2 pieces
         MIN_SPLIT_RATIO: 0.1,       // Smallest piece is at least 10% of original
         
-        // Scoring (points awarded based on asteroid size)
+        // Scoring (points awarded based on asteroid size - thresholds normalized)
         POINTS_LARGE: 20,           // Points for large asteroids
         POINTS_MEDIUM: 50,          // Points for medium asteroids
         POINTS_SMALL: 100,          // Points for small asteroids
+        ASTEROID_LARGE_THRESHOLD: 0.067,  // ~40px at 600 ref
+        ASTEROID_MEDIUM_THRESHOLD: 0.042, // ~25px at 600 ref
         
         // Game settings
         STARTING_LIVES: 3,          // Lives at game start
@@ -903,7 +902,7 @@
         
         // Start screen
         START_SCREEN_ASTEROIDS: 4,  // Asteroids shown on start screen
-        SPAWN_MIN_DISTANCE: 150     // Minimum spawn distance from ship
+        SPAWN_MIN_DISTANCE: 0.25    // Minimum spawn distance from ship (normalized)
     };
 
     // ============================================
@@ -912,17 +911,139 @@
     // ============================================
 
     /**
+     * Get the reference dimension for size normalization (shorter of width/height)
+     * This ensures circles remain circular regardless of aspect ratio
+     * @returns {number} Reference dimension in pixels
+     */
+    function getReferenceDimension() {
+        return Math.min(getGameWidth(), getGameHeight());
+    }
+
+    /**
+     * Convert normalized X position (0-1) to pixel X within gameplay area
+     * @param {number} normX - Normalized X (0 = left, 1 = right)
+     * @returns {number} Pixel X coordinate
+     */
+    function fromNormalizedX(normX) {
+        return normX * getGameWidth();
+    }
+
+    /**
+     * Convert pixel X to normalized X position (0-1)
+     * @param {number} pixelX - Pixel X coordinate
+     * @returns {number} Normalized X (0-1)
+     */
+    function toNormalizedX(pixelX) {
+        return pixelX / getGameWidth();
+    }
+
+    /**
+     * Convert normalized Y position (0-1) to pixel Y within gameplay area
+     * @param {number} normY - Normalized Y (0 = top, 1 = bottom)
+     * @returns {number} Pixel Y coordinate
+     */
+    function fromNormalizedY(normY) {
+        return normY * getGameHeight();
+    }
+
+    /**
+     * Convert pixel Y to normalized Y position (0-1)
+     * @param {number} pixelY - Pixel Y coordinate
+     * @returns {number} Normalized Y (0-1)
+     */
+    function toNormalizedY(pixelY) {
+        return pixelY / getGameHeight();
+    }
+
+    /**
+     * Convert normalized size to pixel size
+     * Uses shorter dimension as reference to preserve aspect ratio of shapes
+     * @param {number} normSize - Normalized size (fraction of reference dimension)
+     * @returns {number} Pixel size
+     */
+    function fromNormalizedSize(normSize) {
+        return normSize * getReferenceDimension();
+    }
+
+    /**
+     * Convert pixel size to normalized size
+     * @param {number} pixelSize - Pixel size
+     * @returns {number} Normalized size
+     */
+    function toNormalizedSize(pixelSize) {
+        return pixelSize / getReferenceDimension();
+    }
+
+    /**
+     * Convert normalized velocity to pixel velocity for X axis
+     * Velocity is stored as "fraction of dimension per second"
+     * @param {number} normVelX - Normalized velocity (per second)
+     * @returns {number} Pixel velocity per frame (at 60fps)
+     */
+    function fromNormalizedVelocityX(normVelX) {
+        return normVelX * getGameWidth() / CONFIG.TARGET_FPS;
+    }
+
+    /**
+     * Convert normalized velocity to pixel velocity for Y axis
+     * @param {number} normVelY - Normalized velocity (per second)
+     * @returns {number} Pixel velocity per frame (at 60fps)
+     */
+    function fromNormalizedVelocityY(normVelY) {
+        return normVelY * getGameHeight() / CONFIG.TARGET_FPS;
+    }
+
+    /**
+     * Convert normalized velocity (reference-dimension per second) to position delta for X axis
+     * This accounts for aspect ratio to ensure consistent visual speed in all directions
+     * @param {number} normVel - Normalized velocity (reference dimension per second)
+     * @returns {number} Position delta in normalized X coordinates (per frame at 60fps)
+     */
+    function velocityToNormalizedDeltaX(normVel) {
+        const refDim = getReferenceDimension();
+        return normVel * refDim / getGameWidth() / CONFIG.TARGET_FPS;
+    }
+
+    /**
+     * Convert normalized velocity (reference-dimension per second) to position delta for Y axis
+     * This accounts for aspect ratio to ensure consistent visual speed in all directions
+     * @param {number} normVel - Normalized velocity (reference dimension per second)
+     * @returns {number} Position delta in normalized Y coordinates (per frame at 60fps)
+     */
+    function velocityToNormalizedDeltaY(normVel) {
+        const refDim = getReferenceDimension();
+        return normVel * refDim / getGameHeight() / CONFIG.TARGET_FPS;
+    }
+
+    /**
+     * Convert a normalized size to normalized X coordinate offset
+     * Used when adding size-based offsets to positions (e.g., nose position relative to ship center)
+     * @param {number} normSize - Size normalized to reference dimension
+     * @returns {number} Equivalent offset in normalized X coordinates
+     */
+    function sizeToNormalizedX(normSize) {
+        const refDim = getReferenceDimension();
+        return normSize * refDim / getGameWidth();
+    }
+
+    /**
+     * Convert a normalized size to normalized Y coordinate offset
+     * @param {number} normSize - Size normalized to reference dimension
+     * @returns {number} Equivalent offset in normalized Y coordinates
+     */
+    function sizeToNormalizedY(normSize) {
+        const refDim = getReferenceDimension();
+        return normSize * refDim / getGameHeight();
+    }
+
+    /**
      * Resize the canvas to fill the window while maintaining game state
-     * Scales all game entity positions proportionally
+     * With normalized coordinates, positions don't need scaling on resize
      */
     function resizeCanvas(forceViewportRecalc = false) {
         const container = document.getElementById('game-container');
         const newWidth = container.clientWidth;
         const newHeight = container.clientHeight;
-        
-        // Store old gameplay dimensions for scaling entities
-        const oldGameWidth = game.viewport.width || canvas.width || CONFIG.BASE_WIDTH;
-        const oldGameHeight = game.viewport.height || canvas.height || CONFIG.BASE_HEIGHT;
         
         // Only resize if dimensions changed, unless forcing viewport recalculation
         const dimensionsChanged = newWidth !== canvas.width || newHeight !== canvas.height;
@@ -961,47 +1082,13 @@
             game.viewport.height = newHeight;
         }
         
-        // Calculate scale factors based on gameplay area change
-        const scaleX = game.viewport.width / oldGameWidth;
-        const scaleY = game.viewport.height / oldGameHeight;
-        
-        // Scale all game entity positions if game is initialized
-        if (game.ship) {
-            game.ship.x *= scaleX;
-            game.ship.y *= scaleY;
-        }
-        
-        if (game.asteroids) {
-            game.asteroids.forEach(asteroid => {
-                asteroid.x *= scaleX;
-                asteroid.y *= scaleY;
-            });
-        }
-        
-        if (game.bullets) {
-            game.bullets.forEach(bullet => {
-                bullet.x *= scaleX;
-                bullet.y *= scaleY;
-            });
-        }
-    }
-
-    /**
-     * Get the scale factor relative to base design dimensions
-     * Uses gameplay viewport dimensions, not full canvas
-     * @returns {number} Scale factor
-     */
-    function getScaleFactor() {
-        const gameWidth = game.viewport.width || canvas.width;
-        const gameHeight = game.viewport.height || canvas.height;
-        const scaleX = gameWidth / CONFIG.BASE_WIDTH;
-        const scaleY = gameHeight / CONFIG.BASE_HEIGHT;
-        return Math.min(scaleX, scaleY);
+        // No need to scale entity positions - they use normalized coordinates (0-1)
+        // The conversion functions (fromNormalizedX, etc.) handle the mapping to pixels
     }
 
     /**
      * Get the gameplay area width (viewport width in session mode, canvas width in solo)
-     * @returns {number} Gameplay width
+     * @returns {number} Gameplay width in pixels
      */
     function getGameWidth() {
         return game.viewport.width || canvas.width;
@@ -1009,30 +1096,45 @@
 
     /**
      * Get the gameplay area height (viewport height in session mode, canvas height in solo)
-     * @returns {number} Gameplay height
+     * @returns {number} Gameplay height in pixels
      */
     function getGameHeight() {
         return game.viewport.height || canvas.height;
     }
 
     /**
-     * Wraps a position to the opposite side of the gameplay area
+     * Wraps a normalized position (0-1) to stay within bounds
      * Creates the classic "wrap-around" effect
-     * @param {number} value - Current position (in gameplay coordinates)
-     * @param {number} max - Gameplay dimension
-     * @returns {number} Wrapped position
+     * @param {number} value - Current normalized position (0-1)
+     * @returns {number} Wrapped normalized position (0-1)
      */
-    function wrapValue(value, max) {
-        if (value < 0) return max + value;
-        if (value > max) return value - max;
+    function wrapNormalized(value) {
+        if (value < 0) return 1 + value;
+        if (value > 1) return value - 1;
         return value;
     }
 
     /**
-     * Calculates distance between two points
+     * Calculates distance between two normalized points
+     * @param {number} x1, y1 - First point (normalized)
+     * @param {number} x2, y2 - Second point (normalized)
+     * @returns {number} Distance in normalized units (relative to reference dimension)
+     */
+    function normalizedDistance(x1, y1, x2, y2) {
+        // Convert to pixel space for proper distance calculation with aspect ratio
+        const px1 = fromNormalizedX(x1);
+        const py1 = fromNormalizedY(y1);
+        const px2 = fromNormalizedX(x2);
+        const py2 = fromNormalizedY(y2);
+        const pixelDist = Math.sqrt((px2 - px1) ** 2 + (py2 - py1) ** 2);
+        return pixelDist / getReferenceDimension();
+    }
+
+    /**
+     * Calculates distance between two points (pixel coordinates)
      * @param {number} x1, y1 - First point
      * @param {number} x2, y2 - Second point
-     * @returns {number} Distance
+     * @returns {number} Distance in pixels
      */
     function distance(x1, y1, x2, y2) {
         return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
@@ -1125,19 +1227,21 @@
     // ============================================
     // SECTION 3: GAME ENTITY CLASSES
     // Ship, Asteroid, and Bullet definitions
+    // All positions/velocities stored in normalized coordinates (0-1)
     // ============================================
 
     /**
      * Ship Class
      * The player-controlled spacecraft
+     * All positions and velocities are normalized (0-1 range)
      */
     class Ship {
         constructor(x, y) {
-            this.x = x;                    // X position
-            this.y = y;                    // Y position
+            this.x = x;                    // Normalized X position (0-1)
+            this.y = y;                    // Normalized Y position (0-1)
             this.angle = -Math.PI / 2;     // Facing up initially
-            this.velocityX = 0;            // Horizontal velocity
-            this.velocityY = 0;            // Vertical velocity
+            this.velocityX = 0;            // Normalized horizontal velocity (per second)
+            this.velocityY = 0;            // Normalized vertical velocity (per second)
             this.thrusting = false;        // Is thrust active?
             this.invulnerable = 0;         // Invulnerability frames remaining
             this.shootCooldown = 0;        // Frames until can shoot again
@@ -1145,6 +1249,7 @@
 
         /**
          * Update ship state based on physics and input
+         * Velocity is in reference-dimension per second, converted with aspect ratio
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
         update(dt = 1) {
@@ -1153,26 +1258,27 @@
             this.velocityX *= friction;
             this.velocityY *= friction;
             
-            // Apply thrust in facing direction
+            // Apply thrust in facing direction (normalized acceleration)
             if (this.thrusting) {
                 this.velocityX += Math.cos(this.angle) * CONFIG.SHIP_THRUST * dt;
                 this.velocityY += Math.sin(this.angle) * CONFIG.SHIP_THRUST * dt;
             }
             
-            // Limit to max speed
+            // Limit to max speed (in reference-dimension per second)
             const speed = Math.sqrt(this.velocityX ** 2 + this.velocityY ** 2);
             if (speed > CONFIG.SHIP_MAX_SPEED) {
                 this.velocityX = (this.velocityX / speed) * CONFIG.SHIP_MAX_SPEED;
                 this.velocityY = (this.velocityY / speed) * CONFIG.SHIP_MAX_SPEED;
             }
             
-            // Update position
-            this.x += this.velocityX * dt;
-            this.y += this.velocityY * dt;
+            // Update position using aspect-ratio-aware conversion
+            // This ensures consistent visual speed regardless of viewport dimensions
+            this.x += velocityToNormalizedDeltaX(this.velocityX) * dt;
+            this.y += velocityToNormalizedDeltaY(this.velocityY) * dt;
             
-            // Wrap around gameplay area edges
-            this.x = wrapValue(this.x, getGameWidth());
-            this.y = wrapValue(this.y, getGameHeight());
+            // Wrap around normalized space (0-1)
+            this.x = wrapNormalized(this.x);
+            this.y = wrapNormalized(this.y);
             
             // Decrement timers (adjusted for delta time)
             if (this.invulnerable > 0) this.invulnerable -= dt;
@@ -1180,27 +1286,29 @@
         }
 
         /**
-         * Get the ship's triangle vertices in world coordinates
-         * Used for both rendering and collision detection
-         * @returns {array} Array of {x, y} vertices
+         * Get the ship's triangle vertices in pixel coordinates for rendering
+         * Converts from normalized position to pixels
+         * @returns {array} Array of {x, y} vertices in pixels
          */
         getVertices() {
-            const size = CONFIG.SHIP_SIZE;
+            const pixelX = fromNormalizedX(this.x);
+            const pixelY = fromNormalizedY(this.y);
+            const size = fromNormalizedSize(CONFIG.SHIP_SIZE);
             return [
                 // Nose (front point)
                 {
-                    x: this.x + Math.cos(this.angle) * size,
-                    y: this.y + Math.sin(this.angle) * size
+                    x: pixelX + Math.cos(this.angle) * size,
+                    y: pixelY + Math.sin(this.angle) * size
                 },
                 // Left wing
                 {
-                    x: this.x + Math.cos(this.angle + Math.PI * 0.8) * size * 0.7,
-                    y: this.y + Math.sin(this.angle + Math.PI * 0.8) * size * 0.7
+                    x: pixelX + Math.cos(this.angle + Math.PI * 0.8) * size * 0.7,
+                    y: pixelY + Math.sin(this.angle + Math.PI * 0.8) * size * 0.7
                 },
                 // Right wing
                 {
-                    x: this.x + Math.cos(this.angle - Math.PI * 0.8) * size * 0.7,
-                    y: this.y + Math.sin(this.angle - Math.PI * 0.8) * size * 0.7
+                    x: pixelX + Math.cos(this.angle - Math.PI * 0.8) * size * 0.7,
+                    y: pixelY + Math.sin(this.angle - Math.PI * 0.8) * size * 0.7
                 }
             ];
         }
@@ -1217,6 +1325,9 @@
             }
             
             const vertices = this.getVertices();
+            const pixelX = fromNormalizedX(this.x);
+            const pixelY = fromNormalizedY(this.y);
+            const size = fromNormalizedSize(CONFIG.SHIP_SIZE);
             
             // Draw ship triangle
             ctx.strokeStyle = CONFIG.STROKE_COLOR;
@@ -1235,19 +1346,19 @@
                 
                 // Flame base points (between wings)
                 const flameBase1 = {
-                    x: this.x + Math.cos(this.angle + Math.PI * 0.9) * CONFIG.SHIP_SIZE * 0.4,
-                    y: this.y + Math.sin(this.angle + Math.PI * 0.9) * CONFIG.SHIP_SIZE * 0.4
+                    x: pixelX + Math.cos(this.angle + Math.PI * 0.9) * size * 0.4,
+                    y: pixelY + Math.sin(this.angle + Math.PI * 0.9) * size * 0.4
                 };
                 const flameBase2 = {
-                    x: this.x + Math.cos(this.angle - Math.PI * 0.9) * CONFIG.SHIP_SIZE * 0.4,
-                    y: this.y + Math.sin(this.angle - Math.PI * 0.9) * CONFIG.SHIP_SIZE * 0.4
+                    x: pixelX + Math.cos(this.angle - Math.PI * 0.9) * size * 0.4,
+                    y: pixelY + Math.sin(this.angle - Math.PI * 0.9) * size * 0.4
                 };
                 
                 // Flame tip (flickers randomly)
-                const flameLength = CONFIG.SHIP_SIZE * (0.8 + Math.random() * 0.4);
+                const flameLength = size * (0.8 + Math.random() * 0.4);
                 const flameTip = {
-                    x: this.x + Math.cos(this.angle + Math.PI) * flameLength,
-                    y: this.y + Math.sin(this.angle + Math.PI) * flameLength
+                    x: pixelX + Math.cos(this.angle + Math.PI) * flameLength,
+                    y: pixelY + Math.sin(this.angle + Math.PI) * flameLength
                 };
                 
                 ctx.moveTo(flameBase1.x, flameBase1.y);
@@ -1269,22 +1380,25 @@
             // Play fire sound
             AudioSystem.playFire();
             
-            // Spawn bullet at ship's nose
-            const nose = this.getVertices()[0];
+            // Get nose position in normalized coords
+            // Use aspect-ratio-aware conversion for the offset
+            const noseX = this.x + Math.cos(this.angle) * sizeToNormalizedX(CONFIG.SHIP_SIZE);
+            const noseY = this.y + Math.sin(this.angle) * sizeToNormalizedY(CONFIG.SHIP_SIZE);
+            
             return new Bullet(
-                nose.x,
-                nose.y,
+                noseX,
+                noseY,
                 Math.cos(this.angle) * CONFIG.BULLET_SPEED,
                 Math.sin(this.angle) * CONFIG.BULLET_SPEED
             );
         }
 
         /**
-         * Reset ship to center of gameplay area
+         * Reset ship to center of gameplay area (normalized: 0.5, 0.5)
          */
         reset() {
-            this.x = getGameWidth() / 2;
-            this.y = getGameHeight() / 2;
+            this.x = 0.5;
+            this.y = 0.5;
             this.angle = -Math.PI / 2;
             this.velocityX = 0;
             this.velocityY = 0;
@@ -1295,23 +1409,24 @@
     /**
      * Asteroid Class
      * Space rocks that the player must destroy
+     * Position is normalized (0-1), radius/velocity are in reference-dimension units
      */
     class Asteroid {
         constructor(x, y, radius, velocityX, velocityY) {
-            this.x = x;                    // X position
-            this.y = y;                    // Y position
-            this.radius = radius;          // Size (collision radius)
-            this.velocityX = velocityX;    // Horizontal velocity
-            this.velocityY = velocityY;    // Vertical velocity
+            this.x = x;                    // Normalized X position (0-1)
+            this.y = y;                    // Normalized Y position (0-1)
+            this.radius = radius;          // Normalized size (relative to ref dimension)
+            this.velocityX = velocityX;    // Velocity in reference-dimension per second
+            this.velocityY = velocityY;    // Velocity in reference-dimension per second
             this.angle = Math.random() * Math.PI * 2;  // Random rotation
             this.rotationSpeed = randomRange(-0.02, 0.02);  // Spin rate
-            this.vertices = this.generateShape();  // Irregular polygon
+            this.vertices = this.generateShape();  // Irregular polygon (normalized)
         }
 
         /**
          * Generate an irregular polygon shape
          * Creates the classic jagged asteroid look
-         * @returns {array} Array of {x, y} vertices (relative to center)
+         * @returns {array} Array of vertices with angle and distance (normalized)
          */
         generateShape() {
             const vertices = [];
@@ -1324,7 +1439,7 @@
                                  Math.random() * CONFIG.ASTEROID_JAGGEDNESS * 2;
                 vertices.push({
                     angle: angle,
-                    distance: this.radius * variance
+                    distance: this.radius * variance  // Normalized distance
                 });
             }
             
@@ -1332,47 +1447,52 @@
         }
 
         /**
-         * Get vertices in world coordinates (accounting for position and rotation)
-         * Uses caching to avoid recalculation when position/rotation unchanged
-         * @returns {array} Array of {x, y} world-space vertices
+         * Get vertices in pixel coordinates for rendering and collision
+         * @returns {array} Array of {x, y} pixel coordinates
          */
         getWorldVertices() {
+            const pixelX = fromNormalizedX(this.x);
+            const pixelY = fromNormalizedY(this.y);
+            const ref = getReferenceDimension();
+            
             // Check if cached result is still valid
             if (this._cachedVerts && 
-                this._cacheX === this.x && 
-                this._cacheY === this.y && 
-                this._cacheAngle === this.angle) {
+                this._cacheX === pixelX && 
+                this._cacheY === pixelY && 
+                this._cacheAngle === this.angle &&
+                this._cacheRef === ref) {
                 return this._cachedVerts;
             }
             
-            // Calculate and cache
+            // Calculate and cache - convert normalized distances to pixels
             this._cachedVerts = this.vertices.map(v => ({
-                x: this.x + Math.cos(v.angle + this.angle) * v.distance,
-                y: this.y + Math.sin(v.angle + this.angle) * v.distance
+                x: pixelX + Math.cos(v.angle + this.angle) * v.distance * ref,
+                y: pixelY + Math.sin(v.angle + this.angle) * v.distance * ref
             }));
-            this._cacheX = this.x;
-            this._cacheY = this.y;
+            this._cacheX = pixelX;
+            this._cacheY = pixelY;
             this._cacheAngle = this.angle;
+            this._cacheRef = ref;
             
             return this._cachedVerts;
         }
 
         /**
          * Update asteroid position and rotation
-         * @param {object} canvas - Canvas element for wrapping
+         * Velocity is in reference-dimension per second, converted with aspect ratio
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
         update(dt = 1) {
-            // Move asteroid
-            this.x += this.velocityX * dt;
-            this.y += this.velocityY * dt;
+            // Move asteroid using aspect-ratio-aware conversion
+            this.x += velocityToNormalizedDeltaX(this.velocityX) * dt;
+            this.y += velocityToNormalizedDeltaY(this.velocityY) * dt;
             
             // Rotate
             this.angle += this.rotationSpeed * dt;
             
-            // Wrap around gameplay area edges
-            this.x = wrapValue(this.x, getGameWidth());
-            this.y = wrapValue(this.y, getGameHeight());
+            // Wrap around normalized space (0-1)
+            this.x = wrapNormalized(this.x);
+            this.y = wrapNormalized(this.y);
         }
 
         /**
@@ -1397,12 +1517,12 @@
 
         /**
          * Get points awarded for destroying this asteroid
-         * Smaller asteroids = more points
+         * Smaller asteroids = more points (using normalized thresholds)
          * @returns {number} Point value
          */
         getPoints() {
-            if (this.radius >= 40) return CONFIG.POINTS_LARGE;
-            if (this.radius >= 25) return CONFIG.POINTS_MEDIUM;
+            if (this.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD) return CONFIG.POINTS_LARGE;
+            if (this.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD) return CONFIG.POINTS_MEDIUM;
             return CONFIG.POINTS_SMALL;
         }
     }
@@ -1410,13 +1530,14 @@
     /**
      * Bullet Class
      * Projectiles fired by the ship
+     * Position is normalized (0-1), velocity is in reference-dimension per second
      */
     class Bullet {
         constructor(x, y, velocityX, velocityY) {
-            this.x = x;                    // X position
-            this.y = y;                    // Y position
-            this.velocityX = velocityX;    // Horizontal velocity
-            this.velocityY = velocityY;    // Vertical velocity
+            this.x = x;                    // Normalized X position (0-1)
+            this.y = y;                    // Normalized Y position (0-1)
+            this.velocityX = velocityX;    // Velocity in reference-dimension per second
+            this.velocityY = velocityY;    // Velocity in reference-dimension per second
             this.lifetime = CONFIG.BULLET_LIFETIME;  // Frames until expiry
         }
 
@@ -1425,12 +1546,13 @@
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
         update(dt = 1) {
-            this.x += this.velocityX * dt;
-            this.y += this.velocityY * dt;
+            // Move bullet using aspect-ratio-aware conversion
+            this.x += velocityToNormalizedDeltaX(this.velocityX) * dt;
+            this.y += velocityToNormalizedDeltaY(this.velocityY) * dt;
             
-            // Wrap around gameplay area edges
-            this.x = wrapValue(this.x, getGameWidth());
-            this.y = wrapValue(this.y, getGameHeight());
+            // Wrap around normalized space (0-1)
+            this.x = wrapNormalized(this.x);
+            this.y = wrapNormalized(this.y);
             
             // Decrement lifetime (adjusted for delta time)
             this.lifetime -= dt;
@@ -1441,10 +1563,14 @@
          * @param {CanvasRenderingContext2D} ctx - Canvas context
          */
         draw(ctx) {
+            const pixelX = fromNormalizedX(this.x);
+            const pixelY = fromNormalizedY(this.y);
+            const pixelRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
+            
             ctx.strokeStyle = CONFIG.STROKE_COLOR;
             ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.arc(this.x, this.y, CONFIG.BULLET_RADIUS, 0, Math.PI * 2);
+            ctx.arc(pixelX, pixelY, pixelRadius, 0, Math.PI * 2);
             ctx.stroke();
         }
 
@@ -1532,9 +1658,10 @@
 
     /**
      * Initialize or reset the game to starting state
+     * Ship starts at center (normalized 0.5, 0.5)
      */
     function init() {
-        game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
+        game.ship = new Ship(0.5, 0.5);  // Center in normalized coords
         game.asteroids = [];
         game.bullets = [];
         game.score = 0;
@@ -1596,15 +1723,16 @@
 
     /**
      * Spawn a single asteroid at a safe distance from the ship
+     * Uses normalized coordinates (0-1 range)
      */
     function spawnAsteroidAwayFromShip() {
         let x, y;
         
-        // Keep trying until we find a safe spawn point
+        // Keep trying until we find a safe spawn point (all in normalized coords)
         do {
-            x = Math.random() * getGameWidth();
-            y = Math.random() * getGameHeight();
-        } while (distance(x, y, game.ship.x, game.ship.y) < CONFIG.SPAWN_MIN_DISTANCE);
+            x = Math.random();  // 0-1
+            y = Math.random();  // 0-1
+        } while (normalizedDistance(x, y, game.ship.x, game.ship.y) < CONFIG.SPAWN_MIN_DISTANCE);
         
         // Random velocity direction
         const angle = Math.random() * Math.PI * 2;
@@ -1623,14 +1751,16 @@
     /**
      * Split an asteroid into two smaller pieces
      * Implements conservation of area (mass) and energy
+     * All values are in normalized coordinates
      * @param {Asteroid} asteroid - The asteroid to split
      */
     function splitAsteroid(asteroid) {
         // Add points
         game.score += asteroid.getPoints();
         
-        // Play explosion sound based on asteroid size
-        const size = asteroid.radius >= 40 ? 'large' : asteroid.radius >= 25 ? 'medium' : 'small';
+        // Play explosion sound based on asteroid size (using normalized thresholds)
+        const size = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
+                     asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
         AudioSystem.playExplosion(size);
         
         // Don't split if too small
@@ -1786,6 +1916,7 @@
 
     /**
      * Check all collisions between game entities
+     * All collision checks work in pixel coordinates
      */
     function checkCollisions() {
         // Bullet vs Asteroid collisions
@@ -1795,11 +1926,11 @@
             for (let j = game.asteroids.length - 1; j >= 0; j--) {
                 const asteroid = game.asteroids[j];
                 
-                // Circle-to-polygon collision for bullet vs asteroid
+                // Circle-to-polygon collision for bullet vs asteroid (in pixel coords)
                 const bulletCircle = {
-                    x: bullet.x,
-                    y: bullet.y,
-                    radius: CONFIG.BULLET_RADIUS
+                    x: fromNormalizedX(bullet.x),
+                    y: fromNormalizedY(bullet.y),
+                    radius: fromNormalizedSize(CONFIG.BULLET_RADIUS)
                 };
                 
                 if (circlePolygonCollision(bulletCircle, asteroid.getWorldVertices())) {
@@ -1817,10 +1948,10 @@
         
         // Ship vs Asteroid collisions (only if not invulnerable)
         if (game.ship.invulnerable <= 0 && game.state === 'playing') {
-            const shipVertices = game.ship.getVertices();
+            const shipVertices = game.ship.getVertices();  // Already in pixel coords
             
             for (const asteroid of game.asteroids) {
-                const asteroidVerts = asteroid.getWorldVertices();
+                const asteroidVerts = asteroid.getWorldVertices();  // Already in pixel coords
                 
                 // Check if any ship vertex is inside asteroid
                 for (const vertex of shipVertices) {
@@ -2243,16 +2374,17 @@
     resizeCanvas();
 
     // Initialize game objects for start screen display (but don't start playing)
-    game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
+    // Use normalized coordinates (0.5, 0.5 = center)
+    game.ship = new Ship(0.5, 0.5);
     game.asteroids = [];
     game.bullets = [];
-    // Spawn some asteroids for visual effect on start screen
+    // Spawn some asteroids for visual effect on start screen (normalized coords)
     for (let i = 0; i < CONFIG.START_SCREEN_ASTEROIDS; i++) {
         const angle = Math.random() * Math.PI * 2;
         const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
         game.asteroids.push(new Asteroid(
-            Math.random() * getGameWidth(),
-            Math.random() * getGameHeight(),
+            Math.random(),  // 0-1 normalized X
+            Math.random(),  // 0-1 normalized Y
             CONFIG.INITIAL_ASTEROID_RADIUS,
             Math.cos(angle) * speed,
             Math.sin(angle) * speed
@@ -2530,16 +2662,16 @@
         // Recalculate viewport now that we're back in solo mode (force recalc even if window size unchanged)
         resizeCanvas(true);
 
-        // Reinitialize start screen visuals
-        game.ship = new Ship(getGameWidth() / 2, getGameHeight() / 2);
+        // Reinitialize start screen visuals (normalized coordinates)
+        game.ship = new Ship(0.5, 0.5);
         game.asteroids = [];
         game.bullets = [];
         for (let i = 0; i < CONFIG.START_SCREEN_ASTEROIDS; i++) {
             const angle = Math.random() * Math.PI * 2;
             const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
             game.asteroids.push(new Asteroid(
-                Math.random() * getGameWidth(),
-                Math.random() * getGameHeight(),
+                Math.random(),  // 0-1 normalized X
+                Math.random(),  // 0-1 normalized Y
                 CONFIG.INITIAL_ASTEROID_RADIUS,
                 Math.cos(angle) * speed,
                 Math.sin(angle) * speed
