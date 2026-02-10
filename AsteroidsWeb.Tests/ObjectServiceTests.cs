@@ -24,7 +24,7 @@ public class ObjectServiceTests
         var creator = result.Creator!;
 
         // Act
-        var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Session, new Dictionary<string, object?>
         {
             ["type"] = "asteroid",
             ["x"] = 100.0,
@@ -36,7 +36,8 @@ public class ObjectServiceTests
         obj!.Id.Should().NotBe(Guid.Empty);
         obj.SessionId.Should().Be(session.Id);
         obj.CreatorMemberId.Should().Be(creator.Id);
-        obj.AffiliatedRole.Should().Be(MemberRole.Server);
+        obj.OwnerMemberId.Should().Be(creator.Id);
+        obj.Scope.Should().Be(ObjectScope.Session);
         obj.Data["type"].Should().Be("asteroid");
         obj.Version.Should().Be(1);
     }
@@ -51,21 +52,22 @@ public class ObjectServiceTests
         var client = joinResult.Member!;
 
         // Act
-        var obj = _objectService.CreateObject(session.Id, client.Id, new Dictionary<string, object?>
+        var obj = _objectService.CreateObject(session.Id, client.Id, ObjectScope.Member, new Dictionary<string, object?>
         {
             ["type"] = "bullet"
         });
 
         // Assert
         obj.Should().NotBeNull();
-        obj!.AffiliatedRole.Should().Be(MemberRole.Client);
+        obj!.OwnerMemberId.Should().Be(client.Id);
+        obj.Scope.Should().Be(ObjectScope.Member);
     }
 
     [Fact]
     public void CreateObject_InvalidSession_ShouldReturnNull()
     {
         // Act
-        var obj = _objectService.CreateObject(Guid.NewGuid(), Guid.NewGuid());
+        var obj = _objectService.CreateObject(Guid.NewGuid(), Guid.NewGuid(), ObjectScope.Member);
 
         // Assert
         obj.Should().BeNull();
@@ -78,7 +80,7 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?>
         {
             ["x"] = 100.0,
             ["y"] = 200.0
@@ -106,7 +108,7 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?>
         {
             ["x"] = 100.0
         });
@@ -128,7 +130,7 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        var obj = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?>
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?>
         {
             ["x"] = 100.0
         });
@@ -150,8 +152,8 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        var obj1 = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?> { ["x"] = 0 });
-        var obj2 = _objectService.CreateObject(session.Id, creator.Id, new Dictionary<string, object?> { ["x"] = 0 });
+        var obj1 = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?> { ["x"] = 0 });
+        var obj2 = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?> { ["x"] = 0 });
 
         var updates = new List<ObjectUpdate>
         {
@@ -175,7 +177,7 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        var obj = _objectService.CreateObject(session.Id, creator.Id);
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member);
 
         // Act
         var deleted = _objectService.DeleteObject(session.Id, obj!.Id);
@@ -205,9 +207,9 @@ public class ObjectServiceTests
         var result = _sessionService.CreateSession("connection-1", 1.5);
         var session = result.Session!;
         var creator = result.Creator!;
-        _objectService.CreateObject(session.Id, creator.Id);
-        _objectService.CreateObject(session.Id, creator.Id);
-        _objectService.CreateObject(session.Id, creator.Id);
+        _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member);
+        _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member);
+        _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member);
 
         // Act
         var objects = _objectService.GetSessionObjects(session.Id).ToList();

@@ -158,7 +158,6 @@ public class SessionService : ISessionService
             return null;
 
         Member? promotedMember = null;
-        var affectedObjectIds = new List<Guid>();
 
         // If the leaving member was the server, promote a client
         if (member.Role == MemberRole.Server && session.Members.Count > 0)
@@ -180,15 +179,6 @@ public class SessionService : ISessionService
                         _logger?.LogInformation("Member {MemberId} promoted to Server in session {SessionName}", 
                             promotedMember.Id, session.Name);
 
-                        // Update object affiliations
-                        foreach (var obj in session.Objects.Values)
-                        {
-                            if (obj.AffiliatedRole == MemberRole.Server)
-                            {
-                                affectedObjectIds.Add(obj.Id);
-                            }
-                        }
-
                         session.Version++;
                     }
                 }
@@ -207,8 +197,7 @@ public class SessionService : ISessionService
             session.Name,
             memberId,
             sessionDestroyed,
-            promotedMember,
-            affectedObjectIds
+            promotedMember
         );
     }
 

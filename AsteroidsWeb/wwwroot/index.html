@@ -950,9 +950,9 @@
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 6,       // Shared lives pool for multiplayer sessions
-        SYNC_INTERVAL: 24,          // Object sync interval in ms (default, can be changed)
-        INTERPOLATION_DELAY: 50,    // Render delay for smooth interpolation (ms)
-        INTERPOLATION_ENABLED: false // Enable/disable interpolation for remote objects
+        SYNC_INTERVAL: 16,          // Object sync interval in ms (default, can be changed)
+        INTERPOLATION_DELAY: 16,    // Render delay for smooth interpolation (ms)
+        INTERPOLATION_ENABLED: true // Enable/disable interpolation for remote objects
     };
 
     // ============================================
@@ -1995,6 +1995,9 @@
         cosmeticAsteroids: []
     };
     
+    // Collision cooldown map - prevents re-detection while owner processes hit
+    const shipCollisionCooldowns = new Map(); // objectId → remaining cooldown time
+    
     // Helper to check if in session mode
     function isSessionMode() {
         return game.mode === 'session';
@@ -2053,7 +2056,7 @@
         game.multiplayer.myColorIndex = colorIndex;
         
         try {
-            const objectInfo = await ObjectSync.createObject(game.ship.toSyncData());
+            const objectInfo = await ObjectSync.createObject(game.ship.toSyncData(), 'Member');
             game.ship.syncObjectId = objectInfo.id;
             game.multiplayer.myShipObjectId = objectInfo.id;
         } catch (err) {
@@ -2067,10 +2070,9 @@
      */
     function syncLocalShip() {
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
-        
         ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toSyncData());
     }
-
+    
     /**
      * Delete the local player's ship from ObjectSync
      * Called when leaving a session or returning to spectating
@@ -2116,13 +2118,17 @@
                 game.multiplayer.remoteShips.set(obj.id, remoteShip);
             }
             
-            // Apply interpolated state for smooth rendering
+            // Apply interpolated state for smooth rendering (position/angle)
             const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 remoteShip.fromSyncData(interpolated);
             } else {
                 remoteShip.fromSyncData(obj.data);
             }
+            
+            // Apply invulnerable and thrusting directly from sync
+            if (obj.data.invulnerable !== undefined) remoteShip.invulnerable = obj.data.invulnerable;
+            if (obj.data.thrusting !== undefined) remoteShip.thrusting = obj.data.thrusting;
         }
         
         // Remove ships that no longer exist
@@ -2180,7 +2186,11 @@
         game.multiplayer.remoteShips.clear();
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
+        game.asteroids = [];
+        game.bullets = [];
+        shipCollisionCooldowns.clear();
         RemoteObjects.clear();
+        ObjectSync.clear();
     }
 
     /**
@@ -2191,7 +2201,7 @@
         if (!isSessionMode() || !isAuthority()) return;
         
         try {
-            const objectInfo = await ObjectSync.createObject(asteroid.toSyncData());
+            const objectInfo = await ObjectSync.createObject(asteroid.toSyncData(), 'Session');
             asteroid.syncObjectId = objectInfo.id;
         } catch (err) {
             console.error('[Multiplayer] Failed to create asteroid:', err);
@@ -2280,7 +2290,7 @@
         if (!isSessionMode()) return;
         
         try {
-            const objectInfo = await ObjectSync.createObject(bullet.toSyncData());
+            const objectInfo = await ObjectSync.createObject(bullet.toSyncData(), 'Member');
             bullet.syncObjectId = objectInfo.id;
         } catch (err) {
             console.error('[Multiplayer] Failed to create bullet:', err);
@@ -2390,7 +2400,7 @@
                 waveDelayTimer: game.waveDelayTimer
             };
             
-            const objectInfo = await ObjectSync.createObject(gameStateData);
+            const objectInfo = await ObjectSync.createObject(gameStateData, 'Session');
             game.multiplayer.gameStateObjectId = objectInfo.id;
         } catch (err) {
             console.error('[Multiplayer] Failed to create GameState:', err);
@@ -2471,19 +2481,19 @@
             game.multiplayer.gameStateObjectId = gameStateObj.id;
         }
         
-        // Take over asteroid syncing - assign syncObjectIds to existing asteroids
+        // Take over asteroid simulation - rebuild from ObjectSync
         const asteroidObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.ASTEROID);
+        game.asteroids = [];
         for (const obj of asteroidObjects) {
-            // Find matching asteroid by position (approximate)
-            const asteroid = game.asteroids.find(a => 
-                Math.abs(a.x - obj.data.x) < 0.01 && 
-                Math.abs(a.y - obj.data.y) < 0.01 &&
-                !a.syncObjectId
-            );
-            if (asteroid) {
-                asteroid.syncObjectId = obj.id;
-            }
+            const asteroid = Asteroid.fromSyncData(obj.data);
+            asteroid.syncObjectId = obj.id;
+            game.asteroids.push(asteroid);
         }
+        
+        // Clear any stale collision cooldowns
+        shipCollisionCooldowns.clear();
+        
+        console.log('[Multiplayer] Server promotion: took over', asteroidObjects.length, 'asteroids');
     }
 
     // ============================================
@@ -2840,10 +2850,9 @@
      */
     function checkCollisions() {
         // In multiplayer, non-authority clients don't resolve collisions
-        // They receive the results via ObjectSync (asteroids/bullets disappear)
+        // They receive the results via events
         if (isSessionMode() && !isAuthority()) {
-            // Clients still check their own ship collision for immediate feedback
-            checkLocalShipCollision();
+            // Non-authority: collisions handled by server, results received via events
             return;
         }
         
@@ -2886,19 +2895,40 @@
         if (isSessionMode()) {
             // Check local ship
             if (game.ship && game.ship.invulnerable <= 0 && game.state === 'playing') {
-                checkShipAsteroidCollision(game.ship, true);
+                if (checkShipAsteroidCollision(game.ship)) {
+                    handleShipHit(game.ship);
+                }
             }
             
-            // Check remote ships (authority handles their deaths too)
+            // Check remote ships (authority detects collision and notifies owner)
             for (const [objectId, ship] of game.multiplayer.remoteShips) {
-                if (ship.invulnerable <= 0) {
-                    checkShipAsteroidCollision(ship, false);
+                // Skip ships on cooldown or invulnerable
+                if (ship.invulnerable > 0) continue;
+                if (shipCollisionCooldowns.has(objectId)) continue;
+                
+                if (checkShipAsteroidCollision(ship)) {
+                    // Server detected collision - notify owner, don't modify ship
+                    game.lives--;
+                    updateHUD();
+                    if (game.lives <= 0) {
+                        game.state = 'gameover';
+                        AudioSystem.beat.stop();
+                        if (isSessionMode()) syncGameState();
+                    } else {
+                        syncGameState();
+                    }
+                    // Set cooldown (3 seconds) to prevent re-detection
+                    shipCollisionCooldowns.set(objectId, 3.0);
+                    // Notify ship owner via SignalR
+                    SessionClient.notifyShipHit(objectId);
                 }
             }
         } else {
             // Solo mode - just check local ship
             if (game.ship && game.ship.invulnerable <= 0 && game.state === 'playing') {
-                checkShipAsteroidCollision(game.ship, true);
+                if (checkShipAsteroidCollision(game.ship)) {
+                    handleShipHit(game.ship);
+                }
             }
         }
     }
@@ -2906,9 +2936,9 @@
     /**
      * Check collision for a specific ship against all asteroids
      * @param {Ship} ship - The ship to check
-     * @param {boolean} isLocal - Whether this is the local player's ship
+     * @returns {boolean} True if collision detected
      */
-    function checkShipAsteroidCollision(ship, isLocal) {
+    function checkShipAsteroidCollision(ship) {
         const shipVertices = ship.getVertices();
         
         for (const asteroid of game.asteroids) {
@@ -2917,85 +2947,43 @@
             // Check if any ship vertex is inside asteroid
             for (const vertex of shipVertices) {
                 if (pointInPolygon(vertex, asteroidVerts)) {
-                    handleShipHit(ship, isLocal);
-                    return;
+                    return true;
                 }
             }
             
             // Check if any asteroid vertex is inside ship triangle
             for (const vertex of asteroidVerts) {
                 if (pointInPolygon(vertex, shipVertices)) {
-                    handleShipHit(ship, isLocal);
-                    return;
+                    return true;
                 }
             }
         }
+        return false;
     }
 
     /**
-     * Check only local ship collision (for non-authority clients)
-     * Provides immediate feedback even though authority handles resolution
-     */
-    function checkLocalShipCollision() {
-        if (!game.ship || game.ship.invulnerable > 0 || game.state !== 'playing') return;
-        
-        const shipVertices = game.ship.getVertices();
-        
-        for (const asteroid of game.asteroids) {
-            const asteroidVerts = asteroid.getWorldVertices();
-            
-            for (const vertex of shipVertices) {
-                if (pointInPolygon(vertex, asteroidVerts)) {
-                    // Play sound immediately for feedback
-                    AudioSystem.playShipExplosion();
-                    AudioSystem.thrustSound.stop();
-                    // Authority will handle the actual respawn via sync
-                    return;
-                }
-            }
-            
-            for (const vertex of asteroidVerts) {
-                if (pointInPolygon(vertex, shipVertices)) {
-                    AudioSystem.playShipExplosion();
-                    AudioSystem.thrustSound.stop();
-                    return;
-                }
-            }
-        }
-    }
-
-    /**
-     * Handle ship being hit by asteroid
+     * Handle ship being hit by asteroid (local ship only - server's own or solo mode)
      * @param {Ship} ship - The ship that was hit
-     * @param {boolean} isLocal - Whether this is the local player's ship
      */
-    function handleShipHit(ship, isLocal) {
-        // Decrement shared lives
+    function handleShipHit(ship) {
         game.lives--;
         updateHUD();
-        
-        // Play ship explosion sound (only for local ship to avoid cacophony)
-        if (isLocal) {
-            AudioSystem.playShipExplosion();
-            AudioSystem.thrustSound.stop();
-        }
+        AudioSystem.playShipExplosion();
+        AudioSystem.thrustSound.stop();
         
         if (game.lives <= 0) {
             game.state = 'gameover';
-            // Stop background beat on game over
             AudioSystem.beat.stop();
-            
-            // Sync game over state
             if (isSessionMode() && isAuthority()) {
                 syncGameState();
             }
         } else {
-            // Respawn ship at center with invulnerability
             ship.reset();
-            
-            // Sync the ship state after respawn
-            if (isSessionMode() && isLocal && game.multiplayer.myShipObjectId) {
+            if (isSessionMode() && game.multiplayer.myShipObjectId) {
                 ObjectSync.updateObject(game.multiplayer.myShipObjectId, ship.toSyncData(), true);
+            }
+            if (isSessionMode() && isAuthority()) {
+                syncGameState();
             }
         }
     }
@@ -3085,6 +3073,16 @@
             // Update remote ships from ObjectSync
             if (isSessionMode()) {
                 updateRemoteShips();
+                
+                // Decrement collision cooldowns
+                for (const [objectId, remaining] of shipCollisionCooldowns) {
+                    const newVal = remaining - dt;
+                    if (newVal <= 0) {
+                        shipCollisionCooldowns.delete(objectId);
+                    } else {
+                        shipCollisionCooldowns.set(objectId, newVal);
+                    }
+                }
             }
             
             // Update asteroids (authority updates locally, clients sync from server)
@@ -4011,7 +4009,7 @@
     });
 
     // Handle role changes (e.g., promoted to server when server leaves)
-    SessionClient.on('onRoleChanged', (newRole, affectedObjectIds) => {
+    SessionClient.on('onRoleChanged', (newRole) => {
         if (game.sessionInfo) {
             game.sessionInfo.role = newRole;
         }
@@ -4024,6 +4022,44 @@
         
         // Role data already provided in event - just update UI, no need to refetch
         updatePickerButtons();
+    });
+
+    // Handle member leaving - clean up their objects
+    SessionClient.on('onMemberLeft', (info) => {
+        // Handle object cleanup from member departure
+        if (info.deletedObjectIds && info.deletedObjectIds.length > 0) {
+            ObjectSync.handleMemberDeparture(info.deletedObjectIds);
+            // Remove from local game state
+            for (const objectId of info.deletedObjectIds) {
+                // Clean up remote ship
+                if (game.multiplayer.remoteShips.has(objectId)) {
+                    game.multiplayer.remoteShips.delete(objectId);
+                    RemoteObjects.remove(objectId);
+                }
+                // Clean up bullets owned by departing member
+                game.bullets = game.bullets.filter(b => b.syncObjectId !== objectId);
+                // Clean up collision cooldowns
+                shipCollisionCooldowns.delete(objectId);
+            }
+        }
+        if (info.migratedObjectIds && info.migratedObjectIds.length > 0 && info.promotedMemberId) {
+            ObjectSync.handleOwnershipMigration(info.migratedObjectIds, info.promotedMemberId);
+        }
+    });
+
+    // Handle ship hit notification from server
+    SessionClient.on('onShipHit', (hitInfo) => {
+        // Check if this is OUR ship
+        if (game.multiplayer.myShipObjectId === hitInfo.shipObjectId) {
+            if (game.ship && game.ship.invulnerable <= 0) {
+                // Reset our ship with invulnerability
+                game.ship.reset();
+                AudioSystem.playShipExplosion();
+                AudioSystem.thrustSound.stop();
+                // Sync the reset state immediately
+                ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toSyncData(), true);
+            }
+        }
     });
 
     // Handle session list changes (signal from server - fetch fresh data with jitter)

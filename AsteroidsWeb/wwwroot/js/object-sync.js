@@ -124,7 +124,8 @@ const ObjectSync = (function() {
                 const localObj = {
                     id: obj.id,
                     creatorMemberId: obj.creatorMemberId,
-                    affiliatedRole: obj.affiliatedRole,
+                    ownerMemberId: obj.ownerMemberId,
+                    scope: obj.scope,
                     data: obj.data || {},
                     version: obj.version,
                     isLocal: false
@@ -152,16 +153,17 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Handle role changed - update object affiliations.
+     * Handle role changed - update ownership for migrated objects.
      */
-    function handleRoleChanged(newRole, affectedObjectIds) {
-        for (const objectId of affectedObjectIds) {
+    function handleRoleChanged(newRole, migratedObjectIds) {
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        for (const objectId of migratedObjectIds) {
             const obj = objects.get(objectId);
-            if (obj) {
-                obj.affiliatedRole = newRole;
+            if (obj && myMemberId) {
+                obj.ownerMemberId = myMemberId;
             }
         }
-        console.log('[ObjectSync] Updated affiliations for', affectedObjectIds.length, 'objects');
+        console.log('[ObjectSync] Migrated ownership for', migratedObjectIds.length, 'objects');
     }
 
     /**
@@ -171,7 +173,8 @@ const ObjectSync = (function() {
         const obj = {
             id: objectInfo.id,
             creatorMemberId: objectInfo.creatorMemberId,
-            affiliatedRole: objectInfo.affiliatedRole,
+            ownerMemberId: objectInfo.ownerMemberId,
+            scope: objectInfo.scope,
             data: objectInfo.data || {},
             version: objectInfo.version,
             isLocal: objectInfo.creatorMemberId === SessionClient.getCurrentMember()?.id
@@ -197,7 +200,7 @@ const ObjectSync = (function() {
                     const oldType = existing.data?.type;
                     existing.data = update.data;
                     existing.version = update.version;
-                    existing.affiliatedRole = update.affiliatedRole;
+                    existing.ownerMemberId = update.ownerMemberId;
                     
                     // Update type index if type changed
                     updateTypeIndex(existing, oldType, update.data?.type);
@@ -211,7 +214,8 @@ const ObjectSync = (function() {
                 const obj = {
                     id: update.id,
                     creatorMemberId: update.creatorMemberId,
-                    affiliatedRole: update.affiliatedRole,
+                    ownerMemberId: update.ownerMemberId,
+                    scope: update.scope,
                     data: update.data || {},
                     version: update.version,
                     isLocal: false
@@ -243,14 +247,16 @@ const ObjectSync = (function() {
 
     /**
      * Create a new synchronized object.
+     * @param {object} data - Object data
+     * @param {string} scope - 'Member' or 'Session' (default: 'Member')
      */
-    async function createObject(data = {}) {
+    async function createObject(data = {}, scope = 'Member') {
         if (!SessionClient.isInSession()) {
             throw new Error('Not in a session');
         }
 
         try {
-            const objectInfo = await SessionClient.createObject(data);
+            const objectInfo = await SessionClient.createObject(data, scope);
             // Object will be added via the onObjectCreated event
             return objectInfo;
         } catch (err) {
@@ -372,10 +378,10 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Get objects by affiliation.
+     * Get objects by owner member ID.
      */
-    function getObjectsByRole(role) {
-        return getAllObjects().filter(obj => obj.affiliatedRole === role);
+    function getObjectsByOwner(memberId) {
+        return getAllObjects().filter(obj => obj.ownerMemberId === memberId);
     }
 
     /**
@@ -432,6 +438,39 @@ const ObjectSync = (function() {
     }
 
     /**
+     * Handle ownership migration for objects (called when a member leaves and objects are migrated).
+     * @param {string[]} migratedObjectIds - IDs of objects whose ownership changed
+     * @param {string} newOwnerId - The new owner's member ID
+     */
+    function handleOwnershipMigration(migratedObjectIds, newOwnerId) {
+        for (const objectId of migratedObjectIds) {
+            const obj = objects.get(objectId);
+            if (obj) {
+                obj.ownerMemberId = newOwnerId;
+                obj.version++;
+            }
+        }
+    }
+
+    /**
+     * Handle member departure - remove deleted objects from local state.
+     * @param {string[]} deletedObjectIds - IDs of objects that were deleted
+     */
+    function handleMemberDeparture(deletedObjectIds) {
+        for (const objectId of deletedObjectIds) {
+            const obj = objects.get(objectId);
+            if (obj) {
+                removeFromTypeIndex(obj);
+                objects.delete(objectId);
+
+                if (callbacks.onObjectDeleted) {
+                    callbacks.onObjectDeleted(obj);
+                }
+            }
+        }
+    }
+
+    /**
      * Get object count.
      */
     function getObjectCount() {
@@ -456,13 +495,15 @@ const ObjectSync = (function() {
         flushUpdates,
         getObject,
         getAllObjects,
-        getObjectsByRole,
+        getObjectsByOwner,
         getLocalObjects,
         getObjectsByType,
         getObjectByType,
         getObjectCount,
         setSyncInterval,
         getSyncInterval,
+        handleOwnershipMigration,
+        handleMemberDeparture,
         on,
         clear
     };
