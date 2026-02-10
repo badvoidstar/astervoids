@@ -32,7 +32,7 @@ param maxReplicas int = 3
 param cpu string = '1.0'
 
 @description('Memory allocated to the container')
-param memory string = '1Gi'
+param memory string = '2Gi'
 
 @description('Environment variables for the container')
 param env array = []
