@@ -1089,10 +1089,11 @@
             } else {
                 // Extrapolate using velocity
                 const extraTime = (targetTime - state.currentTime) / 1000;
+                const refDim = getReferenceDimension();
                 return {
                     ...state.current,
-                    x: wrapNormalized(state.current.x + state.velocity.x * extraTime),
-                    y: wrapNormalized(state.current.y + state.velocity.y * extraTime),
+                    x: wrapNormalized(state.current.x + state.velocity.x * (refDim / getGameWidth()) * extraTime),
+                    y: wrapNormalized(state.current.y + state.velocity.y * (refDim / getGameHeight()) * extraTime),
                     angle: state.current.angle + (state.current.rotationSpeed || 0) * CONFIG.TARGET_FPS * extraTime
                 };
             }
@@ -1127,13 +1128,18 @@
             const h11 = t3 - t2;
             
             // Position interpolation with tangents from velocity (scaled by interval)
+            // velocityX/Y are in reference-dimension per second; positions are in normalized [0,1]
+            // Convert velocity to normalized-position-per-second for correct tangents
+            const refDim = getReferenceDimension();
+            const velScaleX = refDim / getGameWidth();
+            const velScaleY = refDim / getGameHeight();
             if (state.previous.x !== undefined && state.current.x !== undefined) {
                 let dx = state.current.x - state.previous.x;
                 if (dx > 0.5) dx -= 1; else if (dx < -0.5) dx += 1;
                 const p0 = state.previous.x;
                 const p1 = p0 + dx;
-                const m0 = (state.previousVelocity.x || 0) * dt;
-                const m1 = (state.velocity.x || 0) * dt;
+                const m0 = (state.previousVelocity.x || 0) * velScaleX * dt;
+                const m1 = (state.velocity.x || 0) * velScaleX * dt;
                 result.x = wrapNormalized(h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1);
             }
             if (state.previous.y !== undefined && state.current.y !== undefined) {
@@ -1141,8 +1147,8 @@
                 if (dy > 0.5) dy -= 1; else if (dy < -0.5) dy += 1;
                 const p0 = state.previous.y;
                 const p1 = p0 + dy;
-                const m0 = (state.previousVelocity.y || 0) * dt;
-                const m1 = (state.velocity.y || 0) * dt;
+                const m0 = (state.previousVelocity.y || 0) * velScaleY * dt;
+                const m1 = (state.velocity.y || 0) * velScaleY * dt;
                 result.y = wrapNormalized(h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1);
             }
             
