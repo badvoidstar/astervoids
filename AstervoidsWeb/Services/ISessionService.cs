@@ -70,8 +70,7 @@ public record LeaveSessionResult(
     string SessionName,
     Guid MemberId,
     bool SessionDestroyed,
-    Member? PromotedMember,
-    IEnumerable<Guid> AffectedObjectIds
+    Member? PromotedMember
 );
 
 /// <summary>

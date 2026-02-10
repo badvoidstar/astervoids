@@ -104,7 +104,7 @@ public class SessionHub : Hub
         // Return session state including existing objects
         var members = session.Members.Values.Select(m => new MemberInfo(m.Id, m.Role.ToString(), m.JoinedAt));
         var objects = session.Objects.Values.Select(o => new ObjectInfo(
-            o.Id, o.CreatorMemberId, o.AffiliatedRole.ToString(), o.Data, o.Version));
+            o.Id, o.CreatorMemberId, o.OwnerMemberId, o.Scope.ToString(), o.Data, o.Version));
 
         return new JoinSessionResponse(
             session.Id,
@@ -130,23 +130,30 @@ public class SessionHub : Hub
             return;
         }
 
+        // Handle object cleanup based on scope
+        var departureResult = _objectService.HandleMemberDeparture(
+            result.SessionId, result.MemberId, result.PromotedMember?.Id);
+
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, result.SessionId.ToString());
 
         if (!result.SessionDestroyed)
         {
-            // Notify remaining members
+            // Notify remaining members with enriched departure info
             await Clients.Group(result.SessionId.ToString()).SendAsync("OnMemberLeft", new MemberLeftInfo(
                 result.MemberId,
                 result.PromotedMember?.Id,
                 result.PromotedMember?.Role.ToString(),
-                result.AffectedObjectIds
+                departureResult.DeletedObjectIds,
+                departureResult.MigratedObjectIds
             ));
 
             if (result.PromotedMember != null)
             {
                 _logger.LogInformation(
-                    "Member {PromotedMemberId} promoted to Server in session {SessionName}",
-                    result.PromotedMember.Id, result.SessionName);
+                    "Member {PromotedMemberId} promoted to Server in session {SessionName}. Migrated {MigratedCount} objects, deleted {DeletedCount} objects.",
+                    result.PromotedMember.Id, result.SessionName,
+                    departureResult.MigratedObjectIds.Count(),
+                    departureResult.DeletedObjectIds.Count());
             }
         }
         else
@@ -230,7 +237,7 @@ public class SessionHub : Hub
     /// <summary>
     /// Creates a new synchronized object in the session.
     /// </summary>
-    public async Task<ObjectInfo?> CreateObject(Dictionary<string, object?>? data)
+    public async Task<ObjectInfo?> CreateObject(Dictionary<string, object?>? data, string scope = "Member")
     {
         var member = _sessionService.GetMemberByConnectionId(Context.ConnectionId);
         if (member == null)
@@ -239,19 +246,23 @@ public class SessionHub : Hub
             return null;
         }
 
-        var obj = _objectService.CreateObject(member.SessionId, member.Id, data);
+        var objectScope = scope.Equals("Session", StringComparison.OrdinalIgnoreCase) 
+            ? ObjectScope.Session 
+            : ObjectScope.Member;
+
+        var obj = _objectService.CreateObject(member.SessionId, member.Id, objectScope, data);
         if (obj == null)
         {
             _logger.LogWarning("CreateObject failed - could not create object in session");
             return null;
         }
 
-        var objectInfo = new ObjectInfo(obj.Id, obj.CreatorMemberId, obj.AffiliatedRole.ToString(), obj.Data, obj.Version);
+        var objectInfo = new ObjectInfo(obj.Id, obj.CreatorMemberId, obj.OwnerMemberId, obj.Scope.ToString(), obj.Data, obj.Version);
 
         // Notify all members including sender
         await Clients.Group(member.SessionId.ToString()).SendAsync("OnObjectCreated", objectInfo);
 
-        _logger.LogDebug("Object {ObjectId} created in session by member {MemberId}", obj.Id, member.Id);
+        _logger.LogDebug("Object {ObjectId} created in session by member {MemberId} (scope: {Scope})", obj.Id, member.Id, objectScope);
 
         return objectInfo;
     }
@@ -272,7 +283,7 @@ public class SessionHub : Hub
         var updatedObjects = _objectService.UpdateObjects(session.Id, objectUpdates);
 
         var objectInfos = updatedObjects.Select(o => new ObjectInfo(
-            o.Id, o.CreatorMemberId, o.AffiliatedRole.ToString(), o.Data, o.Version)).ToList();
+            o.Id, o.CreatorMemberId, o.OwnerMemberId, o.Scope.ToString(), o.Data, o.Version)).ToList();
 
         if (objectInfos.Count > 0)
         {
@@ -320,6 +331,22 @@ public class SessionHub : Hub
 
         await base.OnDisconnectedAsync(exception);
     }
+
+    /// <summary>
+    /// Called by the server member to notify that a ship was hit by an asteroid.
+    /// Broadcasts to all session members so the ship owner can handle the collision.
+    /// </summary>
+    public async Task NotifyShipHit(Guid shipObjectId)
+    {
+        var member = _sessionService.GetMemberByConnectionId(Context.ConnectionId);
+        if (member == null || member.Role != MemberRole.Server)
+        {
+            _logger.LogWarning("NotifyShipHit failed - caller is not the server");
+            return;
+        }
+
+        await Clients.Group(member.SessionId.ToString()).SendAsync("OnShipHit", new ShipHitInfo(shipObjectId));
+    }
 }
 
 // Response DTOs
@@ -335,8 +362,15 @@ public record JoinSessionResponse(
     bool GameStarted
 );
 public record MemberInfo(Guid Id, string Role, DateTime JoinedAt);
-public record MemberLeftInfo(Guid MemberId, Guid? PromotedMemberId, string? PromotedRole, IEnumerable<Guid> AffectedObjectIds);
+public record MemberLeftInfo(
+    Guid MemberId,
+    Guid? PromotedMemberId,
+    string? PromotedRole,
+    IEnumerable<Guid> DeletedObjectIds,
+    IEnumerable<Guid> MigratedObjectIds
+);
 public record SessionListItem(Guid Id, string Name, int MemberCount, int MaxMembers, DateTime CreatedAt, bool GameStarted);
 public record ActiveSessionsResponse(IEnumerable<SessionListItem> Sessions, int MaxSessions, bool CanCreateSession);
-public record ObjectInfo(Guid Id, Guid CreatorMemberId, string AffiliatedRole, Dictionary<string, object?> Data, long Version);
+public record ObjectInfo(Guid Id, Guid CreatorMemberId, Guid OwnerMemberId, string Scope, Dictionary<string, object?> Data, long Version);
 public record ObjectUpdateRequest(Guid ObjectId, Dictionary<string, object?> Data, long? ExpectedVersion = null);
+public record ShipHitInfo(Guid ShipObjectId);

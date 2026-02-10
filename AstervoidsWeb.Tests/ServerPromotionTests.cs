@@ -39,7 +39,7 @@ public class ServerPromotionTests
     }
 
     [Fact]
-    public void ServerLeaves_ShouldReturnAffectedObjectIds()
+    public void ServerLeaves_MemberScopedObjectsDeleted_SessionScopedMigrated()
     {
         // Arrange
         var result = _sessionService.CreateSession("server-conn", 1.5);
@@ -49,20 +49,20 @@ public class ServerPromotionTests
         Assert.True(joinResult.Success);
         var client = joinResult.Member!;
 
-        // Create objects - some by server, some by client
-        var serverObj1 = _objectService.CreateObject(session.Id, server.Id);
-        var serverObj2 = _objectService.CreateObject(session.Id, server.Id);
-        var clientObj = _objectService.CreateObject(session.Id, client.Id);
+        // Create objects - member-scoped by server, session-scoped by server, member-scoped by client
+        var serverMemberObj = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Member);
+        var serverSessionObj = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Session);
+        var clientObj = _objectService.CreateObject(session.Id, client.Id, ObjectScope.Member);
 
         // Act
         var leaveResult = _sessionService.LeaveSession("server-conn");
+        var departureResult = _objectService.HandleMemberDeparture(session.Id, server.Id, leaveResult!.PromotedMember?.Id);
 
         // Assert
-        leaveResult.Should().NotBeNull();
-        leaveResult!.AffectedObjectIds.Should().HaveCount(2);
-        leaveResult.AffectedObjectIds.Should().Contain(serverObj1!.Id);
-        leaveResult.AffectedObjectIds.Should().Contain(serverObj2!.Id);
-        leaveResult.AffectedObjectIds.Should().NotContain(clientObj!.Id);
+        departureResult.DeletedObjectIds.Should().Contain(serverMemberObj!.Id);
+        departureResult.MigratedObjectIds.Should().Contain(serverSessionObj!.Id);
+        departureResult.DeletedObjectIds.Should().NotContain(clientObj!.Id);
+        departureResult.MigratedObjectIds.Should().NotContain(clientObj.Id);
     }
 
     [Fact]

@@ -26,6 +26,7 @@ const SessionClient = (function() {
         onObjectDeleted: null,
         onSessionsChanged: null,
         onGameStarted: null,
+        onShipHit: null,
         onError: null
     };
 
@@ -147,7 +148,7 @@ const SessionClient = (function() {
                     }
                 }
                 if (callbacks.onRoleChanged) {
-                    callbacks.onRoleChanged(info.promotedRole, info.affectedObjectIds);
+                    callbacks.onRoleChanged(info.promotedRole, info.migratedObjectIds || []);
                 }
             }
 
@@ -194,6 +195,13 @@ const SessionClient = (function() {
             }
             if (callbacks.onGameStarted) {
                 callbacks.onGameStarted(sessionId);
+            }
+        });
+
+        // Ship hit notification from server
+        connection.on('OnShipHit', (hitInfo) => {
+            if (callbacks.onShipHit) {
+                callbacks.onShipHit(hitInfo);
             }
         });
     }
@@ -357,8 +365,10 @@ const SessionClient = (function() {
 
     /**
      * Create an object in the current session.
+     * @param {object} data - Object data
+     * @param {string} scope - 'Member' or 'Session'
      */
-    async function createObject(data) {
+    async function createObject(data, scope = 'Member') {
         if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
             throw new Error('Not connected to session hub');
         }
@@ -367,7 +377,7 @@ const SessionClient = (function() {
         }
 
         try {
-            return await connection.invoke('CreateObject', data);
+            return await connection.invoke('CreateObject', data, scope);
         } catch (err) {
             console.error('[SessionClient] Create object failed:', err);
             throw err;
@@ -409,6 +419,21 @@ const SessionClient = (function() {
         } catch (err) {
             console.error('[SessionClient] Delete object failed:', err);
             throw err;
+        }
+    }
+
+    /**
+     * Notify all session members that a ship was hit (server only).
+     * @param {string} shipObjectId - The ObjectSync ID of the ship that was hit
+     */
+    async function notifyShipHit(shipObjectId) {
+        if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+            return;
+        }
+        try {
+            await connection.invoke('NotifyShipHit', shipObjectId);
+        } catch (err) {
+            console.error('[SessionClient] NotifyShipHit failed:', err);
         }
     }
 
@@ -463,6 +488,7 @@ const SessionClient = (function() {
         createObject,
         updateObjects,
         deleteObject,
+        notifyShipHit,
         on,
         getCurrentSession,
         getCurrentMember,
