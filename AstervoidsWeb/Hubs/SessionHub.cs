@@ -326,8 +326,15 @@ public class SessionHub : Hub
             _logger.LogWarning(exception, "Client disconnected with exception: {ConnectionId}", Context.ConnectionId);
         }
 
-        // Clean up session membership
-        await LeaveSession();
+        // Clean up session membership - must not throw to prevent orphaned entries
+        try
+        {
+            await LeaveSession();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during disconnect cleanup for {ConnectionId}", Context.ConnectionId);
+        }
 
         await base.OnDisconnectedAsync(exception);
     }

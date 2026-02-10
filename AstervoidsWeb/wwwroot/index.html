@@ -1185,6 +1185,8 @@
         clear() {
             this.states.clear();
             this.lastVersions.clear();
+            this.adaptiveDelay.packetIntervals = [];
+            this.adaptiveDelay.computedDelay = CONFIG.INTERPOLATION_DELAY;
         }
     };
 
@@ -2270,6 +2272,11 @@
         shipCollisionCooldowns.clear();
         RemoteObjects.clear();
         ObjectSync.clear();
+        // Clear background sync interval if running (tab hidden during session)
+        if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
+            clearInterval(backgroundInterval);
+            backgroundInterval = null;
+        }
     }
 
     /**
