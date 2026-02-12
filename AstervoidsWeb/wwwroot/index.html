@@ -2294,7 +2294,11 @@
      * @param {Asteroid} asteroid - The asteroid to sync
      */
     async function createSyncedAsteroid(asteroid) {
-        if (!isSessionMode() || !isAuthority()) return;
+        if (!isSessionMode()) return;
+        if (!isAuthority()) {
+            console.warn('[Multiplayer] createSyncedAsteroid skipped: isAuthority=false, isSessionMode=true, game.multiplayer.isAuthority=', game.multiplayer.isAuthority);
+            return;
+        }
         
         try {
             const objectInfo = await ObjectSync.createObject(asteroid.toSyncData(), 'Session');
@@ -2586,8 +2590,9 @@
      * Called when this client is promoted to Server role
      */
     function handleServerPromotion() {
-        console.log('[Multiplayer] This client promoted to Server - taking over authority');
+        console.log('[Multiplayer] handleServerPromotion called. game.state:', game.state, 'isAuthority before:', game.multiplayer.isAuthority);
         game.multiplayer.isAuthority = true;
+        console.log('[Multiplayer] isAuthority set to true. isAuthority():', isAuthority());
         
         // Take over GameState syncing
         const gameStateObj = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
@@ -2595,16 +2600,17 @@
             game.multiplayer.gameStateObjectId = gameStateObj.id;
         }
         
-        // Take over asteroid simulation - rebuild from ObjectSync
-        const asteroidObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.ASTEROID);
-        game.astervoids = [];
-        for (const obj of asteroidObjects) {
-            const asteroid = Asteroid.fromSyncData(obj.data);
-            asteroid.syncObjectId = obj.id;
-            game.astervoids.push(asteroid);
+        // Take over asteroid simulation - rebuild from ObjectSync (if game is active)
+        if (game.state === 'playing' || game.state === 'waveDelay') {
+            const asteroidObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.ASTEROID);
+            game.astervoids = [];
+            for (const obj of asteroidObjects) {
+                const asteroid = Asteroid.fromSyncData(obj.data);
+                asteroid.syncObjectId = obj.id;
+                game.astervoids.push(asteroid);
+            }
+            console.log('[Multiplayer] Server promotion: took over', asteroidObjects.length, 'astervoids');
         }
-        
-        console.log('[Multiplayer] Server promotion: took over', asteroidObjects.length, 'astervoids');
     }
 
     // ============================================
@@ -2979,8 +2985,6 @@
                         // Check if we own this asteroid
                         const asteroidSyncObj = asteroid.syncObjectId ? ObjectSync.getObject(asteroid.syncObjectId) : null;
                         const asteroidOwner = asteroidSyncObj?.ownerMemberId;
-                        
-                        console.log('[Collision] Bullet hit asteroid. asteroidOwner:', asteroidOwner, 'myMemberId:', myMemberId, 'match:', asteroidOwner === myMemberId, 'syncObjExists:', !!asteroidSyncObj);
                         
                         if (asteroidOwner === myMemberId) {
                             // We own both bullet and asteroid — process locally
@@ -4114,14 +4118,17 @@
     });
 
     // Handle role changes (e.g., promoted to server when server leaves)
-    SessionClient.on('onRoleChanged', (newRole) => {
+    SessionClient.on('onRoleChanged', (newRole, migratedObjectIds) => {
+        // Let ObjectSync migrate ownership for migrated objects
+        ObjectSync.handleRoleChanged(newRole, migratedObjectIds || []);
+        
         if (game.sessionInfo) {
             game.sessionInfo.role = newRole;
         }
         sessionPicker.isServer = newRole === 'Server';
         
-        // If promoted to Server while playing, take over authority
-        if (newRole === 'Server' && game.state === 'playing') {
+        // If promoted to Server, take over authority
+        if (newRole === 'Server') {
             handleServerPromotion();
         }
         
