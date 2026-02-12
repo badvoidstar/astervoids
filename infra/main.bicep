@@ -77,7 +77,7 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction) {
     targetPort: 8080
     external: true
     minReplicas: 0
-    maxReplicas: 3
+    maxReplicas: 1
     customDomainName: ''
   }
   dependsOn: [containerAppsProduction]

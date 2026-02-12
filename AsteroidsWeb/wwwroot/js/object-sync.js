@@ -364,11 +364,11 @@ const ObjectSync = (function() {
             const success = await SessionClient.deleteObject(objectId);
             return success;
         } catch (err) {
-            console.error('[ObjectSync] Delete object failed:', err);
+            console.warn('[ObjectSync] Server delete failed (local deletion already applied):', objectId, err.message);
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('delete', err);
             }
-            throw err;
+            return false;
         }
     }
 
