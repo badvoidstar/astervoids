@@ -106,7 +106,6 @@ const ObjectSync = (function() {
         SessionClient.on('onObjectDeleted', handleRemoteObjectDeleted);
         SessionClient.on('onSessionJoined', handleSessionJoined);
         SessionClient.on('onSessionLeft', handleSessionLeft);
-        SessionClient.on('onRoleChanged', handleRoleChanged);
 
         console.log('[ObjectSync] Initialized');
     }
@@ -514,6 +513,7 @@ const ObjectSync = (function() {
         getSyncInterval,
         handleOwnershipMigration,
         handleMemberDeparture,
+        handleRoleChanged,
         on,
         clear
     };
