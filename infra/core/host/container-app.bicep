@@ -26,7 +26,7 @@ param external bool = true
 param minReplicas int = 0
 
 @description('Maximum number of replicas')
-param maxReplicas int = 3
+param maxReplicas int = 1
 
 @description('CPU cores allocated to the container')
 param cpu string = '1.0'

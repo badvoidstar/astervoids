@@ -217,4 +217,121 @@ public class ObjectServiceTests
         // Assert
         objects.Should().HaveCount(3);
     }
+
+    [Fact]
+    public void DeleteObject_AlreadyDeleted_ShouldReturnFalseAndNotCorruptSession()
+    {
+        // Arrange - simulates two bullets hitting the same asteroid
+        var result = _sessionService.CreateSession("connection-1", 1.5);
+        var session = result.Session!;
+        var creator = result.Creator!;
+        var asteroid = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Session, new Dictionary<string, object?>
+        {
+            ["type"] = "asteroid",
+            ["x"] = 0.5,
+            ["y"] = 0.5
+        });
+        var otherObj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Session);
+
+        // Act - first delete succeeds, second is a no-op
+        var firstDelete = _objectService.DeleteObject(session.Id, asteroid!.Id);
+        var secondDelete = _objectService.DeleteObject(session.Id, asteroid.Id);
+
+        // Assert - double-delete is safe, other objects unaffected
+        firstDelete.Should().BeTrue();
+        secondDelete.Should().BeFalse();
+        _objectService.GetObject(session.Id, asteroid.Id).Should().BeNull();
+        _objectService.GetObject(session.Id, otherObj!.Id).Should().NotBeNull();
+        _objectService.GetSessionObjects(session.Id).Should().HaveCount(1);
+    }
+
+    [Fact]
+    public void UpdateObject_AfterDeletion_ShouldReturnNull()
+    {
+        // Arrange - simulates an in-flight update arriving after deletion
+        var result = _sessionService.CreateSession("connection-1", 1.5);
+        var session = result.Session!;
+        var creator = result.Creator!;
+        var obj = _objectService.CreateObject(session.Id, creator.Id, ObjectScope.Member, new Dictionary<string, object?>
+        {
+            ["x"] = 100.0
+        });
+        _objectService.DeleteObject(session.Id, obj!.Id);
+
+        // Act - update on deleted object
+        var updated = _objectService.UpdateObject(session.Id, obj.Id, new Dictionary<string, object?>
+        {
+            ["x"] = 200.0
+        });
+
+        // Assert - gracefully returns null, no exception
+        updated.Should().BeNull();
+    }
+
+    [Fact]
+    public void ConcurrentCollision_TwoBulletsHitSameAsteroid_SecondDeleteIsSafe()
+    {
+        // Arrange - two players each fire a bullet at the same asteroid
+        var createResult = _sessionService.CreateSession("connection-1", 1.5);
+        var session = createResult.Session!;
+        var server = createResult.Creator!;
+        var joinResult = _sessionService.JoinSession(session.Id, "connection-2");
+        var client = joinResult.Member!;
+
+        // Server owns the asteroid
+        var asteroid = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Session, new Dictionary<string, object?>
+        {
+            ["type"] = "asteroid",
+            ["x"] = 0.5,
+            ["y"] = 0.5,
+            ["radius"] = 0.08
+        });
+
+        // Each player owns a bullet
+        var bullet1 = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Member, new Dictionary<string, object?>
+        {
+            ["type"] = "bullet"
+        });
+        var bullet2 = _objectService.CreateObject(session.Id, client.Id, ObjectScope.Member, new Dictionary<string, object?>
+        {
+            ["type"] = "bullet"
+        });
+
+        // Act - first bullet hit: asteroid owner deletes asteroid, creates children
+        var asteroidDeleted = _objectService.DeleteObject(session.Id, asteroid!.Id);
+        var child1 = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Session, new Dictionary<string, object?>
+        {
+            ["type"] = "asteroid",
+            ["x"] = 0.48,
+            ["y"] = 0.5,
+            ["radius"] = 0.05
+        });
+        var child2 = _objectService.CreateObject(session.Id, server.Id, ObjectScope.Session, new Dictionary<string, object?>
+        {
+            ["type"] = "asteroid",
+            ["x"] = 0.52,
+            ["y"] = 0.5,
+            ["radius"] = 0.05
+        });
+        var bullet1Deleted = _objectService.DeleteObject(session.Id, bullet1!.Id);
+
+        // Second bullet hit arrives — asteroid already gone
+        var secondAsteroidDelete = _objectService.DeleteObject(session.Id, asteroid.Id);
+        var asteroidLookup = _objectService.GetObject(session.Id, asteroid.Id);
+
+        // Assert
+        asteroidDeleted.Should().BeTrue();
+        child1.Should().NotBeNull();
+        child2.Should().NotBeNull();
+        bullet1Deleted.Should().BeTrue();
+        secondAsteroidDelete.Should().BeFalse("asteroid was already destroyed by first bullet");
+        asteroidLookup.Should().BeNull("asteroid should not reappear");
+
+        // Session should contain: child1, child2, bullet2 (bullet1 was deleted)
+        var remaining = _objectService.GetSessionObjects(session.Id).ToList();
+        remaining.Should().HaveCount(3);
+        remaining.Should().Contain(o => o.Id == child1!.Id);
+        remaining.Should().Contain(o => o.Id == child2!.Id);
+        remaining.Should().Contain(o => o.Id == bullet2!.Id);
+    }
 }
