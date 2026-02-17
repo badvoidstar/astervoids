@@ -36,7 +36,7 @@ A multiplayer Astervoids game with real-time synchronization via SignalR.
 - SignalR hub (`/sessionHub`) broadcasts state changes to all session members
 
 ### Deployment Model
-- Production deploys from `master` branch to its own resource group
+- Production deploys from `main` branch to its own resource group
 - Feature branches deploy as separate Container Apps within the production resource group
 - Use `azd deploy` for quick code changes (~24 sec), `azd up` for full provision + deploy
 

@@ -9,7 +9,7 @@ on:
       - '.gitignore'
   pull_request:
     branches:
-      - master
+      - main
     paths-ignore:
       - '**.md'
       - '.gitignore'
@@ -73,8 +73,8 @@ jobs:
           SANITIZED=$(.github/scripts/sanitize-branch-name.sh "$BRANCH_NAME")
           echo "sanitized_branch=$SANITIZED" >> $GITHUB_OUTPUT
           
-          # Determine if this is production (master branch)
-          if [ "$BRANCH_NAME" = "master" ]; then
+          # Determine if this is production (main branch)
+          if [ "$BRANCH_NAME" = "main" ]; then
             echo "is_production=true" >> $GITHUB_OUTPUT
             echo "env_name=production" >> $GITHUB_OUTPUT
           else
@@ -109,7 +109,7 @@ jobs:
         if: steps.vars.outputs.is_production != 'true'
         run: |
           if ! az group show --name "${{ env.PRODUCTION_RG }}" &>/dev/null; then
-            echo "::error::Production environment must be deployed first. Deploy master branch before deploying feature branches."
+            echo "::error::Production environment must be deployed first. Deploy main branch before deploying feature branches."
             exit 1
           fi
 

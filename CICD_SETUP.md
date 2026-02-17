@@ -104,7 +104,7 @@ If the custom domain secrets are configured, the workflow will automatically set
 
 The workflow will automatically run when:
 - Code is pushed to **any branch** (builds, tests, and deploys)
-- A pull request is opened against `master` (builds and tests only)
+- A pull request is opened against `main` (builds and tests only)
 - A branch is deleted (cleanup workflow removes resources)
 
 ### Manual Trigger
@@ -127,7 +127,7 @@ When you push to any branch, the workflow automatically:
 ### Subdomain Naming
 
 Branch deployments get subdomains following this pattern:
-- **Production (master):** `{subdomain}.{domain}` (e.g., `app.yourdomain.com`)
+- **Production (main):** `{subdomain}.{domain}` (e.g., `app.yourdomain.com`)
 - **Feature branches:** `{subdomain}-{branch}.{domain}` (e.g., `app-feature-login.yourdomain.com`)
 
 Branch names are sanitized for DNS compatibility:
@@ -156,7 +156,7 @@ When a branch is deleted from GitHub:
 3. Removes DNS records (CNAME and TXT)
 4. Removes the managed certificate
 
-**Note:** The master branch cleanup is blocked to prevent accidental deletion of production.
+**Note:** The main branch cleanup is blocked to prevent accidental deletion of production.
 
 ## Monitoring Deployments
 
@@ -177,7 +177,7 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 - Builds the solution
 - Runs tests
 
-### Deploy Job (master branch only)
+### Deploy Job (main branch only)
 - Installs Azure Developer CLI (azd)
 - Authenticates to Azure using OIDC (federated credentials)
 - Authenticates azd using GitHub's federated credential provider
