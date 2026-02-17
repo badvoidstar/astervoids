@@ -7,11 +7,5 @@
         "respawning",
         "Verts",
         "WASD"
-    ],
-    "chat.tools.terminal.autoApprove": {
-        "/^start c:\\\\Users\\\\sguest\\\\astervoids\\\\astervoids\\.html$/": {
-            "approve": true,
-            "matchCommandLine": true
-        }
-    }
+    ]
 }
