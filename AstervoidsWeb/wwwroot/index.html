@@ -4388,13 +4388,20 @@
                         syncLocalShip();
                     }
                     
-                    // Update astervoids (authority)
-                    if (isAuthority()) {
-                        game.astervoids.forEach(a => a.update(dt));
-                        syncLocalAstervoids();
-                    } else {
-                        updateAstervoidsFromSync();
-                    }
+                    // Update astervoids (owned locally, others from sync)
+                    const bgMemberId = SessionClient.getCurrentMember()?.id;
+                    game.astervoids.forEach(a => {
+                        if (!a.syncObjectId) {
+                            a.update(dt);
+                        } else {
+                            const syncObj = ObjectSync.getObject(a.syncObjectId);
+                            if (syncObj && syncObj.ownerMemberId === bgMemberId) {
+                                a.update(dt);
+                            }
+                        }
+                    });
+                    syncLocalAstervoids();
+                    updateAstervoidsFromSync();
                     
                     // Update remote state
                     updateRemoteShips();
