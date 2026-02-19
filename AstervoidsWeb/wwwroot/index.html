@@ -3039,6 +3039,7 @@
                         
                         if (asteroidOwner === myMemberId) {
                             // We own both bullet and asteroid — process locally
+                            const points = asteroid.getPoints();
                             const removedBullet = game.bullets.splice(i, 1)[0];
                             if (removedBullet.syncObjectId) {
                                 deleteSyncedBullet(removedBullet);
@@ -3047,9 +3048,9 @@
                             if (asteroid.syncObjectId) {
                                 deleteSyncedAsteroid(asteroid);
                             }
-                            game.score += asteroid.getPoints();
                             splitAsteroid(asteroid);
-                            syncGameState();
+                            // Report score to authority (uniform path for all players)
+                            SessionClient.reportScore(points);
                         } else {
                             // Asteroid owned by someone else — report collision, hide bullet
                             bullet.pendingHit = true;
@@ -3111,7 +3112,7 @@
 
     /**
      * Handle ship being hit by asteroid (local ship only)
-     * Ship owner handles reset locally; notifies GameState owner for lives in multiplayer.
+     * Ship owner handles reset locally; reports to authority for lives decrement.
      * @param {Ship} ship - The ship that was hit
      */
     function handleShipHit(ship) {
@@ -3125,18 +3126,8 @@
                 ObjectSync.updateObject(game.multiplayer.myShipObjectId, ship.toSyncData(), true);
             }
             
-            if (isAuthority()) {
-                // Authority is GameState owner — decrement lives directly
-                game.lives--;
-                updateHUD();
-                if (game.lives <= 0) {
-                    AudioSystem.beat.stop();
-                }
-                syncGameState(true);
-            } else {
-                // Notify GameState owner to decrement lives
-                SessionClient.reportShipHit();
-            }
+            // All players report ship hit — authority processes via onShipHitReported
+            SessionClient.reportShipHit();
         } else {
             // Solo mode — handle everything locally
             game.lives--;
@@ -4194,9 +4185,8 @@
     });
 
     // Handle role changes (e.g., promoted to server when server leaves)
-    SessionClient.on('onRoleChanged', (newRole, migratedObjectIds) => {
-        // Let ObjectSync migrate ownership for migrated objects
-        ObjectSync.handleRoleChanged(newRole, migratedObjectIds || []);
+    SessionClient.on('onRoleChanged', (newRole) => {
+        ObjectSync.handleRoleChanged(newRole);
         
         if (game.sessionInfo) {
             game.sessionInfo.role = newRole;
@@ -4228,8 +4218,8 @@
                 game.bullets = game.bullets.filter(b => b.syncObjectId !== objectId);
             }
         }
-        if (info.migratedObjectIds && info.migratedObjectIds.length > 0 && info.migrationTargetMemberId) {
-            ObjectSync.handleOwnershipMigration(info.migratedObjectIds, info.migrationTargetMemberId);
+        if (info.migratedObjects && info.migratedObjects.length > 0) {
+            ObjectSync.handleOwnershipMigration(info.migratedObjects);
         }
     });
 
@@ -4256,12 +4246,10 @@
         const size = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
                      asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
         
-        game.score += points;
         game.astervoids.splice(asteroidIndex, 1);
         if (asteroid.syncObjectId) {
             deleteSyncedAsteroid(asteroid);
         }
-        syncGameState();
         
         // Confirm back to the bullet owner with asteroid data for splitting
         SessionClient.confirmBulletHit(report.bulletObjectId, report.reporterMemberId, points, size,
