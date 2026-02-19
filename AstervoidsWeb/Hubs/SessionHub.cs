@@ -130,17 +130,18 @@ public class SessionHub : Hub
             return;
         }
 
-        // Handle object cleanup based on scope
-        // Determine migration target: promoted member (Server left) or current Server (Client left)
-        Guid? migrationTarget = result.PromotedMember?.Id;
-        if (migrationTarget == null && !result.SessionDestroyed)
+        // Handle object cleanup — gather remaining member IDs for round-robin distribution
+        var remainingMemberIds = new List<Guid>();
+        if (!result.SessionDestroyed)
         {
             var session = _sessionService.GetSession(result.SessionId);
-            migrationTarget = session?.Members.Values
-                .FirstOrDefault(m => m.Role == MemberRole.Server)?.Id;
+            if (session != null)
+            {
+                remainingMemberIds = session.Members.Keys.ToList();
+            }
         }
         var departureResult = _objectService.HandleMemberDeparture(
-            result.SessionId, result.MemberId, migrationTarget);
+            result.SessionId, result.MemberId, remainingMemberIds);
 
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, result.SessionId.ToString());
 
@@ -152,8 +153,7 @@ public class SessionHub : Hub
                 result.PromotedMember?.Id,
                 result.PromotedMember?.Role.ToString(),
                 departureResult.DeletedObjectIds,
-                departureResult.MigratedObjectIds,
-                migrationTarget
+                departureResult.MigratedObjects
             ));
 
             if (result.PromotedMember != null)
@@ -161,7 +161,7 @@ public class SessionHub : Hub
                 _logger.LogInformation(
                     "Member {PromotedMemberId} promoted to Server in session {SessionName}. Migrated {MigratedCount} objects, deleted {DeletedCount} objects.",
                     result.PromotedMember.Id, result.SessionName,
-                    departureResult.MigratedObjectIds.Count(),
+                    departureResult.MigratedObjects.Count(),
                     departureResult.DeletedObjectIds.Count());
             }
 
@@ -475,8 +475,7 @@ public record MemberLeftInfo(
     Guid? PromotedMemberId,
     string? PromotedRole,
     IEnumerable<Guid> DeletedObjectIds,
-    IEnumerable<Guid> MigratedObjectIds,
-    Guid? MigrationTargetMemberId
+    IEnumerable<ObjectMigration> MigratedObjects
 );
 public record SessionListItem(Guid Id, string Name, int MemberCount, int MaxMembers, DateTime CreatedAt, bool GameStarted);
 public record ActiveSessionsResponse(IEnumerable<SessionListItem> Sessions, int MaxSessions, bool CanCreateSession);

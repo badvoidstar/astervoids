@@ -142,7 +142,12 @@ const SessionClient = (function() {
                 currentSession.members = currentSession.members.filter(m => m.id !== info.memberId);
             }
 
-            // Check if we were promoted
+            // Handle object cleanup/migration FIRST (before role change, so promoted member sees correct ownership)
+            if (callbacks.onMemberLeft) {
+                callbacks.onMemberLeft(info);
+            }
+
+            // Check if we were promoted (after migration so ownership is correct for handleServerPromotion)
             if (info.promotedMemberId && currentMember && 
                 info.promotedMemberId === currentMember.id) {
                 currentMember.role = info.promotedRole;
@@ -154,12 +159,8 @@ const SessionClient = (function() {
                     }
                 }
                 if (callbacks.onRoleChanged) {
-                    callbacks.onRoleChanged(info.promotedRole, info.migratedObjectIds || []);
+                    callbacks.onRoleChanged(info.promotedRole);
                 }
-            }
-
-            if (callbacks.onMemberLeft) {
-                callbacks.onMemberLeft(info);
             }
         });
 

@@ -450,7 +450,7 @@ public class ObjectServiceTests
         });
 
         // Act — client leaves, their member-scoped objects are deleted
-        var departure = _objectService.HandleMemberDeparture(session.Id, client.Id, server.Id);
+        var departure = _objectService.HandleMemberDeparture(session.Id, client.Id, new List<Guid> { server.Id });
 
         // Assert — ship type becomes empty (only client had one), bullet does not (server still has one)
         departure.AffectedTypes.Should().Contain("ship");
@@ -476,10 +476,10 @@ public class ObjectServiceTests
         });
 
         // Act — client leaves, session-scoped objects should migrate to server
-        var departure = _objectService.HandleMemberDeparture(session.Id, client.Id, server.Id);
+        var departure = _objectService.HandleMemberDeparture(session.Id, client.Id, new List<Guid> { server.Id });
 
         // Assert
-        departure.MigratedObjectIds.Should().Contain(asteroid!.Id);
+        departure.MigratedObjects.Should().Contain(m => m.ObjectId == asteroid!.Id);
         var migratedObj = _objectService.GetObject(session.Id, asteroid.Id);
         migratedObj.Should().NotBeNull();
         migratedObj!.OwnerMemberId.Should().Be(server.Id);
