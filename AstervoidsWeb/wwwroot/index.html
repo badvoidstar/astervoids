@@ -2990,8 +2990,9 @@
             AudioSystem.thrustSound.stop();
         }
         
-        // Shoot
-        if (input.fire() && game.bullets.length < CONFIG.MAX_BULLETS) {
+        // Shoot — only count local player's active (non-pending) bullets toward the cap
+        const myBulletCount = game.bullets.filter(b => b.ownerMemberId === game.ship.memberId && !b.pendingHit).length;
+        if (input.fire() && myBulletCount < CONFIG.MAX_BULLETS) {
             const bullet = game.ship.shoot();
             if (bullet) {
                 game.bullets.push(bullet);
