@@ -2346,11 +2346,11 @@
      * Create a synced asteroid object (authority only)
      * @param {Asteroid} asteroid - The asteroid to sync
      */
-    async function createSyncedAsteroid(asteroid) {
+    async function createSyncedAsteroid(asteroid, ownerMemberId = null) {
         if (!isSessionMode()) return;
         
         try {
-            const objectInfo = await ObjectSync.createObject(asteroid.toSyncData(), 'Session');
+            const objectInfo = await ObjectSync.createObject(asteroid.toSyncData(), 'Session', ownerMemberId);
             asteroid.syncObjectId = objectInfo.id;
         } catch (err) {
             console.error('[Multiplayer] Failed to create asteroid:', err);
@@ -2404,7 +2404,16 @@
         
         for (const obj of asteroidObjects) {
             // Skip astervoids we own — we update those locally
-            if (obj.ownerMemberId === myMemberId) continue;
+            if (obj.ownerMemberId === myMemberId) {
+                // But if we own it and don't have it locally, adopt it (created remotely on our behalf)
+                const existing = game.astervoids.find(a => a.syncObjectId === obj.id);
+                if (!existing) {
+                    const asteroid = Asteroid.fromSyncData(obj.data);
+                    asteroid.syncObjectId = obj.id;
+                    game.astervoids.push(asteroid);
+                }
+                continue;
+            }
             
             currentSyncIds.add(obj.id);
             
@@ -2836,7 +2845,7 @@
      * Called by the asteroid owner to process a hit.
      * @param {Asteroid} asteroid - The asteroid to split
      */
-    function splitAsteroid(asteroid) {
+    function splitAsteroid(asteroid, childOwnerMemberId = null) {
         // Don't split if too small
         if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS) {
             return;  // Asteroid is destroyed, no children spawned
@@ -2894,9 +2903,9 @@
             
             game.astervoids.push(childAsteroid);
             
-            // Fire-and-forget sync creation for children (owner creates, so owner owns)
+            // Fire-and-forget sync creation for children
             if (isSessionMode()) {
-                createSyncedAsteroid(childAsteroid);
+                createSyncedAsteroid(childAsteroid, childOwnerMemberId);
             }
         }
         
@@ -4257,7 +4266,7 @@
             return;
         }
         
-        // Accept the hit — remove asteroid and confirm with asteroid data for bullet owner to split
+        // Accept the hit — remove asteroid, split with children owned by the shooter
         const asteroid = game.astervoids[asteroidIndex];
         const points = asteroid.getPoints();
         const size = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
@@ -4271,12 +4280,14 @@
         // Play explosion sound (asteroid owner hears their asteroid being destroyed)
         AudioSystem.playExplosion(size);
         
-        // Confirm back to the bullet owner with asteroid data for splitting
-        SessionClient.confirmBulletHit(report.bulletObjectId, report.reporterMemberId, points, size,
-            asteroid.x, asteroid.y, asteroid.velocityX, asteroid.velocityY, asteroid.radius);
+        // Split asteroid here — children owned by the shooter (reporterMemberId)
+        splitAsteroid(asteroid, report.reporterMemberId);
+        
+        // Confirm back to the bullet owner (no physics data needed, split already done)
+        SessionClient.confirmBulletHit(report.bulletObjectId, report.reporterMemberId, points, size);
     });
 
-    // Handle bullet hit confirmed — bullet owner cleans up and splits asteroid
+    // Handle bullet hit confirmed — bullet owner cleans up bullet and reports score
     SessionClient.on('onBulletHitConfirmed', (confirmation) => {
         const myMemberId = SessionClient.getCurrentMember()?.id;
         if (confirmation.bulletOwnerMemberId !== myMemberId) return;
@@ -4290,13 +4301,8 @@
             }
         }
         
-        // Reconstruct asteroid from confirmation data and split it (creates children owned by us)
-        const asteroid = new Asteroid(
-            confirmation.asteroidX, confirmation.asteroidY,
-            confirmation.asteroidRadius,
-            confirmation.asteroidVelocityX, confirmation.asteroidVelocityY
-        );
-        splitAsteroid(asteroid);
+        // Play explosion sound for the shooter
+        AudioSystem.playExplosion(confirmation.asteroidSize);
         
         // Report score to authority
         SessionClient.reportScore(confirmation.points);

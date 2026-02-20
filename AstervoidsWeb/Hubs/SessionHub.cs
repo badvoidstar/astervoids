@@ -255,7 +255,7 @@ public class SessionHub : Hub
     /// <summary>
     /// Creates a new synchronized object in the session.
     /// </summary>
-    public async Task<ObjectInfo?> CreateObject(Dictionary<string, object?>? data, string scope = "Member")
+    public async Task<ObjectInfo?> CreateObject(Dictionary<string, object?>? data, string scope = "Member", string? ownerMemberId = null)
     {
         var member = _sessionService.GetMemberByConnectionId(Context.ConnectionId);
         if (member == null)
@@ -268,7 +268,13 @@ public class SessionHub : Hub
             ? ObjectScope.Session 
             : ObjectScope.Member;
 
-        var obj = _objectService.CreateObject(member.SessionId, member.Id, objectScope, data);
+        Guid? ownerGuid = null;
+        if (ownerMemberId != null && Guid.TryParse(ownerMemberId, out var parsed))
+        {
+            ownerGuid = parsed;
+        }
+
+        var obj = _objectService.CreateObject(member.SessionId, member.Id, objectScope, data, ownerGuid);
         if (obj == null)
         {
             _logger.LogWarning("CreateObject failed - could not create object in session");
@@ -433,7 +439,7 @@ public class SessionHub : Hub
     /// Broadcasts to all session members so the bullet owner can handle cleanup.
     /// Caller must not be the bullet owner (the asteroid owner confirms).
     /// </summary>
-    public async Task ConfirmBulletHit(Guid bulletObjectId, Guid bulletOwnerMemberId, int points, string asteroidSize, double asteroidX, double asteroidY, double asteroidVelocityX, double asteroidVelocityY, double asteroidRadius)
+    public async Task ConfirmBulletHit(Guid bulletObjectId, Guid bulletOwnerMemberId, int points, string asteroidSize)
     {
         var member = _sessionService.GetMemberByConnectionId(Context.ConnectionId);
         if (member == null)
@@ -450,7 +456,7 @@ public class SessionHub : Hub
         }
 
         await Clients.Group(member.SessionId.ToString()).SendAsync("OnBulletHitConfirmed",
-            new BulletHitConfirmation(bulletObjectId, bulletOwnerMemberId, points, asteroidSize, asteroidX, asteroidY, asteroidVelocityX, asteroidVelocityY, asteroidRadius));
+            new BulletHitConfirmation(bulletObjectId, bulletOwnerMemberId, points, asteroidSize));
     }
 
     /// <summary>
@@ -538,7 +544,7 @@ public record ActiveSessionsResponse(IEnumerable<SessionListItem> Sessions, int 
 public record ObjectInfo(Guid Id, Guid CreatorMemberId, Guid OwnerMemberId, string Scope, Dictionary<string, object?> Data, long Version);
 public record ObjectUpdateRequest(Guid ObjectId, Dictionary<string, object?> Data, long? ExpectedVersion = null);
 public record BulletHitReport(Guid AsteroidObjectId, Guid BulletObjectId, Guid ReporterMemberId);
-public record BulletHitConfirmation(Guid BulletObjectId, Guid BulletOwnerMemberId, int Points, string AsteroidSize, double AsteroidX, double AsteroidY, double AsteroidVelocityX, double AsteroidVelocityY, double AsteroidRadius);
+public record BulletHitConfirmation(Guid BulletObjectId, Guid BulletOwnerMemberId, int Points, string AsteroidSize);
 public record BulletHitRejection(Guid BulletObjectId, Guid BulletOwnerMemberId);
 public record ShipHitReport(Guid ReporterMemberId);
 public record ScoreReport(Guid ReporterMemberId, int Points);
