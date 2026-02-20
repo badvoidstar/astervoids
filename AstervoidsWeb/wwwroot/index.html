@@ -2846,8 +2846,11 @@
      * @param {Asteroid} asteroid - The asteroid to split
      */
     function splitAsteroid(asteroid, childOwnerMemberId = null) {
-        // Don't split if too small
+        // Don't split if too small — just clean up sync
         if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS) {
+            if (isSessionMode() && asteroid.syncObjectId) {
+                deleteSyncedAsteroid(asteroid);
+            }
             return;  // Asteroid is destroyed, no children spawned
         }
         
@@ -2878,7 +2881,8 @@
         // Calculate total mass of surviving children for energy distribution
         const totalChildMass = children.reduce((sum, r) => sum + r ** 2, 0);
         
-        // Spawn all child astervoids synchronously
+        // Build child asteroids
+        const childAsteroids = [];
         for (let index = 0; index < children.length; index++) {
             const childRadius = children[index];
             
@@ -2902,14 +2906,44 @@
             );
             
             game.astervoids.push(childAsteroid);
-            
-            // Fire-and-forget sync creation for children
-            if (isSessionMode()) {
-                createSyncedAsteroid(childAsteroid, childOwnerMemberId);
+            childAsteroids.push(childAsteroid);
+        }
+        
+        // Sync: use atomic replaceObject if parent is synced, otherwise create individually
+        if (isSessionMode() && asteroid.syncObjectId && childAsteroids.length > 0) {
+            replaceSyncedAsteroid(asteroid, childAsteroids, childOwnerMemberId);
+        } else if (isSessionMode()) {
+            // Parent too small to split or no sync ID — just delete parent
+            if (asteroid.syncObjectId) {
+                deleteSyncedAsteroid(asteroid);
+            }
+            for (const child of childAsteroids) {
+                createSyncedAsteroid(child, childOwnerMemberId);
             }
         }
         
         updateHUD();
+    }
+
+    /**
+     * Atomically replace a synced asteroid with child asteroids.
+     * Deletes parent and creates children in a single broadcast to all members.
+     */
+    async function replaceSyncedAsteroid(parentAsteroid, childAsteroids, ownerMemberId = null) {
+        if (!isSessionMode() || !parentAsteroid.syncObjectId) return;
+        
+        try {
+            const replacements = childAsteroids.map(child => child.toSyncData());
+            const createdInfos = await ObjectSync.replaceObject(
+                parentAsteroid.syncObjectId, replacements, 'Session', ownerMemberId);
+            if (createdInfos) {
+                for (let i = 0; i < createdInfos.length && i < childAsteroids.length; i++) {
+                    childAsteroids[i].syncObjectId = createdInfos[i].id;
+                }
+            }
+        } catch (err) {
+            console.error('[Multiplayer] Failed to replace asteroid:', err);
+        }
     }
 
     /**
@@ -3056,9 +3090,6 @@
                                 deleteSyncedBullet(removedBullet);
                             }
                             game.astervoids.splice(j, 1);
-                            if (asteroid.syncObjectId) {
-                                deleteSyncedAsteroid(asteroid);
-                            }
                             // Play explosion locally (remote members hear via updateAstervoidsFromSync)
                             const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
                                                   asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
@@ -4266,21 +4297,18 @@
             return;
         }
         
-        // Accept the hit — remove asteroid, split with children owned by the shooter
+        // Accept the hit — remove asteroid locally, split with children owned by the shooter
         const asteroid = game.astervoids[asteroidIndex];
         const points = asteroid.getPoints();
         const size = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
                      asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
         
         game.astervoids.splice(asteroidIndex, 1);
-        if (asteroid.syncObjectId) {
-            deleteSyncedAsteroid(asteroid);
-        }
         
         // Play explosion sound (asteroid owner hears their asteroid being destroyed)
         AudioSystem.playExplosion(size);
         
-        // Split asteroid here — children owned by the shooter (reporterMemberId)
+        // Split asteroid — atomically replaces parent with children (owned by shooter) on server
         splitAsteroid(asteroid, report.reporterMemberId);
         
         // Confirm back to the bullet owner (no physics data needed, split already done)
