@@ -24,6 +24,7 @@ const SessionClient = (function() {
         onObjectCreated: null,
         onObjectsUpdated: null,
         onObjectDeleted: null,
+        onObjectReplaced: null,
         onObjectTypeEmpty: null,
         onObjectTypeRestored: null,
         onSessionsChanged: null,
@@ -180,6 +181,12 @@ const SessionClient = (function() {
         connection.on('OnObjectDeleted', (objectId) => {
             if (callbacks.onObjectDeleted) {
                 callbacks.onObjectDeleted(objectId);
+            }
+        });
+
+        connection.on('OnObjectReplaced', (event) => {
+            if (callbacks.onObjectReplaced) {
+                callbacks.onObjectReplaced(event);
             }
         });
 
@@ -444,6 +451,25 @@ const SessionClient = (function() {
     }
 
     /**
+     * Atomically delete an object and create replacements in a single broadcast.
+     */
+    async function replaceObject(deleteObjectId, replacements, scope = 'Session', ownerMemberId = null) {
+        if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+            throw new Error('Not connected to session hub');
+        }
+        if (!currentSession) {
+            throw new Error('Not in a session');
+        }
+
+        try {
+            return await connection.invoke('ReplaceObject', deleteObjectId, replacements, scope, ownerMemberId);
+        } catch (err) {
+            console.error('[SessionClient] Replace object failed:', err);
+            throw err;
+        }
+    }
+
+    /**
      * Delete an object from the session.
      */
     async function deleteObject(objectId) {
@@ -574,6 +600,7 @@ const SessionClient = (function() {
         getActiveSessions,
         createObject,
         updateObjects,
+        replaceObject,
         deleteObject,
         reportBulletHit,
         confirmBulletHit,
