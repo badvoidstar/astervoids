@@ -955,7 +955,7 @@
         MULTIPLAYER_LIVES: 6,       // Shared lives pool for multiplayer sessions
         SYNC_NOMINAL_FRAME_TIME: 1/30, // Target send interval in seconds (~33ms)
         SYNC_MIN_FRAME_TIME: 1/480,  // Min frame time clamp for threshold calc
-        INTERPOLATION_DELAY: 32,    // Render delay for smooth interpolation (ms)
+        INTERPOLATION_DELAY: 1/60,    // Render delay for smooth interpolation (ms)
         INTERPOLATION_ENABLED: true, // Enable/disable interpolation for remote objects
         ADAPTIVE_DELAY_ENABLED: false, // Auto-tune interpolation delay based on jitter
         SNAP_THRESHOLD: 0.25        // Snap instead of interpolate when position error exceeds this (normalized)
