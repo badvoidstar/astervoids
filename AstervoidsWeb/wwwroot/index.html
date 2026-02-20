@@ -2983,15 +2983,9 @@
         }
         
         if (isGameOver()) {
-            // Check for restart/return to menu
+            // Return to main menu on Enter
             if (keys['Enter']) {
-                if (isSessionMode()) {
-                    // Return to start screen for session mode
-                    returnToStartScreen();
-                } else {
-                    // Restart for solo mode
-                    init();
-                }
+                returnToStartScreen();
             }
             return;
         }
@@ -3087,11 +3081,8 @@
                             if (removedBullet.syncObjectId) {
                                 deleteSyncedBullet(removedBullet);
                             }
-                            // Play explosion locally
-                            const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
-                                                  asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                            AudioSystem.playExplosion(explosionSize);
-                            // Split sends to server — OnObjectReplaced handles local state for all clients
+                            // Split sends to server — OnObjectReplaced handles asteroid state for all clients
+                            // Explosion sound plays via updateAstervoidsFromSync cleanup when parent disappears
                             splitAsteroid(asteroid);
                             // Report score to authority (uniform path for all players)
                             SessionClient.reportScore(points);
@@ -3433,12 +3424,7 @@
             drawCenteredText('GAME OVER', getGameHeight() / 2 - 40, 48);
             drawCenteredText(`Final Score: ${game.score}`, getGameHeight() / 2 + 10, 24);
             if (!touchControlsEnabled) {
-                // Show different message based on mode
-                if (isSessionMode()) {
-                    drawCenteredText('Press ENTER for menu', getGameHeight() / 2 + 50, 20);
-                } else {
-                    drawCenteredText('Press ENTER to restart', getGameHeight() / 2 + 50, 20);
-                }
+                drawCenteredText('Press ENTER for menu', getGameHeight() / 2 + 50, 20);
             }
         }
         
@@ -3593,12 +3579,7 @@
             if (isGameOver() || game.state === 'paused') {
                 pauseMenu.classList.remove('visible');
                 touchButtons.restart.classList.remove('visible');
-                // Return to menu for session mode, restart for solo
-                if (isSessionMode()) {
-                    returnToStartScreen();
-                } else {
-                    init();
-                }
+                returnToStartScreen();
             }
         }, { passive: false });
     }
@@ -4300,6 +4281,7 @@
                      asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
         
         // Split asteroid — sends to server, all clients process via OnObjectReplaced
+        // Explosion sound plays via updateAstervoidsFromSync cleanup when parent disappears
         splitAsteroid(asteroid, report.reporterMemberId);
         
         // Confirm back to the bullet owner
@@ -4320,8 +4302,7 @@
             }
         }
         
-        // Play explosion sound for the shooter
-        AudioSystem.playExplosion(confirmation.asteroidSize);
+        // Explosion sound plays via updateAstervoidsFromSync cleanup when parent disappears
         
         // Report score to authority
         SessionClient.reportScore(confirmation.points);
