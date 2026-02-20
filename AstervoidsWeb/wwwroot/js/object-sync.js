@@ -247,13 +247,13 @@ const ObjectSync = (function() {
      * @param {object} data - Object data
      * @param {string} scope - 'Member' or 'Session' (default: 'Member')
      */
-    async function createObject(data = {}, scope = 'Member') {
+    async function createObject(data = {}, scope = 'Member', ownerMemberId = null) {
         if (!SessionClient.isInSession()) {
             throw new Error('Not in a session');
         }
 
         try {
-            const objectInfo = await SessionClient.createObject(data, scope);
+            const objectInfo = await SessionClient.createObject(data, scope, ownerMemberId);
             // Object will be added via the onObjectCreated event
             return objectInfo;
         } catch (err) {
