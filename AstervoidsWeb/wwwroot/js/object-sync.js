@@ -15,6 +15,7 @@ const ObjectSync = (function() {
     
     // Delta encoding: track last-sent data per object to only send changes
     const lastSentData = new Map();
+    let deltaEncodingEnabled = false;
     
     // Full-state sync interval (frames at nominal rate)
     const FULL_SYNC_INTERVAL = 60;
@@ -44,6 +45,9 @@ const ObjectSync = (function() {
         }
         if (config.minFrameTime !== undefined) {
             minFrameTime = config.minFrameTime;
+        }
+        if (config.deltaEncoding !== undefined) {
+            deltaEncodingEnabled = config.deltaEncoding;
         }
     }
     
@@ -406,33 +410,38 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Flush all pending updates to the server, sending only changed fields.
+     * Flush all pending updates to the server.
+     * When delta encoding is enabled, only sends changed fields.
      */
     async function flushUpdates() {
         if (pendingUpdates.length === 0) return;
         if (!SessionClient.isInSession()) return;
 
-        const forceFullSync = (++fullSyncCounter >= FULL_SYNC_INTERVAL);
-        if (forceFullSync) fullSyncCounter = 0;
+        let updates;
+        if (deltaEncodingEnabled) {
+            const forceFullSync = (++fullSyncCounter >= FULL_SYNC_INTERVAL);
+            if (forceFullSync) fullSyncCounter = 0;
 
-        // Apply delta encoding — only send fields that changed since last send
-        const deltaUpdates = [];
-        for (const update of pendingUpdates) {
-            const delta = computeDelta(update.objectId, update.data, forceFullSync);
-            if (delta) {
-                deltaUpdates.push({
-                    objectId: update.objectId,
-                    data: delta,
-                    expectedVersion: update.expectedVersion
-                });
+            updates = [];
+            for (const update of pendingUpdates) {
+                const delta = computeDelta(update.objectId, update.data, forceFullSync);
+                if (delta) {
+                    updates.push({
+                        objectId: update.objectId,
+                        data: delta,
+                        expectedVersion: update.expectedVersion
+                    });
+                }
             }
+        } else {
+            updates = pendingUpdates;
         }
         pendingUpdates = [];
 
-        if (deltaUpdates.length === 0) return;
+        if (updates.length === 0) return;
 
         try {
-            await SessionClient.updateObjects(deltaUpdates);
+            await SessionClient.updateObjects(updates);
         } catch (err) {
             console.error('[ObjectSync] Batch update failed:', err);
             if (callbacks.onSyncError) {

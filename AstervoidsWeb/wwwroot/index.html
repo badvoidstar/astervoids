@@ -961,11 +961,12 @@
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 6,       // Shared lives pool for multiplayer sessions
-        SYNC_NOMINAL_FRAME_TIME: 1/30, // Target send interval in seconds (~33ms)
+        SYNC_NOMINAL_FRAME_TIME: 1/20, // Target send interval (seconds)
         SYNC_MIN_FRAME_TIME: 1/480,  // Min frame time clamp for threshold calc
-        INTERPOLATION_DELAY: 1000/60, // Render delay for smooth interpolation (ms)
+        DELTA_ENCODING_ENABLED: true, // Send only changed fields to reduce bandwidth
+        INTERPOLATION_DELAY: 1000/20, // Render delay for smooth interpolation (ms)
         INTERPOLATION_ENABLED: true, // Enable/disable interpolation for remote objects
-        ADAPTIVE_DELAY_ENABLED: true, // Auto-tune interpolation delay based on jitter
+        ADAPTIVE_DELAY_ENABLED: false, // Auto-tune interpolation delay based on jitter
         SNAP_THRESHOLD: 0.25        // Snap instead of interpolate when position error exceeds this (normalized)
     };
 
@@ -3948,7 +3949,8 @@
                 // Apply configured sync timing
                 ObjectSync.configure({
                     nominalFrameTime: CONFIG.SYNC_NOMINAL_FRAME_TIME,
-                    minFrameTime: CONFIG.SYNC_MIN_FRAME_TIME
+                    minFrameTime: CONFIG.SYNC_MIN_FRAME_TIME,
+                    deltaEncoding: CONFIG.DELTA_ENCODING_ENABLED
                 });
                 
                 sessionPicker.connected = true;
