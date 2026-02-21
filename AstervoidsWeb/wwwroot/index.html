@@ -60,13 +60,11 @@
         /* HUD overlay for score, lives, and wave info */
         #hud {
             position: absolute;
-            top: 10px;
-            left: 10px;
-            right: 10px;
             display: flex;
             justify-content: space-between;
+            align-items: baseline;
             color: #fff;
-            font-size: 18px;
+            font-size: 36px;
             pointer-events: none;
         }
 
@@ -80,6 +78,13 @@
             color: #666;
             font-size: 12px;
             pointer-events: none;
+        }
+
+        /* Network quality indicator */
+        #net-quality {
+            position: absolute;
+            pointer-events: none;
+            font-family: 'Courier New', monospace;
         }
 
         /* Pause menu overlay */
@@ -487,6 +492,9 @@
             <span id="wave">Wave: 1</span>
             <span id="lives">Lives: 3</span>
         </div>
+        
+        <!-- Network quality indicator -->
+        <div id="net-quality" style="display: none;"></div>
         
         <!-- Instructions: control hints -->
         <div id="instructions">
@@ -992,7 +1000,8 @@
         adaptiveDelay: {
             packetIntervals: [],   // recent inter-packet intervals (ms)
             maxSamples: 30,
-            computedDelay: CONFIG.INTERPOLATION_DELAY
+            computedDelay: CONFIG.INTERPOLATION_DELAY,
+            lastPacketTime: 0
         },
         
         /**
@@ -1005,10 +1014,6 @@
             const existing = this.states.get(objectId);
             
             if (existing) {
-                // Track inter-packet interval for adaptive delay
-                if (CONFIG.ADAPTIVE_DELAY_ENABLED) {
-                    this.recordPacketInterval(now - existing.currentTime);
-                }
                 // Shift current to previous
                 existing.previous = existing.current;
                 existing.previousTime = existing.currentTime;
@@ -1038,6 +1043,19 @@
         },
 
         /**
+         * Record arrival of an update packet for adaptive delay calculation.
+         * Call once per OnObjectsUpdated broadcast, not per object.
+         */
+        recordPacketArrival() {
+            if (!CONFIG.ADAPTIVE_DELAY_ENABLED) return;
+            const now = performance.now();
+            if (this.adaptiveDelay.lastPacketTime > 0) {
+                this.recordPacketInterval(now - this.adaptiveDelay.lastPacketTime);
+            }
+            this.adaptiveDelay.lastPacketTime = now;
+        },
+
+        /**
          * Record a packet interval for adaptive delay calculation
          */
         recordPacketInterval(interval) {
@@ -1051,7 +1069,7 @@
                 const mean = ad.packetIntervals.reduce((s, v) => s + v, 0) / ad.packetIntervals.length;
                 const variance = ad.packetIntervals.reduce((s, v) => s + (v - mean) ** 2, 0) / ad.packetIntervals.length;
                 const stddev = Math.sqrt(variance);
-                ad.computedDelay = Math.max(16, Math.min(100, mean + 2 * stddev));
+                ad.computedDelay = Math.max(16, Math.min(266, mean + 2 * stddev));
             }
         },
 
@@ -1217,6 +1235,7 @@
             this.lastVersions.clear();
             this.adaptiveDelay.packetIntervals = [];
             this.adaptiveDelay.computedDelay = CONFIG.INTERPOLATION_DELAY;
+            this.adaptiveDelay.lastPacketTime = 0;
         }
     };
 
@@ -1395,6 +1414,28 @@
             game.viewport.y = 0;
             game.viewport.width = newWidth;
             game.viewport.height = newHeight;
+        }
+        
+        // Position HUD within the viewport and scale text to viewport size
+        const hud = document.getElementById('hud');
+        if (hud) {
+            const vp = game.viewport;
+            const padding = Math.round(vp.height * 0.015);
+            hud.style.top = `${vp.y + padding}px`;
+            hud.style.left = `${vp.x + padding}px`;
+            hud.style.right = `${(newWidth - vp.x - vp.width) + padding}px`;
+            hud.style.fontSize = `${Math.round(Math.min(vp.width, vp.height) * 0.035)}px`;
+        }
+        
+        // Position network quality indicator at bottom of viewport
+        const netQuality = document.getElementById('net-quality');
+        if (netQuality) {
+            const vp = game.viewport;
+            const padding = Math.round(vp.height * 0.015);
+            const fontSize = Math.round(Math.min(vp.width, vp.height) * 0.025);
+            netQuality.style.bottom = `${(newHeight - vp.y - vp.height) + padding}px`;
+            netQuality.style.left = `${vp.x + padding}px`;
+            netQuality.style.fontSize = `${fontSize}px`;
         }
         
         // No need to scale entity positions - they use normalized coordinates (0-1)
@@ -3204,6 +3245,23 @@
                 sessionIndicator.style.display = 'none';
             }
         }
+        
+        // Update network quality indicator
+        const netQuality = document.getElementById('net-quality');
+        if (netQuality) {
+            if (isSessionMode()) {
+                const delayMs = Math.round(RemoteObjects.getDelay());
+                let color;
+                if (delayMs <= 64) color = '#00ff00';
+                else if (delayMs <= 128) color = '#ffff00';
+                else color = '#ff0000';
+                netQuality.textContent = `${delayMs}ms`;
+                netQuality.style.color = color;
+                netQuality.style.display = '';
+            } else {
+                netQuality.style.display = 'none';
+            }
+        }
     }
 
     /**
@@ -3214,8 +3272,9 @@
      * @param {number} size - Font size
      */
     function drawCenteredText(text, y, size = 32) {
+        const scaledSize = Math.round(size * getReferenceDimension() / 600);
         ctx.fillStyle = CONFIG.STROKE_COLOR;
-        ctx.font = `${size}px 'Courier New', monospace`;
+        ctx.font = `${scaledSize}px 'Courier New', monospace`;
         ctx.textAlign = 'center';
         ctx.fillText(text, getGameWidth() / 2, y);
     }
@@ -3417,14 +3476,15 @@
         
         // Draw state-specific overlays (in gameplay coordinates)
         if (game.state === 'waveDelay') {
-            drawCenteredText(`WAVE ${game.wave + 1}`, getGameHeight() / 2, 48);
+            drawCenteredText(`WAVE ${game.wave + 1}`, getGameHeight() / 2, 96);
         }
         
         if (isGameOver()) {
-            drawCenteredText('GAME OVER', getGameHeight() / 2 - 40, 48);
-            drawCenteredText(`Final Score: ${game.score}`, getGameHeight() / 2 + 10, 24);
+            const gh = getGameHeight();
+            drawCenteredText('GAME OVER', gh / 2 - 80, 96);
+            drawCenteredText(`Final Score: ${game.score}`, gh / 2 + 20, 48);
             if (!touchControlsEnabled) {
-                drawCenteredText('Press ENTER for menu', getGameHeight() / 2 + 50, 20);
+                drawCenteredText('Press ENTER for menu', gh / 2 + 100, 40);
             }
         }
         
@@ -3884,6 +3944,7 @@
             if (success) {
                 // Initialize ObjectSync after connection
                 ObjectSync.init();
+                ObjectSync.on('onBatchReceived', () => RemoteObjects.recordPacketArrival());
                 // Apply configured sync timing
                 ObjectSync.configure({
                     nominalFrameTime: CONFIG.SYNC_NOMINAL_FRAME_TIME,

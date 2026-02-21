@@ -30,6 +30,7 @@ const ObjectSync = (function() {
         onObjectCreated: null,
         onObjectUpdated: null,
         onObjectDeleted: null,
+        onBatchReceived: null,
         onSyncError: null
     };
     
@@ -196,6 +197,10 @@ const ObjectSync = (function() {
      * Handle remote objects updated.
      */
     function handleRemoteObjectsUpdated(updatedObjects) {
+        // Signal packet arrival (for adaptive delay tracking)
+        if (callbacks.onBatchReceived) {
+            callbacks.onBatchReceived();
+        }
         // Updates contain only id, data, version (metadata stripped for bandwidth)
         for (const update of updatedObjects) {
             const existing = objects.get(update.id);
