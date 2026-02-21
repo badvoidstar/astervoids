@@ -331,8 +331,9 @@ public class SessionHub : Hub
 
         if (objectInfos.Count > 0)
         {
-            // Notify all members including sender
-            await Clients.Group(member.SessionId.ToString()).SendAsync("OnObjectsUpdated", objectInfos);
+            // Broadcast trimmed update (no metadata that doesn't change after creation)
+            var updateInfos = updatedObjects.Select(o => new ObjectUpdateInfo(o.Id, o.Data, o.Version)).ToList();
+            await Clients.Group(member.SessionId.ToString()).SendAsync("OnObjectsUpdated", updateInfos);
         }
 
         return objectInfos;
@@ -635,6 +636,7 @@ public record MemberLeftInfo(
 public record SessionListItem(Guid Id, string Name, int MemberCount, int MaxMembers, DateTime CreatedAt, bool GameStarted);
 public record ActiveSessionsResponse(IEnumerable<SessionListItem> Sessions, int MaxSessions, bool CanCreateSession);
 public record ObjectInfo(Guid Id, Guid CreatorMemberId, Guid OwnerMemberId, string Scope, Dictionary<string, object?> Data, long Version);
+public record ObjectUpdateInfo(Guid Id, Dictionary<string, object?> Data, long Version);
 public record ObjectUpdateRequest(Guid ObjectId, Dictionary<string, object?> Data, long? ExpectedVersion = null);
 public record BulletHitReport(Guid AsteroidObjectId, Guid BulletObjectId, Guid ReporterMemberId);
 public record BulletHitConfirmation(Guid BulletObjectId, Guid BulletOwnerMemberId, int Points, string AsteroidSize);
