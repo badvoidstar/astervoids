@@ -108,7 +108,8 @@ public class BinaryGuidFormatterTests
     {
         var dto = new CreateSessionResponse(
             Guid.NewGuid(), "TestSession", Guid.NewGuid(), MemberRole.Server,
-            new Dictionary<string, object?> { ["aspectRatio"] = 1.5 });
+            new Dictionary<string, object?> { ["aspectRatio"] = 1.5 },
+            RegionId: "local");
 
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<CreateSessionResponse>(bytes, Options);
@@ -224,7 +225,8 @@ public class BinaryGuidFormatterTests
             Guid.NewGuid(), "Banana", Guid.NewGuid(), MemberRole.Client,
             new[] { member }, new[] { obj },
             new[] { new GuidLongPair(obj.Id, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) },
-            new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
+            new Dictionary<string, object?> { ["aspectRatio"] = 1.78 },
+            RegionId: "local");
 
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<JoinSessionResponse>(bytes, Options);

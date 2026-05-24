@@ -67,6 +67,7 @@ public class SessionCleanupServiceTests
             sessionService,
             CreateHubContextMock(),
             registry,
+            new InMemorySessionDirectory(),
             settings,
             Mock.Of<ILogger<SessionCleanupService>>());
     }

@@ -33,6 +33,13 @@ public class Session
     public required string Name { get; init; }
 
     /// <summary>
+    /// The region ID of the instance that created this session.
+    /// Sourced from <c>RegionsOptions.Self</c> at creation time and immutable thereafter.
+    /// Defaults to "local" for backward-compat when no region config is present.
+    /// </summary>
+    public string RegionId { get; init; } = "local";
+
+    /// <summary>
     /// Per-session synchronization root.  All session-local mutations (member
     /// add/remove, promotion, object create/update/delete, ownership migration,
     /// lifecycle transitions, and <see cref="LastMemberLeftAt"/> updates) must be

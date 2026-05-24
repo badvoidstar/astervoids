@@ -5,12 +5,31 @@ using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Services;
 using MessagePack;
 using MessagePack.Resolvers;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Register configuration
 builder.Services.Configure<SessionSettings>(
     builder.Configuration.GetSection(SessionSettings.SectionName));
+builder.Services.Configure<RegionsOptions>(
+    builder.Configuration.GetSection(RegionsOptions.SectionName));
+builder.Services.Configure<DirectoryOptions>(
+    builder.Configuration.GetSection(DirectoryOptions.SectionName));
+
+// Register session directory (InMemory by default; Cosmos when Directory:Provider == "Cosmos")
+var directoryProvider = builder.Configuration
+    .GetSection(DirectoryOptions.SectionName)
+    .GetValue<string>("Provider") ?? "InMemory";
+
+if (string.Equals(directoryProvider, "Cosmos", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<ISessionDirectory, CosmosSessionDirectory>();
+}
+else
+{
+    builder.Services.AddSingleton<ISessionDirectory, InMemorySessionDirectory>();
+}
 
 // Register services
 builder.Services.AddSingleton<ISessionNameGenerator, FruitNameGenerator>();
@@ -19,6 +38,7 @@ builder.Services.AddSingleton<IObjectService, ObjectService>();
 builder.Services.AddSingleton<ServerMetricsService>();
 builder.Services.AddSingleton<AstervoidsWeb.Hubs.SyncSchemaRegistry>();
 builder.Services.AddHostedService<SessionCleanupService>();
+builder.Services.AddHostedService<SessionDirectoryMirror>();
 
 // Use camelCase JSON property names for REST API endpoints
 builder.Services.ConfigureHttpJsonOptions(options =>
@@ -134,6 +154,22 @@ app.UseStaticFiles();
 
 // Map SignalR hub
 app.MapHub<SessionHub>("/sessionHub");
+
+// RTT probe endpoint — 204 No Content, used by RegionProbe to measure network latency
+app.MapGet("/api/ping", () => Results.NoContent());
+
+// Region list endpoint — returns the configured region list for the RegionProbe client
+app.MapGet("/api/regions", (IOptions<RegionsOptions> regions) =>
+    Results.Ok(new
+    {
+        self = regions.Value.Self,
+        all = regions.Value.All.Select(r => new
+        {
+            id = r.Id,
+            displayName = r.DisplayName,
+            publicUrl = r.PublicUrl
+        })
+    }));
 
 // Server monitoring metrics API endpoint
 app.MapGet("/api/srvmon", (ServerMetricsService metrics, ISessionService sessionService) =>

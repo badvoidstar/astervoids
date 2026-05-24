@@ -11,7 +11,8 @@ public record CreateSessionResponse(
     [property: Key("sessionName")] string SessionName,
     [property: Key("memberId")] Guid MemberId,
     [property: Key("role")] MemberRole Role,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata);
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("regionId")] string RegionId);
 
 [MessagePackObject]
 public record JoinSessionResponse(
@@ -22,7 +23,8 @@ public record JoinSessionResponse(
     [property: Key("members")] IEnumerable<MemberInfo> Members,
     [property: Key("objects")] IEnumerable<ObjectInfo> Objects,
     [property: Key("validAts")] GuidLongPair[] ValidAts,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("regionId")] string RegionId
 );
 
 [MessagePackObject]
@@ -37,7 +39,8 @@ public record SessionListItem(
     [property: Key("name")] string Name,
     [property: Key("memberCount")] int MemberCount,
     [property: Key("maxMembers")] int MaxMembers,
-    [property: Key("createdAt")] DateTime CreatedAt);
+    [property: Key("createdAt")] DateTime CreatedAt,
+    [property: Key("regionId")] string RegionId);
 
 [MessagePackObject]
 public record SessionStateSnapshot(
