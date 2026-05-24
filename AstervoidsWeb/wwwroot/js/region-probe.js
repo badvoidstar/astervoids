@@ -48,7 +48,9 @@ const RegionProbe = (() => {
     function _emit(event, data) {
         for (const l of _listeners) {
             if (l.event === event) {
-                try { l.cb(data); } catch (_) {}
+                try { l.cb(data); } catch (err) {
+                    console.warn('[RegionProbe] listener error:', err);
+                }
             }
         }
     }

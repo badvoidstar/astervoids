@@ -7188,6 +7188,10 @@
     }
 
     // Render session list
+    // Helper: format an RTT value for display in the picker
+    const _regionProbeAvailable = () => typeof RegionProbe !== 'undefined';
+    function _formatRtt(rttMs) { return rttMs !== null ? Math.round(rttMs) + ' ms' : '—'; }
+
     function renderSessionList() {
         const { listEl, sessions, currentSessionId } = sessionPicker;
         listEl.innerHTML = '';
@@ -7196,15 +7200,15 @@
             return; // CSS :empty will show "No sessions available"
         }
 
+        const hasProbe = _regionProbeAvailable();
         sessions.forEach(session => {
             const isFull = session.memberCount >= session.maxMembers;
             const isCurrent = session.id === currentSessionId;
             const isClickable = !isFull && !isCurrent;
 
             const regionId   = session.regionId || 'local';
-            const regionName = (typeof RegionProbe !== 'undefined') ? RegionProbe.getDisplayName(regionId) : regionId;
-            const rttMs      = (typeof RegionProbe !== 'undefined') ? RegionProbe.getRtt(regionId) : null;
-            const rttText    = rttMs !== null ? Math.round(rttMs) + ' ms' : '—';
+            const regionName = hasProbe ? RegionProbe.getDisplayName(regionId) : regionId;
+            const rttText    = _formatRtt(hasProbe ? RegionProbe.getRtt(regionId) : null);
 
             const item = document.createElement('div');
             item.className = 'session-item' + 
@@ -7232,11 +7236,11 @@
      */
     function updatePickerRttColumn(regionId) {
         if (!sessionPicker.listEl) return;
+        const hasProbe = _regionProbeAvailable();
+        const rttText   = _formatRtt(hasProbe ? RegionProbe.getRtt(regionId) : null);
+        const regionName = hasProbe ? RegionProbe.getDisplayName(regionId) : regionId;
         const cells = sessionPicker.listEl.querySelectorAll(`[data-region-id="${regionId}"]`);
         cells.forEach(cell => {
-            const rttMs = (typeof RegionProbe !== 'undefined') ? RegionProbe.getRtt(regionId) : null;
-            const rttText = rttMs !== null ? Math.round(rttMs) + ' ms' : '—';
-            const regionName = (typeof RegionProbe !== 'undefined') ? RegionProbe.getDisplayName(regionId) : regionId;
             if (cell.classList.contains('session-rtt')) {
                 cell.textContent = rttText;
             } else if (cell.classList.contains('session-region')) {

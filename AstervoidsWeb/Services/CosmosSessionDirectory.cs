@@ -93,9 +93,10 @@ public sealed class CosmosSessionDirectory : ISessionDirectory, IAsyncDisposable
     public async Task RemoveAsync(Guid sessionId, CancellationToken ct = default)
     {
         EnsureInitialized();
-        // We don't know the regionId here for the partition key; do a point-read-then-delete
-        // or use a cross-partition query. In practice the caller should pass the entry with
-        // regionId; for now we use a cheap cross-partition query to find and delete it.
+        // Cross-partition query: we don't have the regionId (partition key) at this call site.
+        // This is acceptable for the low-rate lifecycle path (removes happen on session destroy,
+        // not per-frame). Phase 3 may evolve the interface to accept regionId to enable a
+        // point-delete instead.
         var query = new QueryDefinition("SELECT * FROM c WHERE c.id = @id")
             .WithParameter("@id", sessionId.ToString("D"));
         using var iter = _container!.GetItemQueryIterator<CosmosSessionDocument>(
