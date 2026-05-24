@@ -351,6 +351,24 @@
             color: #ff4444;
         }
 
+        .session-item .session-region {
+            font-size: 9px;
+            color: #69c;
+            min-width: 44px;
+            text-align: center;
+        }
+
+        .session-item .session-rtt {
+            font-size: 9px;
+            color: #8c8;
+            min-width: 48px;
+            text-align: right;
+        }
+
+        .session-item.disabled .session-rtt {
+            color: #888;
+        }
+
         #picker-buttons {
             display: flex;
             flex-direction: column;
@@ -653,6 +671,8 @@
     <script>window.ASTERVOIDS_DEBUG = false;</script>
     <!-- Session client module -->
     <script src="/js/session-client.js"></script>
+    <!-- Region probe — measures per-region RTT, exposes RegionProbe.getRtt(regionId) -->
+    <script src="/js/region-probe.js"></script>
     <!-- Object sync module -->
     <script src="/js/object-sync.js"></script>
 
@@ -7180,7 +7200,12 @@
             const isFull = session.memberCount >= session.maxMembers;
             const isCurrent = session.id === currentSessionId;
             const isClickable = !isFull && !isCurrent;
-            
+
+            const regionId   = session.regionId || 'local';
+            const regionName = (typeof RegionProbe !== 'undefined') ? RegionProbe.getDisplayName(regionId) : regionId;
+            const rttMs      = (typeof RegionProbe !== 'undefined') ? RegionProbe.getRtt(regionId) : null;
+            const rttText    = rttMs !== null ? Math.round(rttMs) + ' ms' : '—';
+
             const item = document.createElement('div');
             item.className = 'session-item' + 
                 (isCurrent ? ' current' : '') +
@@ -7190,11 +7215,33 @@
             item.innerHTML = `
                 <span class="session-name">${session.name}</span>
                 <span class="session-players">${session.memberCount}/${session.maxMembers}${isFull && !isCurrent ? ' FULL' : ''}</span>
+                <span class="session-region" data-region-id="${regionId}">${regionName}</span>
+                <span class="session-rtt" data-region-id="${regionId}">${rttText}</span>
             `;
             if (isClickable) {
                 item.addEventListener('click', () => handleSelectSession(session.id));
             }
             listEl.appendChild(item);
+        });
+    }
+
+    /**
+     * Re-render only the RTT and region-name cells for a changed regionId.
+     * Called by RegionProbe.on('changed', ...) so only the affected cells update,
+     * without rebuilding the whole list.
+     */
+    function updatePickerRttColumn(regionId) {
+        if (!sessionPicker.listEl) return;
+        const cells = sessionPicker.listEl.querySelectorAll(`[data-region-id="${regionId}"]`);
+        cells.forEach(cell => {
+            const rttMs = (typeof RegionProbe !== 'undefined') ? RegionProbe.getRtt(regionId) : null;
+            const rttText = rttMs !== null ? Math.round(rttMs) + ' ms' : '—';
+            const regionName = (typeof RegionProbe !== 'undefined') ? RegionProbe.getDisplayName(regionId) : regionId;
+            if (cell.classList.contains('session-rtt')) {
+                cell.textContent = rttText;
+            } else if (cell.classList.contains('session-region')) {
+                cell.textContent = regionName;
+            }
         });
     }
 
@@ -8384,7 +8431,15 @@
 
     // Initialize session connection
     connectToSessionHub();
-    
+
+    // Initialize region probe (measures RTT to each configured region)
+    if (typeof RegionProbe !== 'undefined') {
+        RegionProbe.init().catch(err => console.warn('[RegionProbe] init failed:', err));
+        RegionProbe.on('changed', ({ regionId }) => {
+            updatePickerRttColumn(regionId);
+        });
+    }
+
     requestAnimationFrame(gameLoop);  // Use rAF to provide timestamp
 
     </script>

@@ -1442,3 +1442,89 @@ Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cya
 | **Debug** | `/debug/index.html` | Real-time client network metrics display using BroadcastChannel. Shows per-member BUF, RTT, jitter, send rate, reconciliation count. Auto-connects to the game page's metrics broadcast. |
 | **Server Monitor** | `/srvmon/index.html` | Server-side monitoring page. Polls `GET /api/srvmon` every 2 seconds and renders CPU / memory / GC / connection counts and per-member TX/RX byte rates derived from poll deltas. |
 | **Session Test** | `/session-test.html` | Interactive test harness for session management. Tests create/join/leave sessions, object CRUD, and SignalR events. Uses local `signalr.min.js` and `signalr-protocol-msgpack.min.js`. |
+
+## Regional deployment (Phase 2)
+
+Phase 2 makes the session directory **real and observable**, stamps every session with its origin region, and wires directory writes through the hub lifecycle.  The default configuration is still single-region (`InMemory` directory); Phase 3 adds multi-region provisioning.
+
+### Promoted `ISessionDirectory` with change subscription
+
+```csharp
+public interface ISessionDirectory {
+    Task UpsertAsync(SessionDirectoryEntry entry, CancellationToken ct = default);
+    Task RemoveAsync(Guid sessionId, CancellationToken ct = default);
+    Task<IReadOnlyList<SessionDirectoryEntry>> ListAsync(CancellationToken ct = default);
+    IAsyncEnumerable<SessionDirectoryChange> SubscribeAsync(CancellationToken ct);
+}
+```
+
+`SessionDirectoryChange` carries a `SessionDirectoryChangeKind` (`Upserted` / `Removed`) and the affected `SessionDirectoryEntry`.
+
+`InMemorySessionDirectory` implements `SubscribeAsync` with a bounded `Channel<SessionDirectoryChange>` per subscriber (capacity 128, `DropOldest` on overflow).  Each subscriber gets an independent stream; slow consumers do not stall others.
+
+### `Directory:Provider` config knob
+
+```json
+{
+  "Directory": {
+    "Provider": "InMemory",
+    "Cosmos": {
+      "ConnectionString": "",
+      "DatabaseId": "astervoids",
+      "ContainerId": "sessions"
+    }
+  }
+}
+```
+
+| Value | Class | Notes |
+|-------|-------|-------|
+| `"InMemory"` (default) | `InMemorySessionDirectory` | No external dependency; used in local dev, CI, and tests. |
+| `"Cosmos"` | `CosmosSessionDirectory` | Requires `Directory:Cosmos:ConnectionString`. |
+
+**Cosmos implementation outline:**
+- `Microsoft.Azure.Cosmos` SDK.
+- Partition key `/regionId`; TTL enabled (`DefaultTimeToLive = -1`).
+- Documents mirror `SessionDirectoryEntry` plus an optional `ttl` field (seconds).
+- `SubscribeAsync` uses the **change feed processor** with a lease container `sessions-leases` (auto-created on startup).  One processor instance per app instance; instance name = `{MachineName}-{Guid}`.
+- `InitializeAsync()` must be called at startup (e.g. from a hosted service or DI extension) to create the database/containers and start the processor.
+
+### Hot-path invariant: directory writes are fire-and-forget
+
+All directory writes from `SessionHub` and `SessionCleanupService` are wrapped in:
+
+```csharp
+_ = Task.Run(async () => {
+    try { await _directory.UpsertAsync(...); }
+    catch (Exception ex) { _logger.LogWarning(ex, ...); }
+});
+```
+
+This ensures failures (transient network errors, Cosmos throttling, etc.) never increase the latency of the SignalR hot path.  Writes happen **outside** `Session.SyncRoot` — the hub only calls them after the atomic service call has returned and the SignalR broadcast has been issued.
+
+### `Session.RegionId`
+
+Every `Session` object now carries an immutable `RegionId` string, stamped at creation time from `RegionsOptions.Self` (default `"local"`).  It is included in:
+
+- `SessionListItem` (the `GetActiveSessions` payload).
+- `CreateSessionResponse` and `JoinSessionResponse` (the hub invoke responses).
+- `SessionDirectoryEntry` (every directory write).
+
+### `SessionDirectoryMirror` (hosted service)
+
+`SessionDirectoryMirror` subscribes to `ISessionDirectory.SubscribeAsync` and rebroadcasts `OnSessionsChanged` to the `AllClients` SignalR group on every change.
+
+Today (single region) this is redundant with the inline broadcasts in `SessionHub`.  In Phase 3, when each regional instance subscribes to the same shared Cosmos change feed, this becomes the mechanism that propagates remote-region session changes to every browser, regardless of which region the browser is connected to.
+
+### `GetActiveSessions` union
+
+`SessionHub.GetActiveSessions` now returns the union of:
+
+1. Local `_sessions` (authoritative for this region; always included with full fidelity).
+2. `ISessionDirectory.ListAsync()` (remote-region sessions; only included if not already in the local snapshot).
+
+Local entries take precedence by `SessionId`.  `maxSessions` and `canCreateSession` are evaluated locally (per-region caps).
+
+### Forward reference to Phase 3
+
+Phase 3 provisions a second Azure region in Bicep (`azd provision`), each with its own Container App instance and `Regions:Self` env var.  All instances share a single Cosmos directory account.  Per-region hub URLs and the client-side `connect(targetRegionUrl)` path are introduced in Phase 3.
