@@ -96,6 +96,13 @@ const RegionProbe = (() => {
         return prev + alpha * (sample - prev);
     }
 
+    // Twitchy threshold: react to large outliers relative to current EMA,
+    // but always require at least a 30 ms absolute jump.
+    function _calculateTwitchyThreshold(ema) {
+        if (ema === null) return TWITCHY_MIN_DIFF_MS;
+        return Math.max(ema * 3, TWITCHY_MIN_DIFF_MS);
+    }
+
     // ── Single probe ──────────────────────────────────────────────────
     async function _probe(region) {
         const url = region.publicUrl ? `${region.publicUrl}/api/ping` : '/api/ping';
@@ -182,7 +189,7 @@ const RegionProbe = (() => {
         }
 
         const prev = state.ema;
-        const twitchyDiffThreshold = prev !== null ? Math.max(prev * 3, TWITCHY_MIN_DIFF_MS) : TWITCHY_MIN_DIFF_MS;
+        const twitchyDiffThreshold = _calculateTwitchyThreshold(prev);
         const isTwitchySample = prev !== null && Math.abs(sample - prev) > twitchyDiffThreshold;
 
         if (isTwitchySample) {

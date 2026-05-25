@@ -109,8 +109,24 @@
             }
         }
 
-        poll();
-        setInterval(poll, 5000);
+        let pollTimer = null;
+        function startPolling() {
+            if (pollTimer) return;
+            poll();
+            pollTimer = setInterval(poll, 5000);
+        }
+        function stopPolling() {
+            if (!pollTimer) return;
+            clearInterval(pollTimer);
+            pollTimer = null;
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') stopPolling();
+            else startPolling();
+        });
+
+        startPolling();
     </script>
 </body>
 </html>

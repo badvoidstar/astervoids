@@ -383,6 +383,18 @@
             font-size: 10px;
         }
 
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            border: 0;
+            white-space: nowrap;
+        }
+
         #ops-link {
             margin-top: 8px;
             text-align: right;
@@ -7257,7 +7269,7 @@
             const regionHealth = _regionHealth(regionId);
             const regionTooltip = _regionTooltip(regionId);
             const regionWarning = regionHealth === 'unhealthy'
-                ? '<span class="region-warning" aria-hidden="true">⚠</span>'
+                ? '<span class="region-warning" aria-hidden="true">⚠</span><span class="sr-only">(unhealthy)</span>'
                 : '';
 
             const item = document.createElement('div');
@@ -7300,7 +7312,7 @@
             } else if (cell.classList.contains('session-region')) {
                 cell.title = regionTooltip;
                 cell.innerHTML = regionHealth === 'unhealthy'
-                    ? `${regionName}<span class="region-warning" aria-hidden="true">⚠</span>`
+                    ? `${regionName}<span class="region-warning" aria-hidden="true">⚠</span><span class="sr-only">(unhealthy)</span>`
                     : regionName;
                 const row = cell.closest('.session-item');
                 if (row) {

@@ -222,7 +222,7 @@ app.MapGet("/api/srvmon/all", async (
     });
 
     var payload = new SrvmonAllResponse((await Task.WhenAll(tasks)).ToList());
-    SrvmonAllDebounce.Cache.Set(cacheKey, payload, TimeSpan.FromMilliseconds(500));
+    SrvmonAllDebounce.Cache.Set(cacheKey, payload, TimeSpan.FromMilliseconds(SrvmonAllDebounce.DurationMs));
     return Results.Ok(payload);
 });
 
@@ -233,6 +233,7 @@ public partial class Program { }
 
 internal static class SrvmonAllDebounce
 {
+    internal const int DurationMs = 500;
     internal static readonly MemoryCache Cache = new(new MemoryCacheOptions());
 }
 
@@ -249,6 +250,8 @@ public record SrvmonRegionEntry(
 
 internal static class SrvmonFanout
 {
+    internal const int TimeoutMs = 1500;
+
     internal static async Task<SrvmonRegionEntry> QueryRemoteSrvmonAsync(
         RegionEntry region,
         HttpClient httpClient,
@@ -262,7 +265,7 @@ internal static class SrvmonFanout
             var baseUri = region.PublicUrl.EndsWith('/') ? region.PublicUrl : $"{region.PublicUrl}/";
             var uri = new Uri(new Uri(baseUri, UriKind.Absolute), "api/srvmon");
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(1500));
+            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(TimeoutMs));
 
             using var response = await httpClient.GetAsync(uri, timeoutCts.Token);
             response.EnsureSuccessStatusCode();

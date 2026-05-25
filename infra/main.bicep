@@ -50,7 +50,8 @@ var tags = {
   'azd-env-name': environmentName
 }
 
-var selectedRegion = length(regions) > 0 ? regions[0] : {}
+var matchedRegions = filter(regions, region => !contains(region, 'location') || toLower(string(region.location)) == toLower(location))
+var selectedRegion = length(matchedRegions) > 0 ? matchedRegions[0] : {}
 var effectiveMinReplicas = contains(selectedRegion, 'minReplicas') ? int(selectedRegion.minReplicas) : 0
 var effectiveMaxReplicas = contains(selectedRegion, 'maxReplicas') ? int(selectedRegion.maxReplicas) : 3
 
