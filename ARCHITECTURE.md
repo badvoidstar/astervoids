@@ -1525,9 +1525,37 @@ Today (single region) this is redundant with the inline broadcasts in `SessionHu
 
 Local entries take precedence by `SessionId`.  `maxSessions` and `canCreateSession` are evaluated locally (per-region caps).
 
-### Forward reference to Phase 3
+### Phase 3 — implemented: multi-region provisioning
 
-Phase 3 provisions a second Azure region in Bicep (`azd provision`), each with its own Container App instance and `Regions:Self` env var.  All instances share a single Cosmos directory account.  Per-region hub URLs and the client-side `connect(targetRegionUrl)` path are introduced in Phase 3.
+Phase 3 is now live in `infra/`. The regional deployment plan is a single source of truth in `infra/main.parameters.json` under the `regions` parameter; both `infra/main.bicep` and `.github/workflows/azure-deploy.yml` read from it. Today the plan ships **two regions**:
+
+| Region ID    | Location      | Role      | minReplicas | maxReplicas |
+|--------------|---------------|-----------|-------------|-------------|
+| `westus2`    | `westus2`     | primary   | 0           | 3           |
+| `northeurope`| `northeurope` | secondary | 0           | 3           |
+
+`northeurope` is Azure's Dublin (Ireland) datacenter and is the closest region to Irish/UK/EU players.
+
+**Resource layout per region:**
+
+- **Primary region** keeps the historic names — `rg-production`, `cae-production`, `cr<hash>` (ACR), and `ca-web-production` — so existing deployments and tooling continue to work.
+- **Each secondary region** gets `rg-production-<id>`, `cae-production-<id>` (a CAE + Log Analytics workspace only — no per-region ACR), and `ca-web-production-<id>`. Secondary container apps pull images from the primary region's ACR via the cross-RG `containerRegistryResourceGroup` param on `infra/core/host/container-app.bicep`.
+- A shared Cosmos directory account (or `InMemory` directory in environments that haven't enabled it) is referenced by all regions, so every instance sees the same `SessionDirectoryEntry` set.
+
+**Scale-to-zero invariant.** Every region's `minReplicas` defaults to `0` in `infra/main.parameters.json` and the KEDA scale rules in `infra/core/host/container-app.bicep` (`http-rule` at 50 concurrent requests + `cpu-rule` at 70% utilization) both report zero load when there are no active SignalR connections, so each region collapses to 0 replicas independently. `AstervoidsWeb.Tests/RegionalDeploymentPlanTests.cs` locks this guarantee.
+
+> Note: "no connections" for the HTTP scaler includes long-lived SignalR WebSocket connections — a region only scales to zero when every client has disconnected (or failed over to a sibling region) and the cooldown has elapsed.
+
+**CI/CD fan-out (`.github/workflows/azure-deploy.yml`).** The `production` deploy now:
+
+1. Runs `azd up` once. Bicep provisions the primary RG + ACR + Container App and every secondary RG + CAE + Container App in parallel. `azd deploy` updates the primary container app's image.
+2. A follow-up **Sync multi-region container apps** step reads `infra/main.parameters.json`, queries every region's auto-generated FQDN, builds the cross-region `Regions__All__N__{Id,DisplayName,PublicUrl}` env-var set, and `az containerapp update`s every region in lock-step — pushing the same primary image to each secondary and setting `Regions__Self=<id>` plus the full sibling list everywhere. This is also the mechanism that picks up the `Regions:All` env vars consumed by `ServerMetricsService`, `/api/srvmon/all`, and the client-side `RegionProbe`.
+
+Branch (PR preview) deploys remain single-region (`westus2` only) — they pass an empty `regions` array to keep PR previews cheap.
+
+### Forward reference to (former) Phase 3 — historical
+
+The original Phase 3 plan ("provision a second Azure region in Bicep, each with its own Container App instance and `Regions:Self` env var") is realized above.
 
 ## Regional deployment (Phase 4)
 

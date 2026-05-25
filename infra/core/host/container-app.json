@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.43.8.12551",
-      "templateHash": "17849199807280436008"
+      "templateHash": "359257265402915321"
     }
   },
   "parameters": {
@@ -41,6 +41,13 @@
         "description": "Name of the Container Registry"
       }
     },
+    "containerRegistryResourceGroup": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().name]",
+      "metadata": {
+        "description": "Resource group of the Container Registry. Defaults to the current resource group. Set to the primary region resource group when this app lives in a secondary region that pulls from a shared ACR."
+      }
+    },
     "imageName": {
       "type": "string",
       "defaultValue": "",
@@ -73,7 +80,7 @@
       "type": "int",
       "defaultValue": 3,
       "metadata": {
-        "description": "Maximum number of replicas"
+        "description": "Maximum number of replicas. Increase above 3 for high-traffic regions."
       }
     },
     "cpu": {
@@ -125,15 +132,15 @@
           },
           "registries": [
             {
-              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer]",
-              "username": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username]",
+              "server": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer]",
+              "username": "[listCredentials(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username]",
               "passwordSecretRef": "registry-password"
             }
           ],
           "secrets": [
             {
               "name": "registry-password",
-              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value]"
+              "value": "[listCredentials(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value]"
             }
           ]
         },
@@ -141,7 +148,7 @@
           "containers": [
             {
               "name": "main",
-              "image": "[if(not(empty(parameters('imageName'))), format('{0}/{1}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, parameters('imageName')), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
+              "image": "[if(not(empty(parameters('imageName'))), format('{0}/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, parameters('imageName')), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
               "resources": {
                 "cpu": "[json(parameters('cpu'))]",
                 "memory": "[parameters('memory')]"

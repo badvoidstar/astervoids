@@ -13,6 +13,9 @@ param containerAppsEnvironmentName string
 @description('Name of the Container Registry')
 param containerRegistryName string
 
+@description('Resource group of the Container Registry. Defaults to the current resource group. Set to the primary region resource group when this app lives in a secondary region that pulls from a shared ACR.')
+param containerRegistryResourceGroup string = resourceGroup().name
+
 @description('Container image name (leave empty for initial deployment)')
 param imageName string = ''
 
@@ -45,9 +48,10 @@ resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01'
   name: containerAppsEnvironmentName
 }
 
-// Reference existing Container Registry
+// Reference existing Container Registry (may live in a different resource group for secondary regions)
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: containerRegistryName
+  scope: resourceGroup(containerRegistryResourceGroup)
 }
 
 // Container App
