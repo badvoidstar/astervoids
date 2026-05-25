@@ -18,15 +18,23 @@ public class RegionalDeploymentPlanTests
 {
     private static JsonElement LoadRegionsArray()
     {
-        // Walk up from the test binary directory to the repo root, then read the parameters file.
+        // Walk up from the test binary directory to the repo root, then read the parameters
+        // file. Cap depth to avoid pathological loops in containerised/odd CWDs.
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "infra", "main.parameters.json")))
+        const int maxDepth = 16;
+        for (var i = 0; i < maxDepth && dir != null; i++)
         {
+            if (File.Exists(Path.Combine(dir.FullName, "infra", "main.parameters.json")))
+            {
+                break;
+            }
             dir = dir.Parent;
         }
-        dir.Should().NotBeNull("infra/main.parameters.json must be reachable from the test working directory");
-
+        dir.Should().NotBeNull(
+            $"infra/main.parameters.json must be reachable within {maxDepth} parents of the test working directory");
         var path = Path.Combine(dir!.FullName, "infra", "main.parameters.json");
+        File.Exists(path).Should().BeTrue($"expected file at {path}");
+
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         var regions = doc.RootElement
             .GetProperty("parameters")

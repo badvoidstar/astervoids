@@ -266,6 +266,10 @@ jobs:
           set -euo pipefail
 
           REGIONS_JSON=$(jq -c '.parameters.regions.value' infra/main.parameters.json)
+          if [ -z "$REGIONS_JSON" ] || [ "$REGIONS_JSON" = "null" ]; then
+            echo "::error::Failed to read .parameters.regions.value from infra/main.parameters.json"
+            exit 1
+          fi
           REGION_COUNT=$(echo "$REGIONS_JSON" | jq 'length')
           echo "Configured regions: $REGION_COUNT"
 
@@ -299,6 +303,10 @@ jobs:
 
             FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
               --query properties.configuration.ingress.fqdn -o tsv)
+            if [ -z "$FQDN" ]; then
+              echo "::error::Could not resolve FQDN for container app '$APP' in '$RG'. Aborting multi-region sync."
+              exit 1
+            fi
             URL="https://${FQDN}"
 
             REGIONS_ENV_ARGS+=("Regions__All__${IDX}__Id=${ID}")
