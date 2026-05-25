@@ -22,11 +22,11 @@ param targetPort int = 8080
 @description('Allow external ingress')
 param external bool = true
 
-@description('Minimum number of replicas')
+@description('Minimum number of replicas. Set to 0 for cold-start regions; bump to 1 for hot primary regions.')
 param minReplicas int = 0
 
 @description('Maximum number of replicas')
-param maxReplicas int = 1
+param maxReplicas int = 3
 
 @description('CPU cores allocated to the container')
 param cpu string = '1.0'
@@ -106,7 +106,17 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             name: 'http-rule'
             http: {
               metadata: {
-                concurrentRequests: '100'
+                concurrentRequests: '50'
+              }
+            }
+          }
+          {
+            name: 'cpu-rule'
+            custom: {
+              type: 'cpu'
+              metadata: {
+                type: 'Utilization'
+                value: '70'
               }
             }
           }

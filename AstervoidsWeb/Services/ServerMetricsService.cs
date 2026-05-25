@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using AstervoidsWeb.Configuration;
+using Microsoft.Extensions.Options;
 
 namespace AstervoidsWeb.Services;
 
@@ -12,6 +14,7 @@ public sealed class ServerMetricsService : IDisposable
 {
     private readonly Process _process;
     private readonly int _processorCount;
+    public string RegionId { get; }
 
     // Connection tracking (Interlocked for thread safety)
     private long _connectedCount;
@@ -28,8 +31,9 @@ public sealed class ServerMetricsService : IDisposable
     private readonly object _cpuLock = new();
     private readonly Timer _cpuTimer;
 
-    public ServerMetricsService()
+    public ServerMetricsService(IOptions<RegionsOptions>? regionsOptions = null)
     {
+        RegionId = regionsOptions?.Value.Self ?? "local";
         _process = Process.GetCurrentProcess();
         _processorCount = Math.Max(1, Environment.ProcessorCount);
 
@@ -217,7 +221,7 @@ public sealed class ServerMetricsService : IDisposable
             })
             .ToList();
 
-        return new ServerMetricsSnapshot(system, connections, sessions);
+        return new ServerMetricsSnapshot(RegionId, system, connections, sessions);
     }
 
     public void Dispose()
@@ -284,6 +288,7 @@ public record SessionMetricsSnapshot(
 );
 
 public record ServerMetricsSnapshot(
+    string RegionId,
     SystemMetricsSnapshot System,
     ConnectionMetricsSnapshot Connections,
     List<SessionMetricsSnapshot> Sessions

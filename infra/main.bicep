@@ -24,6 +24,9 @@ param customSubdomain string = ''
 @description('Use shared production infrastructure (for CI/CD branch deployments). When false, creates standalone infra.')
 param useSharedInfra bool = false
 
+@description('Optional per-region sizing overrides from the regional deployment plan. Each element may include minReplicas/maxReplicas; minReplicas: 0 cold-starts on first traffic, while hot primary regions should set minReplicas: 1.')
+param regions array = []
+
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
@@ -46,6 +49,10 @@ var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}
 var tags = {
   'azd-env-name': environmentName
 }
+
+var selectedRegion = length(regions) > 0 ? regions[0] : {}
+var effectiveMinReplicas = contains(selectedRegion, 'minReplicas') ? int(selectedRegion.minReplicas) : 0
+var effectiveMaxReplicas = contains(selectedRegion, 'maxReplicas') ? int(selectedRegion.maxReplicas) : 3
 
 // ============================================================================
 // PRODUCTION DEPLOYMENT PATH
@@ -83,8 +90,8 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction) {
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1
+    minReplicas: effectiveMinReplicas
+    maxReplicas: effectiveMaxReplicas
     customDomainName: ''
   }
   dependsOn: [containerAppsProduction]
@@ -149,8 +156,8 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1
+    minReplicas: effectiveMinReplicas
+    maxReplicas: effectiveMaxReplicas
     customDomainName: ''
   }
   dependsOn: [containerAppsStandalone]
@@ -178,8 +185,8 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1  // Limit branch deployments
+    minReplicas: effectiveMinReplicas
+    maxReplicas: effectiveMaxReplicas
     customDomainName: ''
   }
 }

@@ -1528,3 +1528,88 @@ Local entries take precedence by `SessionId`.  `maxSessions` and `canCreateSessi
 ### Forward reference to Phase 3
 
 Phase 3 provisions a second Azure region in Bicep (`azd provision`), each with its own Container App instance and `Regions:Self` env var.  All instances share a single Cosmos directory account.  Per-region hub URLs and the client-side `connect(targetRegionUrl)` path are introduced in Phase 3.
+
+## Regional deployment (Phase 4)
+
+Phase 4 hardens the regional rollout for operations: autoscale defaults are region-aware, server metrics become region-self-describing, cross-region ops fan-out is available via one endpoint, and the client probe loop adapts cadence to healthy/twitchy/unhealthy network conditions.
+
+### Per-region Container App autoscale
+
+`infra/core/host/container-app.bicep` now applies two scale rules together (Container Apps takes the max desired replicas across rules):
+
+1. **HTTP concurrency rule**: `http.concurrentRequests = 50`
+2. **CPU rule**: `custom(type='cpu', metadata: { type='Utilization', value='70' })`
+
+Replica bounds are parameterized as:
+
+- `minReplicas` default `0`
+- `maxReplicas` default `3`
+
+`infra/main.bicep` exposes optional per-region overrides through the `regions` parameter (`minReplicas?`, `maxReplicas?`).
+
+> Operational note: `minReplicas: 0` means a region can cold-start on first traffic. That is acceptable for low-volume secondary regions, but primaries should usually set `minReplicas: 1`.
+
+### `ServerMetricsService.RegionId` and `/api/srvmon`
+
+`ServerMetricsService` now captures `RegionsOptions.Self` and includes it in snapshots. `GET /api/srvmon` now returns top-level `regionId` (camelCase JSON) so every response is self-describing.
+
+### `/api/srvmon/all` fan-out
+
+New endpoint: `GET /api/srvmon/all`.
+
+- Reads region list from `RegionsOptions.All`
+- Inlines local region metrics (does not self-call)
+- Fans out `/api/srvmon` calls to other regions using named `HttpClient` (`SrvmonFanout`)
+- Uses a 1.5s timeout per region
+- Returns:
+
+```json
+{
+  "regions": [
+    { "id": "...", "displayName": "...", "publicUrl": "...", "ok": true, "metrics": { /* /api/srvmon payload */ } },
+    { "id": "...", "displayName": "...", "publicUrl": "...", "ok": false, "error": "..." }
+  ]
+}
+```
+
+To reduce fan-out storms from aggressive polling, `/api/srvmon/all` uses a small per-caller-IP debounce cache (500 ms).
+
+### RegionProbe adaptive cadence and health states
+
+`wwwroot/js/region-probe.js` now runs with per-region independent timers and health states:
+
+| State | Trigger | Cadence |
+|---|---|---|
+| steady | 3 consecutive rounds with EMA drift `< 5 ms` | 60 s |
+| twitchy | single sample delta `> max(EMA×3, 30 ms)` | 5 s for next 5 rounds |
+| failed | non-204 / network error | 3 s for next 3 rounds |
+| unhealthy | 5 consecutive failures | 30 s backoff |
+
+Visibility behavior from earlier phases is preserved:
+
+- Hidden tab → pause probes
+- Visible again → immediate probe round for **every** region, then resume per-region cadence
+
+Public/client API additions:
+
+- `RegionProbe.on('unhealthy', regionId)`
+- `RegionProbe.getRegionHealth(regionId) -> 'ok' | 'twitchy' | 'unhealthy' | 'unknown'`
+
+`changed` events are still coalesced per probe cycle and now optionally include `{ changedRegionIds: string[] }`.
+
+### Lobby picker and ops UI hook
+
+Lobby region rows now reflect probe health:
+
+- `region-unhealthy` rows (dim + ⚠ glyph)
+- `region-twitchy` rows (subtle indicator)
+
+Region tooltip shows EMA, current interval, and health state for quick diagnosis.
+
+A new static page `/ops.html` polls `/api/srvmon/all` every 5s and shows per-region ops metrics (connections, hub invocations/sec, CPU, memory, reconciliations, reconnects, errors). `index.html` links to it via a small **Ops** link.
+
+`ops.html` and `/api/srvmon/all` are intentionally not auth-gated in this phase; operators can gate them at ingress/reverse-proxy level if desired.
+
+### Forward reference (Phase 5)
+
+Phase 5 is expected to add geo-aware session creation defaults (create in your best region) and expose regional capacity caps directly in the picker.
