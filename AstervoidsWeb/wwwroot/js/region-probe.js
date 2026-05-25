@@ -8,7 +8,7 @@
  *   RegionProbe.getAllRegions()        // → [{ id, displayName, publicUrl, rttMs, intervalMs, health }]
  *   RegionProbe.getBestRegion()        // → { id, displayName, rttMs }
  *   RegionProbe.getRegionHealth(id)    // → 'ok' | 'twitchy' | 'unhealthy' | 'unknown'
- *   RegionProbe.on('changed', cb)      // cb({ changedRegionIds, regionId })
+ *   RegionProbe.on('changed', cb)      // cb({ changedRegionIds, regionId }) (regionId retained for legacy subscribers)
  *   RegionProbe.on('unhealthy', cb)    // cb(regionId)
  *
  * Cadence ladder (per-region, independent timers)
@@ -32,7 +32,7 @@ const RegionProbe = (() => {
     const STEADY_INTERVAL_MS       = 60_000;
     const UNHEALTHY_BACKOFF_MS     = 30_000;
     const PROBE_WARMUP_SAMPLES     = 3;
-    const PROBE_TIMEOUT_MS         = 2_500;
+    const PROBE_TIMEOUT_MS         = 2_500; // Keep below the 3s failed-fast cadence.
     const SPIKE_ALPHA              = 0.3;
     const DECAY_ALPHA              = 0.1;
     const CHANGE_THRESHOLD_MS      = 5;

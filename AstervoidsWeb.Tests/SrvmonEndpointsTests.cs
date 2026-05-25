@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using AstervoidsWeb.Services;
 using FluentAssertions;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -90,31 +91,26 @@ public class SrvmonEndpointsTests : IClassFixture<SrvmonEndpointsTests.Factory>
         {
             if (request.RequestUri?.Host == "healthy.region.test")
             {
-                var payload = """
-                              {
-                                "regionId": "westus2",
-                                "system": {
-                                  "uptimeSeconds": 1,
-                                  "cpuUsagePercent": 12.3,
-                                  "memoryUsagePercent": 45.6,
-                                  "memoryWorkingSetBytes": 1000,
-                                  "memoryTotalBytes": 2000,
-                                  "gcGen0": 1,
-                                  "gcGen1": 1,
-                                  "gcGen2": 1,
-                                  "threadPoolWorkerAvailable": 10,
-                                  "threadPoolIoAvailable": 10,
-                                  "threadPoolWorkerMax": 100,
-                                  "threadPoolIoMax": 100
-                                },
-                                "connections": {
-                                  "currentConnections": 1,
-                                  "peakConnections": 2,
-                                  "totalHubInvocations": 3
-                                },
-                                "sessions": []
-                              }
-                              """;
+                var payload = JsonSerializer.Serialize(new ServerMetricsSnapshot(
+                    RegionId: "westus2",
+                    System: new SystemMetricsSnapshot(
+                        UptimeSeconds: 1,
+                        CpuUsagePercent: 12.3,
+                        MemoryUsagePercent: 45.6,
+                        MemoryWorkingSetBytes: 1000,
+                        MemoryTotalBytes: 2000,
+                        GcGen0: 1,
+                        GcGen1: 1,
+                        GcGen2: 1,
+                        ThreadPoolWorkerAvailable: 10,
+                        ThreadPoolIoAvailable: 10,
+                        ThreadPoolWorkerMax: 100,
+                        ThreadPoolIoMax: 100),
+                    Connections: new ConnectionMetricsSnapshot(
+                        CurrentConnections: 1,
+                        PeakConnections: 2,
+                        TotalHubInvocations: 3),
+                    Sessions: []));
 
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
                 {

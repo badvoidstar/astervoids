@@ -25,7 +25,7 @@ param external bool = true
 @description('Minimum number of replicas. Set to 0 for cold-start regions; bump to 1 for hot primary regions.')
 param minReplicas int = 0
 
-@description('Maximum number of replicas')
+@description('Maximum number of replicas. Increase above 3 for high-traffic regions.')
 param maxReplicas int = 3
 
 @description('CPU cores allocated to the container')

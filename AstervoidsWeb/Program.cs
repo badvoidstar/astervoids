@@ -186,7 +186,10 @@ app.MapGet("/api/srvmon/all", async (
     IHttpClientFactory httpClientFactory,
     CancellationToken cancellationToken) =>
 {
-    var callerIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    var forwardedFor = httpContext.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+    var callerIp = !string.IsNullOrWhiteSpace(forwardedFor)
+        ? forwardedFor.Split(',')[0].Trim()
+        : (httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown");
     var cacheKey = $"srvmon-all:{callerIp}";
     if (SrvmonAllDebounce.Cache.TryGetValue(cacheKey, out SrvmonAllResponse? cached) && cached is not null)
         return Results.Ok(cached);
@@ -222,7 +225,11 @@ app.MapGet("/api/srvmon/all", async (
     });
 
     var payload = new SrvmonAllResponse((await Task.WhenAll(tasks)).ToList());
-    SrvmonAllDebounce.Cache.Set(cacheKey, payload, TimeSpan.FromMilliseconds(SrvmonAllDebounce.DurationMs));
+    SrvmonAllDebounce.Cache.Set(cacheKey, payload, new MemoryCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(SrvmonAllDebounce.DurationMs),
+        Size = 1
+    });
     return Results.Ok(payload);
 });
 
@@ -234,7 +241,7 @@ public partial class Program { }
 internal static class SrvmonAllDebounce
 {
     internal const int DurationMs = 500;
-    internal static readonly MemoryCache Cache = new(new MemoryCacheOptions());
+    internal static readonly MemoryCache Cache = new(new MemoryCacheOptions { SizeLimit = 4096 });
 }
 
 public record SrvmonAllResponse(List<SrvmonRegionEntry> Regions);
