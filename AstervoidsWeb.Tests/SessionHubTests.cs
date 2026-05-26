@@ -192,7 +192,8 @@ public class SessionHubTests
             _objectService,
             Mock.Of<ILogger<SessionHub>>(),
             new ServerMetricsService(),
-            new SyncSchemaRegistry());
+            new SyncSchemaRegistry(),
+            new InMemorySessionDirectory());
 
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns(connectionId);
@@ -258,7 +259,7 @@ public class SessionHubTests
             .Callback<string, object?[], CancellationToken>((method, _, _) => callOrder.Add($"send:{method}"))
             .Returns(Task.CompletedTask);
 
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
+        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry(), new InMemorySessionDirectory());
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns("connection-new");
         hub.Context = context.Object;
@@ -362,7 +363,7 @@ public class SessionHubTests
             })
             .Returns(Task.CompletedTask);
 
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
+        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry(), new InMemorySessionDirectory());
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns("connection-1");
         hub.Context = context.Object;
@@ -764,7 +765,7 @@ public class SessionHubTests
 
     private SessionHub CreateHubWithProxy(string connectionId, Mock<IClientProxy> proxy)
     {
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
+        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry(), new InMemorySessionDirectory());
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns(connectionId);
         hub.Context = context.Object;

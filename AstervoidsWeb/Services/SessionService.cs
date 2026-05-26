@@ -39,6 +39,7 @@ public class SessionService : ISessionService
     private readonly int _maxSessions;
     private readonly int _maxMembersPerSession;
     private readonly bool _distributeOrphanedObjects;
+    private readonly string _selfRegionId;
 
     public int MaxSessions => _maxSessions;
     public int MaxMembersPerSession => _maxMembersPerSession;
@@ -53,15 +54,26 @@ public class SessionService : ISessionService
         _maxSessions = 6;
         _maxMembersPerSession = 4;
         _distributeOrphanedObjects = true;
+        _selfRegionId = "local";
     }
 
     public SessionService(IOptions<SessionSettings> settings, ILogger<SessionService> logger, ISessionNameGenerator nameGenerator)
+        : this(settings, logger, nameGenerator, regionsOptions: null)
+    {
+    }
+
+    public SessionService(
+        IOptions<SessionSettings> settings,
+        ILogger<SessionService> logger,
+        ISessionNameGenerator nameGenerator,
+        IOptions<RegionsOptions>? regionsOptions)
     {
         _nameGenerator = nameGenerator;
         _maxSessions = settings.Value.MaxSessions;
         _maxMembersPerSession = settings.Value.MaxMembersPerSession;
         _distributeOrphanedObjects = settings.Value.DistributeOrphanedObjects;
         _logger = logger;
+        _selfRegionId = regionsOptions?.Value.Self ?? "local";
     }
 
     /// <summary>Creates a failed CreateSessionResult with the specified error message.</summary>
@@ -95,7 +107,8 @@ public class SessionService : ISessionService
             {
                 Name = _nameGenerator.GenerateUniqueName(
                     _sessions.Values.Select(s => s.Name).ToHashSet()),
-                Metadata = metadata ?? new Dictionary<string, object?>()
+                Metadata = metadata ?? new Dictionary<string, object?>(),
+                RegionId = _selfRegionId
             };
 
             _sessions.TryAdd(session.Id, session);
@@ -283,7 +296,7 @@ public class SessionService : ISessionService
     {
         var sessions = _sessions.Values
             .Where(s => !s.Members.IsEmpty)
-            .Select(s => new SessionInfo(s.Id, s.Name, s.Members.Count, _maxMembersPerSession, s.CreatedAt))
+            .Select(s => new SessionInfo(s.Id, s.Name, s.Members.Count, _maxMembersPerSession, s.CreatedAt, s.RegionId))
             .OrderByDescending(s => s.CreatedAt)
             .ToList();
 

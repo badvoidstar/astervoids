@@ -20,6 +20,7 @@ public class SessionHub : Hub
     private readonly ILogger<SessionHub> _logger;
     private readonly ServerMetricsService _metrics;
     private readonly SyncSchemaRegistry _schemaRegistry;
+    private readonly ISessionDirectory _directory;
 
     // Group name for all connected clients to receive session list updates
     internal const string AllClientsGroup = "AllClients";
@@ -29,13 +30,15 @@ public class SessionHub : Hub
         IObjectService objectService,
         ILogger<SessionHub> logger,
         ServerMetricsService metrics,
-        SyncSchemaRegistry schemaRegistry)
+        SyncSchemaRegistry schemaRegistry,
+        ISessionDirectory directory)
     {
         _sessionService = sessionService;
         _objectService = objectService;
         _logger = logger;
         _metrics = metrics;
         _schemaRegistry = schemaRegistry;
+        _directory = directory;
     }
 
     // ── Payload byte estimation ────────────────────────────────────────
@@ -253,12 +256,16 @@ public class SessionHub : Hub
         // Broadcast session list update to all connected clients
         await BroadcastSessionsChanged();
 
+        // Fire-and-forget: write to directory outside the hot path
+        FireAndForgetDirectoryUpsert(session, memberCount: 1);
+
         return new CreateSessionResponse(
             session.Id,
             session.Name,
             creator.Id,
             creator.Role,
-            session.Metadata
+            session.Metadata,
+            session.RegionId
         );
     }
 
@@ -362,6 +369,9 @@ public class SessionHub : Hub
         // Broadcast session list update to all connected clients
         await BroadcastSessionsChanged();
 
+        // Fire-and-forget: write updated member count to directory
+        FireAndForgetDirectoryUpsert(session, memberCount: session.Members.Count);
+
         return new JoinSessionResponse(
             session.Id,
             session.Name,
@@ -370,7 +380,8 @@ public class SessionHub : Hub
             members,
             objects,
             validAts,
-            session.Metadata
+            session.Metadata,
+            session.RegionId
         );
     }
 
@@ -450,19 +461,52 @@ public class SessionHub : Hub
 
         // Broadcast session list update to all connected clients
         await BroadcastSessionsChanged();
+
+        // Fire-and-forget: update directory with new member count (or 0 for last member)
+        var sessionAfterLeave = _sessionService.GetSession(result.SessionId);
+        if (sessionAfterLeave != null)
+        {
+            FireAndForgetDirectoryUpsert(sessionAfterLeave, memberCount: sessionAfterLeave.Members.Count);
+        }
     }
 
     /// <summary>
-    /// Gets all active sessions.
+    /// Gets all active sessions — union of local in-memory sessions (authoritative for
+    /// this region) and the directory (which may include remote-region sessions).
+    /// Local entries take precedence when both contain the same session ID.
     /// </summary>
-    public ActiveSessionsResponse GetActiveSessions()
+    public async Task<ActiveSessionsResponse> GetActiveSessions()
     {
-        var result = _sessionService.GetActiveSessions();
-        return new ActiveSessionsResponse(
-            result.Sessions.Select(s => new SessionListItem(s.Id, s.Name, s.MemberCount, s.MaxMembers, s.CreatedAt)),
-            result.MaxSessions,
-            result.CanCreateSession
-        );
+        var localResult = _sessionService.GetActiveSessions();
+
+        // Build a dict from local sessions (authoritative)
+        var merged = localResult.Sessions
+            .ToDictionary(s => s.Id, s => new SessionListItem(s.Id, s.Name, s.MemberCount, s.MaxMembers, s.CreatedAt, s.RegionId));
+
+        // Merge directory entries; local takes precedence
+        try
+        {
+            var directoryEntries = await _directory.ListAsync();
+            foreach (var entry in directoryEntries)
+            {
+                if (!merged.ContainsKey(entry.SessionId))
+                {
+                    merged[entry.SessionId] = new SessionListItem(
+                        entry.SessionId,
+                        entry.Name,
+                        entry.MemberCount,
+                        entry.MaxMembers,
+                        entry.CreatedAt,
+                        entry.RegionId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read session directory; returning local sessions only");
+        }
+
+        return new ActiveSessionsResponse(merged.Values, localResult.MaxSessions, localResult.CanCreateSession);
     }
 
     /// <summary>
@@ -472,6 +516,58 @@ public class SessionHub : Hub
     private async Task BroadcastSessionsChanged()
     {
         await Clients.Group(AllClientsGroup).SendAsync("OnSessionsChanged");
+    }
+
+    /// <summary>
+    /// Fire-and-forget: upserts the session entry into the directory.
+    /// Failures are logged at Warning level; they never affect the hot path.
+    /// </summary>
+    private void FireAndForgetDirectoryUpsert(Session session, int memberCount)
+    {
+        var entry = new SessionDirectoryEntry(
+            session.Id,
+            session.Name,
+            session.RegionId,
+            memberCount,
+            _sessionService.MaxMembersPerSession,
+            session.CreatedAt);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _directory.UpsertAsync(entry);
+                _logger.LogInformation(
+                    "Directory upsert: session {SessionName} ({SessionId}) region={RegionId} members={MemberCount}",
+                    session.Name, session.Id, session.RegionId, memberCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Directory upsert failed for session {SessionId}", session.Id);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Fire-and-forget: removes the session entry from the directory.
+    /// Failures are logged at Warning level; they never affect the hot path.
+    /// </summary>
+    private void FireAndForgetDirectoryRemove(Guid sessionId)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _directory.RemoveAsync(sessionId);
+                _logger.LogInformation("Directory remove: session {SessionId}", sessionId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Directory remove failed for session {SessionId}", sessionId);
+            }
+        });
     }
 
     /// <summary>

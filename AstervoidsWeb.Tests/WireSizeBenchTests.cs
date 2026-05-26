@@ -310,14 +310,16 @@ public class WireSizeBenchTests
             Members: members,
             Objects: objects,
             ValidAts: validAtsList.ToArray(),
-            Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
+            Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 },
+            RegionId: "local");
 
         var size = Size(dto);
         // Phase 3 envelope: ObjectInfo×6 each gains ~+4 B (fixarray2 + schemaId
         // + bin8 length header). Roughly +24 B vs the post-Phase-1 baseline of
         // 2056 B (range had ~24 B headroom). Phase 4 typed schemas will then
         // shrink each ObjectInfo's data slot considerably.
-        size.Should().BeInRange(2030, 2090, "JoinSessionResponse with 4 asteroids + 2 ships (Phase 3 envelope)");
+        // Phase 2 (regdev): +regionId field "local" adds ~15 B.
+        size.Should().BeInRange(2088, 2110, "JoinSessionResponse with 4 asteroids + 2 ships (Phase 3 envelope + regionId)");
     }
 
     [Fact]

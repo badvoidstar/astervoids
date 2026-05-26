@@ -13,6 +13,9 @@ param containerAppsEnvironmentName string
 @description('Name of the Container Registry')
 param containerRegistryName string
 
+@description('Resource group of the Container Registry. Defaults to the current resource group. Set to the primary region resource group when this app lives in a secondary region that pulls from a shared ACR.')
+param containerRegistryResourceGroup string = resourceGroup().name
+
 @description('Container image name (leave empty for initial deployment)')
 param imageName string = ''
 
@@ -22,11 +25,11 @@ param targetPort int = 8080
 @description('Allow external ingress')
 param external bool = true
 
-@description('Minimum number of replicas')
+@description('Minimum number of replicas. Set to 0 for cold-start regions; bump to 1 for hot primary regions.')
 param minReplicas int = 0
 
-@description('Maximum number of replicas')
-param maxReplicas int = 1
+@description('Maximum number of replicas. Increase above 3 for high-traffic regions.')
+param maxReplicas int = 3
 
 @description('CPU cores allocated to the container')
 param cpu string = '1.0'
@@ -45,9 +48,10 @@ resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01'
   name: containerAppsEnvironmentName
 }
 
-// Reference existing Container Registry
+// Reference existing Container Registry (may live in a different resource group for secondary regions)
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: containerRegistryName
+  scope: resourceGroup(containerRegistryResourceGroup)
 }
 
 // Container App
@@ -106,7 +110,17 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             name: 'http-rule'
             http: {
               metadata: {
-                concurrentRequests: '100'
+                concurrentRequests: '50'
+              }
+            }
+          }
+          {
+            name: 'cpu-rule'
+            custom: {
+              type: 'cpu'
+              metadata: {
+                type: 'Utilization'
+                value: '70'
               }
             }
           }

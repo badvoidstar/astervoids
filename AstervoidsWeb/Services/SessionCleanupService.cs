@@ -17,6 +17,7 @@ public class SessionCleanupService : BackgroundService
     private readonly ISessionService _sessionService;
     private readonly IHubContext<SessionHub> _hubContext;
     private readonly SyncSchemaRegistry _schemaRegistry;
+    private readonly ISessionDirectory _directory;
     private readonly ILogger<SessionCleanupService> _logger;
     private readonly TimeSpan _emptyTimeout;
     private readonly TimeSpan _absoluteTimeout;
@@ -29,12 +30,14 @@ public class SessionCleanupService : BackgroundService
         ISessionService sessionService,
         IHubContext<SessionHub> hubContext,
         SyncSchemaRegistry schemaRegistry,
+        ISessionDirectory directory,
         IOptions<SessionSettings> settings,
         ILogger<SessionCleanupService> logger)
     {
         _sessionService = sessionService;
         _hubContext = hubContext;
         _schemaRegistry = schemaRegistry;
+        _directory = directory;
         _logger = logger;
         _emptyTimeout = TimeSpan.FromSeconds(settings.Value.EmptyTimeoutSeconds);
         _absoluteTimeout = TimeSpan.FromMinutes(settings.Value.AbsoluteTimeoutMinutes);
@@ -127,6 +130,21 @@ public class SessionCleanupService : BackgroundService
                     // Clear positional schemas registered for this session id so
                     // the registry doesn't accumulate entries forever.
                     _schemaRegistry.ClearSession(session.Id);
+
+                    // Remove from directory (fire-and-forget; failures are logged)
+                    var capturedSessionId = session.Id;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _directory.RemoveAsync(capturedSessionId);
+                            _logger.LogInformation("Directory remove (cleanup): session {SessionId}", capturedSessionId);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Directory remove failed for session {SessionId}", capturedSessionId);
+                        }
+                    });
 
                     // Notify any connected members (only relevant for absolute timeout)
                     foreach (var connectionId in result.ConnectionIds)
