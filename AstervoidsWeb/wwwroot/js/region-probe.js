@@ -2,43 +2,69 @@
  * RegionProbe — measures and maintains per-region RTT for the local browser.
  *
  * Usage:
- *   await RegionProbe.init();         // Pulls region list from /api/regions, starts probing
- *   RegionProbe.getRtt('westus2')     // → ms (or null if not yet sampled)
- *   RegionProbe.getSelf()             // → RTT for the local region
- *   RegionProbe.getAllRegions()        // → [{ id, displayName, publicUrl, rttMs }]
- *   RegionProbe.getBestRegion()       // → { id, displayName, rttMs }
- *   RegionProbe.on('changed', cb)     // fires when any region's EMA changes by >5ms
+ *   await RegionProbe.init();          // Pulls region list from /api/regions, starts probing
+ *   RegionProbe.getRtt('westus2')      // → ms (or null if not yet sampled)
+ *   RegionProbe.getSelf()              // → RTT for the local region
+ *   RegionProbe.getAllRegions()        // → [{ id, displayName, publicUrl, rttMs, intervalMs, health }]
+ *   RegionProbe.getBestRegion()        // → { id, displayName, rttMs }
+ *   RegionProbe.getRegionHealth(id)    // → 'ok' | 'twitchy' | 'unhealthy' | 'unknown'
+ *   RegionProbe.on('changed', cb)      // cb({ changedRegionIds, regionId }) (regionId retained for legacy subscribers)
+ *   RegionProbe.on('unhealthy', cb)    // cb(regionId)
  *
- * Architecture notes
- * ──────────────────
- * • Fully standalone; has no dependency on SignalR, SessionClient, or ObjectSync.
- * • RTT is measured via fetch(<region.publicUrl>/api/ping, { cache: 'no-store' }).
- *   For the local region (same origin) the URL is '/api/ping'.
- * • Uses an asymmetric EMA (spike α = 0.3, decay α = 0.1) for consistency with
- *   ObjectSync.updateSendRate.
- * • Re-probes every PROBE_INTERVAL_MS (default 15 s) and on visibilitychange.
- * • Probes pause when document.visibilityState === 'hidden'.
- * • Three samples are taken before the first EMA is published (avoids first-call
- *   DNS skew). Samples <1 ms or from non-204 responses are rejected as noise.
+ * Cadence ladder (per-region, independent timers)
+ * ─────────────────────────────────────
+ * 1) Default probe cadence starts at 15s.
+ * 2) If EMA stays stable (<5 ms change) for 3 consecutive successful rounds,
+ *    the region slows to 60s probes.
+ * 3) If a sample is twitchy (|sample-EMA| > max(EMA*3, 30ms)), cadence snaps
+ *    to 5s for the next 5 rounds.
+ * 4) Failed probes (network/non-204) snap to 3s for the next 3 rounds.
+ * 5) After 5 consecutive failures, the region is marked unhealthy and backs off
+ *    to 30s probes until recovery.
  */
 'use strict';
 
 const RegionProbe = (() => {
     // ── Constants ─────────────────────────────────────────────────────
-    const PROBE_INTERVAL_MS      = 15_000;
-    const PROBE_WARMUP_SAMPLES   = 3;
-    const SPIKE_ALPHA            = 0.3;
-    const DECAY_ALPHA            = 0.1;
-    const CHANGE_THRESHOLD_MS    = 5;
-    const MIN_RTT_MS             = 1;   // below this is loopback / proxy noise
+    const DEFAULT_INTERVAL_MS      = 15_000;
+    const FAST_TWITCHY_MS          = 5_000;
+    const FAST_FAILED_MS           = 3_000;
+    const STEADY_INTERVAL_MS       = 60_000;
+    const UNHEALTHY_BACKOFF_MS     = 30_000;
+    const PROBE_WARMUP_SAMPLES     = 3;
+    const PROBE_TIMEOUT_MS         = 2_500; // Keep below the 3s failed-fast cadence.
+    const SPIKE_ALPHA              = 0.3;
+    const DECAY_ALPHA              = 0.1;
+    const CHANGE_THRESHOLD_MS      = 5;
+    const TWITCHY_MIN_DIFF_MS      = 30;
+    const TWITCHY_ROUNDS           = 5;
+    const FAIL_FAST_ROUNDS         = 3;
+    const STABLE_ROUNDS_TO_SLOW    = 3;
+    const UNHEALTHY_FAILURES       = 5;
+    const MIN_RTT_MS               = 1;
 
     // ── State ─────────────────────────────────────────────────────────
-    let _regions     = [];   // [{ id, displayName, publicUrl }]
+    let _regions     = [];
     let _selfId      = '';
-    let _rttMap      = {};   // { [regionId]: { ema: number|null, samples: number } }
+    let _rttMap      = {}; // { [regionId]: RegionState }
     let _listeners   = [];
-    let _timer       = null;
+    let _timers      = {}; // { [regionId]: timeoutId }
     let _initialized = false;
+
+    function _newState() {
+        return {
+            ema: null,
+            samples: 0,
+            stableConsecutive: 0,
+            lastErrorAt: null,
+            currentIntervalMs: DEFAULT_INTERVAL_MS,
+            failures: 0,
+            twitchyRoundsLeft: 0,
+            failedFastRoundsLeft: 0,
+            health: 'unknown',
+            unhealthyNotified: false
+        };
+    }
 
     // ── Event emitter (minimal) ───────────────────────────────────────
     function on(event, cb) {
@@ -55,66 +81,175 @@ const RegionProbe = (() => {
         }
     }
 
+    function _emitChanged(changedRegionIds) {
+        if (!changedRegionIds || changedRegionIds.length === 0) return;
+        _emit('changed', {
+            changedRegionIds,
+            regionId: changedRegionIds[0]
+        });
+    }
+
     // ── EMA update ────────────────────────────────────────────────────
-    /**
-     * Asymmetric EMA: rising edges (spikes) use SPIKE_ALPHA for fast reaction;
-     * falling edges use DECAY_ALPHA so transient spikes don't permanently inflate
-     * the estimate.
-     */
     function _updateEma(prev, sample) {
         if (prev === null) return sample;
         const alpha = sample > prev ? SPIKE_ALPHA : DECAY_ALPHA;
         return prev + alpha * (sample - prev);
     }
 
+    // Twitchy threshold: react to large outliers relative to current EMA,
+    // but always require at least a 30 ms absolute jump.
+    function _calculateTwitchyThreshold(ema) {
+        if (ema === null) return TWITCHY_MIN_DIFF_MS;
+        return Math.max(ema * 3, TWITCHY_MIN_DIFF_MS);
+    }
+
     // ── Single probe ──────────────────────────────────────────────────
     async function _probe(region) {
         const url = region.publicUrl ? `${region.publicUrl}/api/ping` : '/api/ping';
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
         const t0 = performance.now();
+
         try {
-            const res = await fetch(url, { cache: 'no-store', mode: 'cors' });
+            const res = await fetch(url, {
+                cache: 'no-store',
+                mode: 'cors',
+                signal: controller.signal
+            });
             const rtt = performance.now() - t0;
             if (res.status !== 204 || rtt < MIN_RTT_MS) return null;
             return rtt;
         } catch (_) {
             return null;
+        } finally {
+            clearTimeout(timeout);
         }
     }
 
-    // ── Probe one region, update EMA ──────────────────────────────────
-    async function _probeRegion(region) {
+    function _setRegionTimer(regionId, delayMs) {
+        _clearRegionTimer(regionId);
+        _timers[regionId] = setTimeout(() => {
+            const region = _regions.find(r => r.id === regionId);
+            if (!region || document.visibilityState === 'hidden') return;
+            _probeCycle([region], true);
+        }, Math.max(0, delayMs));
+    }
+
+    function _clearRegionTimer(regionId) {
+        const timer = _timers[regionId];
+        if (timer) clearTimeout(timer);
+        delete _timers[regionId];
+    }
+
+    function _clearAllTimers() {
+        for (const regionId of Object.keys(_timers)) {
+            _clearRegionTimer(regionId);
+        }
+    }
+
+    async function _probeOneRegion(region) {
+        const state = _rttMap[region.id] = _rttMap[region.id] || _newState();
         const sample = await _probe(region);
-        if (sample === null) return;
 
-        const state = _rttMap[region.id] = _rttMap[region.id] || { ema: null, samples: 0 };
+        if (sample === null) {
+            state.failures = Math.min(state.failures + 1, UNHEALTHY_FAILURES);
+            state.lastErrorAt = Date.now();
+            state.stableConsecutive = 0;
+
+            if (state.failures >= UNHEALTHY_FAILURES) {
+                state.currentIntervalMs = UNHEALTHY_BACKOFF_MS;
+                state.health = 'unhealthy';
+                if (!state.unhealthyNotified) {
+                    state.unhealthyNotified = true;
+                    _emit('unhealthy', region.id);
+                }
+            } else {
+                state.failedFastRoundsLeft = Math.max(state.failedFastRoundsLeft, FAIL_FAST_ROUNDS);
+                state.currentIntervalMs = FAST_FAILED_MS;
+                if (state.health === 'unknown' && state.samples > 0) {
+                    state.health = 'ok';
+                }
+            }
+
+            return false;
+        }
+
+        // Recovery from failure/backoff state.
+        state.lastErrorAt = null;
+        state.failures = 0;
+        state.unhealthyNotified = false;
+
         state.samples++;
-
-        // Warm-up: collect PROBE_WARMUP_SAMPLES before publishing the EMA
-        if (state.samples < PROBE_WARMUP_SAMPLES) {
+        if (state.samples <= PROBE_WARMUP_SAMPLES) {
             state.ema = _updateEma(state.ema, sample);
-            return;
+            if (state.health === 'unknown' && state.samples >= PROBE_WARMUP_SAMPLES) {
+                state.health = 'ok';
+            }
+            return false;
         }
 
         const prev = state.ema;
-        state.ema = _updateEma(state.ema === null ? sample : state.ema, sample);
+        const twitchyDiffThreshold = _calculateTwitchyThreshold(prev);
+        const isTwitchySample = prev !== null && Math.abs(sample - prev) > twitchyDiffThreshold;
 
-        if (prev === null || Math.abs(state.ema - prev) >= CHANGE_THRESHOLD_MS) {
-            _emit('changed', { regionId: region.id, rttMs: state.ema });
+        if (isTwitchySample) {
+            state.twitchyRoundsLeft = Math.max(state.twitchyRoundsLeft, TWITCHY_ROUNDS);
+            state.stableConsecutive = 0;
+            state.currentIntervalMs = FAST_TWITCHY_MS;
+            state.health = 'twitchy';
         }
+
+        state.ema = _updateEma(prev === null ? sample : prev, sample);
+
+        let changed = false;
+        if (prev === null || Math.abs(state.ema - prev) >= CHANGE_THRESHOLD_MS) {
+            changed = true;
+        }
+
+        if (!isTwitchySample) {
+            const delta = prev === null ? 0 : Math.abs(state.ema - prev);
+            if (delta < CHANGE_THRESHOLD_MS) {
+                state.stableConsecutive++;
+            } else {
+                state.stableConsecutive = 0;
+            }
+        }
+
+        if (state.failedFastRoundsLeft > 0) {
+            state.failedFastRoundsLeft--;
+            state.currentIntervalMs = FAST_FAILED_MS;
+        } else if (state.twitchyRoundsLeft > 0) {
+            state.twitchyRoundsLeft--;
+            state.currentIntervalMs = FAST_TWITCHY_MS;
+        } else if (state.stableConsecutive >= STABLE_ROUNDS_TO_SLOW) {
+            state.currentIntervalMs = STEADY_INTERVAL_MS;
+            state.health = 'ok';
+        } else {
+            state.currentIntervalMs = DEFAULT_INTERVAL_MS;
+            state.health = 'ok';
+        }
+
+        return changed;
     }
 
-    // ── Probe all regions in parallel ────────────────────────────────
-    async function _probeAll() {
+    // ── Probe cycle (one or many regions), coalesced changed event ───────────
+    async function _probeCycle(regions, reschedule) {
         if (document.visibilityState === 'hidden') return;
-        await Promise.all(_regions.map(_probeRegion));
+
+        const changes = await Promise.all(regions.map(async region => {
+            const changed = await _probeOneRegion(region);
+            if (reschedule) {
+                const state = _rttMap[region.id] || _newState();
+                _setRegionTimer(region.id, state.currentIntervalMs);
+            }
+            return changed ? region.id : null;
+        }));
+
+        const changedRegionIds = changes.filter(Boolean);
+        _emitChanged(changedRegionIds);
     }
 
     // ── Public API ────────────────────────────────────────────────────
-
-    /**
-     * Initialise RegionProbe. Fetches /api/regions, then starts probing.
-     * Safe to call multiple times — subsequent calls are no-ops.
-     */
     async function init() {
         if (_initialized) return;
         _initialized = true;
@@ -123,68 +258,55 @@ const RegionProbe = (() => {
             const res = await fetch('/api/regions', { cache: 'no-store' });
             if (!res.ok) throw new Error(`/api/regions returned ${res.status}`);
             const data = await res.json();
-            _selfId  = data.self   || 'local';
-            _regions = data.all    || [{ id: 'local', displayName: 'Local', publicUrl: '' }];
+            _selfId = data.self || 'local';
+            _regions = data.all || [{ id: 'local', displayName: 'Local', publicUrl: '' }];
         } catch (err) {
             console.warn('[RegionProbe] Failed to load regions, using local fallback:', err);
-            _selfId  = 'local';
+            _selfId = 'local';
             _regions = [{ id: 'local', displayName: 'Local', publicUrl: '' }];
         }
 
-        // Initialise state map
         for (const r of _regions) {
-            _rttMap[r.id] = { ema: null, samples: 0 };
+            _rttMap[r.id] = _newState();
         }
 
-        // First probe
-        await _probeAll();
+        await _probeCycle(_regions, true);
 
-        // Periodic re-probe
-        _timer = setInterval(_probeAll, PROBE_INTERVAL_MS);
-
-        // Re-probe on tab focus
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible') _probeAll();
+            if (document.visibilityState === 'hidden') {
+                _clearAllTimers();
+                return;
+            }
+
+            _clearAllTimers();
+            _probeCycle(_regions, true);
         });
     }
 
-    /**
-     * Returns the current EMA RTT (ms) for the given regionId, or null if not yet sampled.
-     */
     function getRtt(regionId) {
         const state = _rttMap[regionId];
         return state ? state.ema : null;
     }
 
-    /**
-     * Returns the current EMA RTT for this instance's own region.
-     */
     function getSelf() {
         return getRtt(_selfId);
     }
 
-    /**
-     * Returns the region ID for this instance.
-     */
     function getSelfId() {
         return _selfId;
     }
 
-    /**
-     * Returns all regions as [{ id, displayName, publicUrl, rttMs }].
-     */
     function getAllRegions() {
         return _regions.map(r => ({
             id: r.id,
             displayName: r.displayName,
             publicUrl: r.publicUrl,
-            rttMs: getRtt(r.id)
+            rttMs: getRtt(r.id),
+            intervalMs: (_rttMap[r.id] && _rttMap[r.id].currentIntervalMs) || DEFAULT_INTERVAL_MS,
+            health: getRegionHealth(r.id)
         }));
     }
 
-    /**
-     * Returns the region with the lowest EMA RTT, or null if no samples yet.
-     */
     function getBestRegion() {
         let best = null;
         for (const r of _regions) {
@@ -197,13 +319,31 @@ const RegionProbe = (() => {
         return best;
     }
 
-    /**
-     * Looks up the display name for a regionId. Falls back to the raw id.
-     */
     function getDisplayName(regionId) {
         const r = _regions.find(r => r.id === regionId);
         return r ? r.displayName : regionId;
     }
 
-    return { init, on, getRtt, getSelf, getSelfId, getAllRegions, getBestRegion, getDisplayName };
+    function getRegionHealth(regionId) {
+        const state = _rttMap[regionId];
+        return state ? state.health : 'unknown';
+    }
+
+    function getRegionInterval(regionId) {
+        const state = _rttMap[regionId];
+        return state ? state.currentIntervalMs : DEFAULT_INTERVAL_MS;
+    }
+
+    return {
+        init,
+        on,
+        getRtt,
+        getSelf,
+        getSelfId,
+        getAllRegions,
+        getBestRegion,
+        getDisplayName,
+        getRegionHealth,
+        getRegionInterval
+    };
 })();

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Astervoids Ops</title>
+    <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; background: #0d1117; color: #c9d1d9; }
+        h1 { margin: 0 0 12px; font-size: 20px; }
+        #status { margin-bottom: 10px; color: #8b949e; font-size: 13px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border: 1px solid #30363d; padding: 6px 8px; text-align: left; }
+        th { background: #161b22; }
+        tr.ok-true { background: rgba(35, 134, 54, 0.1); }
+        tr.ok-false { background: rgba(248, 81, 73, 0.1); }
+        td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    </style>
+</head>
+<body>
+    <h1>Regional Ops</h1>
+    <div id="status">Loading…</div>
+    <table>
+        <thead>
+            <tr>
+                <th>Region</th>
+                <th>OK</th>
+                <th>Connections</th>
+                <th>Hub Invocations / sec</th>
+                <th>CPU %</th>
+                <th>Mem MB</th>
+                <th>Reconciliations</th>
+                <th>Reconnects</th>
+                <th>Last Error</th>
+            </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+    </table>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const rowsEl = document.getElementById('rows');
+        const totals = new Map();
+
+        function sumMemberMetric(region, key) {
+            const sessions = region.metrics && Array.isArray(region.metrics.sessions) ? region.metrics.sessions : [];
+            let sum = 0;
+            for (const s of sessions) {
+                const members = Array.isArray(s.members) ? s.members : [];
+                for (const m of members) {
+                    sum += Number(m[key] || 0);
+                }
+            }
+            return sum;
+        }
+
+        function invocationsPerSec(region) {
+            if (!region.ok || !region.metrics || !region.metrics.connections) return '—';
+            const now = Date.now();
+            const total = Number(region.metrics.connections.totalHubInvocations || 0);
+            const prev = totals.get(region.id);
+            totals.set(region.id, { total, at: now });
+            if (!prev) return '—';
+            const dt = (now - prev.at) / 1000;
+            if (dt <= 0) return '—';
+            return ((total - prev.total) / dt).toFixed(2);
+        }
+
+        function render(data) {
+            const regions = Array.isArray(data.regions) ? data.regions : [];
+            rowsEl.innerHTML = '';
+
+            for (const region of regions) {
+                const metrics = region.metrics || {};
+                const system = metrics.system || {};
+                const conn = metrics.connections || {};
+                const row = document.createElement('tr');
+                row.className = `ok-${Boolean(region.ok)}`;
+
+                const memMb = system.memoryWorkingSetBytes ? (system.memoryWorkingSetBytes / (1024 * 1024)).toFixed(1) : '—';
+                const cpu = system.cpuUsagePercent != null ? Number(system.cpuUsagePercent).toFixed(1) : '—';
+                const invPerSec = invocationsPerSec(region);
+                const reconciliations = region.ok ? sumMemberMetric(region, 'reconciliations') : '—';
+                const reconnects = region.ok ? sumMemberMetric(region, 'reconnects') : '—';
+
+                row.innerHTML = `
+                    <td class="mono">${region.displayName || region.id}</td>
+                    <td>${region.ok ? 'yes' : 'no'}</td>
+                    <td>${region.ok ? (conn.currentConnections ?? '—') : '—'}</td>
+                    <td>${invPerSec}</td>
+                    <td>${cpu}</td>
+                    <td>${memMb}</td>
+                    <td>${reconciliations}</td>
+                    <td>${reconnects}</td>
+                    <td>${region.ok ? '' : (region.error || 'unknown error')}</td>
+                `;
+                rowsEl.appendChild(row);
+            }
+        }
+
+        async function poll() {
+            try {
+                const res = await fetch('/api/srvmon/all', { cache: 'no-store' });
+                if (!res.ok) throw new Error(`/api/srvmon/all returned ${res.status}`);
+                const data = await res.json();
+                render(data);
+                statusEl.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+            } catch (err) {
+                statusEl.textContent = `Error: ${err.message}`;
+            }
+        }
+
+        let pollTimer = null;
+        function startPolling() {
+            if (pollTimer) return;
+            poll();
+            pollTimer = setInterval(poll, 5000);
+        }
+        function stopPolling() {
+            if (!pollTimer) return;
+            clearInterval(pollTimer);
+            pollTimer = null;
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') stopPolling();
+            else startPolling();
+        });
+
+        startPolling();
+    </script>
+</body>
+</html>

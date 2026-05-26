@@ -1,0 +1,209 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "359257265402915321"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container App"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for resources"
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags for resources"
+      }
+    },
+    "containerAppsEnvironmentName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container Apps Environment"
+      }
+    },
+    "containerRegistryName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container Registry"
+      }
+    },
+    "containerRegistryResourceGroup": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().name]",
+      "metadata": {
+        "description": "Resource group of the Container Registry. Defaults to the current resource group. Set to the primary region resource group when this app lives in a secondary region that pulls from a shared ACR."
+      }
+    },
+    "imageName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Container image name (leave empty for initial deployment)"
+      }
+    },
+    "targetPort": {
+      "type": "int",
+      "defaultValue": 8080,
+      "metadata": {
+        "description": "Target port for the container"
+      }
+    },
+    "external": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Allow external ingress"
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 0,
+      "metadata": {
+        "description": "Minimum number of replicas. Set to 0 for cold-start regions; bump to 1 for hot primary regions."
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 3,
+      "metadata": {
+        "description": "Maximum number of replicas. Increase above 3 for high-traffic regions."
+      }
+    },
+    "cpu": {
+      "type": "string",
+      "defaultValue": "1.0",
+      "metadata": {
+        "description": "CPU cores allocated to the container"
+      }
+    },
+    "memory": {
+      "type": "string",
+      "defaultValue": "2Gi",
+      "metadata": {
+        "description": "Memory allocated to the container"
+      }
+    },
+    "env": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Environment variables for the container"
+      }
+    },
+    "customDomainName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Custom domain name (optional, e.g., app.yourdomain.com)"
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppsEnvironmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": "[parameters('external')]",
+            "targetPort": "[parameters('targetPort')]",
+            "transport": "auto",
+            "allowInsecure": false,
+            "customDomains": "[if(not(empty(parameters('customDomainName'))), createArray(createObject('name', parameters('customDomainName'), 'bindingType', 'Disabled')), createArray())]"
+          },
+          "registries": [
+            {
+              "server": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer]",
+              "username": "[listCredentials(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username]",
+              "passwordSecretRef": "registry-password"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "registry-password",
+              "value": "[listCredentials(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "main",
+              "image": "[if(not(empty(parameters('imageName'))), format('{0}/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('containerRegistryResourceGroup')), 'Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, parameters('imageName')), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
+              "resources": {
+                "cpu": "[json(parameters('cpu'))]",
+                "memory": "[parameters('memory')]"
+              },
+              "env": "[parameters('env')]"
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]",
+            "rules": [
+              {
+                "name": "http-rule",
+                "http": {
+                  "metadata": {
+                    "concurrentRequests": "50"
+                  }
+                }
+              },
+              {
+                "name": "cpu-rule",
+                "custom": {
+                  "type": "cpu",
+                  "metadata": {
+                    "type": "Utilization",
+                    "value": "70"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "name": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "uri": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2023-05-01').configuration.ingress.fqdn)]"
+    },
+    "id": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.App/containerApps', parameters('name'))]"
+    },
+    "fqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2023-05-01').configuration.ingress.fqdn]"
+    },
+    "verificationId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2023-05-01').customDomainVerificationId]"
+    }
+  }
+}

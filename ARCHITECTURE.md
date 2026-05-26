@@ -1525,6 +1525,119 @@ Today (single region) this is redundant with the inline broadcasts in `SessionHu
 
 Local entries take precedence by `SessionId`.  `maxSessions` and `canCreateSession` are evaluated locally (per-region caps).
 
-### Forward reference to Phase 3
+### Phase 3 — implemented: multi-region provisioning
 
-Phase 3 provisions a second Azure region in Bicep (`azd provision`), each with its own Container App instance and `Regions:Self` env var.  All instances share a single Cosmos directory account.  Per-region hub URLs and the client-side `connect(targetRegionUrl)` path are introduced in Phase 3.
+Phase 3 is now live in `infra/`. The regional deployment plan is a single source of truth in `infra/main.parameters.json` under the `regions` parameter; both `infra/main.bicep` and `.github/workflows/azure-deploy.yml` read from it. Today the plan ships **two regions**:
+
+| Region ID    | Location      | Role      | minReplicas | maxReplicas |
+|--------------|---------------|-----------|-------------|-------------|
+| `westus2`    | `westus2`     | primary   | 0           | 3           |
+| `northeurope`| `northeurope` | secondary | 0           | 3           |
+
+`northeurope` is Azure's Dublin (Ireland) datacenter and is the closest region to Irish/UK/EU players.
+
+**Resource layout per region:**
+
+- **Primary region** keeps the historic names — `rg-production`, `cae-production`, `cr<hash>` (ACR), and `ca-web-production` — so existing deployments and tooling continue to work.
+- **Each secondary region** gets `rg-production-<id>`, `cae-production-<id>` (a CAE + Log Analytics workspace only — no per-region ACR), and `ca-web-production-<id>`. Secondary container apps pull images from the primary region's ACR via the cross-RG `containerRegistryResourceGroup` param on `infra/core/host/container-app.bicep`.
+- A shared Cosmos directory account (or `InMemory` directory in environments that haven't enabled it) is referenced by all regions, so every instance sees the same `SessionDirectoryEntry` set.
+
+**Scale-to-zero invariant.** Every region's `minReplicas` defaults to `0` in `infra/main.parameters.json` and the KEDA scale rules in `infra/core/host/container-app.bicep` (`http-rule` at 50 concurrent requests + `cpu-rule` at 70% utilization) both report zero load when there are no active SignalR connections, so each region collapses to 0 replicas independently. `AstervoidsWeb.Tests/RegionalDeploymentPlanTests.cs` locks this guarantee.
+
+> Note: "no connections" for the HTTP scaler includes long-lived SignalR WebSocket connections — a region only scales to zero when every client has disconnected (or failed over to a sibling region) and the cooldown has elapsed.
+
+**CI/CD fan-out (`.github/workflows/azure-deploy.yml`).** The `production` deploy now:
+
+1. Runs `azd up` once. Bicep provisions the primary RG + ACR + Container App and every secondary RG + CAE + Container App in parallel. `azd deploy` updates the primary container app's image.
+2. A follow-up **Sync multi-region container apps** step reads `infra/main.parameters.json`, queries every region's auto-generated FQDN, builds the cross-region `Regions__All__N__{Id,DisplayName,PublicUrl}` env-var set, and `az containerapp update`s every region in lock-step — pushing the same primary image to each secondary and setting `Regions__Self=<id>` plus the full sibling list everywhere. This is also the mechanism that picks up the `Regions:All` env vars consumed by `ServerMetricsService`, `/api/srvmon/all`, and the client-side `RegionProbe`.
+
+Branch (PR preview) deploys remain single-region (`westus2` only) — they pass an empty `regions` array to keep PR previews cheap.
+
+### Forward reference to (former) Phase 3 — historical
+
+The original Phase 3 plan ("provision a second Azure region in Bicep, each with its own Container App instance and `Regions:Self` env var") is realized above.
+
+## Regional deployment (Phase 4)
+
+Phase 4 hardens the regional rollout for operations: autoscale defaults are region-aware, server metrics become region-self-describing, cross-region ops fan-out is available via one endpoint, and the client probe loop adapts cadence to healthy/twitchy/unhealthy network conditions.
+
+### Per-region Container App autoscale
+
+`infra/core/host/container-app.bicep` now applies two scale rules together (Container Apps takes the max desired replicas across rules):
+
+1. **HTTP concurrency rule**: `http.concurrentRequests = 50`
+2. **CPU rule**: `custom(type='cpu', metadata: { type='Utilization', value='70' })`
+
+Replica bounds are parameterized as:
+
+- `minReplicas` default `0`
+- `maxReplicas` default `3`
+
+`infra/main.bicep` exposes optional per-region overrides through the `regions` parameter (`minReplicas?`, `maxReplicas?`).
+
+> Operational note: `minReplicas: 0` means a region can cold-start on first traffic. That is acceptable for low-volume secondary regions, but primaries should usually set `minReplicas: 1`.
+
+### `ServerMetricsService.RegionId` and `/api/srvmon`
+
+`ServerMetricsService` now captures `RegionsOptions.Self` and includes it in snapshots. `GET /api/srvmon` now returns top-level `regionId` (camelCase JSON) so every response is self-describing.
+
+### `/api/srvmon/all` fan-out
+
+New endpoint: `GET /api/srvmon/all`.
+
+- Reads region list from `RegionsOptions.All`
+- Inlines local region metrics (does not self-call)
+- Fans out `/api/srvmon` calls to other regions using named `HttpClient` (`SrvmonFanout`)
+- Uses a 1.5s timeout per region
+- Returns:
+
+```json
+{
+  "regions": [
+    { "id": "...", "displayName": "...", "publicUrl": "...", "ok": true, "metrics": { /* /api/srvmon payload */ } },
+    { "id": "...", "displayName": "...", "publicUrl": "...", "ok": false, "error": "..." }
+  ]
+}
+```
+
+To reduce fan-out storms from aggressive polling, `/api/srvmon/all` uses a small per-caller-IP debounce cache (500 ms).
+
+### RegionProbe adaptive cadence and health states
+
+`wwwroot/js/region-probe.js` now runs with per-region independent timers and health states:
+
+| State | Trigger | Cadence |
+|---|---|---|
+| steady | 3 consecutive rounds with EMA drift `< 5 ms` | 60 s |
+| twitchy | single sample delta `> max(EMA×3, 30 ms)` | 5 s for next 5 rounds |
+| failed | non-204 / network error | 3 s for next 3 rounds |
+| unhealthy | 5 consecutive failures | 30 s backoff |
+
+Visibility behavior from earlier phases is preserved:
+
+- Hidden tab → pause probes
+- Visible again → immediate probe round for **every** region, then resume per-region cadence
+
+Public/client API additions:
+
+- `RegionProbe.on('unhealthy', regionId)`
+- `RegionProbe.getRegionHealth(regionId) -> 'ok' | 'twitchy' | 'unhealthy' | 'unknown'`
+
+`changed` events are still coalesced per probe cycle and now optionally include `{ changedRegionIds: string[] }`.
+
+### Lobby picker and ops UI hook
+
+Lobby region rows now reflect probe health:
+
+- `region-unhealthy` rows (dim + ⚠ glyph)
+- `region-twitchy` rows (subtle indicator)
+
+Region tooltip shows EMA, current interval, and health state for quick diagnosis.
+
+A new static page `/ops.html` polls `/api/srvmon/all` every 5s and shows per-region ops metrics (connections, hub invocations/sec, CPU, memory, reconciliations, reconnects, errors). `index.html` links to it via a small **Ops** link.
+
+`ops.html` and `/api/srvmon/all` are intentionally not auth-gated in this phase; operators can gate them at ingress/reverse-proxy level if desired.
+
+### Forward reference (Phase 5)
+
+Phase 5 is expected to add geo-aware session creation defaults (create in your best region) and expose regional capacity caps directly in the picker.

@@ -369,6 +369,48 @@
             color: #888;
         }
 
+        .session-item.region-twitchy {
+            box-shadow: inset 2px 0 0 rgba(255, 200, 100, 0.7);
+        }
+
+        .session-item.region-unhealthy {
+            opacity: 0.45;
+        }
+
+        .session-item .region-warning {
+            margin-left: 4px;
+            color: #ffcc66;
+            font-size: 10px;
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            border: 0;
+            white-space: nowrap;
+        }
+
+        #ops-link {
+            margin-top: 8px;
+            text-align: right;
+            font-size: 10px;
+            color: #777;
+        }
+
+        #ops-link a {
+            color: #7aa7ff;
+            text-decoration: none;
+        }
+
+        #ops-link a:hover {
+            text-decoration: underline;
+        }
+
         #picker-buttons {
             display: flex;
             flex-direction: column;
@@ -626,6 +668,7 @@
                     <button id="btn-solo" class="picker-btn solo">Solo Play</button>
                     <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
                 </div>
+                <div id="ops-link"><a href="/ops.html" target="_blank" rel="noopener noreferrer">Ops</a></div>
             </div>
         </div>
 
@@ -7191,6 +7234,20 @@
     // Helper: format an RTT value for display in the picker
     const _regionProbeAvailable = () => typeof RegionProbe !== 'undefined';
     function _formatRtt(rttMs) { return rttMs !== null ? Math.round(rttMs) + ' ms' : '—'; }
+    function _formatInterval(intervalMs) { return Math.round(intervalMs / 1000) + ' s'; }
+    function _regionHealth(regionId) {
+        return _regionProbeAvailable() && typeof RegionProbe.getRegionHealth === 'function'
+            ? RegionProbe.getRegionHealth(regionId)
+            : 'unknown';
+    }
+    function _regionTooltip(regionId) {
+        if (!_regionProbeAvailable()) return '';
+        const ema = _formatRtt(RegionProbe.getRtt(regionId));
+        const intervalMs = typeof RegionProbe.getRegionInterval === 'function'
+            ? RegionProbe.getRegionInterval(regionId)
+            : 15000;
+        return `EMA: ${ema} | Interval: ${_formatInterval(intervalMs)} | Health: ${_regionHealth(regionId)}`;
+    }
 
     function renderSessionList() {
         const { listEl, sessions, currentSessionId } = sessionPicker;
@@ -7209,17 +7266,24 @@
             const regionId   = session.regionId || 'local';
             const regionName = hasProbe ? RegionProbe.getDisplayName(regionId) : regionId;
             const rttText    = _formatRtt(hasProbe ? RegionProbe.getRtt(regionId) : null);
+            const regionHealth = _regionHealth(regionId);
+            const regionTooltip = _regionTooltip(regionId);
+            const regionWarning = regionHealth === 'unhealthy'
+                ? '<span class="region-warning" aria-hidden="true">⚠</span><span class="sr-only">(unhealthy)</span>'
+                : '';
 
             const item = document.createElement('div');
             item.className = 'session-item' + 
                 (isCurrent ? ' current' : '') +
                 (isFull && !isCurrent ? ' disabled' : '') +
+                (regionHealth === 'unhealthy' ? ' region-unhealthy' : '') +
+                (regionHealth === 'twitchy' ? ' region-twitchy' : '') +
                 (isCurrent ? ' disabled' : ''); // Can't click own session
             item.dataset.sessionId = session.id;
             item.innerHTML = `
                 <span class="session-name">${session.name}</span>
                 <span class="session-players">${session.memberCount}/${session.maxMembers}${isFull && !isCurrent ? ' FULL' : ''}</span>
-                <span class="session-region" data-region-id="${regionId}">${regionName}</span>
+                <span class="session-region" data-region-id="${regionId}" title="${regionTooltip}">${regionName}${regionWarning}</span>
                 <span class="session-rtt" data-region-id="${regionId}">${rttText}</span>
             `;
             if (isClickable) {
@@ -7239,12 +7303,22 @@
         const hasProbe = _regionProbeAvailable();
         const rttText   = _formatRtt(hasProbe ? RegionProbe.getRtt(regionId) : null);
         const regionName = hasProbe ? RegionProbe.getDisplayName(regionId) : regionId;
+        const regionHealth = _regionHealth(regionId);
+        const regionTooltip = _regionTooltip(regionId);
         const cells = sessionPicker.listEl.querySelectorAll(`[data-region-id="${regionId}"]`);
         cells.forEach(cell => {
             if (cell.classList.contains('session-rtt')) {
                 cell.textContent = rttText;
             } else if (cell.classList.contains('session-region')) {
-                cell.textContent = regionName;
+                cell.title = regionTooltip;
+                cell.innerHTML = regionHealth === 'unhealthy'
+                    ? `${regionName}<span class="region-warning" aria-hidden="true">⚠</span><span class="sr-only">(unhealthy)</span>`
+                    : regionName;
+                const row = cell.closest('.session-item');
+                if (row) {
+                    row.classList.toggle('region-unhealthy', regionHealth === 'unhealthy');
+                    row.classList.toggle('region-twitchy', regionHealth === 'twitchy');
+                }
             }
         });
     }
@@ -8439,9 +8513,13 @@
     // Initialize region probe (measures RTT to each configured region)
     if (typeof RegionProbe !== 'undefined') {
         RegionProbe.init().catch(err => console.warn('[RegionProbe] init failed:', err));
-        RegionProbe.on('changed', ({ regionId }) => {
-            updatePickerRttColumn(regionId);
+        RegionProbe.on('changed', (payload = {}) => {
+            const ids = Array.isArray(payload.changedRegionIds) && payload.changedRegionIds.length > 0
+                ? payload.changedRegionIds
+                : (payload.regionId ? [payload.regionId] : []);
+            ids.forEach(updatePickerRttColumn);
         });
+        RegionProbe.on('unhealthy', (regionId) => updatePickerRttColumn(regionId));
     }
 
     requestAnimationFrame(gameLoop);  // Use rAF to provide timestamp

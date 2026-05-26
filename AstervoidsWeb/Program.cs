@@ -5,6 +5,7 @@ using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Services;
 using MessagePack;
 using MessagePack.Resolvers;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -39,6 +40,8 @@ builder.Services.AddSingleton<ServerMetricsService>();
 builder.Services.AddSingleton<AstervoidsWeb.Hubs.SyncSchemaRegistry>();
 builder.Services.AddHostedService<SessionCleanupService>();
 builder.Services.AddHostedService<SessionDirectoryMirror>();
+builder.Services.AddMemoryCache();
+builder.Services.AddHttpClient("SrvmonFanout");
 
 // Use camelCase JSON property names for REST API endpoints
 builder.Services.ConfigureHttpJsonOptions(options =>
@@ -175,7 +178,124 @@ app.MapGet("/api/regions", (IOptions<RegionsOptions> regions) =>
 app.MapGet("/api/srvmon", (ServerMetricsService metrics, ISessionService sessionService) =>
     Results.Ok(metrics.GetSnapshot(sessionService)));
 
+app.MapGet("/api/srvmon/all", async (
+    HttpContext httpContext,
+    ServerMetricsService metrics,
+    ISessionService sessionService,
+    IOptions<RegionsOptions> regionsOptions,
+    IHttpClientFactory httpClientFactory,
+    CancellationToken cancellationToken) =>
+{
+    var forwardedFor = httpContext.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+    var callerIp = !string.IsNullOrWhiteSpace(forwardedFor)
+        ? forwardedFor.Split(',')[0].Trim()
+        : (httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown");
+    var cacheKey = $"srvmon-all:{callerIp}";
+    if (SrvmonAllDebounce.Cache.TryGetValue(cacheKey, out SrvmonAllResponse? cached) && cached is not null)
+        return Results.Ok(cached);
+
+    var regions = regionsOptions.Value.All.ToList();
+    if (!regions.Any(r => string.Equals(r.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase)))
+    {
+        regions.Insert(0, new RegionEntry
+        {
+            Id = regionsOptions.Value.Self,
+            DisplayName = regionsOptions.Value.Self,
+            PublicUrl = ""
+        });
+    }
+
+    var localSnapshot = metrics.GetSnapshot(sessionService);
+    var fanoutClient = httpClientFactory.CreateClient("SrvmonFanout");
+
+    var tasks = regions.Select(async region =>
+    {
+        if (string.Equals(region.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase))
+        {
+            return new SrvmonRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: true,
+                Error: null,
+                Metrics: localSnapshot);
+        }
+
+        return await SrvmonFanout.QueryRemoteSrvmonAsync(region, fanoutClient, cancellationToken);
+    });
+
+    var payload = new SrvmonAllResponse((await Task.WhenAll(tasks)).ToList());
+    SrvmonAllDebounce.Cache.Set(cacheKey, payload, new MemoryCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(SrvmonAllDebounce.DurationMs),
+        Size = 1
+    });
+    return Results.Ok(payload);
+});
+
 app.Run();
 
 // Make Program accessible to integration tests (WebApplicationFactory<Program>).
 public partial class Program { }
+
+internal static class SrvmonAllDebounce
+{
+    internal const int DurationMs = 500;
+    internal static readonly MemoryCache Cache = new(new MemoryCacheOptions { SizeLimit = 4096 });
+}
+
+public record SrvmonAllResponse(List<SrvmonRegionEntry> Regions);
+
+public record SrvmonRegionEntry(
+    string Id,
+    string DisplayName,
+    string PublicUrl,
+    bool Ok,
+    string? Error,
+    ServerMetricsSnapshot? Metrics
+);
+
+internal static class SrvmonFanout
+{
+    internal const int TimeoutMs = 1500;
+
+    internal static async Task<SrvmonRegionEntry> QueryRemoteSrvmonAsync(
+        RegionEntry region,
+        HttpClient httpClient,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(region.PublicUrl))
+                throw new InvalidOperationException("Region has no publicUrl configured");
+
+            var baseUri = region.PublicUrl.EndsWith('/') ? region.PublicUrl : $"{region.PublicUrl}/";
+            var uri = new Uri(new Uri(baseUri, UriKind.Absolute), "api/srvmon");
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(TimeoutMs));
+
+            using var response = await httpClient.GetAsync(uri, timeoutCts.Token);
+            response.EnsureSuccessStatusCode();
+            var metrics = await response.Content.ReadFromJsonAsync<ServerMetricsSnapshot>(cancellationToken: timeoutCts.Token)
+                ?? throw new InvalidOperationException("Empty metrics payload");
+
+            return new SrvmonRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: true,
+                Error: null,
+                Metrics: metrics);
+        }
+        catch (Exception ex)
+        {
+            return new SrvmonRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: false,
+                Error: ex.Message,
+                Metrics: null);
+        }
+    }
+}
