@@ -101,6 +101,53 @@ az containerapp hostname bind \
     --validation-method CNAME
 ```
 
+## Regional Custom-Domain Routing Analysis (Pre/Post Phase 3/4)
+
+### 1) Does one custom domain work for all users in multi-region?
+- **Pre-Phase 3/4 (single-region)**: Yes. One custom domain maps to one Container App, and all HTTP + SignalR traffic lands in that region.
+- **Post-Phase 3/4 (multi-region)**: A single custom domain still resolves to **one** regional origin unless a global routing layer is added. Users in other geographies can still connect, but they connect to that mapped region, not automatically to their nearest region.
+
+### 2) What default traffic patterns are enabled/restricted?
+- **HTTP app traffic + `/sessionHub` SignalR** follow the same host origin. With default custom-domain setup, both terminate in the single mapped region.
+- In regional builds, discovery may show sessions from multiple regions, but join/create calls still execute against the region behind the currently connected host.
+- With **N regions**, single-host routing creates an asymmetry: one region is directly reachable by custom domain while others are only reachable by their region FQDN (unless a global entry layer is added).
+
+### 3) What can break or confuse users if only one region is fronted?
+- Higher RTT for far-away users (all game + hub traffic hairpins to the mapped region).
+- Session discovery/join mismatch risk in regional mode (remote sessions may be visible, but joining through the wrong regional host can fail or feel inconsistent).
+- Operational confusion: operators may think “multi-region is on” while the user-facing custom domain effectively behaves single-region.
+- Cold-start/availability concentration: if the mapped region is degraded, the custom domain path is degraded even if sibling regions are healthy.
+
+### 4) If custom domain is moved to another region FQDN, what changes?
+- New and returning users land in the newly mapped region for session creation/join over `/sessionHub`.
+- Region-latency UX and probe outputs shift to the new anchor region.
+- Existing users/bookmarks to old regional FQDNs still work, but mixed links can fragment where sessions are created and joined.
+
+### 5) Caveats for Front Door, `/sessionHub`, and `/api/ping`
+- **Bicep note cross-reference**: see `infra/main.bicep` regional routing caveat comment near `fullCustomDomain` and `useCustomDomain`.
+- Keep `/sessionHub` and `/api/ping` region-pinned to regional origins.
+- Do **not** front these paths with a global route that can silently move a client between regions across calls.
+  - `/sessionHub`: connection affinity and region-local session ownership assumptions can break.
+  - `/api/ping`: probe RTT becomes synthetic to edge pathing, not true region RTT.
+
+### 6) Recommended next steps for seamless single-domain multi-region
+1. Keep one global “entry” hostname (Front Door or equivalent) for static/app shell and region selection UX.
+2. Publish explicit per-region public origins for region-sensitive paths.
+3. Route/pin `/sessionHub` and `/api/ping` directly to chosen regional origin (or use deterministic, sticky routing keyed per user/session).
+4. Make region intent explicit in session lifecycle (create/join should either redirect or fail with clear region guidance).
+5. Add ops monitors for cross-region discovery/join consistency and per-region probe health.
+
+## Ops Checklist (Single- and Multi-Region)
+
+- [ ] Custom domain CNAME points to expected target origin (single region or global entry).
+- [ ] `asuid.<subdomain>` TXT verification exists and matches deployment output.
+- [ ] HTTPS cert is present and bound for the custom hostname.
+- [ ] `/sessionHub` reaches the intended regional backend (no unintended global re-homing).
+- [ ] `/api/ping` (regional mode) is measured per-region, not edge-short-circuited.
+- [ ] Session discovery and join behavior are validated from at least two geographies.
+- [ ] If multiple region FQDNs are exposed, UX copy clarifies region selection and expected latency.
+- [ ] Failover runbook defines how/when to swap custom domain target and how to communicate expected session-impact.
+
 ## Troubleshooting
 
 ### "TXT record not found" Error

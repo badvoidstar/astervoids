@@ -41,6 +41,10 @@ var containerAppsEnvironmentName = isStandalone ? 'cae-${environmentName}' : 'ca
 // Determine if custom domain should be configured
 var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
 var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}' : ''
+// Regional routing caveat (Phase 3/4 architecture):
+// - Keep /sessionHub and /api/ping region-pinned (direct regional origins).
+// - Do not put these paths behind a global Front Door route that can re-home
+//   a client request to a different region between calls.
 
 // Tags for all resources
 var tags = {
