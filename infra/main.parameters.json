@@ -16,6 +16,26 @@
     },
     "useSharedInfra": {
       "value": "${USE_SHARED_INFRA=false}"
+    },
+    "regions": {
+      "value": [
+        {
+          "id": "westus2",
+          "location": "westus2",
+          "displayName": "West US 2",
+          "minReplicas": 0,
+          "maxReplicas": 3,
+          "isPrimary": true
+        },
+        {
+          "id": "northeurope",
+          "location": "northeurope",
+          "displayName": "North Europe",
+          "minReplicas": 0,
+          "maxReplicas": 3,
+          "isPrimary": false
+        }
+      ]
     }
   }
 }

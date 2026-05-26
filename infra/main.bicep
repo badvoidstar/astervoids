@@ -6,7 +6,7 @@ targetScope = 'subscription'
 param environmentName string
 
 @minLength(1)
-@description('Primary location for all resources')
+@description('Primary location for all resources. When the `regions` parameter is non-empty in production, the primary region from that list takes precedence.')
 param location string
 
 @description('Name of the container app')
@@ -24,6 +24,9 @@ param customSubdomain string = ''
 @description('Use shared production infrastructure (for CI/CD branch deployments). When false, creates standalone infra.')
 param useSharedInfra bool = false
 
+@description('Regional deployment plan. Each element: { id, location, displayName, minReplicas?, maxReplicas?, isPrimary? }. Exactly one entry should set isPrimary:true (its location overrides the top-level `location` param for the primary RG). minReplicas: 0 cold-starts on first traffic, while hot primary regions can set minReplicas: 1. An empty array falls back to a single-region deployment at the `location` param.')
+param regions array = []
+
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
@@ -31,6 +34,29 @@ var isStandalone = !isProduction && !useSharedInfra
 
 // For branch deployments, use production's shared infrastructure
 var sharedResourceGroupName = 'rg-production'
+
+// ── Regional deployment plan resolution ───────────────────────────────
+// Primary region: explicit `isPrimary: true` entry, else first entry, else a synthetic
+// entry derived from the `location` param (single-region back-compat).
+var primaryFromFlag = filter(regions, r => contains(r, 'isPrimary') && bool(r.isPrimary))
+var primaryRegion = length(primaryFromFlag) > 0
+  ? primaryFromFlag[0]
+  : (length(regions) > 0
+      ? regions[0]
+      : { id: 'primary', location: location, displayName: 'Primary', minReplicas: 0, maxReplicas: 3, isPrimary: true })
+var primaryLocation = contains(primaryRegion, 'location') ? string(primaryRegion.location) : location
+var primaryMinReplicas = contains(primaryRegion, 'minReplicas') ? int(primaryRegion.minReplicas) : 0
+var primaryMaxReplicas = contains(primaryRegion, 'maxReplicas') ? int(primaryRegion.maxReplicas) : 3
+
+// Secondary regions: every entry that is not the primary (only deployed in the production path).
+var secondaryRegions = filter(regions, r => !(contains(r, 'isPrimary') && bool(r.isPrimary)))
+// Only produce secondaries if a primary was explicitly tagged; otherwise the first entry is the
+// primary (back-compat) and everything else is treated as secondary. Gate on isProduction so
+// for-loops over this variable produce empty arrays in non-production deployments.
+var rawSecondaryRegions = length(primaryFromFlag) > 0
+  ? secondaryRegions
+  : (length(regions) > 1 ? skip(regions, 1) : [])
+var effectiveSecondaryRegions = isProduction ? rawSecondaryRegions : []
 
 // Resource naming per deployment path
 var containerRegistryName = isStandalone
@@ -48,43 +74,43 @@ var tags = {
 }
 
 // ============================================================================
-// PRODUCTION DEPLOYMENT PATH
+// PRODUCTION DEPLOYMENT PATH — primary region (westus2 by default)
 // ============================================================================
 
-// Resource group for production
+// Resource group for production primary region
 resource productionRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isProduction) {
   name: 'rg-production'
-  location: location
+  location: primaryLocation
   tags: tags
 }
 
-// Container Apps Environment with Azure Container Registry (production only)
+// Container Apps Environment with Azure Container Registry (production primary)
 module containerAppsProduction 'core/host/container-apps.bicep' = if (isProduction) {
   name: 'container-apps'
   scope: productionRg
   params: {
     name: containerAppsEnvironmentName
-    location: location
+    location: primaryLocation
     tags: tags
     containerRegistryName: containerRegistryName
   }
 }
 
-// Production Container App
+// Production Container App (primary region)
 module webProduction 'core/host/container-app.bicep' = if (isProduction) {
   name: 'web-production'
   scope: productionRg
   params: {
     name: !empty(webServiceName) ? webServiceName : 'ca-web-production'
-    location: location
+    location: primaryLocation
     tags: union(tags, { 'azd-service-name': 'web' })
     containerAppsEnvironmentName: containerAppsEnvironmentName
     containerRegistryName: containerRegistryName
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1
+    minReplicas: primaryMinReplicas
+    maxReplicas: primaryMaxReplicas
     customDomainName: ''
   }
   dependsOn: [containerAppsProduction]
@@ -112,6 +138,52 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && u
   }
   dependsOn: [dnsZone]
 }
+
+// ============================================================================
+// PRODUCTION DEPLOYMENT PATH — secondary regions (e.g. northeurope for Dublin)
+// ============================================================================
+// Each secondary region gets its own resource group, Container Apps Environment, and
+// Container App. The container apps pull from the primary region's ACR (cross-region pulls
+// are fine at low volume; geo-replication can be layered on later if needed).
+// Sibling Regions__All__* env vars are injected post-provision by the CI/CD workflow
+// once every region's auto-generated FQDN is known.
+
+resource secondaryRgs 'Microsoft.Resources/resourceGroups@2022-09-01' = [for region in effectiveSecondaryRegions: if (isProduction) {
+  name: 'rg-production-${region.id}'
+  location: region.location
+  tags: tags
+}]
+
+module containerAppsSecondary 'core/host/container-apps-env.bicep' = [for (region, i) in effectiveSecondaryRegions: if (isProduction) {
+  name: 'container-apps-${region.id}'
+  scope: resourceGroup('rg-production-${region.id}')
+  params: {
+    name: 'cae-production-${region.id}'
+    location: region.location
+    tags: tags
+  }
+  dependsOn: [secondaryRgs]
+}]
+
+module webSecondary 'core/host/container-app.bicep' = [for (region, i) in effectiveSecondaryRegions: if (isProduction) {
+  name: 'web-production-${region.id}'
+  scope: resourceGroup('rg-production-${region.id}')
+  params: {
+    name: 'ca-web-production-${region.id}'
+    location: region.location
+    tags: union(tags, { 'azd-service-name': 'web-${region.id}' })
+    containerAppsEnvironmentName: 'cae-production-${region.id}'
+    containerRegistryName: containerRegistryName
+    containerRegistryResourceGroup: 'rg-production'
+    imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
+    targetPort: 8080
+    external: true
+    minReplicas: contains(region, 'minReplicas') ? int(region.minReplicas) : 0
+    maxReplicas: contains(region, 'maxReplicas') ? int(region.maxReplicas) : 3
+    customDomainName: ''
+  }
+  dependsOn: [containerAppsSecondary, webProduction]
+}]
 
 // ============================================================================
 // STANDALONE DEPLOYMENT PATH (local dev via azd up)
@@ -149,8 +221,8 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1
+    minReplicas: primaryMinReplicas
+    maxReplicas: primaryMaxReplicas
     customDomainName: ''
   }
   dependsOn: [containerAppsStandalone]
@@ -159,6 +231,7 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
 // ============================================================================
 // BRANCH DEPLOYMENT PATH (CI/CD, uses shared production infra)
 // ============================================================================
+// Branch previews are single-region (primary) only — keeps PR previews cheap and fast.
 
 // Reference to existing production resource group for branch deployments
 resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if (isBranch) {
@@ -178,8 +251,8 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    minReplicas: 0
-    maxReplicas: 1  // Limit branch deployments
+    minReplicas: primaryMinReplicas
+    maxReplicas: primaryMaxReplicas
     customDomainName: ''
   }
 }
@@ -216,3 +289,18 @@ output CONTAINER_APPS_ENVIRONMENT string = containerAppsEnvironmentName
 output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? 'rg-${environmentName}' : sharedResourceGroupName)
 output CUSTOM_DOMAIN string = fullCustomDomain
 output DOMAIN_VERIFICATION_ID string = webVerificationId
+
+// Per-region outputs (primary + secondaries). Workflow uses these to fan out image deploys
+// and inject Regions__* env vars on every region's container app.
+output PRIMARY_REGION_ID string = isProduction ? primaryRegion.id : ''
+output PRIMARY_WEB_URI string = isProduction ? webProduction.outputs.uri : ''
+output PRIMARY_CONTAINER_APP_NAME string = isProduction ? webProduction.outputs.name : ''
+output PRIMARY_RESOURCE_GROUP string = isProduction ? 'rg-production' : ''
+
+output SECONDARY_REGION_IDS array = [for region in effectiveSecondaryRegions: region.id]
+#disable-next-line BCP318
+output SECONDARY_WEB_URIS array = [for (region, i) in effectiveSecondaryRegions: webSecondary[i].outputs.uri]
+#disable-next-line BCP318
+output SECONDARY_CONTAINER_APP_NAMES array = [for (region, i) in effectiveSecondaryRegions: webSecondary[i].outputs.name]
+output SECONDARY_RESOURCE_GROUPS array = [for region in effectiveSecondaryRegions: 'rg-production-${region.id}']
+

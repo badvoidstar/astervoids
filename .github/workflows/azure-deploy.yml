@@ -154,7 +154,11 @@ jobs:
           SANITIZED_BRANCH="${{ steps.vars.outputs.sanitized_branch }}"
           
           if [ "$IS_PRODUCTION" = "true" ]; then
-            # Production: use azd up for full provision + deploy
+            # Production: use azd up for full provision + deploy to the primary region.
+            # Secondary regions (e.g. northeurope) are provisioned by the same Bicep template
+            # but azd's deploy step only targets the resource tagged `azd-service-name: web`
+            # (the primary). We fan out the image + Regions__* env vars to every region
+            # below in the "Sync multi-region container apps" step.
             azd up --no-prompt
           else
             # Branch: provision with azd, then deploy with az cli to specific container app
@@ -180,6 +184,8 @@ jobs:
               CD_NAME=$(azd env get-values | grep '^CUSTOM_DOMAIN_NAME=' | cut -d'=' -f2 | tr -d '"' || echo "")
               CD_SUB=$(azd env get-values | grep '^CUSTOM_SUBDOMAIN=' | cut -d'=' -f2 | tr -d '"' || echo "")
 
+              # Branch deploys are single-region by design (cheaper PR previews);
+              # pass an empty regions array so no secondary stacks are created.
               az deployment sub create \
                 --name "fallback-${SANITIZED_BRANCH}-${{ github.run_id }}" \
                 --location westus2 \
@@ -189,7 +195,8 @@ jobs:
                   location=westus2 \
                   useSharedInfra=true \
                   customDomainName="$CD_NAME" \
-                  customSubdomain="$CD_SUB"
+                  customSubdomain="$CD_SUB" \
+                  regions='[]'
 
               # Re-verify after the fallback deployment.
               if ! az containerapp show \
@@ -200,7 +207,7 @@ jobs:
                 exit 1
               fi
             fi
-
+            
             # Get the container registry name from azd outputs
             ACR_NAME=$(azd env get-values | grep '^AZURE_CONTAINER_REGISTRY_NAME=' | cut -d'=' -f2 | tr -d '"')
             ACR_LOGIN_SERVER=$(azd env get-values | grep '^AZURE_CONTAINER_REGISTRY_ENDPOINT=' | cut -d'=' -f2 | tr -d '"')
@@ -245,6 +252,94 @@ jobs:
           fi
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sync multi-region container apps (production only)
+        if: steps.vars.outputs.is_production == 'true'
+        run: |
+          # Reads the regional deployment plan from infra/main.parameters.json (single source
+          # of truth) and ensures every region runs the same image and has matching
+          # Regions__Self + Regions__All__* env vars so the SignalR session directory,
+          # `/api/srvmon/all` fan-out, and client-side RegionProbe all work cross-region.
+          #
+          # Scale-to-zero is preserved: minReplicas comes from the parameters file (0 for
+          # both regions today), and this step never touches the scale rules.
+          set -euo pipefail
+
+          REGIONS_JSON=$(jq -c '.parameters.regions.value' infra/main.parameters.json)
+          if [ -z "$REGIONS_JSON" ] || [ "$REGIONS_JSON" = "null" ]; then
+            echo "::error::Failed to read .parameters.regions.value from infra/main.parameters.json"
+            exit 1
+          fi
+          REGION_COUNT=$(echo "$REGIONS_JSON" | jq 'length')
+          echo "Configured regions: $REGION_COUNT"
+
+          if [ "$REGION_COUNT" -le 1 ]; then
+            echo "Single-region deployment; nothing to fan out."
+            exit 0
+          fi
+
+          # Pull the image that azd just deployed to the primary so secondary regions stay in lock-step.
+          PRIMARY_IMAGE=$(az containerapp show \
+            --name "${{ env.CONTAINER_APP_PREFIX }}-production" \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "Primary image: $PRIMARY_IMAGE"
+
+          # Build the shared Regions__All__N__* env var arg list once.
+          REGIONS_ENV_ARGS=()
+          IDX=0
+          while IFS= read -r REGION; do
+            ID=$(echo "$REGION" | jq -r '.id')
+            DISPLAY=$(echo "$REGION" | jq -r '.displayName')
+            IS_PRIMARY=$(echo "$REGION" | jq -r '.isPrimary // false')
+
+            if [ "$IS_PRIMARY" = "true" ]; then
+              APP="${{ env.CONTAINER_APP_PREFIX }}-production"
+              RG="${{ env.PRODUCTION_RG }}"
+            else
+              APP="${{ env.CONTAINER_APP_PREFIX }}-production-${ID}"
+              RG="${{ env.PRODUCTION_RG }}-${ID}"
+            fi
+
+            FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query properties.configuration.ingress.fqdn -o tsv)
+            if [ -z "$FQDN" ]; then
+              echo "::error::Could not resolve FQDN for container app '$APP' in '$RG'. Aborting multi-region sync."
+              exit 1
+            fi
+            URL="https://${FQDN}"
+
+            REGIONS_ENV_ARGS+=("Regions__All__${IDX}__Id=${ID}")
+            REGIONS_ENV_ARGS+=("Regions__All__${IDX}__DisplayName=${DISPLAY}")
+            REGIONS_ENV_ARGS+=("Regions__All__${IDX}__PublicUrl=${URL}")
+            IDX=$((IDX + 1))
+          done < <(echo "$REGIONS_JSON" | jq -c '.[]')
+
+          # Apply image + Regions__* env vars to every region's container app.
+          while IFS= read -r REGION; do
+            ID=$(echo "$REGION" | jq -r '.id')
+            IS_PRIMARY=$(echo "$REGION" | jq -r '.isPrimary // false')
+
+            if [ "$IS_PRIMARY" = "true" ]; then
+              APP="${{ env.CONTAINER_APP_PREFIX }}-production"
+              RG="${{ env.PRODUCTION_RG }}"
+              # azd already deployed the image to the primary; only env vars need updating.
+              echo "Updating env vars on primary container app: $APP"
+              az containerapp update \
+                --name "$APP" --resource-group "$RG" \
+                --set-env-vars "Regions__Self=${ID}" "${REGIONS_ENV_ARGS[@]}"
+            else
+              APP="${{ env.CONTAINER_APP_PREFIX }}-production-${ID}"
+              RG="${{ env.PRODUCTION_RG }}-${ID}"
+              echo "Deploying image + env vars to secondary container app: $APP ($RG)"
+              az containerapp update \
+                --name "$APP" --resource-group "$RG" \
+                --image "$PRIMARY_IMAGE" \
+                --set-env-vars "Regions__Self=${ID}" "${REGIONS_ENV_ARGS[@]}"
+            fi
+          done < <(echo "$REGIONS_JSON" | jq -c '.[]')
+
+          echo "Multi-region sync complete."
 
       - name: Configure Custom Domain (if enabled)
         if: env.CUSTOM_DOMAIN != ''
@@ -395,9 +490,30 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
             echo "**Environment:** production" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Regions:**" >> $GITHUB_STEP_SUMMARY
+            REGIONS_JSON=$(jq -c '.parameters.regions.value' infra/main.parameters.json)
+            while IFS= read -r REGION; do
+              ID=$(echo "$REGION" | jq -r '.id')
+              DISPLAY=$(echo "$REGION" | jq -r '.displayName')
+              IS_PRIMARY=$(echo "$REGION" | jq -r '.isPrimary // false')
+              if [ "$IS_PRIMARY" = "true" ]; then
+                APP="${{ env.CONTAINER_APP_PREFIX }}-production"
+                RG="${{ env.PRODUCTION_RG }}"
+                ROLE="primary"
+              else
+                APP="${{ env.CONTAINER_APP_PREFIX }}-production-${ID}"
+                RG="${{ env.PRODUCTION_RG }}-${ID}"
+                ROLE="secondary"
+              fi
+              FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+                --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || echo "(not provisioned)")
+              echo "- **${DISPLAY}** (\`${ID}\`, ${ROLE}): https://${FQDN}" >> $GITHUB_STEP_SUMMARY
+            done < <(echo "$REGIONS_JSON" | jq -c '.[]')
           else
             echo "**Environment:** preview (${{ steps.vars.outputs.branch_name }})" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Application URL:** ${{ steps.deploy.outputs.url }}" >> $GITHUB_STEP_SUMMARY
           if [ -n "$CUSTOM_DOMAIN" ]; then
             echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY

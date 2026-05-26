@@ -33,7 +33,8 @@ For testing on a real URL (e.g., mobile device testing, sharing with others), us
 
 ### First-Time Setup
 ```powershell
-# Set the Azure region
+# Set the Azure region (for local single-region `azd up` testing only;
+# production multi-region deploys use the `regions` array in infra/main.parameters.json)
 azd env set AZURE_LOCATION westus2
 
 # Provision infrastructure and deploy (takes ~3-4 minutes)
@@ -41,6 +42,13 @@ azd up
 ```
 
 This creates a resource group `rg-astervoids` with a Container Registry, Container Apps Environment, and Container App.
+
+> **Multi-region production deploys** (run by `.github/workflows/azure-deploy.yml` on push to `main`)
+> additionally provision `rg-production-northeurope` (Dublin) with its own Container Apps Environment
+> and Container App, both pulling from the primary `westus2` ACR. Both regions keep `minReplicas: 0`
+> so they scale to zero when there are no active SignalR connections. To change the regional
+> deployment plan, edit `infra/main.parameters.json` under the `regions` parameter — that file is the
+> single source of truth consumed by both Bicep and the GitHub Actions workflow.
 
 ### Subsequent Deploys
 ```powershell
