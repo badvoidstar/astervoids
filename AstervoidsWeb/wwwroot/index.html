@@ -7335,7 +7335,7 @@
             const full = c ? !c.canCreateSession : false;
             const option = document.createElement('option');
             option.value = r.id;
-            option.textContent = `${r.displayName} · RTT ${_formatRtt(r.rttMs)} · cap ${capText}${full ? ' (full)' : ''}`;
+            option.textContent = `${r.displayName} | RTT ${_formatRtt(r.rttMs)} | cap ${capText}${full ? ' (full)' : ''}`;
             select.appendChild(option);
         });
 

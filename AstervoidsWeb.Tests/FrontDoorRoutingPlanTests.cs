@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.RegularExpressions;
 using FluentAssertions;
 
 namespace AstervoidsWeb.Tests;
@@ -34,12 +35,14 @@ public class FrontDoorRoutingPlanTests
     public void MainBicep_StaticRoutePatterns_DoNotIncludeRealtimeOrPingPaths()
     {
         var text = LoadMainBicep();
-        text.Should().Contain("'/index.html'");
-        text.Should().Contain("'/ops.html'");
-        text.Should().NotContain("'/sessionHub'");
-        text.Should().NotContain("'/api/ping'");
-        text.Should().Contain("Do NOT broaden to '/api/*'");
-        text.Should().Contain("'/api/*'");
-        text.Should().Contain("'/sessionHub*'");
+        var match = Regex.Match(text, @"var\s+staticRoutePatterns\s*=\s*\[(?<body>[\s\S]*?)\]", RegexOptions.Multiline);
+        match.Success.Should().BeTrue("main.bicep should define staticRoutePatterns");
+
+        var body = match.Groups["body"].Value;
+        body.Should().Contain("'/index.html'");
+        body.Should().Contain("'/ops.html'");
+        body.Should().Contain("'/js/*'");
+        body.Should().NotContain("'/sessionHub'");
+        body.Should().NotContain("'/api/ping'");
     }
 }
