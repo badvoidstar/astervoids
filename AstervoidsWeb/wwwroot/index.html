@@ -411,6 +411,37 @@
             text-decoration: underline;
         }
 
+        #create-region-controls {
+            width: 100%;
+            margin-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        #create-region-controls label {
+            font-size: 10px;
+            color: #9ab;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        #create-region-select {
+            width: 100%;
+            background: #111;
+            border: 1px solid #444;
+            color: #ddd;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            padding: 6px;
+        }
+
+        #create-region-hint {
+            min-height: 14px;
+            font-size: 10px;
+            color: #7fbe7f;
+        }
+
         #picker-buttons {
             display: flex;
             flex-direction: column;
@@ -660,6 +691,11 @@
             <div id="session-picker">
                 <div id="picker-status" class="picker-status connecting">Connecting...</div>
                 <div id="session-list"></div>
+                <div id="create-region-controls">
+                    <label for="create-region-select">Create in region</label>
+                    <select id="create-region-select"></select>
+                    <div id="create-region-hint"></div>
+                </div>
                 <div id="picker-buttons">
                     <div class="button-row">
                         <button id="btn-leave-create" class="picker-btn" disabled>Create</button>
@@ -7211,6 +7247,8 @@
     const sessionPicker = {
         statusEl: document.getElementById('picker-status'),
         listEl: document.getElementById('session-list'),
+        createRegionSelect: document.getElementById('create-region-select'),
+        createRegionHintEl: document.getElementById('create-region-hint'),
         btnLeaveCreate: document.getElementById('btn-leave-create'),
         btnStartEnter: document.getElementById('btn-start-enter'),
         btnSolo: document.getElementById('btn-solo'),
@@ -7221,7 +7259,11 @@
         gameStarted: false,         // Whether the game has been started in current session
         maxSessions: 6,
         canCreate: false,
-        connected: false
+        connected: false,
+        connectedRegionId: null,
+        regionCapacityById: {},
+        selectedCreateRegionId: null,
+        createRegionOverridden: false
     };
 
     // Update status message
@@ -7247,6 +7289,104 @@
             ? RegionProbe.getRegionInterval(regionId)
             : 15000;
         return `EMA: ${ema} | Interval: ${_formatInterval(intervalMs)} | Health: ${_regionHealth(regionId)}`;
+    }
+
+    function getRegionPublicUrl(regionId) {
+        if (!_regionProbeAvailable() || typeof RegionProbe.getRegion !== 'function') return '';
+        const region = RegionProbe.getRegion(regionId);
+        return region?.publicUrl || '';
+    }
+
+    function applyRecommendedCreateRegion(regionId) {
+        if (!regionId || sessionPicker.createRegionOverridden) return;
+        sessionPicker.selectedCreateRegionId = regionId;
+        if (sessionPicker.createRegionSelect) {
+            sessionPicker.createRegionSelect.value = regionId;
+        }
+    }
+
+    function updateCreateRegionHint(selectedRegionId) {
+        if (!sessionPicker.createRegionHintEl) return;
+        const cap = sessionPicker.regionCapacityById[selectedRegionId];
+        if (!cap || !cap.capacity) {
+            sessionPicker.createRegionHintEl.textContent = 'Capacity unknown';
+            return;
+        }
+        const c = cap.capacity;
+        const full = !c.canCreateSession;
+        sessionPicker.createRegionHintEl.textContent = full
+            ? `Region full (${c.activeSessions}/${c.maxSessions})`
+            : `Capacity ${c.activeSessions}/${c.maxSessions}`;
+        sessionPicker.createRegionHintEl.style.color = full ? '#ff8888' : '#7fbe7f';
+    }
+
+    function renderCreateRegionPicker() {
+        if (!sessionPicker.createRegionSelect) return;
+        if (!_regionProbeAvailable()) return;
+        const regions = RegionProbe.getAllRegions();
+        const select = sessionPicker.createRegionSelect;
+        const previous = sessionPicker.selectedCreateRegionId;
+        select.innerHTML = '';
+
+        regions.forEach(r => {
+            const cap = sessionPicker.regionCapacityById[r.id];
+            const c = cap?.capacity;
+            const capText = c ? `${c.activeSessions}/${c.maxSessions}` : '?/?';
+            const full = c ? !c.canCreateSession : false;
+            const option = document.createElement('option');
+            option.value = r.id;
+            option.textContent = `${r.displayName} · RTT ${_formatRtt(r.rttMs)} · cap ${capText}${full ? ' (full)' : ''}`;
+            select.appendChild(option);
+        });
+
+        if (sessionPicker.selectedCreateRegionId && regions.some(r => r.id === sessionPicker.selectedCreateRegionId)) {
+            select.value = sessionPicker.selectedCreateRegionId;
+        } else if (previous && regions.some(r => r.id === previous)) {
+            select.value = previous;
+        } else if (regions.length > 0) {
+            select.value = regions[0].id;
+        }
+
+        sessionPicker.selectedCreateRegionId = select.value || null;
+        updateCreateRegionHint(sessionPicker.selectedCreateRegionId);
+    }
+
+    async function refreshRegionCapacity() {
+        try {
+            const response = await fetch('/api/capacity/all', { cache: 'no-store' });
+            if (!response.ok) throw new Error(`/api/capacity/all returned ${response.status}`);
+            const payload = await response.json();
+            const map = {};
+            for (const region of (payload.regions || [])) {
+                map[region.id] = region;
+            }
+            sessionPicker.regionCapacityById = map;
+            renderCreateRegionPicker();
+        } catch (err) {
+            _warn('Failed to refresh region capacity:', err);
+        }
+    }
+
+    async function refreshDefaultCreateRegion() {
+        if (sessionPicker.createRegionOverridden) return;
+        if (!_regionProbeAvailable()) return;
+        try {
+            const rttMsByRegion = {};
+            for (const r of RegionProbe.getAllRegions()) {
+                rttMsByRegion[r.id] = r.rttMs;
+            }
+            const response = await fetch('/api/regions/recommend', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rttMsByRegion, preferredRegionId: null })
+            });
+            if (!response.ok) throw new Error(`/api/regions/recommend returned ${response.status}`);
+            const payload = await response.json();
+            applyRecommendedCreateRegion(payload.regionId);
+            updateCreateRegionHint(sessionPicker.selectedCreateRegionId);
+        } catch (err) {
+            _warn('Failed to compute default create region:', err);
+        }
     }
 
     function renderSessionList() {
@@ -7327,6 +7467,7 @@
     function selectSession(sessionId) {
         sessionPicker.selectedSessionId = sessionId;
         renderSessionList();
+        renderCreateRegionPicker();
         updatePickerButtons();
     }
 
@@ -7347,11 +7488,17 @@
             fresh.addEventListener('click', handleLeaveCreateButton);
         } else {
             // Not in a session - show Create
+            const selectedCap = sessionPicker.selectedCreateRegionId
+                ? sessionPicker.regionCapacityById[sessionPicker.selectedCreateRegionId]?.capacity
+                : null;
+            const selectedRegionCanCreate = selectedCap ? selectedCap.canCreateSession : canCreate;
             btnLeaveCreate.textContent = 'Create';
-            btnLeaveCreate.disabled = !connected || !canCreate;
+            btnLeaveCreate.disabled = !connected || !selectedRegionCanCreate;
             btnLeaveCreate.className = 'picker-btn';
-            if (!canCreate && connected) {
-                btnLeaveCreate.title = 'Maximum sessions reached';
+            if (!selectedRegionCanCreate && connected) {
+                btnLeaveCreate.title = selectedCap
+                    ? `Selected region full (${selectedCap.activeSessions}/${selectedCap.maxSessions})`
+                    : 'Maximum sessions reached';
             } else {
                 btnLeaveCreate.title = '';
             }
@@ -7419,6 +7566,8 @@
         try {
             const result = await SessionClient.getActiveSessions();
             updateSessionList(result);
+            await refreshRegionCapacity();
+            await refreshDefaultCreateRegion();
         } catch (err) {
             _error('Failed to refresh sessions:', err);
             setPickerStatus('Failed to load sessions', 'error');
@@ -7426,11 +7575,12 @@
     }
 
     // Connect to session hub
-    async function connectToSessionHub(force = false) {
+    async function connectToSessionHub(force = false, targetRegionId = null) {
         setPickerStatus('Connecting...', 'connecting');
 
         try {
-            const success = await SessionClient.connect(force);
+            const hubBaseUrl = targetRegionId ? getRegionPublicUrl(targetRegionId) : null;
+            const success = await SessionClient.connect(force, hubBaseUrl);
             if (success) {
                 // Initialize ObjectSync after connection
                 ObjectSync.init();
@@ -7668,12 +7818,14 @@
                 });
                 
                 sessionPicker.connected = true;
+                sessionPicker.connectedRegionId = targetRegionId || sessionPicker.connectedRegionId || (RegionProbe?.getSelfId?.() || null);
                 // Start the NTP-style clock-offset estimator now that the
                 // hub is reachable. Idempotent — visibility-driven re-bootstraps
                 // happen automatically inside the loop.
                 RemoteObjects.startClockSync();
                 await refreshSessionList();
                 // No polling - we rely on SignalR push notifications
+                return true;
             } else {
                 throw new Error('Connection failed');
             }
@@ -7682,6 +7834,7 @@
             setPickerStatus('Offline - Solo play only', 'error');
             sessionPicker.connected = false;
             updatePickerButtons();
+            return false;
         }
     }
 
@@ -7748,6 +7901,23 @@
                 sessionPicker.currentSessionId = null;
             }
 
+            const targetRegionId = sessionPicker.selectedCreateRegionId
+                || (RegionProbe?.getSelfId?.() || 'local');
+            const targetCapacity = sessionPicker.regionCapacityById[targetRegionId]?.capacity;
+            if (targetCapacity && !targetCapacity.canCreateSession) {
+                setPickerStatus(`Cannot create in ${targetRegionId}: region at capacity`, 'error');
+                await refreshSessionList();
+                return;
+            }
+
+            if (targetRegionId && sessionPicker.connectedRegionId !== targetRegionId) {
+                const connected = await connectToSessionHub(true, targetRegionId);
+                if (!connected) {
+                    setPickerStatus(`Failed to connect to ${targetRegionId}`, 'error');
+                    return;
+                }
+            }
+
             // Capture the current aspect ratio at the moment of session creation
             const currentAspectRatio = canvas.width / canvas.height;
             const result = await SessionClient.createSession({
@@ -7764,7 +7934,8 @@
                     name: result.session.name,
                     memberId: result.member.id,
                     role: result.member.role,
-                    metadata: result.session.metadata
+                    metadata: result.session.metadata,
+                    regionId: result.session.regionId || targetRegionId
                 };
                 adoptSessionConfig(result.session.metadata);
                 sessionPicker.currentSessionId = result.session.id;
@@ -7981,6 +8152,11 @@
     sessionPicker.btnLeaveCreate.addEventListener('click', handleLeaveCreateButton);
     sessionPicker.btnStartEnter.addEventListener('click', handleStartEnterButton);
     sessionPicker.btnSolo.addEventListener('click', handleSoloPlay);
+    sessionPicker.createRegionSelect?.addEventListener('change', (e) => {
+        sessionPicker.createRegionOverridden = true;
+        sessionPicker.selectedCreateRegionId = e.target.value;
+        updateCreateRegionHint(sessionPicker.selectedCreateRegionId);
+    });
 
     // Keyboard navigation for session picker (only when start screen is visible)
     document.addEventListener('keydown', (e) => {
@@ -8518,6 +8694,8 @@
                 ? payload.changedRegionIds
                 : (payload.regionId ? [payload.regionId] : []);
             ids.forEach(updatePickerRttColumn);
+            renderCreateRegionPicker();
+            refreshDefaultCreateRegion();
         });
         RegionProbe.on('unhealthy', (regionId) => updatePickerRttColumn(regionId));
     }

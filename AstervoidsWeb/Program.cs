@@ -174,6 +174,123 @@ app.MapGet("/api/regions", (IOptions<RegionsOptions> regions) =>
         })
     }));
 
+app.MapGet("/api/capacity", (ISessionService sessionService, IOptions<RegionsOptions> regions) =>
+{
+    var local = sessionService.GetActiveSessions();
+    return Results.Ok(new RegionCapacitySnapshot(
+        RegionId: regions.Value.Self,
+        ActiveSessions: local.Sessions.Count(),
+        MaxSessions: local.MaxSessions,
+        CanCreateSession: local.CanCreateSession));
+});
+
+app.MapGet("/api/capacity/all", async (
+    ISessionService sessionService,
+    IOptions<RegionsOptions> regionsOptions,
+    IHttpClientFactory httpClientFactory,
+    CancellationToken cancellationToken) =>
+{
+    var regions = regionsOptions.Value.All
+        .GroupBy(r => r.Id, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.First())
+        .ToList();
+    if (!regions.Any(r => string.Equals(r.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase)))
+    {
+        regions.Insert(0, new RegionEntry
+        {
+            Id = regionsOptions.Value.Self,
+            DisplayName = regionsOptions.Value.Self,
+            PublicUrl = ""
+        });
+    }
+
+    var local = sessionService.GetActiveSessions();
+    var localSnapshot = new RegionCapacitySnapshot(
+        RegionId: regionsOptions.Value.Self,
+        ActiveSessions: local.Sessions.Count(),
+        MaxSessions: local.MaxSessions,
+        CanCreateSession: local.CanCreateSession);
+    var fanoutClient = httpClientFactory.CreateClient("SrvmonFanout");
+
+    var tasks = regions.Select(async region =>
+    {
+        if (string.Equals(region.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase))
+        {
+            return new RegionCapacityRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: true,
+                Error: null,
+                Capacity: localSnapshot);
+        }
+
+        return await RegionCapacityFanout.QueryRemoteCapacityAsync(region, fanoutClient, cancellationToken);
+    });
+
+    return Results.Ok(new RegionCapacityAllResponse((await Task.WhenAll(tasks)).ToList()));
+});
+
+app.MapPost("/api/regions/recommend", async (
+    RegionRecommendationRequest request,
+    ISessionService sessionService,
+    IOptions<RegionsOptions> regionsOptions,
+    IHttpClientFactory httpClientFactory,
+    CancellationToken cancellationToken) =>
+{
+    var regions = regionsOptions.Value.All
+        .GroupBy(r => r.Id, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.First())
+        .ToList();
+    if (!regions.Any())
+    {
+        return Results.Ok(new RegionRecommendationResponse(regionsOptions.Value.Self));
+    }
+
+    var local = sessionService.GetActiveSessions();
+    var localSnapshot = new RegionCapacitySnapshot(
+        RegionId: regionsOptions.Value.Self,
+        ActiveSessions: local.Sessions.Count(),
+        MaxSessions: local.MaxSessions,
+        CanCreateSession: local.CanCreateSession);
+    var fanoutClient = httpClientFactory.CreateClient("SrvmonFanout");
+
+    var tasks = regions.Select(async region =>
+    {
+        if (string.Equals(region.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase))
+        {
+            return new RegionCapacityRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: true,
+                Error: null,
+                Capacity: localSnapshot);
+        }
+
+        return await RegionCapacityFanout.QueryRemoteCapacityAsync(region, fanoutClient, cancellationToken);
+    });
+
+    var capacities = await Task.WhenAll(tasks);
+    var capacityByRegion = capacities
+        .Where(c => c.Capacity is not null)
+        .ToDictionary(c => c.Id, c => c.Capacity!, StringComparer.OrdinalIgnoreCase);
+
+    var candidates = regions.Select(r =>
+    {
+        var rtt = request.RttMsByRegion.TryGetValue(r.Id, out var value) ? value : null;
+        var canCreate = capacityByRegion.TryGetValue(r.Id, out var cap) && cap.CanCreateSession;
+        return new RegionSelectionCandidate(r.Id, rtt, canCreate);
+    });
+
+    var selected = RegionSelectionService.SelectBestRegion(
+        candidates,
+        preferredRegionId: request.PreferredRegionId,
+        fallbackRegionId: regionsOptions.Value.Self);
+
+    return Results.Ok(new RegionRecommendationResponse(selected));
+});
+
 // Server monitoring metrics API endpoint
 app.MapGet("/api/srvmon", (ServerMetricsService metrics, ISessionService sessionService) =>
     Results.Ok(metrics.GetSnapshot(sessionService)));
@@ -194,7 +311,10 @@ app.MapGet("/api/srvmon/all", async (
     if (SrvmonAllDebounce.Cache.TryGetValue(cacheKey, out SrvmonAllResponse? cached) && cached is not null)
         return Results.Ok(cached);
 
-    var regions = regionsOptions.Value.All.ToList();
+    var regions = regionsOptions.Value.All
+        .GroupBy(r => r.Id, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.First())
+        .ToList();
     if (!regions.Any(r => string.Equals(r.Id, regionsOptions.Value.Self, StringComparison.OrdinalIgnoreCase)))
     {
         regions.Insert(0, new RegionEntry
@@ -255,6 +375,31 @@ public record SrvmonRegionEntry(
     ServerMetricsSnapshot? Metrics
 );
 
+public record RegionCapacitySnapshot(
+    string RegionId,
+    int ActiveSessions,
+    int MaxSessions,
+    bool CanCreateSession
+);
+
+public record RegionCapacityAllResponse(List<RegionCapacityRegionEntry> Regions);
+
+public record RegionCapacityRegionEntry(
+    string Id,
+    string DisplayName,
+    string PublicUrl,
+    bool Ok,
+    string? Error,
+    RegionCapacitySnapshot? Capacity
+);
+
+public record RegionRecommendationRequest(
+    Dictionary<string, double?> RttMsByRegion,
+    string? PreferredRegionId
+);
+
+public record RegionRecommendationResponse(string RegionId);
+
 internal static class SrvmonFanout
 {
     internal const int TimeoutMs = 1500;
@@ -287,6 +432,7 @@ internal static class SrvmonFanout
                 Error: null,
                 Metrics: metrics);
         }
+
         catch (Exception ex)
         {
             return new SrvmonRegionEntry(
@@ -296,6 +442,49 @@ internal static class SrvmonFanout
                 Ok: false,
                 Error: ex.Message,
                 Metrics: null);
+        }
+    }
+}
+
+internal static class RegionCapacityFanout
+{
+    internal const int TimeoutMs = 1500;
+
+    internal static async Task<RegionCapacityRegionEntry> QueryRemoteCapacityAsync(
+        RegionEntry region,
+        HttpClient httpClient,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(region.PublicUrl))
+                throw new InvalidOperationException("Region has no publicUrl configured");
+
+            var baseUri = region.PublicUrl.EndsWith('/') ? region.PublicUrl : $"{region.PublicUrl}/";
+            var uri = new Uri(new Uri(baseUri, UriKind.Absolute), "api/capacity");
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(TimeoutMs));
+
+            var payload = await httpClient.GetFromJsonAsync<RegionCapacitySnapshot>(uri, timeoutCts.Token)
+                ?? throw new InvalidOperationException("Empty capacity payload");
+
+            return new RegionCapacityRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: true,
+                Error: null,
+                Capacity: payload);
+        }
+        catch (Exception ex)
+        {
+            return new RegionCapacityRegionEntry(
+                Id: region.Id,
+                DisplayName: region.DisplayName,
+                PublicUrl: region.PublicUrl,
+                Ok: false,
+                Error: ex.Message,
+                Capacity: null);
         }
     }
 }

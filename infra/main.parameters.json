@@ -17,6 +17,9 @@
     "useSharedInfra": {
       "value": "${USE_SHARED_INFRA=false}"
     },
+    "enableFrontDoorStaticOnly": {
+      "value": "${ENABLE_FRONT_DOOR_STATIC_ONLY=false}"
+    },
     "regions": {
       "value": [
         {

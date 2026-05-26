@@ -324,6 +324,19 @@ const RegionProbe = (() => {
         return r ? r.displayName : regionId;
     }
 
+    function getRegion(regionId) {
+        const region = _regions.find(r => r.id === regionId);
+        if (!region) return null;
+        return {
+            id: region.id,
+            displayName: region.displayName,
+            publicUrl: region.publicUrl,
+            rttMs: getRtt(region.id),
+            intervalMs: (_rttMap[region.id] && _rttMap[region.id].currentIntervalMs) || DEFAULT_INTERVAL_MS,
+            health: getRegionHealth(region.id)
+        };
+    }
+
     function getRegionHealth(regionId) {
         const state = _rttMap[regionId];
         return state ? state.health : 'unknown';
@@ -342,6 +355,7 @@ const RegionProbe = (() => {
         getSelfId,
         getAllRegions,
         getBestRegion,
+        getRegion,
         getDisplayName,
         getRegionHealth,
         getRegionInterval
