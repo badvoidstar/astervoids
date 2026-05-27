@@ -24,10 +24,39 @@ param customSubdomain string = ''
 @description('Use shared production infrastructure (for CI/CD branch deployments). When false, creates standalone infra.')
 param useSharedInfra bool = false
 
+@description('''
+Multi-region production deployment manifest. Each entry creates its own
+Container Apps Environment + Container App in `rg-production`, plus stamps
+the running container with `Region__Id` / `Region__DisplayName` env vars
+so the picker can serve the correct manifest.
+
+Entry shape:
+  {
+    name: 'westus2'              // stable id; used as Region__Id and as the resource-name suffix
+    location: 'westus2'          // Azure region (CAE is region-bound)
+    displayName: 'US West'       // shown to the user in the picker
+  }
+
+When the array is empty (default), the legacy single-region production path
+runs — backward-compatible with existing deployments. When the array is
+non-empty, the FIRST entry is treated as the "primary" region (it owns the
+shared ACR + DNS zone) and any branch deployments target its CAE.
+
+Only applied when isProduction; branch and standalone deployments stay
+single-region for cost reasons.
+''')
+param regions array = []
+
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
 var isStandalone = !isProduction && !useSharedInfra
+
+// Multi-region opt-in: production-only and only when the caller passed a
+// non-empty regions array. When false, the legacy single-region production
+// blocks below execute unchanged.
+var isMultiRegion = isProduction && length(regions) > 0
+var primaryRegion = isMultiRegion ? regions[0] : { name: '', location: location, displayName: '' }
 
 // For branch deployments, use production's shared infrastructure
 var sharedResourceGroupName = 'rg-production'
@@ -36,7 +65,12 @@ var sharedResourceGroupName = 'rg-production'
 var containerRegistryName = isStandalone
   ? 'cr${environmentName}${uniqueString(subscription().subscriptionId, 'rg-${environmentName}')}'
   : 'crproduction${uniqueString(subscription().subscriptionId, sharedResourceGroupName)}'
-var containerAppsEnvironmentName = isStandalone ? 'cae-${environmentName}' : 'cae-production'
+// Multi-region: the legacy single CAE is replaced by per-region CAEs named
+// cae-production-<regionName>. Branches target the primary region's CAE so
+// existing branch deploy flows still find a valid environment.
+var containerAppsEnvironmentName = isStandalone
+  ? 'cae-${environmentName}'
+  : (isMultiRegion ? 'cae-production-${primaryRegion.name}' : 'cae-production')
 
 // Determine if custom domain should be configured
 var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
@@ -58,8 +92,9 @@ resource productionRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isPr
   tags: tags
 }
 
+// ── Single-region production (legacy path; runs when regions array is empty) ──
 // Container Apps Environment with Azure Container Registry (production only)
-module containerAppsProduction 'core/host/container-apps.bicep' = if (isProduction) {
+module containerAppsProduction 'core/host/container-apps.bicep' = if (isProduction && !isMultiRegion) {
   name: 'container-apps'
   scope: productionRg
   params: {
@@ -71,7 +106,7 @@ module containerAppsProduction 'core/host/container-apps.bicep' = if (isProducti
 }
 
 // Production Container App
-module webProduction 'core/host/container-app.bicep' = if (isProduction) {
+module webProduction 'core/host/container-app.bicep' = if (isProduction && !isMultiRegion) {
   name: 'web-production'
   scope: productionRg
   params: {
@@ -90,6 +125,52 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction) {
   dependsOn: [containerAppsProduction]
 }
 
+// ── Multi-region production (runs when regions array is non-empty) ──
+// One Container Apps Environment per region, all sharing a single ACR
+// created by the primary region's CAE module (createRegistry=true on index 0,
+// false on all others). Region__Id / Region__DisplayName env vars are
+// stamped onto each container app so /api/regions answers correctly per region.
+
+@batchSize(1)
+module containerAppsRegional 'core/host/container-apps.bicep' = [for (r, i) in (isMultiRegion ? regions : []): {
+  name: 'container-apps-${r.name}'
+  scope: productionRg
+  params: {
+    name: 'cae-production-${r.name}'
+    location: r.location
+    tags: union(tags, { 'astervoids-region': r.name })
+    containerRegistryName: containerRegistryName
+    // Only the first (primary) region creates the ACR; all subsequent
+    // regions reference it via @existing. This avoids creating N registries
+    // and keeps image pulls going through a single source of truth.
+    createRegistry: i == 0
+  }
+}]
+
+@batchSize(1)
+module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegion ? regions : []): {
+  name: 'web-production-${r.name}'
+  scope: productionRg
+  params: {
+    name: 'ca-web-production-${r.name}'
+    location: r.location
+    // Each region's container app is its own azd service so `azd deploy`
+    // (and CI's per-region update step) target the right resource.
+    tags: union(tags, { 'azd-service-name': 'web-${r.name}', 'astervoids-region': r.name })
+    containerAppsEnvironmentName: 'cae-production-${r.name}'
+    containerRegistryName: containerRegistryName
+    imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
+    targetPort: 8080
+    external: true
+    minReplicas: 0
+    maxReplicas: 1
+    customDomainName: ''
+    regionId: r.name
+    regionDisplayName: r.?displayName ?? r.name
+  }
+  dependsOn: [containerAppsRegional]
+}]
+
 // DNS Zone for custom domain (production only)
 module dnsZone 'core/dns/dns-zone.bicep' = if (isProduction && useCustomDomain) {
   name: 'dns-zone'
@@ -100,8 +181,9 @@ module dnsZone 'core/dns/dns-zone.bicep' = if (isProduction && useCustomDomain) 
   }
 }
 
-// DNS records for production custom domain
-module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && useCustomDomain) {
+// DNS records for production custom domain (single-region only; multi-region
+// custom-domain CNAMEs are managed per region by Phase 2 traffic-manager work).
+module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !isMultiRegion && useCustomDomain) {
   name: 'dns-records-production'
   scope: productionRg
   params: {
@@ -111,6 +193,33 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && u
     verificationToken: webProduction.outputs.verificationId
   }
   dependsOn: [dnsZone]
+}
+
+// ── Traffic Manager apex routing (multi-region production only) ──────────────
+// Profile FQDN: <profileName>.trafficmanager.net. The apex custom domain (if
+// configured) CNAMEs to this profile so a first-time visitor hits their nearest
+// region. After load, the client takes over via per-region hostnames.
+//
+// `relativeName` must be globally unique within trafficmanager.net — using a
+// uniqueString suffix keyed on the subscription + 'astervoids' avoids
+// collisions when multiple subscriptions deploy the same template.
+var trafficManagerRelativeName = 'astervoids-${uniqueString(subscription().subscriptionId, 'astervoids-tm')}'
+
+#disable-next-line BCP318
+module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) {
+  name: 'traffic-manager'
+  scope: productionRg
+  params: {
+    name: trafficManagerRelativeName
+    relativeName: trafficManagerRelativeName
+    tags: tags
+    endpoints: [for (r, i) in (isMultiRegion ? regions : []): {
+      name: r.name
+      target: webRegional[i].outputs.fqdn
+      endpointLocation: r.location
+    }]
+  }
+  dependsOn: [webRegional]
 }
 
 // ============================================================================
@@ -200,12 +309,26 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
 // OUTPUTS
 // ============================================================================
 
-// Common web app output expressions (DRY: each conditional module output is referenced once)
-var webUri = isProduction ? webProduction.outputs.uri : (isStandalone ? webStandalone.outputs.uri : webBranch.outputs.uri)
-var webName = isProduction ? webProduction.outputs.name : (isStandalone ? webStandalone.outputs.name : webBranch.outputs.name)
-var webVerificationId = isProduction ? webProduction.outputs.verificationId : (isStandalone ? webStandalone.outputs.verificationId : webBranch.outputs.verificationId)
+// Common web app output expressions (DRY: each conditional module output is referenced once).
+// In multi-region production, the "primary" deployment is index 0 of the regions
+// array — that's what azd / CI tooling reports as the canonical WEB_URI.
+#disable-next-line BCP318
+var webUri = isProduction
+  ? (isMultiRegion ? webRegional[0].outputs.uri : webProduction.outputs.uri)
+  : (isStandalone ? webStandalone.outputs.uri : webBranch.outputs.uri)
+#disable-next-line BCP318
+var webName = isProduction
+  ? (isMultiRegion ? webRegional[0].outputs.name : webProduction.outputs.name)
+  : (isStandalone ? webStandalone.outputs.name : webBranch.outputs.name)
+#disable-next-line BCP318
+var webVerificationId = isProduction
+  ? (isMultiRegion ? webRegional[0].outputs.verificationId : webProduction.outputs.verificationId)
+  : (isStandalone ? webStandalone.outputs.verificationId : webBranch.outputs.verificationId)
 
-output AZURE_CONTAINER_REGISTRY_ENDPOINT string = isProduction ? containerAppsProduction.outputs.registryLoginServer : (isStandalone ? containerAppsStandalone.outputs.registryLoginServer : '${containerRegistryName}.azurecr.io')
+#disable-next-line BCP318
+output AZURE_CONTAINER_REGISTRY_ENDPOINT string = isProduction
+  ? (isMultiRegion ? containerAppsRegional[0].outputs.registryLoginServer : containerAppsProduction.outputs.registryLoginServer)
+  : (isStandalone ? containerAppsStandalone.outputs.registryLoginServer : '${containerRegistryName}.azurecr.io')
 output AZURE_CONTAINER_REGISTRY_NAME string = containerRegistryName
 output WEB_URI string = webUri
 output WEB_AZURE_URI string = webUri
@@ -216,3 +339,22 @@ output CONTAINER_APPS_ENVIRONMENT string = containerAppsEnvironmentName
 output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? 'rg-${environmentName}' : sharedResourceGroupName)
 output CUSTOM_DOMAIN string = fullCustomDomain
 output DOMAIN_VERIFICATION_ID string = webVerificationId
+
+// Multi-region outputs: one entry per region with everything CI/CD needs to
+// push an image and configure DNS. Empty array in single-region mode so
+// downstream tooling can detect "is this a multi-region deploy?" by checking
+// `length(REGION_ENDPOINTS) > 0`.
+#disable-next-line BCP318
+output REGION_ENDPOINTS array = [for (r, i) in (isMultiRegion ? regions : []): {
+  id: r.name
+  displayName: r.?displayName ?? r.name
+  location: r.location
+  containerAppName: webRegional[i].outputs.name
+  fqdn: webRegional[i].outputs.fqdn
+  uri: webRegional[i].outputs.uri
+  verificationId: webRegional[i].outputs.verificationId
+}]
+
+@description('FQDN of the multi-region Traffic Manager profile (CNAME the apex domain here). Empty string when single-region.')
+#disable-next-line BCP318
+output TRAFFIC_MANAGER_FQDN string = isMultiRegion ? trafficManager.outputs.fqdn : ''

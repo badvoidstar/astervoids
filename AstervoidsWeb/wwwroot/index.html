@@ -351,6 +351,125 @@
             color: #ff4444;
         }
 
+        /* ── Regional picker columns ──────────────────────────────────────
+           Phase 1 region awareness: every session row carries a Region label
+           and a live RTT (Ping) cell. The cells use rem units so they scale
+           on mobile zoom. Sort transitions use transform/translateY so a row
+           never instantly moves out from under a finger about to tap on touch.
+           See plan.md → Phase 1 / Picker UI. */
+        .session-item {
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto;
+            gap: 8px;
+            align-items: center;
+            transition: background 0.15s, transform 0.18s ease-out;
+        }
+        .session-item .session-region {
+            font-size: 9px;
+            color: #aac;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .session-item .session-ping {
+            font-size: 10px;
+            color: #aaa;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+            justify-content: flex-end;
+            min-width: 5rem;
+        }
+        .session-item .session-ping.good   { color: #6fce6f; }
+        .session-item .session-ping.ok     { color: #d5d557; }
+        .session-item .session-ping.bad    { color: #ff6464; }
+        .session-item .session-ping.warming { color: #888; font-style: italic; }
+        .session-stale {
+            display: inline-block;
+            margin-left: 4px;
+            font-size: 11px;
+            color: #d5d557;
+            opacity: 0.8;
+            animation: stale-spin 2s linear infinite;
+            transform-origin: center center;
+        }
+        @keyframes stale-spin {
+            from { transform: rotate(0deg); }
+            to   { transform: rotate(360deg); }
+        }
+        /* 4-segment confidence bar — visibly fills as RegionService accumulates
+           samples so the user perceives the value as converging then settling. */
+        .ping-confidence {
+            display: inline-flex;
+            gap: 1px;
+            margin-left: 2px;
+            vertical-align: middle;
+        }
+        .ping-confidence span {
+            display: inline-block;
+            width: 3px;
+            height: 8px;
+            background: #444;
+        }
+        .ping-confidence span.lit { background: currentColor; }
+
+        /* "Your region" banner above the session list. Truncates with
+           ellipsis on narrow viewports so it never wraps and pushes the
+           list off-screen. */
+        #region-banner {
+            width: 100%;
+            font-size: 11px;
+            color: #b8d4ff;
+            background: rgba(60, 90, 140, 0.18);
+            border: 1px solid rgba(120, 160, 220, 0.35);
+            border-radius: 4px;
+            padding: 6px 10px;
+            margin-bottom: 10px;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Region selector for Create. Native <select> so mobile gets the
+           OS-native wheel/sheet — best touch UX possible and zero JS to
+           build a custom dropdown. 44px min-height is the WCAG 2.5.5 /
+           Apple HIG minimum tap target. The selector lives in its own
+           row above the Create button on touch viewports; the surrounding
+           layout already accommodates a vertical stack so there's no
+           desktop-vs-mobile branching at the markup level. */
+        .region-select-row {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .region-select-row label {
+            font-size: 10px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            white-space: nowrap;
+        }
+        #create-region-select {
+            flex: 1;
+            min-height: 44px;
+            background: transparent;
+            border: 1px solid #555;
+            color: #fff;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        #create-region-select:disabled {
+            opacity: 0.5;
+        }
+
         #picker-buttons {
             display: flex;
             flex-direction: column;
@@ -599,8 +718,13 @@
             <h1>ASTERVOIDS</h1>
             <div id="session-picker">
                 <div id="picker-status" class="picker-status connecting">Connecting...</div>
+                <div id="region-banner" style="display: none;"></div>
                 <div id="session-list"></div>
                 <div id="picker-buttons">
+                    <div class="region-select-row" id="create-region-row" style="display: none;">
+                        <label for="create-region-select">Region:</label>
+                        <select id="create-region-select"></select>
+                    </div>
                     <div class="button-row">
                         <button id="btn-leave-create" class="picker-btn" disabled>Create</button>
                         <button id="btn-start-enter" class="picker-btn action" style="display: none;">Start</button>
@@ -651,6 +775,10 @@
     <script src="/js/sync-payload.js"></script>
     <!-- Debug toggle — set to true in browser console: window.ASTERVOIDS_DEBUG = true -->
     <script>window.ASTERVOIDS_DEBUG = false;</script>
+    <!-- Region service — discovers peer regions and measures RTT for the session picker -->
+    <script src="/js/region-service.js"></script>
+    <!-- Spectator client — multi-region SignalR for cross-region session-list updates -->
+    <script src="/js/spectator-client.js"></script>
     <!-- Session client module -->
     <script src="/js/session-client.js"></script>
     <!-- Object sync module -->
@@ -7148,6 +7276,9 @@
     const sessionPicker = {
         statusEl: document.getElementById('picker-status'),
         listEl: document.getElementById('session-list'),
+        regionBannerEl: document.getElementById('region-banner'),
+        createRegionRowEl: document.getElementById('create-region-row'),
+        createRegionSelectEl: document.getElementById('create-region-select'),
         btnLeaveCreate: document.getElementById('btn-leave-create'),
         btnStartEnter: document.getElementById('btn-start-enter'),
         btnSolo: document.getElementById('btn-solo'),
@@ -7158,13 +7289,61 @@
         gameStarted: false,         // Whether the game has been started in current session
         maxSessions: 6,
         canCreate: false,
-        connected: false
+        connected: false,
+        // Regional state (Phase 1 region awareness). selectedCreateRegion is sticky
+        // within a picker session — once the user explicitly chooses a region from
+        // the dropdown, subsequent bestRegion() changes don't override it.
+        regions: [],
+        rttByRegion: {},
+        selectedCreateRegion: null,
+        userOverrodeCreateRegion: false
     };
 
     // Update status message
     function setPickerStatus(message, type = '') {
         sessionPicker.statusEl.textContent = message;
         sessionPicker.statusEl.className = 'picker-status' + (type ? ' ' + type : '');
+    }
+
+    // ── Regional picker helpers ─────────────────────────────────────────────
+    // RegionService is loaded as a separate module (region-service.js). Picker
+    // code accesses it through `window.RegionService` so that environments
+    // without it (e.g. test pages that don't load the region script) degrade
+    // gracefully — RTT cells render as "Warming up…" forever, but every other
+    // picker function still works. This is the same lazy-init pattern used
+    // for SchemaCodec in ObjectSync init.
+
+    function rttClassFor(state, valueMs) {
+        if (state === 'warming' || valueMs == null) return 'warming';
+        if (valueMs < 80) return 'good';
+        if (valueMs < 200) return 'ok';
+        return 'bad';
+    }
+
+    function renderConfidenceBar(confidence) {
+        // 4-segment bar; integer ceil so a single sample already lights one segment.
+        const lit = Math.max(0, Math.min(4, Math.ceil((confidence || 0) * 4)));
+        let html = '<span class="ping-confidence" aria-hidden="true">';
+        for (let i = 0; i < 4; i++) {
+            html += `<span class="${i < lit ? 'lit' : ''}"></span>`;
+        }
+        html += '</span>';
+        return html;
+    }
+
+    function regionDisplayName(regionId) {
+        const r = sessionPicker.regions.find(r => r.id === regionId);
+        return r ? r.displayName : regionId || '—';
+    }
+
+    function pingForRegion(regionId) {
+        // RegionService.getRtt always returns a populated object; if RegionService
+        // isn't loaded, fall back to a synthetic warming state so the row still renders.
+        if (!regionId) return { state: 'warming', valueMs: null, confidence: 0 };
+        if (window.RegionService) {
+            return window.RegionService.getRtt(regionId);
+        }
+        return sessionPicker.rttByRegion[regionId] ?? { state: 'warming', valueMs: null, confidence: 0 };
     }
 
     // Render session list
@@ -7176,26 +7355,160 @@
             return; // CSS :empty will show "No sessions available"
         }
 
-        sessions.forEach(session => {
+        // Stable sort: warming rows last, then by EMA RTT ascending. Confidence
+        // breaks ties so a fully-settled value isn't bumped by a freshly-measured
+        // near-tie that hasn't converged yet.
+        const sortedSessions = sessions.slice().sort((a, b) => {
+            const pa = pingForRegion(a.regionId);
+            const pb = pingForRegion(b.regionId);
+            const aWarm = pa.state === 'warming' || pa.valueMs == null;
+            const bWarm = pb.state === 'warming' || pb.valueMs == null;
+            if (aWarm !== bWarm) return aWarm ? 1 : -1;
+            if (aWarm && bWarm) return 0;
+            return (pa.valueMs - pb.valueMs) || (pb.confidence - pa.confidence);
+        });
+
+        sortedSessions.forEach(session => {
             const isFull = session.memberCount >= session.maxMembers;
             const isCurrent = session.id === currentSessionId;
             const isClickable = !isFull && !isCurrent;
-            
+
             const item = document.createElement('div');
-            item.className = 'session-item' + 
+            item.className = 'session-item' +
                 (isCurrent ? ' current' : '') +
                 (isFull && !isCurrent ? ' disabled' : '') +
                 (isCurrent ? ' disabled' : ''); // Can't click own session
             item.dataset.sessionId = session.id;
+            item.dataset.regionId = session.regionId || '';
+
+            const ping = pingForRegion(session.regionId);
+            const pingClass = rttClassFor(ping.state, ping.valueMs);
+            const pingText = ping.state === 'warming' || ping.valueMs == null
+                ? '🔥 Warming…'
+                : `${Math.round(ping.valueMs)} ms`;
+            const pingTitle = ping.state === 'warming'
+                ? 'Server is starting up — first measurement coming shortly.'
+                : `Round-trip time to ${regionDisplayName(session.regionId)} (confidence ${(ping.confidence * 100).toFixed(0)}%)`;
+            // Stale-region indicator: spectator WebSocket has been in Reconnecting
+            // state for >10s. Sessions in that region may have grown/shrunk without
+            // the picker hearing about it — the REST 30s repoll covers eventual
+            // consistency but the ↻ badge tells the user "this row may be slightly out of date".
+            const isStaleRegion = typeof staleRegions !== 'undefined' && staleRegions.has(session.regionId);
+            const staleBadge = isStaleRegion
+                ? ' <span class="session-stale" title="Live updates from this region temporarily paused; data refreshed every 30 s.">↻</span>'
+                : '';
+
             item.innerHTML = `
-                <span class="session-name">${session.name}</span>
+                <span class="session-name">${session.name}${staleBadge}</span>
+                <span class="session-region" title="${regionDisplayName(session.regionId)}">${regionDisplayName(session.regionId)}</span>
                 <span class="session-players">${session.memberCount}/${session.maxMembers}${isFull && !isCurrent ? ' FULL' : ''}</span>
+                <span class="session-ping ${pingClass}" title="${pingTitle}" aria-label="${pingTitle}">${pingText}${renderConfidenceBar(ping.confidence)}</span>
             `;
             if (isClickable) {
                 item.addEventListener('click', () => handleSelectSession(session.id));
             }
             listEl.appendChild(item);
         });
+    }
+
+    // Update only the ping/region cells for sessions in a given region —
+    // called on every RegionService 'rttUpdated' event so the picker UI
+    // converges as bursts land WITHOUT rebuilding the list (which would
+    // teleport the user's selection / scroll position).
+    function updatePingCellsForRegion(regionId) {
+        const ping = pingForRegion(regionId);
+        const pingClass = rttClassFor(ping.state, ping.valueMs);
+        const pingText = ping.state === 'warming' || ping.valueMs == null
+            ? '🔥 Warming…'
+            : `${Math.round(ping.valueMs)} ms`;
+        const items = sessionPicker.listEl.querySelectorAll(`.session-item[data-region-id="${regionId}"] .session-ping`);
+        items.forEach(el => {
+            el.className = `session-ping ${pingClass}`;
+            el.innerHTML = `${pingText}${renderConfidenceBar(ping.confidence)}`;
+        });
+    }
+
+    function renderRegionBanner() {
+        const banner = sessionPicker.regionBannerEl;
+        if (!banner) return;
+        const regions = sessionPicker.regions;
+        if (regions.length === 0) {
+            banner.style.display = 'none';
+            return;
+        }
+        const bestId = window.RegionService ? window.RegionService.bestRegion() : null;
+        if (!bestId) {
+            banner.style.display = '';
+            banner.textContent = '📡 Measuring regions…';
+            return;
+        }
+        const ping = pingForRegion(bestId);
+        banner.style.display = '';
+        const valueText = ping.valueMs == null ? '—' : `${Math.round(ping.valueMs)} ms`;
+        banner.textContent = `📍 You're closest to ${regionDisplayName(bestId)} (${valueText})`;
+    }
+
+    function renderCreateRegionSelector() {
+        const sel = sessionPicker.createRegionSelectEl;
+        const row = sessionPicker.createRegionRowEl;
+        if (!sel || !row) return;
+        const regions = sessionPicker.regions;
+        // Hide the selector entirely when there's nothing to choose between
+        // (single-region deployment / local dev). Phase 1 ships with N=1 so
+        // the row is initially hidden — but its DOM exists so handleCreateSession
+        // can read `selectedCreateRegion` without branching.
+        if (regions.length <= 1) {
+            row.style.display = 'none';
+            return;
+        }
+        row.style.display = '';
+        const desired = sessionPicker.selectedCreateRegion
+            || (window.RegionService && window.RegionService.bestRegion())
+            || regions[0].id;
+        // Rebuild options only when the region list or RTTs changed enough to
+        // matter. The text format must include live RTT so touch users can
+        // see latency INSIDE the native sheet (no hover tooltip available).
+        sel.innerHTML = '';
+        for (const r of regions) {
+            const opt = document.createElement('option');
+            opt.value = r.id;
+            const ping = pingForRegion(r.id);
+            const rttText = ping.state === 'warming' || ping.valueMs == null
+                ? 'warming…'
+                : `${Math.round(ping.valueMs)} ms`;
+            opt.textContent = `${r.displayName} · ${rttText}`;
+            if (r.id === desired) opt.selected = true;
+            sel.appendChild(opt);
+        }
+        // Only attach the change handler once.
+        if (!sel.dataset.bound) {
+            sel.dataset.bound = '1';
+            sel.addEventListener('change', () => {
+                sessionPicker.selectedCreateRegion = sel.value;
+                sessionPicker.userOverrodeCreateRegion = true;
+                updatePickerButtons();
+            });
+        }
+        sessionPicker.selectedCreateRegion = desired;
+    }
+
+    function getCreateRegionId() {
+        // Phase 1: Region service may not have loaded, or the manifest may have
+        // only one entry. Fall back to a stable string so SessionClient can
+        // route the SignalR connect appropriately when Phase 3 ships.
+        if (sessionPicker.selectedCreateRegion) return sessionPicker.selectedCreateRegion;
+        if (window.RegionService) {
+            const best = window.RegionService.bestRegion();
+            if (best) return best;
+            const local = window.RegionService.getLocalRegionId();
+            if (local) return local;
+        }
+        return null;
+    }
+
+    function getCreateRegionDisplayName(regionId) {
+        if (!regionId) return null;
+        return regionDisplayName(regionId);
     }
 
     // Select a session (keyboard navigation - no longer auto-joins)
@@ -7221,12 +7534,20 @@
             sessionPicker.btnLeaveCreate = fresh;
             fresh.addEventListener('click', handleLeaveCreateButton);
         } else {
-            // Not in a session - show Create
-            btnLeaveCreate.textContent = 'Create';
+            // Not in a session - show Create. Label includes destination region
+            // so the user knows where their session will land BEFORE they click
+            // (essential on touch where hover tooltips don't exist).
+            const regionId = getCreateRegionId();
+            const regionName = getCreateRegionDisplayName(regionId);
+            btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
+                ? `Create in ${regionName}`
+                : 'Create';
             btnLeaveCreate.disabled = !connected || !canCreate;
             btnLeaveCreate.className = 'picker-btn';
             if (!canCreate && connected) {
                 btnLeaveCreate.title = 'Maximum sessions reached';
+            } else if (regionName && sessionPicker.regions.length > 1) {
+                btnLeaveCreate.title = `Create a new session hosted in ${regionName}`;
             } else {
                 btnLeaveCreate.title = '';
             }
@@ -7287,16 +7608,184 @@
         }
     }
 
-    // Fetch session list from server (initial load)
-    async function refreshSessionList() {
-        if (!SessionClient.isConnected()) return;
+    // ── Multi-region session aggregation ────────────────────────────────────
+    // Phase 3: cross-region session list comes from parallel REST polls of
+    // /api/sessions on every region, augmented by spectator-mode SignalR
+    // connections that push OnSessionsChanged so cross-region changes surface
+    // within ~1 inter-region RTT (not the 30s REST poll interval).
+    //
+    // State machine per region:
+    //   - 'fresh': last fetch succeeded
+    //   - 'stale': fetch failed/timed-out; this region's sessions are dropped
+    //              from the merge until the next successful fetch
+    //   - 'cold':  not yet attempted
+    //
+    // Push coalescing: if multiple OnSessionsChanged arrive from the same
+    // region within COALESCE_MS, only one refetch fires. Stops a member-leave
+    // (which triggers promotion + broadcast + cleanup) from triple-fetching.
+    const MultiRegionSessions = (function () {
+        const COALESCE_MS = 250;       // dedup window for repeated pushes
+        const REST_TIMEOUT_MS = 5000;  // per-region REST fetch timeout
+        const POLL_INTERVAL_MS = 30000; // belt-and-suspenders background poll
 
+        const perRegion = new Map();   // regionId -> { sessions, maxSessions, canCreate, state, lastFetchAt, lastError }
+        const pendingRefetch = new Map(); // regionId -> setTimeout handle (debounce)
+        let backgroundPollHandle = null;
+
+        function emptyResult() {
+            return { sessions: [], maxSessions: 6, canCreateSession: true };
+        }
+
+        function regionState(regionId) {
+            const r = perRegion.get(regionId);
+            return r ? r.state : 'cold';
+        }
+
+        async function fetchOneRegion(region) {
+            const url = `${region.hostname.replace(/\/$/, '')}/api/sessions`;
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
+            try {
+                const res = await fetch(url, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    mode: 'cors',
+                    credentials: 'omit',  // intentionally NOT credentialed — public read
+                    signal: controller.signal,
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return await res.json();
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        // Update one region's slice and trigger a picker render. Per-region
+        // failure marks the region 'stale' and drops its sessions from the
+        // merge until the next successful fetch.
+        async function refreshRegion(region) {
+            try {
+                const body = await fetchOneRegion(region);
+                perRegion.set(region.id, {
+                    sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
+                    maxSessions: body.maxSessions ?? 6,
+                    canCreate: body.canCreateSession ?? true,
+                    state: 'fresh',
+                    lastFetchAt: Date.now(),
+                    lastError: null,
+                });
+            } catch (err) {
+                const prev = perRegion.get(region.id) ?? {};
+                perRegion.set(region.id, {
+                    ...prev,
+                    sessions: [],  // drop stale rows so users don't try to join a session whose host is offline
+                    state: 'stale',
+                    lastError: err && err.message,
+                });
+            }
+            // Render with the merged state — every region's fresh slice
+            // contributes its sessions; stale regions contribute nothing.
+            applyMerged();
+        }
+
+        // Coalesce N pushes within COALESCE_MS into one refetch per region.
+        // Without this, a single member leave triggers promotion +
+        // cleanup + broadcast and the receiver would fetch 2-3 times.
+        function requestRefresh(region, immediate = false) {
+            if (immediate) {
+                refreshRegion(region);
+                return;
+            }
+            const existing = pendingRefetch.get(region.id);
+            if (existing) clearTimeout(existing);
+            const handle = setTimeout(() => {
+                pendingRefetch.delete(region.id);
+                refreshRegion(region);
+            }, COALESCE_MS);
+            pendingRefetch.set(region.id, handle);
+        }
+
+        // Apply the merged view to the picker. Sessions are keyed by
+        // sessionId — within a region they're unique, and across regions
+        // they're globally unique (server-side UUIDs). Sort order is by RTT
+        // ascending; rendering preserves it.
+        function applyMerged() {
+            const sessions = [];
+            let maxSessions = 6;
+            let canCreate = true;
+            for (const [, slice] of perRegion) {
+                if (slice.state !== 'fresh') continue;
+                sessions.push(...slice.sessions);
+                maxSessions = Math.max(maxSessions, slice.maxSessions);
+                canCreate = canCreate && slice.canCreate;
+            }
+            updateSessionList({
+                sessions,
+                maxSessions,
+                canCreateSession: canCreate,
+            });
+        }
+
+        // Start the multi-region session-list machine. Idempotent.
+        async function start(regions) {
+            stop();
+            // Bootstrap REST fetch in parallel across every region.
+            await Promise.all(regions.map(r => refreshRegion(r)));
+            // Background belt-and-suspenders poll catches missed pushes.
+            backgroundPollHandle = setInterval(() => {
+                if (typeof document !== 'undefined' && document.hidden) return;
+                regions.forEach(r => requestRefresh(r));
+            }, POLL_INTERVAL_MS);
+        }
+
+        function stop() {
+            if (backgroundPollHandle) {
+                clearInterval(backgroundPollHandle);
+                backgroundPollHandle = null;
+            }
+            for (const t of pendingRefetch.values()) clearTimeout(t);
+            pendingRefetch.clear();
+        }
+
+        function reset() {
+            perRegion.clear();
+        }
+
+        return {
+            start,
+            stop,
+            reset,
+            requestRefresh,
+            regionState,
+            applyMerged,
+            // Test/debug hooks
+            _perRegion: perRegion,
+        };
+    })();
+
+    // Refresh session list from server (or from pushed data).
+    // Single-region (regions array empty): falls back to the legacy
+    // SignalR-based getActiveSessions path so existing deployments keep
+    // working with zero behavioral change.
+    // Multi-region: delegates to MultiRegionSessions which does parallel
+    // REST polls + spectator-push-driven refetches.
+    async function refreshSessionList() {
+        const usingMultiRegion = sessionPicker.regions.length > 1;
+        if (!usingMultiRegion) {
+            if (!SessionClient.isConnected()) return;
+            try {
+                const result = await SessionClient.getActiveSessions();
+                updateSessionList(result);
+            } catch (err) {
+                _error('Failed to refresh sessions:', err);
+                setPickerStatus('Failed to load sessions', 'error');
+            }
+            return;
+        }
         try {
-            const result = await SessionClient.getActiveSessions();
-            updateSessionList(result);
+            await Promise.all(sessionPicker.regions.map(r => MultiRegionSessions.requestRefresh(r, true)));
         } catch (err) {
-            _error('Failed to refresh sessions:', err);
-            setPickerStatus('Failed to load sessions', 'error');
+            _error('Multi-region refresh failed:', err);
         }
     }
 
@@ -7560,7 +8049,10 @@
         }
     }
 
-    // Handle selecting a session (clicking on it) - immediately joins
+    // Handle selecting a session (clicking on it) - immediately joins.
+    // Phase 3: route the SessionClient connection to the session's owning
+    // region BEFORE invoking JoinSession, so the joined hub matches the
+    // region that holds the session's authoritative state.
     async function handleSelectSession(sessionId) {
         if (sessionId === sessionPicker.currentSessionId) return; // Already in this session
         
@@ -7574,6 +8066,18 @@
             // Leave current session if in one
             if (sessionPicker.currentSessionId) {
                 await SessionClient.leaveSession();
+            }
+
+            // Multi-region: close spectator connections to the OTHER regions
+            // (free up sockets, honor scale-to-zero), then reconnect
+            // SessionClient to the owning region's hub. Force=true so an
+            // existing same-origin connection rebinds to the cross-region URL.
+            const targetHostname = getRegionHostnameById(session.regionId);
+            if (sessionPicker.regions.length > 1) {
+                await teardownMultiRegionPicker();
+                if (targetHostname) {
+                    await SessionClient.connect(true, targetHostname);
+                }
             }
 
             const result = await SessionClient.joinSession(sessionId);
@@ -7623,6 +8127,18 @@
                 sessionPicker.currentSessionId = null;
             }
 
+            // Multi-region: route Create to the user's chosen region (defaults
+            // to bestRegion). Close spectator connections to free up sockets
+            // and honor scale-to-zero, then connect SessionClient to the
+            // target region's hub.
+            const targetHostname = getCreateRegionHostname();
+            if (sessionPicker.regions.length > 1) {
+                await teardownMultiRegionPicker();
+                if (targetHostname) {
+                    await SessionClient.connect(true, targetHostname);
+                }
+            }
+
             // Capture the current aspect ratio at the moment of session creation
             const currentAspectRatio = canvas.width / canvas.height;
             const result = await SessionClient.createSession({
@@ -7664,6 +8180,11 @@
 
     // Handle solo play - leave any session first
     async function handleSoloPlay() {
+        // Multi-region: close every spectator connection — Solo has no
+        // need for live session updates.
+        if (sessionPicker.regions.length > 1) {
+            await teardownMultiRegionPicker();
+        }
         // Leave current session if in one
         if (sessionPicker.currentSessionId && SessionClient.isConnected()) {
             try {
@@ -7747,6 +8268,20 @@
             await refreshSessionList();
             if (message) {
                 setPickerStatus(message, 'error');
+            }
+
+            // Multi-region: re-open spectator hubs + restart background poll
+            // so the picker is live again for the user. Reconnect SessionClient
+            // back to same-origin so future Create/Join requests start clean.
+            if (sessionPicker.regions.length > 1) {
+                try {
+                    if (SessionClient.getCurrentHubHostname && SessionClient.getCurrentHubHostname()) {
+                        await SessionClient.connect(true, '');
+                    }
+                    await startMultiRegionPicker();
+                } catch (err) {
+                    _warn('[Picker] Failed to restart multi-region after Leave:', err);
+                }
             }
         } finally {
             leavingSession = false;
@@ -8381,6 +8916,187 @@
             }
         }
     });
+
+    // ── Region service bootstrap ─────────────────────────────────────────────
+    // Loads the regional manifest from /api/regions and starts RTT bursts so
+    // the picker has ping data the moment the user looks at the list. Failure
+    // here is non-fatal (e.g. local dev with no manifest configured) — the
+    // picker simply shows no region/ping cells. We bind the rttUpdated/coldStart
+    // listeners BEFORE awaiting load() so even synchronous emissions are caught.
+    async function initRegionService() {
+        if (!window.RegionService) return;
+        window.RegionService.on('rttUpdated', (regionId) => {
+            updatePingCellsForRegion(regionId);
+            renderRegionBanner();
+            // Best-region may have flipped; refresh the create row + button label
+            // so the user sees the new default immediately.
+            if (!sessionPicker.userOverrodeCreateRegion) {
+                sessionPicker.selectedCreateRegion = null; // let getCreateRegionId() recompute
+            }
+            renderCreateRegionSelector();
+            updatePickerButtons();
+        });
+        window.RegionService.on('coldStart', (regionId) => {
+            _log('[RegionService] cold start:', regionId);
+            updatePingCellsForRegion(regionId);
+        });
+        window.RegionService.on('regionsLoaded', async ({ regions }) => {
+            sessionPicker.regions = regions;
+            renderRegionBanner();
+            renderCreateRegionSelector();
+            renderSessionList();
+            updatePickerButtons();
+
+            // Phase 3: spin up the multi-region picker plumbing when N>1.
+            // Single-region deployments use the legacy SignalR same-origin
+            // path; nothing here is needed for that case.
+            if (regions.length > 1) {
+                await initMultiRegionPicker(regions);
+            }
+        });
+        try {
+            await window.RegionService.load();
+            window.RegionService.start();
+        } catch (err) {
+            _warn('[RegionService] load failed (single-region fallback):', err);
+        }
+    }
+
+    // Whether spectator/multi-region machinery is currently running. Toggled
+    // by initMultiRegionPicker / teardownMultiRegionPicker so visibility and
+    // session lifecycle events can flip without re-binding handlers.
+    let multiRegionActive = false;
+    let multiRegionInitialized = false;
+    let regionDownBannerTimer = null;
+    // Track regions whose spectator connection has been Reconnecting >10s so
+    // the UI can show a ↻ badge per row and the picker doesn't surface
+    // false "region missing" panic during transient drops.
+    const staleRegions = new Set();
+
+    async function initMultiRegionPicker(regions) {
+        if (!window.SpectatorClient || !window.MultiRegionSessions && false) {
+            // MultiRegionSessions lives in this same file; the SpectatorClient
+            // check guards against the script tag being absent (e.g. test page).
+            return;
+        }
+        if (!multiRegionInitialized) {
+            multiRegionInitialized = true;
+
+            // ── Spectator push → region-scoped REST refetch ────────────
+            window.SpectatorClient.on('sessionsChanged', (regionId) => {
+                if (!multiRegionActive) return;
+                const r = sessionPicker.regions.find(x => x.id === regionId);
+                if (r) MultiRegionSessions.requestRefresh(r);
+            });
+
+            // ── Stale-region detection (↻ badge) ──────────────────────
+            // SignalR transitions to 'reconnecting' as soon as it loses the
+            // socket. We wait 10s before flagging the region as stale to
+            // avoid a flicker during normal short drops.
+            const reconnectingSince = new Map();
+            window.SpectatorClient.on('connectionStateChanged', (regionId, state) => {
+                if (state === 'reconnecting') {
+                    if (!reconnectingSince.has(regionId)) {
+                        reconnectingSince.set(regionId, setTimeout(() => {
+                            staleRegions.add(regionId);
+                            renderSessionList();  // re-render to show ↻ on rows
+                            renderRegionDownBanner();
+                            reconnectingSince.delete(regionId);
+                        }, 10000));
+                    }
+                } else {
+                    if (reconnectingSince.has(regionId)) {
+                        clearTimeout(reconnectingSince.get(regionId));
+                        reconnectingSince.delete(regionId);
+                    }
+                    if (staleRegions.delete(regionId)) {
+                        renderSessionList();
+                        renderRegionDownBanner();
+                    }
+                }
+            });
+
+            // ── Visibility gating ──────────────────────────────────────
+            // While the tab is hidden, close spectator connections AND stop
+            // the background REST poll so backgrounded tabs don't keep
+            // regions warm (would defeat CAE scale-to-zero).
+            document.addEventListener('visibilitychange', async () => {
+                if (!multiRegionInitialized) return;
+                if (document.hidden) {
+                    if (multiRegionActive) {
+                        await window.SpectatorClient.closeAll();
+                        MultiRegionSessions.stop();
+                    }
+                } else {
+                    // Tab returned to foreground. If we're still on the picker
+                    // (not in a session), bring everything back online with an
+                    // immediate refresh so the UI is fresh by the time the
+                    // user looks at it.
+                    if (multiRegionActive && !sessionPicker.currentSessionId) {
+                        await startMultiRegionPicker();
+                    }
+                }
+            });
+        }
+
+        await startMultiRegionPicker();
+    }
+
+    async function startMultiRegionPicker() {
+        if (!window.SpectatorClient) return;
+        multiRegionActive = true;
+        // Open one spectator connection per region. Exclude the region that
+        // SessionClient is already connected to (if any) to avoid duplicate
+        // sockets. Currently SessionClient is same-origin at boot, so this
+        // exclusion is a no-op until Create/Join routes it elsewhere.
+        const sessionClientHostname = window.SessionClient && SessionClient.getCurrentHubHostname
+            ? SessionClient.getCurrentHubHostname()
+            : '';
+        await window.SpectatorClient.openAll(sessionPicker.regions, sessionClientHostname);
+        // Bootstrap REST fetch + start background poll.
+        await MultiRegionSessions.start(sessionPicker.regions);
+    }
+
+    async function teardownMultiRegionPicker() {
+        if (!multiRegionActive) return;
+        multiRegionActive = false;
+        if (window.SpectatorClient) await window.SpectatorClient.closeAll();
+        MultiRegionSessions.stop();
+    }
+
+    function renderRegionDownBanner() {
+        // Reuse #region-banner: if any region is stale, append a warning suffix.
+        // Banner already updates per rttUpdated; we just trigger a refresh.
+        const banner = sessionPicker.regionBannerEl;
+        if (!banner || sessionPicker.regions.length <= 1) return;
+        if (staleRegions.size === 0) {
+            renderRegionBanner();  // restore normal banner
+            return;
+        }
+        const names = Array.from(staleRegions)
+            .map(id => regionDisplayName(id))
+            .join(', ');
+        banner.style.display = '';
+        banner.textContent = `⚠ Region${staleRegions.size > 1 ? 's' : ''} unreachable: ${names}`;
+    }
+
+    // Pick the region hostname to connect SessionClient to for Create.
+    // Defaults to the user-selected (or bestRegion) region; falls back to
+    // the current SessionClient host (same-origin) when single-region.
+    function getCreateRegionHostname() {
+        const regions = sessionPicker.regions;
+        if (regions.length <= 1) return '';
+        const regionId = getCreateRegionId();
+        const r = regions.find(x => x.id === regionId);
+        return r ? r.hostname : '';
+    }
+
+    function getRegionHostnameById(regionId) {
+        const r = sessionPicker.regions.find(x => x.id === regionId);
+        return r ? r.hostname : '';
+    }
+
+    initRegionService();
 
     // Initialize session connection
     connectToSessionHub();

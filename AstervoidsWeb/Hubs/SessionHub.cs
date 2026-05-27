@@ -459,7 +459,7 @@ public class SessionHub : Hub
     {
         var result = _sessionService.GetActiveSessions();
         return new ActiveSessionsResponse(
-            result.Sessions.Select(s => new SessionListItem(s.Id, s.Name, s.MemberCount, s.MaxMembers, s.CreatedAt)),
+            result.Sessions.Select(s => new SessionListItem(s.Id, s.Name, s.MemberCount, s.MaxMembers, s.CreatedAt, s.RegionId)),
             result.MaxSessions,
             result.CanCreateSession
         );

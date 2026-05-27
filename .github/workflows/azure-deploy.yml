@@ -25,6 +25,19 @@ env:
   PRODUCTION_RG: 'rg-production'
   CONTAINER_ENV_NAME: 'cae-production'
   CONTAINER_APP_PREFIX: 'ca-web'
+  # ── Multi-region rollout ──────────────────────────────────────────────────
+  # Empty string preserves the legacy single-region production deploy
+  # (everything in westus2 under cae-production). To roll out multi-region,
+  # set this to a JSON array of region objects, e.g.:
+  #   REGIONS_JSON: |
+  #     [
+  #       {"name":"westus2","location":"westus2","displayName":"US West"},
+  #       {"name":"eastus","location":"eastus","displayName":"US East"},
+  #       {"name":"westeurope","location":"westeurope","displayName":"Europe West"}
+  #     ]
+  # The first entry is the "primary" region — it owns the shared ACR and
+  # branch deployments target its CAE. Only applied when deploying main.
+  REGIONS_JSON: ''
 
 jobs:
   build:
@@ -48,6 +61,16 @@ jobs:
 
       - name: Run tests
         run: dotnet test astervoids.sln --configuration Release --no-build --verbosity normal
+
+      # Bicep smoke check — fail fast on template syntax errors before any
+      # Azure deploy is attempted. Runs in the build job so a malformed
+      # bicep change blocks the deploy job from even running.
+      - name: Bicep build (template smoke check)
+        run: |
+          # az is preinstalled on ubuntu-latest runners; bicep CLI auto-installs on first use.
+          az bicep build --file infra/main.bicep --outfile /tmp/main.compiled.json
+          test -s /tmp/main.compiled.json
+          echo "✅ infra/main.bicep compiles"
 
   deploy:
     name: Deploy to Azure
@@ -152,10 +175,100 @@ jobs:
         run: |
           IS_PRODUCTION="${{ steps.vars.outputs.is_production }}"
           SANITIZED_BRANCH="${{ steps.vars.outputs.sanitized_branch }}"
-          
-          if [ "$IS_PRODUCTION" = "true" ]; then
-            # Production: use azd up for full provision + deploy
+          # ── Multi-region detection ────────────────────────────────────────
+          # Only the main branch (production) can be multi-region. Branches
+          # always deploy single-region into the primary region's CAE.
+          # REGIONS_JSON is parsed once here so the script can branch on
+          # `IS_MULTI_REGION` without re-parsing.
+          IS_MULTI_REGION="false"
+          if [ "$IS_PRODUCTION" = "true" ] && [ -n "$REGIONS_JSON" ]; then
+            # Validate it's a non-empty JSON array; fail loudly if it isn't.
+            REGION_COUNT=$(echo "$REGIONS_JSON" | jq 'length' 2>/dev/null || echo "0")
+            if [ "$REGION_COUNT" -gt 0 ] 2>/dev/null; then
+              IS_MULTI_REGION="true"
+              echo "::notice::Multi-region production deploy: $REGION_COUNT regions"
+            else
+              echo "::warning::REGIONS_JSON is set but did not parse as a non-empty array. Falling back to single-region."
+            fi
+          fi
+
+          if [ "$IS_PRODUCTION" = "true" ] && [ "$IS_MULTI_REGION" = "false" ]; then
+            # Production single-region (legacy): use azd up for full provision + deploy
             azd up --no-prompt
+          elif [ "$IS_MULTI_REGION" = "true" ]; then
+            # ── Production multi-region ───────────────────────────────────
+            # We bypass `azd up` because azd doesn't know about per-region
+            # container apps. Instead:
+            #   1. Run bicep directly with regions=<JSON>, which provisions
+            #      per-region CAEs + container apps + Traffic Manager.
+            #   2. Build the Docker image once.
+            #   3. Push it to the shared ACR.
+            #   4. Update each region's container app to point at the new image.
+            # Each region's container app already has Region__Id env var
+            # baked in by the bicep template; only the image tag changes
+            # on subsequent deploys.
+            CD_NAME=$(azd env get-values | grep '^CUSTOM_DOMAIN_NAME=' | cut -d'=' -f2 | tr -d '"' || echo "")
+            CD_SUB=$(azd env get-values | grep '^CUSTOM_SUBDOMAIN=' | cut -d'=' -f2 | tr -d '"' || echo "")
+            PRIMARY_LOCATION=$(echo "$REGIONS_JSON" | jq -r '.[0].location')
+
+            echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
+            az deployment sub create \
+              --name "production-multi-${{ github.run_id }}" \
+              --location "$PRIMARY_LOCATION" \
+              --template-file infra/main.bicep \
+              --parameters \
+                environmentName=production \
+                location="$PRIMARY_LOCATION" \
+                customDomainName="$CD_NAME" \
+                customSubdomain="$CD_SUB" \
+                regions="$REGIONS_JSON" \
+              --output none
+
+            # Get the shared ACR name from the deployment outputs.
+            ACR_NAME=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_NAME.value' -o tsv)
+            ACR_LOGIN_SERVER=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_ENDPOINT.value' -o tsv)
+
+            IMAGE_TAG="${{ github.sha }}"
+            IMAGE_NAME="astervoids-web:${IMAGE_TAG}"
+            FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}"
+
+            echo "Building and pushing image: $FULL_IMAGE"
+            az acr login --name "$ACR_NAME"
+            docker build -t "$FULL_IMAGE" ./AstervoidsWeb
+            docker push "$FULL_IMAGE"
+
+            # Update every region's container app with the new image.
+            echo "$REGIONS_JSON" | jq -r '.[].name' | while read -r REGION_NAME; do
+              CONTAINER_APP_NAME="${{ env.CONTAINER_APP_PREFIX }}-production-${REGION_NAME}"
+              echo "::group::Updating $CONTAINER_APP_NAME ($REGION_NAME)"
+              az containerapp update \
+                --name "$CONTAINER_APP_NAME" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --image "$FULL_IMAGE" \
+                --output table
+              echo "::endgroup::"
+            done
+
+            # Surface Traffic Manager FQDN + per-region details in the run log.
+            echo "Traffic Manager FQDN: $(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)"
+            echo "Per-region endpoints:"
+            az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.REGION_ENDPOINTS.value' -o jsonc
+
+            # Use the primary region's URI as the canonical deploy URL.
+            azd env set WEB_URI "$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.WEB_URI.value' -o tsv)"
+            azd env set CONTAINER_APP_NAME "${{ env.CONTAINER_APP_PREFIX }}-production-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
+            azd env set CONTAINER_APPS_ENVIRONMENT "${{ env.CONTAINER_ENV_NAME }}-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
+            azd env set RESOURCE_GROUP "${{ env.PRODUCTION_RG }}"
           else
             # Branch: provision with azd, then deploy with az cli to specific container app
             # First, provision the infrastructure
@@ -237,7 +350,8 @@ jobs:
           echo "CONTAINER_APP_NAME=$(azd env get-values | grep '^CONTAINER_APP_NAME=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
           echo "CONTAINER_APPS_ENVIRONMENT=$(azd env get-values | grep '^CONTAINER_APPS_ENVIRONMENT=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
           echo "RESOURCE_GROUP=$(azd env get-values | grep '^RESOURCE_GROUP=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
-          
+          echo "IS_MULTI_REGION=${IS_MULTI_REGION}" >> $GITHUB_ENV
+
           # Get custom domain from azd outputs
           CUSTOM_DOMAIN=$(azd env get-values | grep '^CUSTOM_DOMAIN=' | cut -d'=' -f2 | tr -d '"')
           if [ -n "$CUSTOM_DOMAIN" ]; then
@@ -247,7 +361,11 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Configure Custom Domain (if enabled)
-        if: env.CUSTOM_DOMAIN != ''
+        # Skip in multi-region: per-region custom-domain binding is its own
+        # workflow (each region needs the apex hostname bound + a managed
+        # cert), to be addressed in Phase 4. Single-region setups still go
+        # through the legacy DNS+cert flow below unchanged.
+        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true'
         continue-on-error: true
         run: |
           echo "Configuring custom domain: $CUSTOM_DOMAIN"
@@ -402,5 +520,26 @@ jobs:
           if [ -n "$CUSTOM_DOMAIN" ]; then
             echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY
           fi
+
+          # Multi-region: list per-region container apps + Traffic Manager FQDN
+          # so reviewers can spot-check each regional endpoint from the summary.
+          if [ "$IS_MULTI_REGION" = "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Multi-region rollout:** $(echo "$REGIONS_JSON" | jq 'length') regions" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Region | Container App | FQDN |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|---------------|------|" >> $GITHUB_STEP_SUMMARY
+            az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.REGION_ENDPOINTS.value[]' -o json \
+              | jq -r '.[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
+              >> $GITHUB_STEP_SUMMARY
+            TM_FQDN=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Traffic Manager FQDN:** \`$TM_FQDN\` (CNAME the apex domain here)" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "View your deployment in the [Azure Portal](https://portal.azure.com)" >> $GITHUB_STEP_SUMMARY

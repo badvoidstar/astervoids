@@ -1271,6 +1271,135 @@ harness that the suite doesn't yet have. See Phase 2.2 deferral note.
   `spawn-extrapolation`, and `clock-offset` suites stay green at every
   phase.
 
+## Networking: Regional Deployment
+
+Astervoids can deploy to one or many Azure regions simultaneously. Every
+visitor sees every active session in every region; sessions live in
+exactly one region (no replication) and the client routes its Create/Join
+SignalR connection to the correct region's hub.
+
+### Architectural choices
+
+- **Independent regions, client-side merge.** Each region runs its own
+  in-memory `SessionService`; the client polls `GET /api/sessions` on
+  every region in parallel and merges the results. No central registry,
+  no cross-region writes — keeps the existing per-process state model
+  unchanged.
+- **Apex routing via Traffic Manager (DNS performance).** First-time
+  visitors land on their nearest region via apex CNAME → Traffic Manager
+  → regional FQDN. After the client downloads `region-service.js` it
+  takes over: pings every region, pins to its measured-best region.
+  Traffic Manager only needs to be "approximately right" for the initial
+  hit.
+- **Spectator SignalR connections (picker only).** While the start
+  screen is visible, the client opens one read-only SignalR connection
+  per region. Each region's hub still broadcasts `OnSessionsChanged` to
+  every connected client, so cross-region changes surface within
+  ~1 inter-region RTT (typically 50–200 ms). Connections close on
+  Join/Create/Solo and on `document.hidden` — backgrounded tabs must
+  NOT keep regions warm or scale-to-zero is defeated.
+- **Scale-to-zero everywhere.** Container Apps `minReplicas: 0` +
+  `cooldownPeriod: 60s` returns regions to zero ~1 min after the last
+  connection closes. Traffic Manager probes hit `/api/regions` (not
+  `/api/ping`) at 60 s intervals — slow enough that probes don't keep
+  regions warm.
+
+### Latency budget
+
+| Event | Single region (today) | Multi-region (this design) | Mechanism |
+|---|---|---|---|
+| Picker open, regions warm | ~1 RTT to origin | ~1 RTT to slowest region | parallel `/api/sessions` fan-out + parallel WS negotiate |
+| Picker open, regions cold | n/a | up to 15 s budget per region; `🔥 Warming up…` shown until first real sample | client-side cold-start detection (samples >1500 ms suppressed from EMA) |
+| Change in **same** region as visitor | ~1 LAN RTT (push) | ~1 LAN RTT (push) | unchanged `OnSessionsChanged` push |
+| Change in **other** region | n/a | ~1 inter-region RTT | spectator hub in that region pushes `OnSessionsChanged` |
+| Spectator WebSocket dropped | n/a | ≤30 s worst case, `↻` badge sooner | belt-and-suspenders REST 30 s repoll |
+| Ping column updates | n/a | first value ≤1 RTT after load; settled (`confidence === 1`) ~50 s later | RegionService bursts + EMA(α=0.3) + per-cell re-render |
+
+### Module layout
+
+```mermaid
+graph TB
+    BR["Browser"]
+    subgraph Client modules
+        RS["RegionService<br/>region-service.js<br/>Discovers regions · Progressive RTT bursts<br/>EMA · Cold-start handling · bestRegion hysteresis"]
+        SP["SpectatorClient<br/>spectator-client.js<br/>N read-only SignalR connections<br/>OnSessionsChanged → per-region refetch"]
+        SC["SessionClient<br/>session-client.js<br/>Single join connection · region-aware hub URL"]
+        MR["MultiRegionSessions<br/>(inline in index.html)<br/>Parallel /api/sessions fetch · Merge · Coalesce"]
+        UI["Session picker UI<br/>Region+Ping columns · 'Your region' banner<br/>'Create in <region>' button · Native <select>"]
+    end
+    subgraph Per-region server
+        API["GET /api/ping<br/>GET /api/regions<br/>GET /api/sessions"]
+        HUB["/sessionHub<br/>(CORS-enabled for cross-region)"]
+    end
+    TM["Azure Traffic Manager<br/>(apex CNAME · Performance routing)"]
+
+    BR -->|"first-load DNS"| TM
+    TM -->|"nearest region"| API
+    RS -->|"GET /api/regions, /api/ping × N"| API
+    MR -->|"GET /api/sessions × N"| API
+    SP -->|"WS × N (picker only)"| HUB
+    SC -->|"WS × 1 (joined region)"| HUB
+    SP -->|"sessionsChanged(regionId)"| MR
+    MR --> UI
+    RS --> UI
+```
+
+### Cold-start handling
+
+CAE scaling to zero means a visitor opening the picker after an idle
+period hits cold containers on the first ping. `RegionService` handles
+this honestly:
+
+1. First-ever ping per region uses 15 s timeout (vs 5 s for warm pings).
+2. If the first valid sample is > 1500 ms it's treated as container
+   start-up (emits `coldStart` event, **suppressed** from the EMA).
+3. State stays `'warming'` (`🔥 Warming up…` shown in the cell) until a
+   real sub-1500 ms sample lands. `bestRegion()` never picks a warming
+   region.
+4. Once a real sample arrives, state → `'measuring'` → `'settled'`.
+
+### Configuration
+
+- **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
+  Manifest in `appsettings.json` under `Region:Regions`. Empty manifest
+  triggers permissive same-origin CORS for local dev.
+- **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
+  single-region; non-empty = multi-region). Primary region (index 0)
+  owns the shared ACR + DNS zone.
+- **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
+  (empty by default). Set to a JSON array to enable multi-region prod.
+
+### Key files
+
+- `AstervoidsWeb/Configuration/RegionSettings.cs` — manifest binding.
+- `AstervoidsWeb/Program.cs` — `/api/ping`, `/api/regions`,
+  `/api/sessions` + `RegionalApi` CORS policy.
+- `AstervoidsWeb/wwwroot/js/region-service.js` — progressive RTT.
+- `AstervoidsWeb/wwwroot/js/spectator-client.js` — multi-region SignalR.
+- `AstervoidsWeb/wwwroot/index.html` (Section 10) — picker + inline
+  `MultiRegionSessions` module + lifecycle wiring.
+- `infra/main.bicep` — `regions` loop.
+- `infra/core/network/traffic-manager.bicep` — apex Traffic Manager.
+
+### Tests
+
+- `RegionEndpointsTests.cs` — `/api/ping` shape + Cache-Control,
+  `/api/regions` manifest + camelCase, `/api/sessions` regionId stamp,
+  CORS allow-list + reject untrusted origin.
+- `SessionServiceTests.cs` — default `RegionId = "local"`, configured
+  manifest stamps every emitted `SessionInfo`.
+- `PingBudgetTests.cs` — mean handler time < 5 ms over 200 iterations;
+  response body shape pinned to `{ now }`.
+- `AstervoidsWeb/region-service.test.mjs` — warm-up discard, cold-start
+  gating, EMA convergence, confidence monotonicity, `bestRegion`
+  hysteresis.
+- `AstervoidsWeb/spectator-client.test.mjs` — open/close per region,
+  exclude-by-hostname, push dispatch, connection-state transitions,
+  error tolerance.
+- `AstervoidsWeb/picker-freshness.test.mjs` — bootstrap merge,
+  per-region failure isolation, 250 ms push coalescing,
+  visibility-driven `stop()`, cold-region non-blocking render.
+
 ## Project Structure
 
 ```
