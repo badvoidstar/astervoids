@@ -182,7 +182,7 @@ module dnsZone 'core/dns/dns-zone.bicep' = if (isProduction && useCustomDomain) 
 }
 
 // DNS records for production custom domain (single-region only; multi-region
-// custom-domain CNAMEs are managed per region by Phase 2 traffic-manager work).
+// custom-domain DNS is emitted by `dnsRecordsProductionMultiRegion` below).
 module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !isMultiRegion && useCustomDomain) {
   name: 'dns-records-production'
   scope: productionRg
@@ -220,6 +220,26 @@ module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) 
     }]
   }
   dependsOn: [webRegional]
+}
+
+// DNS records for production custom domain (multi-region path).
+// CNAMEs the user's custom subdomain to the Traffic Manager FQDN so a
+// browser visiting `<customSubdomain>.<customDomainName>` is DNS-routed to
+// the nearest healthy region. The asuid TXT record carries one
+// customDomainVerificationId per region so every region's managed-cert
+// validation can succeed independently — TXT-based validation (vs CNAME)
+// is required because the CNAME doesn't point at a single container app.
+#disable-next-line BCP318
+module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMultiRegion && useCustomDomain) {
+  name: 'dns-records-production-multi'
+  scope: productionRg
+  params: {
+    dnsZoneName: customDomainName
+    subdomain: customSubdomain
+    targetHostname: trafficManager.outputs.fqdn
+    verificationTokens: [for (r, i) in (isMultiRegion ? regions : []): webRegional[i].outputs.verificationId]
+  }
+  dependsOn: [dnsZone, trafficManager]
 }
 
 // ============================================================================

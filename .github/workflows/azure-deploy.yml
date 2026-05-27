@@ -365,34 +365,45 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Configure Custom Domain (if enabled)
-        # Skip in multi-region: per-region custom-domain binding is its own
-        # workflow (each region needs the apex hostname bound + a managed
-        # cert), to be addressed in Phase 4. Single-region setups still go
-        # through the legacy DNS+cert flow below unchanged.
-        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true'
+        # Single-region: binds CUSTOM_DOMAIN to the one container app with
+        # CNAME-based cert validation (CNAME points directly at the container
+        # app FQDN, so Azure can confirm ownership trivially).
+        #
+        # Multi-region: the same CUSTOM_DOMAIN is bound to EVERY region's
+        # container app, with TXT-based cert validation (CNAME points at the
+        # Traffic Manager profile FQDN, not at any single container app —
+        # so CNAME validation would always fail; bicep emits an asuid TXT
+        # record with one customDomainVerificationId per region so every
+        # region's managed cert can independently validate).
+        if: env.CUSTOM_DOMAIN != ''
         continue-on-error: true
         run: |
-          echo "Configuring custom domain: $CUSTOM_DOMAIN"
-          
-          # Check if hostname already exists and is bound with HTTPS
-          EXISTING=$(az containerapp hostname list \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$CONTAINER_APP_NAME" \
-            --query "[?name=='$CUSTOM_DOMAIN'].bindingType" -o tsv 2>/dev/null || echo "")
-          
-          if [ "$EXISTING" = "SniEnabled" ]; then
-            echo "✅ Custom domain already configured with HTTPS"
-            exit 0
+          echo "Configuring custom domain: $CUSTOM_DOMAIN (IS_MULTI_REGION=${IS_MULTI_REGION})"
+
+          # Build the (region_label, env_name, container_app_name) tuples to
+          # bind. Single-region: one tuple from the workflow's
+          # CONTAINER_APPS_ENVIRONMENT / CONTAINER_APP_NAME env vars.
+          # Multi-region: one tuple per region in REGIONS_JSON.
+          if [ "$IS_MULTI_REGION" = "true" ]; then
+            VALIDATION_METHOD="TXT"
+            TARGETS=()
+            while read -r REGION_NAME; do
+              TARGETS+=("${REGION_NAME}|cae-production-${REGION_NAME}|ca-web-production-${REGION_NAME}")
+            done < <(echo "$REGIONS_JSON" | jq -r '.[].name')
+            echo "Multi-region: will bind $CUSTOM_DOMAIN to ${#TARGETS[@]} container apps with TXT validation"
+          else
+            VALIDATION_METHOD="CNAME"
+            TARGETS=("single|${CONTAINER_APPS_ENVIRONMENT}|${CONTAINER_APP_NAME}")
+            echo "Single-region: will bind $CUSTOM_DOMAIN to $CONTAINER_APP_NAME with CNAME validation"
           fi
-          
-          # Function to check DNS propagation
+
+          # ── DNS propagation probe (shared across all regions) ──────────
+          # The same DNS records back every region's binding; we only need
+          # to probe once before kicking off per-region work.
           check_dns() {
             echo "Checking DNS propagation for $CUSTOM_DOMAIN..."
-            # Check CNAME record
             CNAME_RESULT=$(nslookup "$CUSTOM_DOMAIN" 2>/dev/null | grep -i "canonical name" || echo "")
-            # Check TXT verification record
             TXT_RESULT=$(nslookup -type=TXT "asuid.$CUSTOM_DOMAIN" 2>/dev/null | grep -i "text" || echo "")
-            
             if [ -n "$CNAME_RESULT" ] && [ -n "$TXT_RESULT" ]; then
               echo "✅ DNS records found"
               return 0
@@ -401,115 +412,155 @@ jobs:
               return 1
             fi
           }
-          
-          # Retry logic with exponential backoff for the entire custom domain setup
+
+          # ── Per-region bind/cert/attach (idempotent) ──────────────────
+          # Returns 0 on success (hostname bound with HTTPS) or 1 on
+          # transient failure (caller retries via the outer attempt loop).
+          # Idempotent: skips work when the hostname is already SniEnabled
+          # or the managed cert already exists.
+          bind_one() {
+            local label="$1"
+            local env_name="$2"
+            local app_name="$3"
+            local rg="${PRODUCTION_RG}"
+
+            echo "::group::Binding $CUSTOM_DOMAIN on $app_name ($label)"
+
+            # Fast path: already SniEnabled means the cert is bound and
+            # serving HTTPS — no work to do.
+            local existing_binding
+            existing_binding=$(az containerapp hostname list \
+              --resource-group "$rg" \
+              --name "$app_name" \
+              --query "[?name=='$CUSTOM_DOMAIN'].bindingType" -o tsv 2>/dev/null || echo "")
+            if [ "$existing_binding" = "SniEnabled" ]; then
+              echo "✅ Already SniEnabled — skipping"
+              echo "::endgroup::"
+              return 0
+            fi
+
+            # Add custom hostname (unbound first; validation happens during cert create).
+            local hostname_exists
+            hostname_exists=$(az containerapp hostname list \
+              --resource-group "$rg" --name "$app_name" \
+              --query "[?name=='$CUSTOM_DOMAIN'].name" -o tsv 2>/dev/null || echo "")
+            if [ -z "$hostname_exists" ]; then
+              echo "Adding custom hostname..."
+              if ! az containerapp hostname add \
+                --resource-group "$rg" --name "$app_name" \
+                --hostname "$CUSTOM_DOMAIN" 2>&1; then
+                echo "::warning::Failed to add hostname on $app_name"
+                echo "::endgroup::"
+                return 1
+              fi
+            else
+              echo "Hostname already exists, skipping add..."
+            fi
+
+            # Create managed cert (per-environment resource; each region
+            # has its own CAE so its own cert resource).
+            local cert_name="cert-${CUSTOM_DOMAIN//./-}"
+            local cert_exists
+            cert_exists=$(az containerapp env certificate list \
+              --resource-group "$rg" --name "$env_name" \
+              --query "[?name=='$cert_name'].name" -o tsv 2>/dev/null || echo "")
+            if [ -z "$cert_exists" ]; then
+              echo "Creating managed certificate (validation: $VALIDATION_METHOD)..."
+              if ! az containerapp env certificate create \
+                --resource-group "$rg" --name "$env_name" \
+                --certificate-name "$cert_name" \
+                --hostname "$CUSTOM_DOMAIN" \
+                --validation-method "$VALIDATION_METHOD" 2>&1; then
+                echo "::warning::Failed to create certificate on $env_name"
+                echo "::endgroup::"
+                return 1
+              fi
+            fi
+
+            # Wait for cert provisioning (up to 5 minutes).
+            local cert_id="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$rg/providers/Microsoft.App/managedEnvironments/$env_name/managedCertificates/$cert_name"
+            local cert_ready=false
+            for i in $(seq 1 30); do
+              local state
+              state=$(az resource show --ids "$cert_id" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
+              echo "[$label] cert state: $state (check $i/30)"
+              if [ "$state" = "Succeeded" ]; then
+                cert_ready=true
+                break
+              elif [ "$state" = "Failed" ]; then
+                echo "::warning::Cert provisioning Failed on $env_name"
+                break
+              fi
+              sleep 10
+            done
+
+            if [ "$cert_ready" = "true" ]; then
+              echo "Binding certificate..."
+              if az containerapp hostname bind \
+                --resource-group "$rg" --name "$app_name" \
+                --hostname "$CUSTOM_DOMAIN" \
+                --environment "$env_name" \
+                --validation-method "$VALIDATION_METHOD" 2>&1; then
+                echo "✅ HTTPS enabled for $CUSTOM_DOMAIN on $app_name"
+                echo "::endgroup::"
+                return 0
+              fi
+            fi
+
+            echo "::warning::Cert not ready / bind failed for $app_name"
+            echo "::endgroup::"
+            return 1
+          }
+
+          # ── Outer attempt loop ─────────────────────────────────────────
           MAX_RETRIES=3
-          RETRY_DELAY=120  # Start with 2 minutes
-          
+          RETRY_DELAY=120
+          OVERALL_SUCCESS=true
+
           for attempt in $(seq 1 $MAX_RETRIES); do
             echo ""
             echo "=========================================="
             echo "Custom domain setup attempt $attempt of $MAX_RETRIES"
             echo "=========================================="
-            
-            # Wait for DNS propagation before attempting (skip wait on first attempt if DNS already propagated)
+
+            # Wait for DNS propagation before attempting (skip wait on
+            # first attempt if DNS is already propagated).
             if [ $attempt -gt 1 ] || ! check_dns; then
               if [ $attempt -gt 1 ]; then
                 WAIT_TIME=$((RETRY_DELAY * (attempt - 1)))
                 echo "Waiting ${WAIT_TIME}s before retry..."
                 sleep $WAIT_TIME
               fi
-              
-              # Check DNS again after waiting
               if ! check_dns; then
                 echo "DNS not propagated yet, will retry..."
                 if [ $attempt -eq $MAX_RETRIES ]; then
                   echo "::warning::DNS not propagated after $MAX_RETRIES attempts. Custom domain setup incomplete."
-                  echo "Run the deployment again later or configure manually."
                   exit 0
                 fi
                 continue
               fi
             fi
-            
-            # Check if hostname already exists (refresh check each attempt)
-            HOSTNAME_EXISTS=$(az containerapp hostname list \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$CONTAINER_APP_NAME" \
-              --query "[?name=='$CUSTOM_DOMAIN'].name" -o tsv 2>/dev/null || echo "")
-            
-            # Add custom hostname (skip if already exists)
-            if [ -z "$HOSTNAME_EXISTS" ]; then
-              echo "Adding custom hostname..."
-              if ! az containerapp hostname add \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APP_NAME" \
-                --hostname "$CUSTOM_DOMAIN" 2>&1; then
-                echo "Failed to add hostname, will retry..."
-                continue
+
+            # Per-region binding — accumulate failures across targets so
+            # one slow region doesn't abort the others.
+            OVERALL_SUCCESS=true
+            for tuple in "${TARGETS[@]}"; do
+              IFS='|' read -r region_label env_name app_name <<< "$tuple"
+              if ! bind_one "$region_label" "$env_name" "$app_name"; then
+                OVERALL_SUCCESS=false
               fi
-            else
-              echo "Hostname already exists, skipping add..."
-            fi
-            
-            # Create certificate
-            CERT_NAME="cert-${CUSTOM_DOMAIN//./-}"
-            CERT_EXISTS=$(az containerapp env certificate list \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$CONTAINER_APPS_ENVIRONMENT" \
-              --query "[?name=='$CERT_NAME'].name" -o tsv 2>/dev/null || echo "")
-            
-            if [ -z "$CERT_EXISTS" ]; then
-              echo "Creating managed certificate..."
-              if ! az containerapp env certificate create \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APPS_ENVIRONMENT" \
-                --certificate-name "$CERT_NAME" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --validation-method CNAME 2>&1; then
-                echo "Failed to create certificate, will retry..."
-                continue
-              fi
-            fi
-            
-            # Wait for certificate to be ready (up to 5 minutes per attempt)
-            echo "Waiting for certificate provisioning..."
-            CERT_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/managedEnvironments/$CONTAINER_APPS_ENVIRONMENT/managedCertificates/$CERT_NAME"
-            CERT_READY=false
-            
-            for i in $(seq 1 30); do
-              STATE=$(az resource show --ids "$CERT_ID" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
-              echo "Certificate state: $STATE (check $i/30)"
-              
-              if [ "$STATE" = "Succeeded" ]; then
-                CERT_READY=true
-                break
-              elif [ "$STATE" = "Failed" ]; then
-                echo "Certificate provisioning failed"
-                break
-              fi
-              sleep 10
             done
-            
-            if [ "$CERT_READY" = "true" ]; then
-              echo "Binding certificate..."
-              if az containerapp hostname bind \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APP_NAME" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --environment "$CONTAINER_APPS_ENVIRONMENT" \
-                --validation-method CNAME 2>&1; then
-                echo "✅ HTTPS enabled for $CUSTOM_DOMAIN"
-                exit 0
-              fi
+
+            if [ "$OVERALL_SUCCESS" = "true" ]; then
+              echo "✅ All targets bound on attempt $attempt"
+              exit 0
             fi
-            
-            echo "Certificate not ready, will retry..."
+            echo "One or more targets failed on attempt $attempt; will retry..."
           done
-          
+
           echo "::warning::Custom domain setup incomplete after $MAX_RETRIES attempts."
-          echo "The deployment succeeded but HTTPS is not yet configured."
-          echo "This usually resolves on the next deployment after DNS propagates."
+          echo "The deployment succeeded but HTTPS is not yet configured on every region."
+          echo "Usually resolves on the next deployment after DNS propagates."
 
       - name: Deployment Summary
         run: |
