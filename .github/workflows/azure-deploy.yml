@@ -254,18 +254,37 @@ jobs:
             --output none
 
           # 2. Create the cert resource on the CAE if it doesn't already exist.
+          # The az CLI's `az containerapp env certificate create` only supports
+          # the managed-cert path (--hostname + --validation-method). For
+          # KV-backed BYO certs we PUT the ARM resource directly — same shape
+          # as bicep's Microsoft.App/managedEnvironments/certificates resource.
           CERT_EXISTS=$(az containerapp env certificate list \
             --resource-group "$RG" --name "$CAE_NAME" \
             --query "[?name=='$CERT_KEY_VAULT_CERT_NAME'].name" -o tsv 2>/dev/null || echo "")
           if [ -z "$CERT_EXISTS" ]; then
-            echo "Cert '$CERT_KEY_VAULT_CERT_NAME' not present on CAE — creating from Key Vault..."
-            az containerapp env certificate create \
+            echo "Cert '$CERT_KEY_VAULT_CERT_NAME' not present on CAE — PUT'ing ARM resource from Key Vault..."
+            CAE_LOCATION=$(az containerapp env show \
               --resource-group "$RG" --name "$CAE_NAME" \
-              --certificate-name "$CERT_KEY_VAULT_CERT_NAME" \
-              --certificate-key-vault-url "$CERT_KEY_VAULT_SECRET_URL" \
-              --certificate-identity "$CERT_READER_IDENTITY_ID" \
-              --output none
-            echo "✅ Cert created"
+              --query location -o tsv)
+            CERT_ARM_URL="https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RG}/providers/Microsoft.App/managedEnvironments/${CAE_NAME}/certificates/${CERT_KEY_VAULT_CERT_NAME}?api-version=2024-10-02-preview"
+            BODY=$(jq -n \
+              --arg loc "$CAE_LOCATION" \
+              --arg identity "$CERT_READER_IDENTITY_ID" \
+              --arg kvurl "$CERT_KEY_VAULT_SECRET_URL" \
+              '{
+                location: $loc,
+                properties: {
+                  certificateKeyVaultProperties: {
+                    identity: $identity,
+                    keyVaultUrl: $kvurl
+                  }
+                }
+              }')
+            TMP_BODY=$(mktemp)
+            echo "$BODY" > "$TMP_BODY"
+            az rest --method PUT --uri "$CERT_ARM_URL" --body "@$TMP_BODY" --output none
+            rm -f "$TMP_BODY"
+            echo "✅ Cert created via ARM PUT"
           else
             echo "✅ Cert '$CERT_KEY_VAULT_CERT_NAME' already present on CAE — no action needed"
           fi
