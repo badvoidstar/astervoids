@@ -335,22 +335,26 @@ resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if 
   name: sharedResourceGroupName
 }
 
+// Branch cert resource ID. When BYO is enabled, branches bind their custom
+// hostname to the SAME wildcard cert that production uses, parented on the
+// shared CAE. The cert is materialised by:
+//   - the workflow's "Bootstrap BYO cert on shared CAE" step BEFORE this
+//     bicep runs (idempotently attaches the cert-reader identity to the
+//     existing CAE and creates the cert resource if missing), OR
+//   - a prior production deploy (bicep already created both via its
+//     containerAppsProduction / containerAppsRegional modules).
+// Either way, by the time this expression is evaluated the cert exists
+// and we just reference it by its known resource ID.
+var branchCertResourceId = (isBranch && byoCertEnabled)
+  ? '/subscriptions/${subscription().subscriptionId}/resourceGroups/${sharedResourceGroupName}/providers/Microsoft.App/managedEnvironments/${containerAppsEnvironmentName}/certificates/${certKeyVaultCertName}'
+  : ''
+
 // Branch Container App (uses existing shared infrastructure).
-//
-// Branches NEVER use BYO cert — only production does. Two reasons:
-//   1. The shared 'cae-production' CAE must have the user-assigned
-//      identity attached (properties.identity.userAssignedIdentities) before
-//      any cert resource on it can reference that identity. Production's
-//      deploy adds the identity; branches can't modify the existing CAE
-//      without risking property collisions.
-//   2. Per-branch subdomains (e.g. astervoids-mybranch.<domain>) are
-//      short-lived and work fine with DigiCert managed certs (CNAME-validated
-//      directly against the branch container app's FQDN — no intermediate
-//      hop, so managed-cert validation succeeds). The 5-7 min cert wait per
-//      branch is acceptable for ephemeral preview environments.
-// The workflow's 'Configure Custom Domain' step picks up the managed-cert
-// flow whenever certificateId is empty (legacy path), regardless of whether
-// BYO vars are set globally.
+// When BYO cert is enabled, branches bind their per-branch subdomain
+// (e.g. astervoids-mybranch.<domain>) to the shared wildcard cert with
+// SniEnabled — no managed-cert provisioning, ~5 min saved per deploy.
+// When BYO is NOT enabled, branches fall back to the legacy managed-cert
+// flow via the workflow's Configure Custom Domain step.
 module webBranch 'core/host/container-app.bicep' = if (isBranch) {
   name: 'web-${environmentName}'
   scope: sharedRg
@@ -366,13 +370,14 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     minReplicas: 0
     maxReplicas: 1  // Limit branch deployments
     customDomainName: useCustomDomain ? fullCustomDomain : ''
-    certificateId: ''  // branches always use legacy managed-cert flow
+    certificateId: branchCertResourceId
   }
 }
 
 // DNS records for branch custom domain (uses existing DNS zone in production RG).
-// Branches always use managed-cert flow → asuid TXT IS emitted with the
-// branch container app's customDomainVerificationId.
+// When BYO is enabled, skip the asuid TXT (no managed-cert validation runs).
+// When BYO is disabled, emit the asuid TXT with the branch container app's
+// verificationId so the legacy managed-cert flow can validate ownership.
 module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain) {
   name: 'dns-records-${environmentName}'
   scope: sharedRg
@@ -380,7 +385,8 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: webBranch.outputs.fqdn
-    verificationToken: webBranch.outputs.verificationId
+    verificationToken: byoCertEnabled ? '' : webBranch.outputs.verificationId
+    skipAsuid: byoCertEnabled
   }
 }
 
