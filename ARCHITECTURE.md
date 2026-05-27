@@ -1559,7 +1559,10 @@ The original Phase 3 plan ("provision a second Azure region in Bicep, each with 
 
 ## Regional deployment (Phase 4)
 
-Phase 4 hardens the regional rollout for operations: autoscale defaults are region-aware, server metrics become region-self-describing, cross-region ops fan-out is available via one endpoint, and the client probe loop adapts cadence to healthy/twitchy/unhealthy network conditions.
+Phase 4 now includes two previously deferred production behaviors:
+
+1. **Static-only Azure Front Door split**
+2. **Best-region session creation defaults with live capacity caps**
 
 ### Per-region Container App autoscale
 
@@ -1576,6 +1579,22 @@ Replica bounds are parameterized as:
 `infra/main.bicep` exposes optional per-region overrides through the `regions` parameter (`minReplicas?`, `maxReplicas?`).
 
 > Operational note: `minReplicas: 0` means a region can cold-start on first traffic. That is acceptable for low-volume secondary regions, but primaries should usually set `minReplicas: 1`.
+
+### Static-only Azure Front Door split
+
+`infra/main.bicep` adds optional `enableFrontDoorStaticOnly` (production-only). When enabled:
+
+- Azure Front Door Standard is provisioned.
+- Route patterns are intentionally static-only:
+  - `/`, `/index.html`, `/ops.html`, and static asset prefixes (`/js/*`, `/css/*`, `/img/*`, `/audio/*`, `/fonts/*`, `/debug/*`, etc.).
+- The custom-domain DNS CNAME targets Front Door instead of the primary regional app.
+
+**Split enforcement and caveats**
+
+- `/sessionHub` and `/api/ping` are deliberately **not** routed through Front Door.
+- Realtime traffic must continue to hit direct regional endpoints.
+- This avoids websocket/proxy ambiguity and extra control-plane latency on reconnect/probe paths.
+- Do not broaden Front Door route patterns to `/api/*` or `/sessionHub*` unless the realtime architecture is intentionally redesigned.
 
 ### `ServerMetricsService.RegionId` and `/api/srvmon`
 
@@ -1601,6 +1620,22 @@ New endpoint: `GET /api/srvmon/all`.
 ```
 
 To reduce fan-out storms from aggressive polling, `/api/srvmon/all` uses a small per-caller-IP debounce cache (500 ms).
+
+### Regional capacity APIs
+
+New endpoints:
+
+- `GET /api/capacity` → local `{ regionId, activeSessions, maxSessions, canCreateSession }`
+- `GET /api/capacity/all` → cross-region fan-out list with per-region `capacity` payload (or `{ ok:false, error }`)
+- `POST /api/regions/recommend` → default create-region recommendation using:
+  - browser RTT map (`rttMsByRegion`) from RegionProbe
+  - live regional capacity (`canCreateSession`) from `/api/capacity`
+
+`RegionSelectionService` applies this ordering:
+
+1. user preferred region (when still capacity-eligible)
+2. lowest RTT among capacity-eligible regions
+3. configured fallback region (`Regions:Self`) if every region is full/unavailable
 
 ### RegionProbe adaptive cadence and health states
 
@@ -1634,10 +1669,12 @@ Lobby region rows now reflect probe health:
 
 Region tooltip shows EMA, current interval, and health state for quick diagnosis.
 
+Session creation UI now includes a **Create in region** picker that shows live capacity/cap values per region (for example `2/6`, plus `(full)` when exhausted). By default, it applies the recommendation from `POST /api/regions/recommend` (lowest RTT region with available capacity). Users can override this selection before creating.
+
 A new static page `/ops.html` polls `/api/srvmon/all` every 5s and shows per-region ops metrics (connections, hub invocations/sec, CPU, memory, reconciliations, reconnects, errors). `index.html` links to it via a small **Ops** link.
 
 `ops.html` and `/api/srvmon/all` are intentionally not auth-gated in this phase; operators can gate them at ingress/reverse-proxy level if desired.
 
-### Forward reference (Phase 5)
+### Note on Front Door + regional endpoints
 
-Phase 5 is expected to add geo-aware session creation defaults (create in your best region) and expose regional capacity caps directly in the picker.
+Front Door only fronts static content. Regional endpoint URLs are still first-class runtime dependencies for SignalR and probe/capacity APIs. During incidents, operators can bypass Front Door for realtime diagnostics by targeting region `PublicUrl` values directly.

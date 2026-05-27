@@ -12,6 +12,7 @@ const SessionClient = (function() {
     let currentSession = null;
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
+    let currentHubBaseUrl = '';
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
@@ -40,7 +41,7 @@ const SessionClient = (function() {
     /**
      * Initialize the SignalR connection.
      */
-    async function connect(force = false) {
+    async function connect(force = false, hubBaseUrl = null) {
         if (!force && connection && connection.state === signalR.HubConnectionState.Connected) {
             // console.log('[SessionClient] Already connected');
             return true;
@@ -81,8 +82,12 @@ const SessionClient = (function() {
         }
 
         try {
+            const requestedBase = hubBaseUrl === null ? currentHubBaseUrl : hubBaseUrl;
+            const normalizedBase = (requestedBase || '').replace(/\/+$/, '');
+            const hubUrl = normalizedBase ? `${normalizedBase}/sessionHub` : '/sessionHub';
+            currentHubBaseUrl = normalizedBase;
             connection = new signalR.HubConnectionBuilder()
-                .withUrl('/sessionHub')
+                .withUrl(hubUrl)
                 .withHubProtocol(new signalR.protocols.msgpack.MessagePackHubProtocol())
                 .withAutomaticReconnect({
                     nextRetryDelayInMilliseconds: retryContext => {
@@ -362,7 +367,8 @@ const SessionClient = (function() {
                 name: response.sessionName,
                 members: [currentMember],
                 objects: [],
-                metadata: response.metadata || {}
+                metadata: response.metadata || {},
+                regionId: response.regionId || null
             };
 
             // console.log('[SessionClient] Session created:', currentSession.name);
@@ -414,7 +420,8 @@ const SessionClient = (function() {
                 members: response.members,
                 objects: response.objects,
                 validAts: WireEnum.pairsToObject(response.validAts),
-                metadata: response.metadata || {}
+                metadata: response.metadata || {},
+                regionId: response.regionId || null
             };
             currentMember = {
                 id: response.memberId,
@@ -682,6 +689,10 @@ const SessionClient = (function() {
         return lastSessionId;
     }
 
+    function getHubBaseUrl() {
+        return currentHubBaseUrl;
+    }
+
     /**
      * Clear stale session/member state without disconnecting.
      * Used when reconciliation fails after auto-reconnect: the transport is alive
@@ -713,6 +724,7 @@ const SessionClient = (function() {
         isConnected,
         isInSession,
         getLastSessionId,
+        getHubBaseUrl,
         clearSessionState
     };
 })();

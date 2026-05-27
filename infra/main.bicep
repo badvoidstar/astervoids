@@ -24,6 +24,9 @@ param customSubdomain string = ''
 @description('Use shared production infrastructure (for CI/CD branch deployments). When false, creates standalone infra.')
 param useSharedInfra bool = false
 
+@description('When true (production only), deploy Azure Front Door for static-only HTTP routing. Only static SPA assets are routed through Front Door; realtime and probe endpoints (/sessionHub, /api/ping) must stay on direct regional endpoints for reliability and protocol correctness.')
+param enableFrontDoorStaticOnly bool = false
+
 @description('Regional deployment plan. Each element: { id, location, displayName, minReplicas?, maxReplicas?, isPrimary? }. Exactly one entry should set isPrimary:true (its location overrides the top-level `location` param for the primary RG). minReplicas: 0 cold-starts on first traffic, while hot primary regions can set minReplicas: 1. An empty array falls back to a single-region deployment at the `location` param.')
 param regions array = []
 
@@ -67,6 +70,20 @@ var containerAppsEnvironmentName = isStandalone ? 'cae-${environmentName}' : 'ca
 // Determine if custom domain should be configured
 var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
 var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}' : ''
+var staticRoutePatterns = [
+  '/'
+  '/index.html'
+  '/ops.html'
+  '/favicon.ico'
+  '/manifest.json'
+  '/robots.txt'
+  '/js/*'
+  '/css/*'
+  '/img/*'
+  '/audio/*'
+  '/fonts/*'
+  '/debug/*'
+]
 
 // Tags for all resources
 var tags = {
@@ -126,6 +143,37 @@ module dnsZone 'core/dns/dns-zone.bicep' = if (isProduction && useCustomDomain) 
   }
 }
 
+// ============================================================================
+// PRODUCTION STATIC FRONT DOOR (optional, static-only split enforcement)
+// ============================================================================
+// Why the split:
+// - Front Door gives one global entrypoint for cacheable SPA/static bytes.
+// - SignalR/WebSocket paths (/sessionHub) and latency probes (/api/ping) are kept
+//   off Front Door to avoid introducing extra hops, websocket/proxy caveats, and
+//   operational ambiguity during region failover or incident response.
+// - Clients must target direct regional endpoints for realtime/control-plane traffic.
+// Caveat: static route patterns below must stay explicit. Do NOT broaden to '/api/*'
+// or '/sessionHub*', or realtime traffic will be fronted accidentally.
+module staticFrontDoor 'core/network/frontdoor-static-only.bicep' = if (isProduction && enableFrontDoorStaticOnly) {
+  name: 'frontdoor-static-only'
+  scope: productionRg
+  params: {
+    profileName: 'afd-static-${uniqueString(subscription().subscriptionId, environmentName)}'
+    originHostName: webProduction.outputs.fqdn
+    staticRoutePatterns: staticRoutePatterns
+    customDomainHostName: useCustomDomain ? fullCustomDomain : ''
+    tags: tags
+  }
+  dependsOn: [webProduction]
+}
+
+// DNS target for the single custom domain:
+// - Front Door endpoint when static split is enabled
+// - direct primary region container app otherwise
+var customDomainTargetHostname = (isProduction && enableFrontDoorStaticOnly)
+  ? staticFrontDoor.outputs.endpointHostName
+  : webProduction.outputs.fqdn
+
 // DNS records for production custom domain
 module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && useCustomDomain) {
   name: 'dns-records-production'
@@ -133,7 +181,7 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && u
   params: {
     dnsZoneName: customDomainName
     subdomain: customSubdomain
-    targetHostname: webProduction.outputs.fqdn
+    targetHostname: customDomainTargetHostname
     verificationToken: webProduction.outputs.verificationId
   }
   dependsOn: [dnsZone]
@@ -303,4 +351,4 @@ output SECONDARY_WEB_URIS array = [for (region, i) in effectiveSecondaryRegions:
 #disable-next-line BCP318
 output SECONDARY_CONTAINER_APP_NAMES array = [for (region, i) in effectiveSecondaryRegions: webSecondary[i].outputs.name]
 output SECONDARY_RESOURCE_GROUPS array = [for region in effectiveSecondaryRegions: 'rg-production-${region.id}']
-
+output FRONT_DOOR_STATIC_ENDPOINT string = (isProduction && enableFrontDoorStaticOnly) ? 'https://${staticFrontDoor.outputs.endpointHostName}' : ''
