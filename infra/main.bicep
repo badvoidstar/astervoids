@@ -335,13 +335,35 @@ resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if 
   name: sharedResourceGroupName
 }
 
-// Branch cert resource ID. The cert was created on the primary CAE by the
-// production deploy; branches reference it by constructed resource ID so
-// they don't have to re-create one. Same wildcard cert covers every branch
-// subdomain (e.g. astervoids-mybranch.<domain> matches *.<domain>).
-var branchCertResourceId = byoCertEnabled
-  ? '/subscriptions/${subscription().subscriptionId}/resourceGroups/${sharedResourceGroupName}/providers/Microsoft.App/managedEnvironments/${containerAppsEnvironmentName}/certificates/${certKeyVaultCertName}'
-  : ''
+// Branch BYO cert — ensures the wildcard cert exists on the shared
+// production CAE BEFORE webBranch tries to bind its hostname to it.
+// Idempotent: production's own deploy creates the same resource with
+// identical properties; whichever deploys first wins, and subsequent
+// invocations are no-ops. Without this module, a branch deploy that
+// runs before production has been redeployed with BYO config (e.g. the
+// first time a developer enables CERT_KEY_VAULT_* vars) would fail with
+// "CertificateNotFound" because the cert simply doesn't exist on
+// cae-production yet.
+#disable-next-line BCP318
+module branchByoCert 'core/host/byo-cert.bicep' = if (isBranch && byoCertEnabled) {
+  name: 'byo-cert-branch-${environmentName}'
+  scope: sharedRg
+  params: {
+    environmentName: containerAppsEnvironmentName
+    name: certKeyVaultCertName
+    keyVaultUrl: certKeyVaultSecretUrl
+    identityResourceId: certReaderIdentityId
+    tags: union(tags, { 'azd-env-name': 'production' })
+  }
+}
+
+// Branch cert resource ID. The cert is materialised by branchByoCert above
+// (when BYO is enabled) — we reference its output so bicep dependency
+// resolution guarantees the cert exists before the container app tries
+// to bind to it. When BYO is disabled, the empty string falls through to
+// the legacy bindingType=Disabled flow in container-app.bicep.
+#disable-next-line BCP318
+var branchCertResourceId = (isBranch && byoCertEnabled) ? branchByoCert.outputs.certificateResourceId : ''
 
 // Branch Container App (uses existing shared infrastructure)
 module webBranch 'core/host/container-app.bicep' = if (isBranch) {
