@@ -1404,9 +1404,38 @@ reference / disaster recovery; you don't normally run them.
 #    https://github.com/shibayan/keyvault-acmebot
 #    Pick: subscription, resource group (default: sg-acmebot), Key Vault name (default: kv-astervoids).
 #    Configure: DNS provider = Azure DNS, mailbox for Let's Encrypt notifications.
-#    Enable Easy Auth: Authentication → Add Microsoft → Require auth.
-#      v2 issuer URL + enableIdTokenIssuance must be set on the Entra app reg
-#      or you'll hit AADSTS700054 (unsupported_response_type: id_token).
+#
+#    Enabling Easy Auth (REQUIRED before the dashboard works — the ARM
+#    template does NOT auto-enable it; visiting the dashboard pre-auth
+#    returns 401 with a JSON error body):
+#
+#      a. In the Azure Portal: Function App → Authentication → Add
+#         identity provider → Microsoft.
+#      b. App registration: "Create new app registration" with name
+#         `<acmebot-function-app>-easyauth`.
+#         IMPORTANT: pick "Workforce" tenant (default) — NOT "Customers"
+#         (B2C is a separate product and the Function App can't use it).
+#      c. Restrict access: "Require authentication". Unauthenticated
+#         request action: "HTTP 401 Unauthorized".
+#      d. After it saves, go to Entra ID → App registrations → find
+#         the new `<acmebot-function-app>-easyauth` app:
+#           • Authentication → enable "ID tokens (used for implicit
+#             and hybrid flows)" checkbox. Save. Without this you'll
+#             hit AADSTS700054 (response_type 'id_token' is not enabled).
+#           • Manifest → confirm `accessTokenAcceptedVersion: 2` and
+#             that the Function App's authsettingsV2 uses the v2 issuer
+#             URL `https://login.microsoftonline.com/<tenant-id>/v2.0`.
+#             (The Portal sometimes wires the v1 URL by default; v1
+#             rejects v2 tokens and you'll get login-loop 401s.)
+#           • Certificates & secrets → "New client secret" → 6-month
+#             expiry. Copy the value.
+#           • In the Function App → Configuration, set
+#             `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` to that value.
+#             (The portal stores it on the Authentication blade but
+#             also exposes it as an app setting under this name.)
+#
+#      Calendar reminder: rotate `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET`
+#      before the 6-month expiry, or the dashboard locks you out.
 
 # 2. [BICEP-MANAGED — provided here for disaster recovery only]
 #    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
@@ -1424,10 +1453,12 @@ az role assignment create \
 
 # 3. [MANUAL, ONE-TIME] Issue the wildcard cert via the ACMEbot dashboard:
 #    Open https://<acmebot-function-app>.azurewebsites.net/
-#    (the Polymind fork serves the dashboard at the root URL, NOT /dashboard
+#    (the Polymind fork serves the dashboard at the ROOT URL, NOT /dashboard
 #    as the upstream wiki says — visiting /dashboard returns 404 / blank).
-#    Click "Create" → enter "*.<your-domain.com>" → wait ~2 min.
-#    Cert lands in Key Vault as a secret (name it `wildcard-<sanitised-domain>`).
+#    Sign in with the Entra ID account that has access to the app reg from step 1.
+#    Click "Add" → enter "*.<your-domain.com>" → wait ~2 min.
+#    Cert lands in Key Vault as a secret (name it `wildcard-<sanitised-domain>`,
+#    where dots are replaced with dashes — e.g. wildcard-example-com).
 
 # 4. [BICEP-MANAGED — provided here for disaster recovery only]
 #    User-assigned identity that production CAEs use to read the cert from KV.
