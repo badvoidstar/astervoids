@@ -56,7 +56,12 @@ env:
   #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com
   #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-your-domain-com (stable name for the CAE cert resource)
   #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
-  #                                 'Key Vault Certificate User' role on the KV holding the cert
+  #                                 'Key Vault Certificate User' role on the KV holding the cert.
+  #                                 OPTIONAL in production when bicep's manageAcmebotPermissions=true
+  #                                 (the default — bicep creates id-acme-cert-reader and uses its
+  #                                 output for the CAE cert binding). STILL REQUIRED for branch deploys
+  #                                 (the bootstrap step needs the ID to attach the identity to the
+  #                                 shared CAE before creating the cert resource).
   CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
   CERT_KEY_VAULT_CERT_NAME: ${{ vars.CERT_KEY_VAULT_CERT_NAME }}
   CERT_READER_IDENTITY_ID: ${{ vars.CERT_READER_IDENTITY_ID }}
