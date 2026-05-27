@@ -1409,8 +1409,13 @@ az role assignment create \
   --scope "$(az network dns zone show \
     --resource-group "$DNS_ZONE_RG" --name "$DNS_ZONE_NAME" --query id -o tsv)"
 
-# 3. Open the ACMEbot dashboard (link in your Function App's overview blade).
-#    Click "Add certificate" → enter "*.<your-domain.com>" → wait ~2 min.
+# 3. Open the ACMEbot dashboard at https://<acmebot-function-app>.azurewebsites.net/
+#    (the Polymind fork serves the dashboard at the root URL, NOT /dashboard
+#    as the upstream wiki says — visiting /dashboard returns 404 / blank).
+#    The ARM template doesn't auto-enable Easy Auth — if you get 401, you
+#    need to enable it via Authentication → Add Microsoft → Require auth,
+#    THEN visit the root URL. Sign in with your Entra ID account.
+#    From the dashboard: click "Create" → enter "*.<your-domain.com>" → wait ~2 min.
 #    Cert lands in Key Vault as a secret.
 
 # 4. Create a user-assigned managed identity that production CAEs use to
