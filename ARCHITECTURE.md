@@ -1389,19 +1389,32 @@ Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
 wildcard cert covers `<subdomain>.<domain>` (apex) AND all per-region /
 per-branch subdomains.
 
-#### One-time setup (~30 min)
+#### One-time setup (~10 min)
+
+Steps 1 and 3 below are manual (one-time external setup that doesn't fit
+bicep). Steps 2, 4, and 5 are now bicep-managed — when you deploy `main`
+with `manageAcmebotPermissions: true` (the default), bicep provisions
+`id-acme-cert-reader` in `rg-production`, grants ACMEbot DNS Zone
+Contributor on the production DNS zone, and grants the cert reader Key
+Vault Certificate User on the ACMEbot KV. They're listed here for
+reference / disaster recovery; you don't normally run them.
 
 ```bash
-# 1. Deploy ACMEbot via its ARM template (use the README button):
+# 1. [MANUAL, ONE-TIME] Deploy ACMEbot via its ARM template (use the README button):
 #    https://github.com/shibayan/keyvault-acmebot
-#    Pick: subscription, resource group, Key Vault name.
+#    Pick: subscription, resource group (default: sg-acmebot), Key Vault name (default: kv-astervoids).
 #    Configure: DNS provider = Azure DNS, mailbox for Let's Encrypt notifications.
+#    Enable Easy Auth: Authentication → Add Microsoft → Require auth.
+#      v2 issuer URL + enableIdTokenIssuance must be set on the Entra app reg
+#      or you'll hit AADSTS700054 (unsupported_response_type: id_token).
 
-# 2. Configure ACMEbot's managed identity to access your Azure DNS zone:
-DNS_ZONE_RG=<your-dns-rg>
+# 2. [BICEP-MANAGED — provided here for disaster recovery only]
+#    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
+#    so it can write _acme-challenge TXT records for the DNS-01 challenge.
+DNS_ZONE_RG=rg-production
 DNS_ZONE_NAME=<your-domain.com>
 ACMEBOT_IDENTITY_ID=$(az functionapp identity show \
-  --resource-group <acmebot-rg> --name <acmebot-function-app> \
+  --resource-group sg-acmebot --name func-astervoids \
   --query principalId -o tsv)
 az role assignment create \
   --assignee "$ACMEBOT_IDENTITY_ID" \
@@ -1409,30 +1422,26 @@ az role assignment create \
   --scope "$(az network dns zone show \
     --resource-group "$DNS_ZONE_RG" --name "$DNS_ZONE_NAME" --query id -o tsv)"
 
-# 3. Open the ACMEbot dashboard at https://<acmebot-function-app>.azurewebsites.net/
+# 3. [MANUAL, ONE-TIME] Issue the wildcard cert via the ACMEbot dashboard:
+#    Open https://<acmebot-function-app>.azurewebsites.net/
 #    (the Polymind fork serves the dashboard at the root URL, NOT /dashboard
 #    as the upstream wiki says — visiting /dashboard returns 404 / blank).
-#    The ARM template doesn't auto-enable Easy Auth — if you get 401, you
-#    need to enable it via Authentication → Add Microsoft → Require auth,
-#    THEN visit the root URL. Sign in with your Entra ID account.
-#    From the dashboard: click "Create" → enter "*.<your-domain.com>" → wait ~2 min.
-#    Cert lands in Key Vault as a secret.
+#    Click "Create" → enter "*.<your-domain.com>" → wait ~2 min.
+#    Cert lands in Key Vault as a secret (name it `wildcard-<sanitised-domain>`).
 
-# 4. Create a user-assigned managed identity that production CAEs use to
-#    read the cert from KV. Lives in the production resource group:
+# 4. [BICEP-MANAGED — provided here for disaster recovery only]
+#    User-assigned identity that production CAEs use to read the cert from KV.
 az identity create \
   --resource-group rg-production \
   --name id-acme-cert-reader \
   --location <primary-region>
-CERT_READER_IDENTITY_ID=$(az identity show \
-  --resource-group rg-production --name id-acme-cert-reader \
-  --query id -o tsv)
+
+# 5. [BICEP-MANAGED — provided here for disaster recovery only]
+#    Grant the identity 'Key Vault Certificate User' role on the KV.
 CERT_READER_PRINCIPAL_ID=$(az identity show \
   --resource-group rg-production --name id-acme-cert-reader \
   --query principalId -o tsv)
-
-# 5. Grant the identity 'Key Vault Certificate User' role on the KV:
-KV_NAME=<your-acmebot-keyvault-name>
+KV_NAME=kv-astervoids
 KV_ID=$(az keyvault show --name "$KV_NAME" --query id -o tsv)
 az role assignment create \
   --assignee-object-id "$CERT_READER_PRINCIPAL_ID" \
@@ -1440,14 +1449,52 @@ az role assignment create \
   --role "Key Vault Certificate User" \
   --scope "$KV_ID"
 
-# 6. Get the cert's Key Vault secret URL (versionless so renewals pick up automatically):
-CERT_NAME=<name-of-cert-in-kv>  # whatever you named it in step 3
+# 6. [REQUIRED, ONE-TIME] Get the cert's Key Vault secret URL (versionless so renewals pick up automatically):
+KV_NAME=kv-astervoids
+CERT_NAME=wildcard-<sanitised-domain>  # whatever you named it in step 3
 CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
 
-# 7. Set GitHub repo variables so the workflow knows where to find everything:
+# 7. [REQUIRED, ONE-TIME] Set GitHub repo variables so the workflow knows where to find everything.
+#    CERT_READER_IDENTITY_ID is OPTIONAL when manageAcmebotPermissions=true (production deploys
+#    look up the identity from bicep output). It IS required for branch deploys (the workflow's
+#    bootstrap step still reads the var). Set it for safety until all production deploys have
+#    run with the new bicep:
+CERT_READER_IDENTITY_ID=$(az identity show \
+  --resource-group rg-production --name id-acme-cert-reader \
+  --query id -o tsv)
 gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
 gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
 gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
+```
+
+##### Opting out of bicep-managed ACMEbot permissions
+
+If you'd rather manage the cert reader identity and role assignments
+yourself (e.g. they live in a different subscription or you have a
+stricter least-privilege flow), pass `manageAcmebotPermissions=false`
+when deploying. Bicep then expects:
+  - `certReaderIdentityId` param (or `CERT_READER_IDENTITY_ID` env var
+    that the workflow forwards) to be set to an existing identity's
+    resource ID.
+  - The identity already has Key Vault Certificate User on the BYO cert KV.
+  - ACMEbot already has DNS Zone Contributor on the production DNS zone.
+
+##### Cleaning up duplicate role assignments after first bicep-managed deploy
+
+If you previously ran steps 2, 4, and 5 manually (random-GUID-named role
+assignments), the first deploy with `manageAcmebotPermissions=true`
+creates a SECOND, deterministically-named assignment alongside each
+manual one. Both are functionally equivalent. To clean up:
+
+```bash
+# List both assignments for the cert reader on the KV — keep the one with
+# the deterministic GUID matching guid(scope, principalId, roleId), delete
+# the random-named one. Same drill for ACMEbot's DNS Zone Contributor.
+az role assignment list \
+  --assignee "$CERT_READER_PRINCIPAL_ID" \
+  --scope "$KV_ID" \
+  --query "[].{name:name,role:roleDefinitionName}" -o table
+az role assignment delete --ids <random-guid-assignment-id>
 ```
 
 After step 7, the next deploy of `main` will:
