@@ -26,18 +26,22 @@ env:
   CONTAINER_ENV_NAME: 'cae-production'
   CONTAINER_APP_PREFIX: 'ca-web'
   # ── Multi-region rollout ──────────────────────────────────────────────────
+  # Source of truth: the GitHub repository variable REGIONS_JSON
+  # (Settings → Secrets and variables → Actions → Variables tab).
   # Empty string preserves the legacy single-region production deploy
   # (everything in westus2 under cae-production). To roll out multi-region,
-  # set this to a JSON array of region objects, e.g.:
-  #   REGIONS_JSON: |
-  #     [
-  #       {"name":"westus2","location":"westus2","displayName":"US West"},
-  #       {"name":"eastus","location":"eastus","displayName":"US East"},
-  #       {"name":"westeurope","location":"westeurope","displayName":"Europe West"}
-  #     ]
+  # set the REGIONS_JSON repo variable to a JSON array of region objects:
+  #
+  #   [
+  #     {"name":"westus2","location":"westus2","displayName":"US West"},
+  #     {"name":"northeurope","location":"northeurope","displayName":"Europe (Dublin)"},
+  #     {"name":"japaneast","location":"japaneast","displayName":"Asia (Tokyo)"}
+  #   ]
+  #
   # The first entry is the "primary" region — it owns the shared ACR and
-  # branch deployments target its CAE. Only applied when deploying main.
-  REGIONS_JSON: ''
+  # branch deployments target its CAE. Only applied when deploying main;
+  # branches always go single-region into the primary region's CAE.
+  REGIONS_JSON: ${{ vars.REGIONS_JSON }}
 
 jobs:
   build:
