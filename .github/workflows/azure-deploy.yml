@@ -217,12 +217,12 @@ jobs:
         # production has already deployed with BYO (it has, → no-op; it hasn't, →
         # creates both). After this step succeeds, bicep's webBranch module can
         # bind the branch hostname to the cert with bindingType=SniEnabled.
-        if: |
-          steps.vars.outputs.is_production != 'true'
-          && env.CUSTOM_DOMAIN_NAME != ''
-          && env.CERT_KEY_VAULT_SECRET_URL != ''
-          && env.CERT_KEY_VAULT_CERT_NAME != ''
-          && env.CERT_READER_IDENTITY_ID != ''
+        #
+        # The custom-domain check is intentionally omitted: env.CUSTOM_DOMAIN_NAME
+        # would be empty (it's a secret, not an env var), and bootstrapping the
+        # cert when no domain is configured is just a few wasted az calls — the
+        # cert sits unbound until something references it.
+        if: steps.vars.outputs.is_production != 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
         run: |
           # Single-region branches target 'cae-production'. After multi-region
           # production is rolled out (REGIONS_JSON populated), this name will
