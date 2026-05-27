@@ -53,18 +53,47 @@ param certKeyVaultSecretUrl string = ''
 @description('BYO cert (optional). Name to give the certificate resource on every CAE that will host this cert. Stable name (typically `wildcard-<sanitised-domain>`) so production multi-region + branch deploys all reference the same identifier.')
 param certKeyVaultCertName string = ''
 
-@description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Required when certKeyVaultSecretUrl is set.')
+@description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Required when certKeyVaultSecretUrl is set. In production, this can be left empty when manageAcmebotPermissions is true (default) — main.bicep will create id-acme-cert-reader and use its resource ID. Branch deploys MUST set this (via the workflow\'s CERT_READER_IDENTITY_ID GitHub variable) because their bicep run doesn\'t exercise the production path that creates the identity.')
 param certReaderIdentityId string = ''
+
+// ─── ACMEbot integration (production only) ─────────────────────────────────
+// When true, main.bicep provisions the bits that connect ACMEbot to the
+// production deployment:
+//   - id-acme-cert-reader user-assigned identity in rg-production
+//   - Key Vault Certificate User role on the ACMEbot KV for that identity
+//   - DNS Zone Contributor on the production DNS zone for ACMEbot's
+//     system-assigned identity (so DNS-01 challenges work)
+// Set to false if ACMEbot is not deployed or you're managing these
+// permissions outside bicep. Has no effect on non-production deploys.
+
+@description('Whether bicep should provision the ACMEbot integration permissions (cert reader identity, KV role, DNS Zone Contributor). Production-only — ignored for branch and standalone deploys. Default true keeps the documented end-to-end IaC path; set false to opt out and manage manually.')
+param manageAcmebotPermissions bool = true
+
+@description('ACMEbot Function App name. Used to look up the system-assigned principal ID for the DNS Zone Contributor role assignment. Default matches the upstream ARM template\'s suggested name.')
+param acmebotFunctionAppName string = 'func-astervoids'
+
+@description('Resource group containing the ACMEbot Function App. Default matches the upstream ARM template\'s suggested RG name.')
+param acmebotFunctionAppResourceGroup string = 'sg-acmebot'
+
+@description('Name of the Key Vault holding the BYO wildcard cert. Defaults to kv-astervoids (the KV ACMEbot creates by default). Override if your ACMEbot deployment uses a different KV name.')
+param acmebotKeyVaultName string = 'kv-astervoids'
+
+@description('Resource group containing the ACMEbot Key Vault. Defaults to sg-acmebot (matches the upstream ARM template). The KV typically lives in the same RG as ACMEbot itself.')
+param acmebotKeyVaultResourceGroup string = 'sg-acmebot'
 
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
 var isStandalone = !isProduction && !useSharedInfra
 
-// BYO cert enabled iff all 3 params are supplied. Single switch consumed by
-// every container-apps/container-app module invocation below so it isn't
-// possible to half-configure (e.g. cert on the CAE but no identity).
-var byoCertEnabled = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertName) && !empty(certReaderIdentityId)
+// BYO cert enabled iff the two cert params are supplied AND a cert reader
+// identity is available — either passed in by the caller, or about to be
+// provisioned by the acmebotPermissions module on the production path.
+// Resolved against the EFFECTIVE identity rather than the raw param so
+// production deploys can omit certReaderIdentityId entirely and still
+// enable BYO. Single switch consumed by every container-apps/container-app
+// module invocation below so it isn't possible to half-configure.
+var byoCertEnabled = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertName) && (!empty(certReaderIdentityId) || (isProduction && manageAcmebotPermissions))
 
 // Multi-region opt-in: production-only and only when the caller passed a
 // non-empty regions array. When false, the legacy single-region production
@@ -106,6 +135,60 @@ resource productionRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isPr
   tags: tags
 }
 
+// ── ACMEbot integration permissions (production + opt-in) ───────────────────
+// Provisions id-acme-cert-reader + DNS Zone Contributor + KV Cert User so
+// the rest of the BYO cert path "just works" end-to-end without manual
+// role assignments. See infra/core/security/acmebot-permissions.bicep for
+// the full ownership matrix.
+//
+// The existing reference to the ACMEbot function app sits OUTSIDE the
+// conditional path so its principalId expression has a known shape at
+// compile time; the conditional gating happens on the modules themselves
+// via the `if (...)` clause.
+
+resource acmebotFunctionApp 'Microsoft.Web/sites@2023-12-01' existing = if (isProduction && manageAcmebotPermissions) {
+  name: acmebotFunctionAppName
+  scope: resourceGroup(acmebotFunctionAppResourceGroup)
+}
+
+#disable-next-line BCP318
+module acmebotPermissions 'core/security/acmebot-permissions.bicep' = if (isProduction && manageAcmebotPermissions) {
+  name: 'acmebot-permissions'
+  scope: productionRg
+  params: {
+    location: location
+    tags: tags
+    dnsZoneName: useCustomDomain ? customDomainName : ''
+    #disable-next-line BCP318
+    acmebotPrincipalId: acmebotFunctionApp.identity.principalId
+  }
+}
+
+#disable-next-line BCP318
+module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (isProduction && manageAcmebotPermissions) {
+  name: 'acmebot-kv-cert-user'
+  scope: resourceGroup(acmebotKeyVaultResourceGroup)
+  params: {
+    keyVaultName: acmebotKeyVaultName
+    #disable-next-line BCP318
+    principalId: acmebotPermissions.outputs.certReaderPrincipalId
+  }
+}
+
+// Effective cert reader identity ID consumed by every downstream
+// container-apps / container-app module that takes certReaderIdentityId.
+// Resolution order (first non-empty wins):
+//   1. Caller-supplied `certReaderIdentityId` param (e.g. from the
+//      workflow's CERT_READER_IDENTITY_ID GitHub variable) — preserves
+//      backward compatibility for non-production deploys.
+//   2. The identity bicep just created via acmebotPermissions module
+//      (production-only, when manageAcmebotPermissions is true).
+//   3. Empty string — BYO cert path stays disabled.
+var effectiveCertReaderIdentityId = !empty(certReaderIdentityId)
+  ? certReaderIdentityId
+  #disable-next-line BCP318
+  : ((isProduction && manageAcmebotPermissions) ? acmebotPermissions.outputs.certReaderIdentityId : '')
+
 // ── Single-region production (legacy path; runs when regions array is empty) ──
 // Container Apps Environment with Azure Container Registry (production only)
 module containerAppsProduction 'core/host/container-apps.bicep' = if (isProduction && !isMultiRegion) {
@@ -118,7 +201,7 @@ module containerAppsProduction 'core/host/container-apps.bicep' = if (isProducti
     containerRegistryName: containerRegistryName
     certKeyVaultSecretUrl: certKeyVaultSecretUrl
     certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: certReaderIdentityId
+    certReaderIdentityId: effectiveCertReaderIdentityId
   }
 }
 
@@ -167,7 +250,7 @@ module containerAppsRegional 'core/host/container-apps.bicep' = [for (r, i) in (
     // so the user-facing custom subdomain has SNI everywhere.
     certKeyVaultSecretUrl: certKeyVaultSecretUrl
     certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: certReaderIdentityId
+    certReaderIdentityId: effectiveCertReaderIdentityId
   }
 }]
 
@@ -300,7 +383,7 @@ module containerAppsStandalone 'core/host/container-apps.bicep' = if (isStandalo
     containerRegistryName: containerRegistryName
     certKeyVaultSecretUrl: certKeyVaultSecretUrl
     certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: certReaderIdentityId
+    certReaderIdentityId: effectiveCertReaderIdentityId
   }
 }
 
@@ -424,6 +507,16 @@ output CONTAINER_APPS_ENVIRONMENT string = containerAppsEnvironmentName
 output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? 'rg-${environmentName}' : sharedResourceGroupName)
 output CUSTOM_DOMAIN string = fullCustomDomain
 output DOMAIN_VERIFICATION_ID string = webVerificationId
+
+// Effective cert reader identity resource ID actually consumed by container-apps modules.
+// In production with manageAcmebotPermissions=true, this is the bicep-created
+// id-acme-cert-reader; otherwise it echoes the caller-supplied param. Empty
+// string when BYO is not configured. Useful for the workflow to assert that
+// the identity it expects to use is the one bicep is wiring up, and for the
+// branch-deploy bootstrap step to discover the ID without needing the
+// CERT_READER_IDENTITY_ID GitHub variable.
+@description('Resource ID of the user-assigned managed identity used to pull the BYO cert from Key Vault. Empty when BYO is not configured.')
+output CERT_READER_IDENTITY_ID string = effectiveCertReaderIdentityId
 
 // Multi-region outputs: one entry per region with everything CI/CD needs to
 // push an image and configure DNS. Empty array in single-region mode so
