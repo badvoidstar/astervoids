@@ -424,3 +424,13 @@ const RegionService = (function () {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = RegionService;
 }
+
+// Browser: attach to window so the picker (which uses `window.RegionService`
+// as a feature-detection idiom) can reach the IIFE result. Top-level
+// `const X = ...` in a classic <script> is NOT attached to window — it's
+// only accessible by bare name from sibling scripts via the script-level
+// lexical scope. Explicit window assignment makes the module reachable
+// either way.
+if (typeof window !== 'undefined') {
+    window.RegionService = RegionService;
+}

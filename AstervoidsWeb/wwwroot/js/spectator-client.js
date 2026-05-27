@@ -209,3 +209,10 @@ const SpectatorClient = (function () {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = SpectatorClient;
 }
+
+// Browser: attach to window so the picker (which uses `window.SpectatorClient`
+// as a feature-detection idiom) can reach the IIFE result. See identical
+// note in region-service.js for the rationale.
+if (typeof window !== 'undefined') {
+    window.SpectatorClient = SpectatorClient;
+}

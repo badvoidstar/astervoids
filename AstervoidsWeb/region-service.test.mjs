@@ -29,6 +29,33 @@ describe('initialRttState', () => {
     });
 });
 
+describe('RegionService browser export', () => {
+    test('module attaches itself to window.RegionService when window is defined', () => {
+        // Regression for the bug where picker code `if (window.RegionService)`
+        // always evaluated false because top-level `const X = ...` in a
+        // classic <script> is NOT attached to window — burst loop never
+        // fired, picker stayed warming forever. The IIFE end of
+        // region-service.js MUST set window.RegionService for the picker's
+        // feature-detection idiom to work.
+        const origWindow = globalThis.window;
+        globalThis.window = globalThis.window || {};
+        try {
+            // Re-require to force the IIFE's window-attachment to run again.
+            const path = resolve(here, 'wwwroot/js/region-service.js');
+            delete require.cache[require.resolve(path)];
+            const RS = require(path);
+            assert.equal(typeof globalThis.window.RegionService, 'object',
+                'window.RegionService must be set after region-service.js loads');
+            assert.strictEqual(globalThis.window.RegionService, RS,
+                'window.RegionService must be the same object that CommonJS exports');
+            assert.equal(typeof globalThis.window.RegionService.load, 'function',
+                'window.RegionService must expose the public API surface');
+        } finally {
+            globalThis.window = origWindow;
+        }
+    });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // applyBurstSample — cold-start gating
 // ─────────────────────────────────────────────────────────────────────────────
