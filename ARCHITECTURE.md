@@ -1369,6 +1369,103 @@ this honestly:
 - **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
   (empty by default). Set to a JSON array to enable multi-region prod.
 
+### Apex TLS via BYO cert (required for multi-region apex HTTPS)
+
+Azure Container Apps' free managed certificates have a hard requirement:
+the custom-domain CNAME must point **directly** at the container app's
+generated FQDN. Mapping to an intermediate CNAME — Traffic Manager, Front
+Door, Cloudflare — blocks managed-cert issuance entirely (see
+[Microsoft docs](https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates)).
+
+For multi-region production, the apex CNAME points at Traffic Manager, so
+managed certs can't validate. The fix: bring our own wildcard cert from
+Let's Encrypt, store it in Azure Key Vault, and have bicep bind it on
+every region's container app (and on branch container apps too, by reusing
+the same cert).
+
+The recommended automation is [keyvault-acmebot](https://github.com/shibayan/keyvault-acmebot)
+— an open-source Azure Function App that auto-issues and rotates Let's
+Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
+wildcard cert covers `<subdomain>.<domain>` (apex) AND all per-region /
+per-branch subdomains.
+
+#### One-time setup (~30 min)
+
+```bash
+# 1. Deploy ACMEbot via its ARM template (use the README button):
+#    https://github.com/shibayan/keyvault-acmebot
+#    Pick: subscription, resource group, Key Vault name.
+#    Configure: DNS provider = Azure DNS, mailbox for Let's Encrypt notifications.
+
+# 2. Configure ACMEbot's managed identity to access your Azure DNS zone:
+DNS_ZONE_RG=<your-dns-rg>
+DNS_ZONE_NAME=<your-domain.com>
+ACMEBOT_IDENTITY_ID=$(az functionapp identity show \
+  --resource-group <acmebot-rg> --name <acmebot-function-app> \
+  --query principalId -o tsv)
+az role assignment create \
+  --assignee "$ACMEBOT_IDENTITY_ID" \
+  --role "DNS Zone Contributor" \
+  --scope "$(az network dns zone show \
+    --resource-group "$DNS_ZONE_RG" --name "$DNS_ZONE_NAME" --query id -o tsv)"
+
+# 3. Open the ACMEbot dashboard (link in your Function App's overview blade).
+#    Click "Add certificate" → enter "*.<your-domain.com>" → wait ~2 min.
+#    Cert lands in Key Vault as a secret.
+
+# 4. Create a user-assigned managed identity that production CAEs use to
+#    read the cert from KV. Lives in the production resource group:
+az identity create \
+  --resource-group rg-production \
+  --name id-acme-cert-reader \
+  --location <primary-region>
+CERT_READER_IDENTITY_ID=$(az identity show \
+  --resource-group rg-production --name id-acme-cert-reader \
+  --query id -o tsv)
+CERT_READER_PRINCIPAL_ID=$(az identity show \
+  --resource-group rg-production --name id-acme-cert-reader \
+  --query principalId -o tsv)
+
+# 5. Grant the identity 'Key Vault Certificate User' role on the KV:
+KV_NAME=<your-acmebot-keyvault-name>
+KV_ID=$(az keyvault show --name "$KV_NAME" --query id -o tsv)
+az role assignment create \
+  --assignee-object-id "$CERT_READER_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Certificate User" \
+  --scope "$KV_ID"
+
+# 6. Get the cert's Key Vault secret URL (versionless so renewals pick up automatically):
+CERT_NAME=<name-of-cert-in-kv>  # whatever you named it in step 3
+CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
+
+# 7. Set GitHub repo variables so the workflow knows where to find everything:
+gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
+gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
+gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
+```
+
+After step 7, the next deploy of `main` will:
+- Provision a `Microsoft.App/managedEnvironments/certificates` resource on every region's CAE referencing the KV secret URL + the reader identity.
+- Bind `<subdomain>.<domain>` on every region's container app with `bindingType: SniEnabled` pointing at that cert resource.
+- The legacy "Configure Custom Domain" workflow step short-circuits (`env.CERT_KEY_VAULT_SECRET_URL != ''` guard) — no DigiCert managed-cert provisioning happens.
+
+Same wildcard cert covers every branch deploy too (e.g. `astervoids-mybranch.<domain>` matches `*.<domain>`), so branch deploys also skip the cert provisioning wait — typically saving 5-7 minutes per branch deploy.
+
+#### Cert rotation
+
+ACMEbot rotates the cert in KV every ~60 days. Container Apps doesn't
+auto-detect new KV cert versions, so a rotation isn't picked up until the
+next deploy. Two practical options:
+
+1. **Redeploy on the next push to main** (typical). The bicep re-reads the
+   KV cert and updates the CAE cert resource.
+2. **Scheduled GitHub Action** (`on: schedule: cron: '0 4 * * 1'`) that
+   runs `az deployment sub create` once a week to pick up rotations.
+
+If you forget for >90 days, the cert expires and `<subdomain>.<domain>`
+serves a stale cert until you redeploy.
+
 ### Key files
 
 - `AstervoidsWeb/Configuration/RegionSettings.cs` — manifest binding.
@@ -1378,8 +1475,13 @@ this honestly:
 - `AstervoidsWeb/wwwroot/js/spectator-client.js` — multi-region SignalR.
 - `AstervoidsWeb/wwwroot/index.html` (Section 10) — picker + inline
   `MultiRegionSessions` module + lifecycle wiring.
-- `infra/main.bicep` — `regions` loop.
+- `infra/main.bicep` — `regions` loop, BYO cert plumbing.
 - `infra/core/network/traffic-manager.bicep` — apex Traffic Manager.
+- `infra/core/host/container-apps.bicep` — CAE + optional BYO cert resource
+  from Key Vault.
+- `infra/core/host/container-app.bicep` — container app + optional
+  `customDomains[bindingType: SniEnabled, certificateId]` binding to the
+  CAE's BYO cert.
 
 ### Tests
 

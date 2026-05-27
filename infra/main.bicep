@@ -47,10 +47,24 @@ single-region for cost reasons.
 ''')
 param regions array = []
 
+@description('BYO cert (optional). Full Key Vault secret URL pointing at the wildcard cert that covers <customSubdomain>.<customDomainName> AND all per-region/per-branch subdomains. Required to enable the BYO cert path; when empty, the legacy managed-cert workflow flow is used.')
+param certKeyVaultSecretUrl string = ''
+
+@description('BYO cert (optional). Name to give the certificate resource on every CAE that will host this cert. Stable name (typically `wildcard-<sanitised-domain>`) so production multi-region + branch deploys all reference the same identifier.')
+param certKeyVaultCertName string = ''
+
+@description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Required when certKeyVaultSecretUrl is set.')
+param certReaderIdentityId string = ''
+
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
 var isStandalone = !isProduction && !useSharedInfra
+
+// BYO cert enabled iff all 3 params are supplied. Single switch consumed by
+// every container-apps/container-app module invocation below so it isn't
+// possible to half-configure (e.g. cert on the CAE but no identity).
+var byoCertEnabled = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertName) && !empty(certReaderIdentityId)
 
 // Multi-region opt-in: production-only and only when the caller passed a
 // non-empty regions array. When false, the legacy single-region production
@@ -102,6 +116,9 @@ module containerAppsProduction 'core/host/container-apps.bicep' = if (isProducti
     location: location
     tags: tags
     containerRegistryName: containerRegistryName
+    certKeyVaultSecretUrl: certKeyVaultSecretUrl
+    certKeyVaultCertName: certKeyVaultCertName
+    certReaderIdentityId: certReaderIdentityId
   }
 }
 
@@ -120,7 +137,9 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction && !isMu
     external: true
     minReplicas: 0
     maxReplicas: 1
-    customDomainName: ''
+    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    #disable-next-line BCP318
+    certificateId: byoCertEnabled ? containerAppsProduction.outputs.byoCertResourceId : ''
   }
   dependsOn: [containerAppsProduction]
 }
@@ -144,6 +163,11 @@ module containerAppsRegional 'core/host/container-apps.bicep' = [for (r, i) in (
     // regions reference it via @existing. This avoids creating N registries
     // and keeps image pulls going through a single source of truth.
     createRegistry: i == 0
+    // BYO cert: every region's CAE pulls the same wildcard cert from KV
+    // so the user-facing custom subdomain has SNI everywhere.
+    certKeyVaultSecretUrl: certKeyVaultSecretUrl
+    certKeyVaultCertName: certKeyVaultCertName
+    certReaderIdentityId: certReaderIdentityId
   }
 }]
 
@@ -164,7 +188,13 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     external: true
     minReplicas: 0
     maxReplicas: 1
-    customDomainName: ''
+    // BYO cert: every region's container app binds the SAME wildcard
+    // hostname using its CAE's cert resource. When BYO is not configured,
+    // customDomainName is empty so the workflow's legacy managed-cert flow
+    // runs per-region instead (with TXT/CNAME validation as appropriate).
+    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    #disable-next-line BCP318
+    certificateId: byoCertEnabled ? containerAppsRegional[i].outputs.byoCertResourceId : ''
     regionId: r.name
     regionDisplayName: r.?displayName ?? r.name
   }
@@ -183,6 +213,8 @@ module dnsZone 'core/dns/dns-zone.bicep' = if (isProduction && useCustomDomain) 
 
 // DNS records for production custom domain (single-region only; multi-region
 // custom-domain DNS is emitted by `dnsRecordsProductionMultiRegion` below).
+// When BYO cert is enabled, the asuid TXT record is omitted (no managed-cert
+// validation is performed) — only the CNAME is required for traffic routing.
 module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !isMultiRegion && useCustomDomain) {
   name: 'dns-records-production'
   scope: productionRg
@@ -190,7 +222,7 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: webProduction.outputs.fqdn
-    verificationToken: webProduction.outputs.verificationId
+    verificationToken: byoCertEnabled ? '' : webProduction.outputs.verificationId
   }
   dependsOn: [dnsZone]
 }
@@ -227,8 +259,8 @@ module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) 
 // browser visiting `<customSubdomain>.<customDomainName>` is DNS-routed to
 // the nearest healthy region. The asuid TXT record carries one
 // customDomainVerificationId per region so every region's managed-cert
-// validation can succeed independently — TXT-based validation (vs CNAME)
-// is required because the CNAME doesn't point at a single container app.
+// validation can succeed independently — UNLESS BYO cert is configured, in
+// which case the asuid TXT is omitted (no managed-cert validation runs).
 #disable-next-line BCP318
 module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMultiRegion && useCustomDomain) {
   name: 'dns-records-production-multi'
@@ -238,6 +270,7 @@ module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMult
     subdomain: customSubdomain
     targetHostname: trafficManager.outputs.fqdn
     verificationTokens: [for (r, i) in (isMultiRegion ? regions : []): webRegional[i].outputs.verificationId]
+    skipAsuid: byoCertEnabled
   }
   dependsOn: [dnsZone, trafficManager]
 }
@@ -253,7 +286,9 @@ resource standaloneRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isSt
   tags: tags
 }
 
-// Container Apps Environment with Azure Container Registry (standalone)
+// Container Apps Environment with Azure Container Registry (standalone).
+// Standalone is local dev — it can opt into BYO cert by passing the same
+// params (rare), but typically isn't used with a custom domain.
 module containerAppsStandalone 'core/host/container-apps.bicep' = if (isStandalone) {
   name: 'container-apps-standalone'
   scope: standaloneRg
@@ -262,6 +297,9 @@ module containerAppsStandalone 'core/host/container-apps.bicep' = if (isStandalo
     location: location
     tags: tags
     containerRegistryName: containerRegistryName
+    certKeyVaultSecretUrl: certKeyVaultSecretUrl
+    certKeyVaultCertName: certKeyVaultCertName
+    certReaderIdentityId: certReaderIdentityId
   }
 }
 
@@ -280,7 +318,9 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
     external: true
     minReplicas: 0
     maxReplicas: 1
-    customDomainName: ''
+    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    #disable-next-line BCP318
+    certificateId: byoCertEnabled ? containerAppsStandalone.outputs.byoCertResourceId : ''
   }
   dependsOn: [containerAppsStandalone]
 }
@@ -293,6 +333,14 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
 resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if (isBranch) {
   name: sharedResourceGroupName
 }
+
+// Branch cert resource ID. The cert was created on the primary CAE by the
+// production deploy; branches reference it by constructed resource ID so
+// they don't have to re-create one. Same wildcard cert covers every branch
+// subdomain (e.g. astervoids-mybranch.<domain> matches *.<domain>).
+var branchCertResourceId = byoCertEnabled
+  ? '/subscriptions/${subscription().subscriptionId}/resourceGroups/${sharedResourceGroupName}/providers/Microsoft.App/managedEnvironments/${containerAppsEnvironmentName}/certificates/${certKeyVaultCertName}'
+  : ''
 
 // Branch Container App (uses existing shared infrastructure)
 module webBranch 'core/host/container-app.bicep' = if (isBranch) {
@@ -309,11 +357,14 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     external: true
     minReplicas: 0
     maxReplicas: 1  // Limit branch deployments
-    customDomainName: ''
+    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    certificateId: branchCertResourceId
   }
 }
 
-// DNS records for branch custom domain (uses existing DNS zone in production RG)
+// DNS records for branch custom domain (uses existing DNS zone in production RG).
+// Same BYO-cert short-circuit as production: skip asuid TXT when bicep is
+// binding the cert directly from KV.
 module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain) {
   name: 'dns-records-${environmentName}'
   scope: sharedRg
@@ -321,7 +372,7 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: webBranch.outputs.fqdn
-    verificationToken: webBranch.outputs.verificationId
+    verificationToken: byoCertEnabled ? '' : webBranch.outputs.verificationId
   }
 }
 

@@ -40,6 +40,9 @@ param env array = []
 @description('Custom domain name (optional, e.g., app.yourdomain.com)')
 param customDomainName string = ''
 
+@description('BYO cert (optional). Resource ID of a Microsoft.App/managedEnvironments/certificates resource on this apps CAE that should be bound to customDomainName with SNI. When empty AND customDomainName is set, the hostname is added unbound (Disabled) and the workflow then runs the legacy managed-cert flow to create + bind a DigiCert managed cert. When BOTH are set, this module emits the hostname binding with SniEnabled — no managed-cert workflow needed.')
+param certificateId string = ''
+
 @description('Region id stamped into the running container as Region__Id (RegionSettings.Id). When empty, no Region__Id env var is injected and the container uses the value from appsettings.json (defaults to "local").')
 param regionId string = ''
 
@@ -94,10 +97,24 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
         transport: 'auto'
         allowInsecure: false
         // Add custom domain without certificate first to allow DNS verification
+        // Custom domain binding strategy
+        //   - No customDomainName:           empty array (no binding)
+        //   - customDomainName + no cert:    Disabled binding (hostname known but no TLS;
+        //                                     workflow's Configure Custom Domain step then
+        //                                     creates a managed cert + flips to SniEnabled)
+        //   - customDomainName + certId:     SniEnabled binding tied to the BYO cert from
+        //                                     Key Vault (no workflow cert provisioning needed —
+        //                                     bicep handles it end-to-end). Same shape works
+        //                                     for production single-region, multi-region, and
+        //                                     branch deploys: they all reference the same cert.
         customDomains: !empty(customDomainName) ? [
-          {
+          empty(certificateId) ? {
             name: customDomainName
-            bindingType: 'Disabled'  // Start without TLS, will be enabled after cert is issued
+            bindingType: 'Disabled'
+          } : {
+            name: customDomainName
+            bindingType: 'SniEnabled'
+            certificateId: certificateId
           }
         ] : []
       }

@@ -7,11 +7,14 @@ param subdomain string
 @description('Target hostname for the CNAME record')
 param targetHostname string
 
-@description('Single Container App customDomainVerificationId. Use when binding the custom hostname to ONE container app (single-region path). Ignored when verificationTokens is non-empty.')
+@description('Single Container App customDomainVerificationId. Use when binding the custom hostname to ONE container app with managed-cert CNAME/HTTP validation (single-region path). Ignored when verificationTokens is non-empty. Empty/empty: no asuid TXT record is emitted (used when BYO cert is configured — no managed-cert validation needed).')
 param verificationToken string = ''
 
-@description('Multi-region path: array of customDomainVerificationId values, one per region whose container app needs to serve this hostname. Emits a multi-value asuid.<subdomain> TXT record so every region can independently validate its own managed cert against the shared hostname. When empty, falls back to verificationToken (single-region).')
+@description('Multi-region path: array of customDomainVerificationId values, one per region whose container app needs to serve this hostname. Emits a multi-value asuid.<subdomain> TXT record so every region can independently validate its own managed cert against the shared hostname. When empty AND verificationToken is empty, no asuid TXT record is emitted.')
 param verificationTokens array = []
+
+@description('When true, never emit the asuid TXT record regardless of verificationToken(s). Used by the BYO cert path: bicep binds the cert from Key Vault directly, so no managed-cert ownership validation runs and the TXT would just be dead weight.')
+param skipAsuid bool = false
 
 // Reference existing DNS zone
 resource dnsZone 'Microsoft.Network/dnsZones@2018-05-01' existing = {
@@ -33,14 +36,17 @@ resource cnameRecord 'Microsoft.Network/dnsZones/CNAME@2018-05-01' = {
   }
 }
 
-// asuid.<subdomain> TXT record for Container Apps custom-domain verification.
-// Azure DNS supports multi-value TXT records — we emit one TXT value per
-// region's customDomainVerificationId so every region's managed-cert
-// validation succeeds when it queries asuid.<subdomain>. Falls back to a
-// single-value record when verificationTokens is empty (single-region path).
-var effectiveTokens = !empty(verificationTokens) ? verificationTokens : [verificationToken]
+// asuid.<subdomain> TXT record for Container Apps managed-certificate
+// validation. Azure DNS supports multi-value TXT records — we emit one
+// value per region's customDomainVerificationId so every region's managed
+// cert validation succeeds when it queries asuid.<subdomain>. Falls back
+// to a single-value record when verificationTokens is empty (single-region
+// path). Skipped entirely when both are empty (BYO cert path — no managed
+// cert validation is performed so no asuid record is needed).
+var effectiveTokens = !empty(verificationTokens) ? verificationTokens : (empty(verificationToken) ? [] : [verificationToken])
+var emitAsuid = !skipAsuid && !empty(effectiveTokens)
 
-resource txtRecord 'Microsoft.Network/dnsZones/TXT@2018-05-01' = {
+resource txtRecord 'Microsoft.Network/dnsZones/TXT@2018-05-01' = if (emitAsuid) {
   parent: dnsZone
   name: 'asuid.${subdomain}'
   properties: {
