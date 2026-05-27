@@ -298,6 +298,22 @@ const RegionService = (function () {
             });
         }
         localRegionId = body.regionId ?? null;
+
+        // Single-region fallback: when the server's manifest is empty
+        // (RegionSettings.Regions=[] — the default in appsettings.json,
+        // which is also what single-region prod + branch deploys see),
+        // synthesize a self-pointing entry using window.location.origin.
+        // Without this the picker would show '🔥 Warming…' forever for
+        // every session because no region exists to ping.
+        if (regions.length === 0 && typeof window !== 'undefined' && window.location && window.location.origin) {
+            const synthId = localRegionId || 'local';
+            regions.push({
+                id: synthId,
+                displayName: body.displayName || 'Local',
+                hostname: window.location.origin,
+            });
+        }
+
         // Reset measurement state to 'warming' for every region.
         rtt.clear();
         for (const r of regions) rtt.set(r.id, initialRttState());

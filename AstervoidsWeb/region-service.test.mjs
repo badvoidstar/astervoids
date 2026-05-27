@@ -367,4 +367,69 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
             restore();
         }
     });
+
+    test('empty regions manifest synthesizes a self-pointing entry from window.location.origin', async () => {
+        // Single-region prod + branch deploys serve /api/regions with an
+        // empty regions array (default RegionSettings.Regions=[]). Without
+        // synthesis the picker would show '🔥 Warming…' forever because no
+        // region exists to ping. The synthesis uses window.location.origin
+        // so RegionService measures RTT against the current page's server.
+        const restore = installFetchStub([
+            ['/api/regions', async () => ({
+                body: {
+                    regionId: 'local',
+                    displayName: 'Local',
+                    regions: [],  // ← empty: triggers fallback
+                },
+            })],
+            ['/api/ping', async () => ({ body: { now: Date.now() }, delayMs: 30 })],
+        ]);
+        // Stub window.location.origin so the synthesis branch fires.
+        const origWindow = globalThis.window;
+        globalThis.window = { ...(origWindow || {}), location: { origin: 'https://my-app.example.com' } };
+        try {
+            RegionService._configure({ BURST_STAGGER_MAX_MS: 0, BURST_INTERVAL_MS: 60_000 });
+            await RegionService.load();
+            const regions = RegionService.getRegions();
+            assert.equal(regions.length, 1,
+                'empty manifest must synthesize exactly one self-pointing region — otherwise the picker is stuck warming forever');
+            assert.equal(regions[0].id, 'local', 'synthesised region inherits the server-stamped regionId');
+            assert.equal(regions[0].hostname, 'https://my-app.example.com',
+                'synthesised hostname comes from window.location.origin so RTT measures against the current server');
+
+            // Verify the synthesis produces a working measurement path
+            // — start() must NOT throw "no regions configured", and a
+            // burst against the synthetic host must populate RTT state.
+            RegionService.start();
+            await new Promise(r => setTimeout(r, 50));
+            const rtt = RegionService.getRtt('local');
+            assert.notEqual(rtt.state, 'warming',
+                'after first burst against the synthetic host, state must advance out of warming');
+        } finally {
+            RegionService.stop();
+            globalThis.window = origWindow;
+            restore();
+        }
+    });
+
+    test('empty regions manifest WITHOUT window.location leaves regions empty (Node / SSR safe)', async () => {
+        // The synthesis is browser-only — defensive guard so the module
+        // remains safe to require in Node tests / SSR contexts where
+        // window.location may not exist.
+        const restore = installFetchStub([
+            ['/api/regions', async () => ({
+                body: { regionId: 'local', displayName: 'Local', regions: [] },
+            })],
+        ]);
+        const origWindow = globalThis.window;
+        globalThis.window = { /* deliberately no location */ };
+        try {
+            await RegionService.load();
+            assert.equal(RegionService.getRegions().length, 0,
+                'without window.location the synthesis is skipped — start() then throws, picker falls back to legacy single-region SignalR');
+        } finally {
+            globalThis.window = origWindow;
+            restore();
+        }
+    });
 });
