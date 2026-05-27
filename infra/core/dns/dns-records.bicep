@@ -7,15 +7,21 @@ param subdomain string
 @description('Target hostname for the CNAME record')
 param targetHostname string
 
-@description('Domain verification token from Container App')
-param verificationToken string
+@description('Single Container App customDomainVerificationId for managed-cert CNAME/HTTP validation (single-region path). Empty when BYO cert path is used (asuid TXT not emitted).')
+param verificationToken string = ''
+
+@description('When true, never emit the asuid TXT record regardless of verificationToken. Used by the BYO cert path: bicep binds the cert from Key Vault directly, so no managed-cert ownership validation runs and the TXT would just be dead weight.')
+param skipAsuid bool = false
 
 // Reference existing DNS zone
 resource dnsZone 'Microsoft.Network/dnsZones@2018-05-01' existing = {
   name: dnsZoneName
 }
 
-// CNAME record for the subdomain
+// CNAME record for the subdomain — points to either a single container app
+// FQDN (single-region) or the Traffic Manager profile FQDN (multi-region).
+// Both shapes are handled identically here; the caller decides which
+// targetHostname to pass.
 resource cnameRecord 'Microsoft.Network/dnsZones/CNAME@2018-05-01' = {
   parent: dnsZone
   name: subdomain
@@ -27,16 +33,20 @@ resource cnameRecord 'Microsoft.Network/dnsZones/CNAME@2018-05-01' = {
   }
 }
 
-// TXT record for domain verification
-resource txtRecord 'Microsoft.Network/dnsZones/TXT@2018-05-01' = {
+// asuid.<subdomain> TXT record for Container Apps managed-certificate
+// validation. Emitted only when (a) we have a verificationToken AND
+// (b) skipAsuid is false. In the multi-region BYO-cert path this is
+// always skipped — bicep binds the cert from KV directly so no
+// managed-cert ownership validation runs.
+var emitAsuid = !skipAsuid && !empty(verificationToken)
+
+resource txtRecord 'Microsoft.Network/dnsZones/TXT@2018-05-01' = if (emitAsuid) {
   parent: dnsZone
   name: 'asuid.${subdomain}'
   properties: {
     TTL: 3600
     TXTRecords: [
-      {
-        value: [verificationToken]
-      }
+      { value: [verificationToken] }
     ]
   }
 }

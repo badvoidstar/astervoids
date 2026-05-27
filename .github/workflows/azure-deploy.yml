@@ -25,6 +25,46 @@ env:
   PRODUCTION_RG: 'rg-production'
   CONTAINER_ENV_NAME: 'cae-production'
   CONTAINER_APP_PREFIX: 'ca-web'
+  # ── Multi-region rollout ──────────────────────────────────────────────────
+  # Source of truth: the GitHub repository variable REGIONS_JSON
+  # (Settings → Secrets and variables → Actions → Variables tab).
+  # Empty string preserves the legacy single-region production deploy
+  # (everything in westus2 under cae-production). To roll out multi-region,
+  # set the REGIONS_JSON repo variable to a JSON array of region objects:
+  #
+  #   [
+  #     {"name":"westus2","location":"westus2","displayName":"US West"},
+  #     {"name":"northeurope","location":"northeurope","displayName":"Europe (Dublin)"},
+  #     {"name":"japaneast","location":"japaneast","displayName":"Asia (Tokyo)"}
+  #   ]
+  #
+  # The first entry is the "primary" region — it owns the shared ACR and
+  # branch deployments target its CAE. Only applied when deploying main;
+  # branches always go single-region into the primary region's CAE.
+  REGIONS_JSON: ${{ vars.REGIONS_JSON }}
+  # ── BYO TLS certificate (optional) ────────────────────────────────────────
+  # When all three are set, bicep binds <subdomain>.<domain> on every region
+  # (and every branch deploy) to a Key Vault-stored certificate — no per-app
+  # DigiCert managed-cert provisioning runs. Recommended path for multi-region
+  # where the apex CNAME must point at Traffic Manager (which blocks ACA
+  # managed-cert validation). See ARCHITECTURE.md "Apex TLS via BYO cert".
+  #
+  # When ANY is empty, falls back to the legacy DigiCert managed-cert flow
+  # (works in single-region only; multi-region apex TLS will fail).
+  #
+  # Set via repo variables (Settings → Secrets and variables → Actions → Variables):
+  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com
+  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-your-domain-com (stable name for the CAE cert resource)
+  #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
+  #                                 'Key Vault Certificate User' role on the KV holding the cert.
+  #                                 OPTIONAL in production when bicep's manageAcmebotPermissions=true
+  #                                 (the default — bicep creates id-acme-cert-reader and uses its
+  #                                 output for the CAE cert binding). STILL REQUIRED for branch deploys
+  #                                 (the bootstrap step needs the ID to attach the identity to the
+  #                                 shared CAE before creating the cert resource).
+  CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
+  CERT_KEY_VAULT_CERT_NAME: ${{ vars.CERT_KEY_VAULT_CERT_NAME }}
+  CERT_READER_IDENTITY_ID: ${{ vars.CERT_READER_IDENTITY_ID }}
 
 jobs:
   build:
@@ -48,6 +88,16 @@ jobs:
 
       - name: Run tests
         run: dotnet test astervoids.sln --configuration Release --no-build --verbosity normal
+
+      # Bicep smoke check — fail fast on template syntax errors before any
+      # Azure deploy is attempted. Runs in the build job so a malformed
+      # bicep change blocks the deploy job from even running.
+      - name: Bicep build (template smoke check)
+        run: |
+          # az is preinstalled on ubuntu-latest runners; bicep CLI auto-installs on first use.
+          az bicep build --file infra/main.bicep --outfile /tmp/main.compiled.json
+          test -s /tmp/main.compiled.json
+          echo "✅ infra/main.bicep compiles"
 
   deploy:
     name: Deploy to Azure
@@ -147,15 +197,223 @@ jobs:
             fi
           fi
 
+          # BYO TLS cert (optional) — passed through to bicep when all three
+          # vars are set. azd reads these via main.parameters.json env-var
+          # substitution (see infra/main.parameters.json).
+          if [ -n "$CERT_KEY_VAULT_SECRET_URL" ]; then
+            azd env set CERT_KEY_VAULT_SECRET_URL "$CERT_KEY_VAULT_SECRET_URL"
+            azd env set CERT_KEY_VAULT_CERT_NAME "$CERT_KEY_VAULT_CERT_NAME"
+            azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
+          fi
+
+      - name: Bootstrap BYO cert on shared CAE (branches only)
+        # Production deploys handle BYO cert + identity attachment via bicep
+        # (container-apps.bicep adds properties.identity.userAssignedIdentities
+        # on the CAE + a managedEnvironments/certificates resource referencing
+        # it). Branch deploys reference an EXISTING CAE via 'existing' and
+        # can't safely modify its properties through bicep without risking
+        # collisions, so we do the equivalent setup here via az CLI before
+        # bicep runs.
+        #
+        # Both operations are idempotent:
+        #   - `az containerapp env identity assign` is a no-op if already attached.
+        #   - The cert-existence check skips creation when the named cert is present.
+        # So this step is safe to run on every branch push regardless of whether
+        # production has already deployed with BYO (it has, → no-op; it hasn't, →
+        # creates both). After this step succeeds, bicep's webBranch module can
+        # bind the branch hostname to the cert with bindingType=SniEnabled.
+        #
+        # The custom-domain check is intentionally omitted: env.CUSTOM_DOMAIN_NAME
+        # would be empty (it's a secret, not an env var), and bootstrapping the
+        # cert when no domain is configured is just a few wasted az calls — the
+        # cert sits unbound until something references it.
+        if: steps.vars.outputs.is_production != 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
+        run: |
+          # Single-region branches target 'cae-production'. After multi-region
+          # production is rolled out (REGIONS_JSON populated), this name will
+          # need to switch to 'cae-production-${primary-region}' — out of scope
+          # for this step's current single-region branch model.
+          CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
+          RG="${{ env.PRODUCTION_RG }}"
+
+          echo "::group::Bootstrap BYO cert on $CAE_NAME"
+
+          # Defensive check: the shared CAE must already exist (production
+          # owns its creation). If it doesn't, fail clearly — the branch
+          # deploy would fail later in confusing ways otherwise.
+          if ! az containerapp env show --resource-group "$RG" --name "$CAE_NAME" &>/dev/null; then
+            echo "::error::Shared CAE '$CAE_NAME' not found in '$RG'."
+            echo "::error::Production must be deployed first to create the CAE."
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # 1. Attach the user-assigned identity if not already attached.
+          # `identity assign` is a PATCH that adds the identity to the
+          # userAssignedIdentities collection; no-op if already present.
+          echo "Attaching identity $CERT_READER_IDENTITY_ID to CAE $CAE_NAME (idempotent)..."
+          az containerapp env identity assign \
+            --resource-group "$RG" \
+            --name "$CAE_NAME" \
+            --user-assigned "$CERT_READER_IDENTITY_ID" \
+            --output none
+
+          # 2. Create the cert resource on the CAE if it doesn't already exist.
+          # The az CLI's `az containerapp env certificate create` only supports
+          # the managed-cert path (--hostname + --validation-method). For
+          # KV-backed BYO certs we PUT the ARM resource directly — same shape
+          # as bicep's Microsoft.App/managedEnvironments/certificates resource.
+          CERT_EXISTS=$(az containerapp env certificate list \
+            --resource-group "$RG" --name "$CAE_NAME" \
+            --query "[?name=='$CERT_KEY_VAULT_CERT_NAME'].name" -o tsv 2>/dev/null || echo "")
+          if [ -z "$CERT_EXISTS" ]; then
+            echo "Cert '$CERT_KEY_VAULT_CERT_NAME' not present on CAE — PUT'ing ARM resource from Key Vault..."
+            CAE_LOCATION=$(az containerapp env show \
+              --resource-group "$RG" --name "$CAE_NAME" \
+              --query location -o tsv)
+            CERT_ARM_URL="https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RG}/providers/Microsoft.App/managedEnvironments/${CAE_NAME}/certificates/${CERT_KEY_VAULT_CERT_NAME}?api-version=2024-10-02-preview"
+            BODY=$(jq -n \
+              --arg loc "$CAE_LOCATION" \
+              --arg identity "$CERT_READER_IDENTITY_ID" \
+              --arg kvurl "$CERT_KEY_VAULT_SECRET_URL" \
+              '{
+                location: $loc,
+                properties: {
+                  certificateKeyVaultProperties: {
+                    identity: $identity,
+                    keyVaultUrl: $kvurl
+                  }
+                }
+              }')
+            TMP_BODY=$(mktemp)
+            echo "$BODY" > "$TMP_BODY"
+            az rest --method PUT --uri "$CERT_ARM_URL" --body "@$TMP_BODY" --output none
+            rm -f "$TMP_BODY"
+            echo "✅ Cert created via ARM PUT"
+          else
+            echo "✅ Cert '$CERT_KEY_VAULT_CERT_NAME' already present on CAE — no action needed"
+          fi
+          echo "::endgroup::"
+
       - name: Provision and Deploy to Azure
         id: deploy
         run: |
           IS_PRODUCTION="${{ steps.vars.outputs.is_production }}"
           SANITIZED_BRANCH="${{ steps.vars.outputs.sanitized_branch }}"
-          
-          if [ "$IS_PRODUCTION" = "true" ]; then
-            # Production: use azd up for full provision + deploy
+          # ── Multi-region detection ────────────────────────────────────────
+          # Only the main branch (production) can be multi-region. Branches
+          # always deploy single-region into the primary region's CAE.
+          # REGIONS_JSON is parsed once here so the script can branch on
+          # `IS_MULTI_REGION` without re-parsing.
+          IS_MULTI_REGION="false"
+          if [ "$IS_PRODUCTION" = "true" ] && [ -n "$REGIONS_JSON" ]; then
+            # Validate it's a non-empty JSON array; fail loudly if it isn't.
+            REGION_COUNT=$(echo "$REGIONS_JSON" | jq 'length' 2>/dev/null || echo "0")
+            if [ "$REGION_COUNT" -gt 0 ] 2>/dev/null; then
+              IS_MULTI_REGION="true"
+              echo "::notice::Multi-region production deploy: $REGION_COUNT regions"
+            else
+              echo "::warning::REGIONS_JSON is set but did not parse as a non-empty array. Falling back to single-region."
+            fi
+          fi
+
+          if [ "$IS_PRODUCTION" = "true" ] && [ "$IS_MULTI_REGION" = "false" ]; then
+            # Production single-region (legacy): use azd up for full provision + deploy
             azd up --no-prompt
+          elif [ "$IS_MULTI_REGION" = "true" ]; then
+            # ── Production multi-region ───────────────────────────────────
+            # We bypass `azd up` because azd doesn't know about per-region
+            # container apps. Instead:
+            #   1. Run bicep directly with regions=<JSON>, which provisions
+            #      per-region CAEs + container apps + Traffic Manager.
+            #   2. Build the Docker image once.
+            #   3. Push it to the shared ACR.
+            #   4. Update each region's container app to point at the new image.
+            # Each region's container app already has Region__Id env var
+            # baked in by the bicep template; only the image tag changes
+            # on subsequent deploys.
+            CD_NAME=$(azd env get-values | grep '^CUSTOM_DOMAIN_NAME=' | cut -d'=' -f2 | tr -d '"' || echo "")
+            CD_SUB=$(azd env get-values | grep '^CUSTOM_SUBDOMAIN=' | cut -d'=' -f2 | tr -d '"' || echo "")
+            PRIMARY_LOCATION=$(echo "$REGIONS_JSON" | jq -r '.[0].location')
+
+            # ── Fail-fast: multi-region + custom domain REQUIRES BYO cert ──
+            # ACA managed certs can't validate behind an intermediate CNAME
+            # like Traffic Manager (Microsoft Container Apps docs:
+            # https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates#free-certificate-requirements).
+            # Without a Key Vault-backed BYO cert, the apex hostname would
+            # bind but never serve a valid TLS cert. Surface this BEFORE
+            # any infra is provisioned so the operator catches the
+            # misconfiguration in seconds, not after a ~10 min deploy.
+            if [ -n "$CD_NAME" ] && [ -z "$CERT_KEY_VAULT_SECRET_URL" ]; then
+              echo "::error::Multi-region with a custom domain requires BYO cert vars."
+              echo "::error::  CUSTOM_DOMAIN_NAME is set ('$CD_NAME') but CERT_KEY_VAULT_SECRET_URL is empty."
+              echo "::error::  Azure Container Apps managed certs cannot validate behind Traffic Manager."
+              echo "::error::  Set vars.CERT_KEY_VAULT_SECRET_URL, vars.CERT_KEY_VAULT_CERT_NAME, and"
+              echo "::error::  vars.CERT_READER_IDENTITY_ID. See ARCHITECTURE.md -> 'Apex TLS via BYO cert'."
+              exit 1
+            fi
+
+            echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
+            az deployment sub create \
+              --name "production-multi-${{ github.run_id }}" \
+              --location "$PRIMARY_LOCATION" \
+              --template-file infra/main.bicep \
+              --parameters \
+                environmentName=production \
+                location="$PRIMARY_LOCATION" \
+                customDomainName="$CD_NAME" \
+                customSubdomain="$CD_SUB" \
+                regions="$REGIONS_JSON" \
+                certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
+                certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
+                certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
+              --output none
+
+            # Get the shared ACR name from the deployment outputs.
+            ACR_NAME=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_NAME.value' -o tsv)
+            ACR_LOGIN_SERVER=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_ENDPOINT.value' -o tsv)
+
+            IMAGE_TAG="${{ github.sha }}"
+            IMAGE_NAME="astervoids-web:${IMAGE_TAG}"
+            FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}"
+
+            echo "Building and pushing image: $FULL_IMAGE"
+            az acr login --name "$ACR_NAME"
+            docker build -t "$FULL_IMAGE" ./AstervoidsWeb
+            docker push "$FULL_IMAGE"
+
+            # Update every region's container app with the new image.
+            echo "$REGIONS_JSON" | jq -r '.[].name' | while read -r REGION_NAME; do
+              CONTAINER_APP_NAME="${{ env.CONTAINER_APP_PREFIX }}-production-${REGION_NAME}"
+              echo "::group::Updating $CONTAINER_APP_NAME ($REGION_NAME)"
+              az containerapp update \
+                --name "$CONTAINER_APP_NAME" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --image "$FULL_IMAGE" \
+                --output table
+              echo "::endgroup::"
+            done
+
+            # Surface Traffic Manager FQDN + per-region details in the run log.
+            echo "Traffic Manager FQDN: $(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)"
+            echo "Per-region endpoints:"
+            az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.REGION_ENDPOINTS.value' -o jsonc
+
+            # Use the primary region's URI as the canonical deploy URL.
+            azd env set WEB_URI "$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.WEB_URI.value' -o tsv)"
+            azd env set CONTAINER_APP_NAME "${{ env.CONTAINER_APP_PREFIX }}-production-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
+            azd env set CONTAINER_APPS_ENVIRONMENT "${{ env.CONTAINER_ENV_NAME }}-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
+            azd env set RESOURCE_GROUP "${{ env.PRODUCTION_RG }}"
           else
             # Branch: provision with azd, then deploy with az cli to specific container app
             # First, provision the infrastructure
@@ -189,7 +447,10 @@ jobs:
                   location=westus2 \
                   useSharedInfra=true \
                   customDomainName="$CD_NAME" \
-                  customSubdomain="$CD_SUB"
+                  customSubdomain="$CD_SUB" \
+                  certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
+                  certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
+                  certReaderIdentityId="$CERT_READER_IDENTITY_ID"
 
               # Re-verify after the fallback deployment.
               if ! az containerapp show \
@@ -237,7 +498,8 @@ jobs:
           echo "CONTAINER_APP_NAME=$(azd env get-values | grep '^CONTAINER_APP_NAME=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
           echo "CONTAINER_APPS_ENVIRONMENT=$(azd env get-values | grep '^CONTAINER_APPS_ENVIRONMENT=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
           echo "RESOURCE_GROUP=$(azd env get-values | grep '^RESOURCE_GROUP=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
-          
+          echo "IS_MULTI_REGION=${IS_MULTI_REGION}" >> $GITHUB_ENV
+
           # Get custom domain from azd outputs
           CUSTOM_DOMAIN=$(azd env get-values | grep '^CUSTOM_DOMAIN=' | cut -d'=' -f2 | tr -d '"')
           if [ -n "$CUSTOM_DOMAIN" ]; then
@@ -247,30 +509,30 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Configure Custom Domain (if enabled)
-        if: env.CUSTOM_DOMAIN != ''
+        # Runs ONLY for single-region production WITHOUT BYO cert vars.
+        # All other cases are handled in-band by bicep + the bootstrap step:
+        #   - Single-region production WITH BYO    → bicep binds via SNI.
+        #   - Multi-region production              → bicep + fail-fast guard.
+        #   - Branches WITH BYO                    → bootstrap step (above)
+        #                                            ensures cert + identity on
+        #                                            the shared CAE; bicep then
+        #                                            binds the branch hostname
+        #                                            via SNI. ~5 min saved vs
+        #                                            the legacy managed-cert flow.
+        #   - Branches WITHOUT BYO                 → this step runs, the
+        #                                            legacy DigiCert flow
+        #                                            creates + binds a managed
+        #                                            cert per branch.
+        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && env.CERT_KEY_VAULT_SECRET_URL == ''
         continue-on-error: true
         run: |
-          echo "Configuring custom domain: $CUSTOM_DOMAIN"
-          
-          # Check if hostname already exists and is bound with HTTPS
-          EXISTING=$(az containerapp hostname list \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$CONTAINER_APP_NAME" \
-            --query "[?name=='$CUSTOM_DOMAIN'].bindingType" -o tsv 2>/dev/null || echo "")
-          
-          if [ "$EXISTING" = "SniEnabled" ]; then
-            echo "✅ Custom domain already configured with HTTPS"
-            exit 0
-          fi
-          
-          # Function to check DNS propagation
+          echo "Configuring custom domain: $CUSTOM_DOMAIN (single-region managed-cert flow)"
+
+          # ── DNS propagation probe ─────────────────────────────────────
           check_dns() {
             echo "Checking DNS propagation for $CUSTOM_DOMAIN..."
-            # Check CNAME record
             CNAME_RESULT=$(nslookup "$CUSTOM_DOMAIN" 2>/dev/null | grep -i "canonical name" || echo "")
-            # Check TXT verification record
             TXT_RESULT=$(nslookup -type=TXT "asuid.$CUSTOM_DOMAIN" 2>/dev/null | grep -i "text" || echo "")
-            
             if [ -n "$CNAME_RESULT" ] && [ -n "$TXT_RESULT" ]; then
               echo "✅ DNS records found"
               return 0
@@ -279,115 +541,139 @@ jobs:
               return 1
             fi
           }
-          
-          # Retry logic with exponential backoff for the entire custom domain setup
+
+          # ── Bind hostname + provision managed cert (idempotent) ───────
+          # Returns 0 on success (hostname bound with HTTPS) or 1 on
+          # transient failure (outer attempt loop retries).
+          bind_single_region() {
+            local rg="${PRODUCTION_RG}"
+            local env_name="$CONTAINER_APPS_ENVIRONMENT"
+            local app_name="$CONTAINER_APP_NAME"
+
+            echo "::group::Binding $CUSTOM_DOMAIN on $app_name"
+
+            # Fast path: already SniEnabled means the cert is bound and
+            # serving HTTPS — no work to do.
+            local existing_binding
+            existing_binding=$(az containerapp hostname list \
+              --resource-group "$rg" --name "$app_name" \
+              --query "[?name=='$CUSTOM_DOMAIN'].bindingType" -o tsv 2>/dev/null || echo "")
+            if [ "$existing_binding" = "SniEnabled" ]; then
+              echo "✅ Already SniEnabled — skipping"
+              echo "::endgroup::"
+              return 0
+            fi
+
+            # Add custom hostname (unbound first; validation happens during cert create).
+            local hostname_exists
+            hostname_exists=$(az containerapp hostname list \
+              --resource-group "$rg" --name "$app_name" \
+              --query "[?name=='$CUSTOM_DOMAIN'].name" -o tsv 2>/dev/null || echo "")
+            if [ -z "$hostname_exists" ]; then
+              echo "Adding custom hostname..."
+              if ! az containerapp hostname add \
+                --resource-group "$rg" --name "$app_name" \
+                --hostname "$CUSTOM_DOMAIN" 2>&1; then
+                echo "::warning::Failed to add hostname on $app_name"
+                echo "::endgroup::"
+                return 1
+              fi
+            else
+              echo "Hostname already exists, skipping add..."
+            fi
+
+            # Create managed cert with CNAME validation.
+            local cert_name="cert-${CUSTOM_DOMAIN//./-}"
+            local cert_exists
+            cert_exists=$(az containerapp env certificate list \
+              --resource-group "$rg" --name "$env_name" \
+              --query "[?name=='$cert_name'].name" -o tsv 2>/dev/null || echo "")
+            if [ -z "$cert_exists" ]; then
+              echo "Creating managed certificate (CNAME validation)..."
+              if ! az containerapp env certificate create \
+                --resource-group "$rg" --name "$env_name" \
+                --certificate-name "$cert_name" \
+                --hostname "$CUSTOM_DOMAIN" \
+                --validation-method CNAME 2>&1; then
+                echo "::warning::Failed to create certificate on $env_name"
+                echo "::endgroup::"
+                return 1
+              fi
+            fi
+
+            # Wait for cert provisioning (up to 5 minutes).
+            local cert_id="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$rg/providers/Microsoft.App/managedEnvironments/$env_name/managedCertificates/$cert_name"
+            local cert_ready=false
+            for i in $(seq 1 30); do
+              local state
+              state=$(az resource show --ids "$cert_id" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
+              echo "Cert state: $state (check $i/30)"
+              if [ "$state" = "Succeeded" ]; then
+                cert_ready=true
+                break
+              elif [ "$state" = "Failed" ]; then
+                echo "::warning::Cert provisioning Failed on $env_name"
+                break
+              fi
+              sleep 10
+            done
+
+            if [ "$cert_ready" = "true" ]; then
+              echo "Binding certificate..."
+              if az containerapp hostname bind \
+                --resource-group "$rg" --name "$app_name" \
+                --hostname "$CUSTOM_DOMAIN" \
+                --environment "$env_name" \
+                --validation-method CNAME 2>&1; then
+                echo "✅ HTTPS enabled for $CUSTOM_DOMAIN on $app_name"
+                echo "::endgroup::"
+                return 0
+              fi
+            fi
+
+            echo "::warning::Cert not ready / bind failed for $app_name"
+            echo "::endgroup::"
+            return 1
+          }
+
+          # ── Outer attempt loop ─────────────────────────────────────────
           MAX_RETRIES=3
-          RETRY_DELAY=120  # Start with 2 minutes
-          
+          RETRY_DELAY=120
+
           for attempt in $(seq 1 $MAX_RETRIES); do
             echo ""
             echo "=========================================="
             echo "Custom domain setup attempt $attempt of $MAX_RETRIES"
             echo "=========================================="
-            
-            # Wait for DNS propagation before attempting (skip wait on first attempt if DNS already propagated)
+
+            # Wait for DNS propagation before attempting (skip wait on
+            # first attempt if DNS is already propagated).
             if [ $attempt -gt 1 ] || ! check_dns; then
               if [ $attempt -gt 1 ]; then
                 WAIT_TIME=$((RETRY_DELAY * (attempt - 1)))
                 echo "Waiting ${WAIT_TIME}s before retry..."
                 sleep $WAIT_TIME
               fi
-              
-              # Check DNS again after waiting
               if ! check_dns; then
                 echo "DNS not propagated yet, will retry..."
                 if [ $attempt -eq $MAX_RETRIES ]; then
                   echo "::warning::DNS not propagated after $MAX_RETRIES attempts. Custom domain setup incomplete."
-                  echo "Run the deployment again later or configure manually."
                   exit 0
                 fi
                 continue
               fi
             fi
-            
-            # Check if hostname already exists (refresh check each attempt)
-            HOSTNAME_EXISTS=$(az containerapp hostname list \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$CONTAINER_APP_NAME" \
-              --query "[?name=='$CUSTOM_DOMAIN'].name" -o tsv 2>/dev/null || echo "")
-            
-            # Add custom hostname (skip if already exists)
-            if [ -z "$HOSTNAME_EXISTS" ]; then
-              echo "Adding custom hostname..."
-              if ! az containerapp hostname add \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APP_NAME" \
-                --hostname "$CUSTOM_DOMAIN" 2>&1; then
-                echo "Failed to add hostname, will retry..."
-                continue
-              fi
-            else
-              echo "Hostname already exists, skipping add..."
+
+            if bind_single_region; then
+              echo "✅ Single-region custom domain bound on attempt $attempt"
+              exit 0
             fi
-            
-            # Create certificate
-            CERT_NAME="cert-${CUSTOM_DOMAIN//./-}"
-            CERT_EXISTS=$(az containerapp env certificate list \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$CONTAINER_APPS_ENVIRONMENT" \
-              --query "[?name=='$CERT_NAME'].name" -o tsv 2>/dev/null || echo "")
-            
-            if [ -z "$CERT_EXISTS" ]; then
-              echo "Creating managed certificate..."
-              if ! az containerapp env certificate create \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APPS_ENVIRONMENT" \
-                --certificate-name "$CERT_NAME" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --validation-method CNAME 2>&1; then
-                echo "Failed to create certificate, will retry..."
-                continue
-              fi
-            fi
-            
-            # Wait for certificate to be ready (up to 5 minutes per attempt)
-            echo "Waiting for certificate provisioning..."
-            CERT_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/managedEnvironments/$CONTAINER_APPS_ENVIRONMENT/managedCertificates/$CERT_NAME"
-            CERT_READY=false
-            
-            for i in $(seq 1 30); do
-              STATE=$(az resource show --ids "$CERT_ID" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
-              echo "Certificate state: $STATE (check $i/30)"
-              
-              if [ "$STATE" = "Succeeded" ]; then
-                CERT_READY=true
-                break
-              elif [ "$STATE" = "Failed" ]; then
-                echo "Certificate provisioning failed"
-                break
-              fi
-              sleep 10
-            done
-            
-            if [ "$CERT_READY" = "true" ]; then
-              echo "Binding certificate..."
-              if az containerapp hostname bind \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$CONTAINER_APP_NAME" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --environment "$CONTAINER_APPS_ENVIRONMENT" \
-                --validation-method CNAME 2>&1; then
-                echo "✅ HTTPS enabled for $CUSTOM_DOMAIN"
-                exit 0
-              fi
-            fi
-            
-            echo "Certificate not ready, will retry..."
+            echo "Bind attempt $attempt failed; will retry..."
           done
-          
+
           echo "::warning::Custom domain setup incomplete after $MAX_RETRIES attempts."
           echo "The deployment succeeded but HTTPS is not yet configured."
-          echo "This usually resolves on the next deployment after DNS propagates."
+          echo "Usually resolves on the next deployment after DNS propagates."
 
       - name: Deployment Summary
         run: |
@@ -402,5 +688,26 @@ jobs:
           if [ -n "$CUSTOM_DOMAIN" ]; then
             echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY
           fi
+
+          # Multi-region: list per-region container apps + Traffic Manager FQDN
+          # so reviewers can spot-check each regional endpoint from the summary.
+          if [ "$IS_MULTI_REGION" = "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Multi-region rollout:** $(echo "$REGIONS_JSON" | jq 'length') regions" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Region | Container App | FQDN |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|---------------|------|" >> $GITHUB_STEP_SUMMARY
+            az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.REGION_ENDPOINTS.value[]' -o json \
+              | jq -r '.[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
+              >> $GITHUB_STEP_SUMMARY
+            TM_FQDN=$(az deployment sub show \
+              --name "production-multi-${{ github.run_id }}" \
+              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Traffic Manager FQDN:** \`$TM_FQDN\` (CNAME the apex domain here)" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "View your deployment in the [Azure Portal](https://portal.azure.com)" >> $GITHUB_STEP_SUMMARY
