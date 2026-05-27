@@ -257,10 +257,12 @@ module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) 
 // DNS records for production custom domain (multi-region path).
 // CNAMEs the user's custom subdomain to the Traffic Manager FQDN so a
 // browser visiting `<customSubdomain>.<customDomainName>` is DNS-routed to
-// the nearest healthy region. The asuid TXT record carries one
-// customDomainVerificationId per region so every region's managed-cert
-// validation can succeed independently — UNLESS BYO cert is configured, in
-// which case the asuid TXT is omitted (no managed-cert validation runs).
+// the nearest healthy region. Multi-region custom domain ALWAYS uses BYO
+// cert (ACA managed certs can't validate behind an intermediate CNAME like
+// Traffic Manager — the workflow's fail-fast guard rejects multi-region +
+// custom domain without BYO cert before bicep ever runs). Therefore the
+// asuid TXT record is always skipped here: bicep binds the cert from KV
+// directly, no managed-cert ownership validation runs.
 #disable-next-line BCP318
 module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMultiRegion && useCustomDomain) {
   name: 'dns-records-production-multi'
@@ -269,8 +271,7 @@ module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMult
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: trafficManager.outputs.fqdn
-    verificationTokens: [for (r, i) in (isMultiRegion ? regions : []): webRegional[i].outputs.verificationId]
-    skipAsuid: byoCertEnabled
+    skipAsuid: true
   }
   dependsOn: [dnsZone, trafficManager]
 }
