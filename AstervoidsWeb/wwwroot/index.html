@@ -2498,8 +2498,29 @@
                     const a0 = state.previous.angle;
                     const a1 = a0 + dAngle;
                     const rpsToPerSec = CONFIG.TARGET_FPS;
-                    const am0 = (state.previousRotationSpeed || 0) * rpsToPerSec * dt;
-                    const am1 = (state.rotationSpeed || 0) * rpsToPerSec * dt;
+                    let am0 = (state.previousRotationSpeed || 0) * rpsToPerSec * dt;
+                    let am1 = (state.rotationSpeed || 0) * rpsToPerSec * dt;
+                    // Fritsch–Carlson monotone-Hermite clamp on the angle
+                    // tangents so the cubic cannot overshoot the [a0, a1]
+                    // chord. Without this, short turn-input taps (where
+                    // prev.rotationSpeed ≈ ±SHIP_TURN_SPEED but the actual
+                    // endpoint chord dAngle is small) produce visible
+                    // angular overshoot on remote observers even with no
+                    // extrapolation and good network conditions. The owner
+                    // doesn't see this because they render the live Ship
+                    // and never sample the snapshot buffer. Position
+                    // tangents are intentionally NOT clamped: linear
+                    // velocity is far more continuous than turn input, so
+                    // the position Hermite rarely overshoots in practice.
+                    // The sufficient condition |am| ≤ 3·|chord| (with same
+                    // sign as chord) guarantees a monotone cubic on the
+                    // parameter interval.
+                    const chord = dAngle;
+                    const maxTangent = 3 * Math.abs(chord);
+                    if (am0 * chord < 0) am0 = 0;
+                    else if (Math.abs(am0) > maxTangent) am0 = Math.sign(am0) * maxTangent;
+                    if (am1 * chord < 0) am1 = 0;
+                    else if (Math.abs(am1) > maxTangent) am1 = Math.sign(am1) * maxTangent;
                     result.angle = h00 * a0 + h10 * am0 + h01 * a1 + h11 * am1;
                 }
             }
