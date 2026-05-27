@@ -13,10 +13,10 @@ param containerRegistryName string
 @description('Whether this module should create the Azure Container Registry. In multi-region deployments, secondary regions share the primary region ACR — set false on secondary regions and the primary region (default true) will create it.')
 param createRegistry bool = true
 
-@description('BYO cert (optional). Full Key Vault secret URL pointing at the cert to bind, e.g. `https://my-kv.vault.azure.net/secrets/wildcard-aiplay-io`. When set, this module emits a Microsoft.App/managedEnvironments/certificates resource pulling the cert into this CAE so container apps in this env can bind their custom domain to it. When empty, no cert resource is emitted — the managed-cert flow (workflow-driven, DigiCert-issued, CNAME-validated) is used instead.')
+@description('BYO cert (optional). Full Key Vault secret URL pointing at the cert to bind, e.g. `https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com`. When set, this module emits a Microsoft.App/managedEnvironments/certificates resource pulling the cert into this CAE so container apps in this env can bind their custom domain to it. When empty, no cert resource is emitted — the managed-cert flow (workflow-driven, DigiCert-issued, CNAME-validated) is used instead.')
 param certKeyVaultSecretUrl string = ''
 
-@description('BYO cert (optional). Name to give the certificate resource on the CAE. Used both as the resource name and as the cert identifier referenced by container apps. Typically a stable name like `wildcard-aiplay-io` so all regions pick up the same cert.')
+@description('BYO cert (optional). Name to give the certificate resource on the CAE. Used both as the resource name and as the cert identifier referenced by container apps. Typically a stable name like `wildcard-your-domain-com` so all regions pick up the same cert.')
 param certKeyVaultCertName string = ''
 
 @description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Azure uses this identity to fetch the cert during creation. Required when certKeyVaultSecretUrl is set.')

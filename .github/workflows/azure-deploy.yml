@@ -53,8 +53,8 @@ env:
   # (works in single-region only; multi-region apex TLS will fail).
   #
   # Set via repo variables (Settings → Secrets and variables → Actions → Variables):
-  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-aiplay-io
-  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-aiplay-io (stable name for the CAE cert resource)
+  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com
+  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-your-domain-com (stable name for the CAE cert resource)
   #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
   #                                 'Key Vault Certificate User' role on the KV holding the cert
   CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
