@@ -16,6 +16,15 @@
     },
     "useSharedInfra": {
       "value": "${USE_SHARED_INFRA=false}"
+    },
+    "certKeyVaultSecretUrl": {
+      "value": "${CERT_KEY_VAULT_SECRET_URL=}"
+    },
+    "certKeyVaultCertName": {
+      "value": "${CERT_KEY_VAULT_CERT_NAME=}"
+    },
+    "certReaderIdentityId": {
+      "value": "${CERT_READER_IDENTITY_ID=}"
     }
   }
 }

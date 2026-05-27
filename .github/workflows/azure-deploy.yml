@@ -42,6 +42,24 @@ env:
   # branch deployments target its CAE. Only applied when deploying main;
   # branches always go single-region into the primary region's CAE.
   REGIONS_JSON: ${{ vars.REGIONS_JSON }}
+  # ── BYO TLS certificate (optional) ────────────────────────────────────────
+  # When all three are set, bicep binds <subdomain>.<domain> on every region
+  # (and every branch deploy) to a Key Vault-stored certificate — no per-app
+  # DigiCert managed-cert provisioning runs. Recommended path for multi-region
+  # where the apex CNAME must point at Traffic Manager (which blocks ACA
+  # managed-cert validation). See ARCHITECTURE.md "Apex TLS via BYO cert".
+  #
+  # When ANY is empty, falls back to the legacy DigiCert managed-cert flow
+  # (works in single-region only; multi-region apex TLS will fail).
+  #
+  # Set via repo variables (Settings → Secrets and variables → Actions → Variables):
+  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-aiplay-io
+  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-aiplay-io (stable name for the CAE cert resource)
+  #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
+  #                                 'Key Vault Certificate User' role on the KV holding the cert
+  CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
+  CERT_KEY_VAULT_CERT_NAME: ${{ vars.CERT_KEY_VAULT_CERT_NAME }}
+  CERT_READER_IDENTITY_ID: ${{ vars.CERT_READER_IDENTITY_ID }}
 
 jobs:
   build:
@@ -174,6 +192,15 @@ jobs:
             fi
           fi
 
+          # BYO TLS cert (optional) — passed through to bicep when all three
+          # vars are set. azd reads these via main.parameters.json env-var
+          # substitution (see infra/main.parameters.json).
+          if [ -n "$CERT_KEY_VAULT_SECRET_URL" ]; then
+            azd env set CERT_KEY_VAULT_SECRET_URL "$CERT_KEY_VAULT_SECRET_URL"
+            azd env set CERT_KEY_VAULT_CERT_NAME "$CERT_KEY_VAULT_CERT_NAME"
+            azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
+          fi
+
       - name: Provision and Deploy to Azure
         id: deploy
         run: |
@@ -226,6 +253,9 @@ jobs:
                 customDomainName="$CD_NAME" \
                 customSubdomain="$CD_SUB" \
                 regions="$REGIONS_JSON" \
+                certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
+                certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
+                certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
               --output none
 
             # Get the shared ACR name from the deployment outputs.
@@ -306,7 +336,10 @@ jobs:
                   location=westus2 \
                   useSharedInfra=true \
                   customDomainName="$CD_NAME" \
-                  customSubdomain="$CD_SUB"
+                  customSubdomain="$CD_SUB" \
+                  certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
+                  certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
+                  certReaderIdentityId="$CERT_READER_IDENTITY_ID"
 
               # Re-verify after the fallback deployment.
               if ! az containerapp show \
@@ -375,7 +408,11 @@ jobs:
         # so CNAME validation would always fail; bicep emits an asuid TXT
         # record with one customDomainVerificationId per region so every
         # region's managed cert can independently validate).
-        if: env.CUSTOM_DOMAIN != ''
+        #
+        # BYO cert (CERT_KEY_VAULT_SECRET_URL set): bicep already bound the
+        # hostname with SniEnabled + the KV cert during provision. This step
+        # is a no-op — skipped via the env-var guard below.
+        if: env.CUSTOM_DOMAIN != '' && env.CERT_KEY_VAULT_SECRET_URL == ''
         continue-on-error: true
         run: |
           echo "Configuring custom domain: $CUSTOM_DOMAIN (IS_MULTI_REGION=${IS_MULTI_REGION})"
