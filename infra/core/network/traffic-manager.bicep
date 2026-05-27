@@ -104,7 +104,14 @@ resource profile 'Microsoft.Network/trafficmanagerprofiles@2022-04-01' = {
 // resource type isn't natively supported as an AzureEndpoint target; the
 // public FQDN works perfectly through the External path with minimal
 // configuration.
-resource regionEndpoints 'Microsoft.Network/trafficmanagerprofiles/externalEndpoints@2022-04-01' = [for ep in endpoints: {
+//
+// `priority` MUST be unique per endpoint within a profile (Azure rejects
+// duplicates with BadRequest "Different endpoints cannot be assigned the
+// same priority"). For Performance routing the priority value is ignored
+// at request-routing time (TM picks by latency, not priority), but Azure
+// still validates uniqueness. We derive `priority: i+1` from the loop
+// index so it's auto-unique and stable across deploys.
+resource regionEndpoints 'Microsoft.Network/trafficmanagerprofiles/externalEndpoints@2022-04-01' = [for (ep, i) in endpoints: {
   parent: profile
   name: ep.name
   properties: {
@@ -113,7 +120,7 @@ resource regionEndpoints 'Microsoft.Network/trafficmanagerprofiles/externalEndpo
     // Required for Performance routing — Traffic Manager uses this to
     // compute distance from the requesting DNS resolver to each endpoint.
     endpointLocation: ep.endpointLocation
-    priority: 1
+    priority: i + 1
     weight: 1
   }
 }]
