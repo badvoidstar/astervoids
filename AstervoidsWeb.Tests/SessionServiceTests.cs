@@ -142,6 +142,42 @@ public class SessionServiceTests
     }
 
     [Fact]
+    public void GetActiveSessions_DefaultRegionId_IsLocal_OnParameterlessConstructor()
+    {
+        // The parameter-less constructor is used by unit tests and legacy callers
+        // that don't bind RegionSettings. It must stamp a stable default so the
+        // client can still merge sessions across "local" and other regions
+        // without crashing on a null id.
+        _sessionService.CreateSession("connection-1");
+
+        var sessions = _sessionService.GetActiveSessions().Sessions.ToList();
+
+        sessions.Should().AllSatisfy(s => s.RegionId.Should().Be("local"));
+    }
+
+    [Fact]
+    public void GetActiveSessions_StampsConfiguredRegionId_WhenRegionSettingsBound()
+    {
+        // The DI-aware constructor takes IOptions<RegionSettings>; every
+        // SessionInfo it emits must carry that region id so cross-region clients
+        // know which region's hub to talk to for Join.
+        var sessionSettings = Microsoft.Extensions.Options.Options.Create(
+            new AstervoidsWeb.Configuration.SessionSettings { MaxSessions = 4, MaxMembersPerSession = 4 });
+        var regionSettings = Microsoft.Extensions.Options.Options.Create(
+            new AstervoidsWeb.Configuration.RegionSettings { Id = "westeurope", DisplayName = "Europe West" });
+        var logger = Microsoft.Extensions.Logging.Abstractions.NullLogger<SessionService>.Instance;
+        var svc = new SessionService(sessionSettings, logger, new FruitNameGenerator(), regionSettings);
+
+        svc.CreateSession("conn-region-stamp");
+        var sessions = svc.GetActiveSessions().Sessions.ToList();
+
+        sessions.Should().NotBeEmpty();
+        sessions.Should().AllSatisfy(s => s.RegionId.Should().Be("westeurope",
+            "every SessionInfo is stamped with the configured RegionSettings.Id " +
+            "so cross-region clients can route a Join call to the owning region"));
+    }
+
+    [Fact]
     public void GetMemberByConnectionId_ShouldReturnMember()
     {
         // Arrange

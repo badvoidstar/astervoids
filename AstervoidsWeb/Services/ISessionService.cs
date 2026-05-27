@@ -134,7 +134,13 @@ public record SessionInfo(
     string Name,
     int MemberCount,
     int MaxMembers,
-    DateTime CreatedAt
+    DateTime CreatedAt,
+    /// <summary>
+    /// Id of the region that owns this session, stamped from <c>RegionSettings.Id</c>
+    /// of the container that hosts it. Used by clients to merge cross-region session
+    /// lists and to route a Join call to the correct region's hub.
+    /// </summary>
+    string RegionId
 );
 
 /// <summary>

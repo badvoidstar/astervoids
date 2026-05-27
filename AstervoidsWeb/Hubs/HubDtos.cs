@@ -37,7 +37,12 @@ public record SessionListItem(
     [property: Key("name")] string Name,
     [property: Key("memberCount")] int MemberCount,
     [property: Key("maxMembers")] int MaxMembers,
-    [property: Key("createdAt")] DateTime CreatedAt);
+    [property: Key("createdAt")] DateTime CreatedAt,
+    /// <summary>
+    /// Id of the region that owns this session. The client must connect to this
+    /// region's <c>/sessionHub</c> to Join. Mirrors <c>SessionInfo.RegionId</c>.
+    /// </summary>
+    [property: Key("regionId")] string RegionId);
 
 [MessagePackObject]
 public record SessionStateSnapshot(

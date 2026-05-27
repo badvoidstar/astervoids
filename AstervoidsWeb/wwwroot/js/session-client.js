@@ -15,6 +15,10 @@ const SessionClient = (function() {
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
+    // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
+    // Empty string = same-origin (legacy single-region behavior). Tracked so reconnect logic
+    // can rebuild the connection against the correct region after a transient drop.
+    let currentHubHostname = '';
 
     // Event callbacks
     const callbacks = {
@@ -39,10 +43,23 @@ const SessionClient = (function() {
 
     /**
      * Initialize the SignalR connection.
+     *
+     * @param {boolean} [force=false] Force reconnect even if already connected.
+     * @param {string} [hubHostname=''] When non-empty, connect to that region's
+     *   `/sessionHub` (e.g. `https://astervoids-eastus.example.com`). When empty,
+     *   connect to same-origin `/sessionHub` (legacy single-region behavior).
+     *   Used by Phase 3 multi-region routing: Create connects to the user's
+     *   best-RTT region, Join connects to the session's owning region.
      */
-    async function connect(force = false) {
-        if (!force && connection && connection.state === signalR.HubConnectionState.Connected) {
-            // console.log('[SessionClient] Already connected');
+    async function connect(force = false, hubHostname = '') {
+        const targetHostname = hubHostname || '';
+        // If already connected to the requested region, fast-path return. A
+        // hostname mismatch always triggers a rebuild so we don't keep stale
+        // connections to a region the caller no longer wants.
+        if (!force
+            && connection
+            && connection.state === signalR.HubConnectionState.Connected
+            && currentHubHostname === targetHostname) {
             return true;
         }
 
@@ -81,8 +98,11 @@ const SessionClient = (function() {
         }
 
         try {
+            const hubUrl = targetHostname
+                ? `${targetHostname.replace(/\/$/, '')}/sessionHub`
+                : '/sessionHub';
             connection = new signalR.HubConnectionBuilder()
-                .withUrl('/sessionHub')
+                .withUrl(hubUrl)
                 .withHubProtocol(new signalR.protocols.msgpack.MessagePackHubProtocol())
                 .withAutomaticReconnect({
                     nextRetryDelayInMilliseconds: retryContext => {
@@ -94,6 +114,7 @@ const SessionClient = (function() {
                 })
                 .configureLogging(signalR.LogLevel.Information)
                 .build();
+            currentHubHostname = targetHostname;
 
             // Register event handlers
             setupEventHandlers();
@@ -692,6 +713,16 @@ const SessionClient = (function() {
         currentMember = null;
     }
 
+    /**
+     * Returns the hostname the current SignalR connection is bound to (e.g.
+     * `https://astervoids-westus2.example.com`), or `''` for same-origin /
+     * legacy single-region connections. Used by the picker to display which
+     * region the user is currently talking to and to verify Phase 3 routing.
+     */
+    function getCurrentHubHostname() {
+        return currentHubHostname;
+    }
+
     // Public API
     return {
         connect,
@@ -713,7 +744,8 @@ const SessionClient = (function() {
         isConnected,
         isInSession,
         getLastSessionId,
-        clearSessionState
+        clearSessionState,
+        getCurrentHubHostname
     };
 })();
 

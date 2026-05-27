@@ -40,8 +40,23 @@ param env array = []
 @description('Custom domain name (optional, e.g., app.yourdomain.com)')
 param customDomainName string = ''
 
+@description('Region id stamped into the running container as Region__Id (RegionSettings.Id). When empty, no Region__Id env var is injected and the container uses the value from appsettings.json (defaults to "local").')
+param regionId string = ''
+
+@description('Human-readable region name stamped into the running container as Region__DisplayName (RegionSettings.DisplayName). Ignored when regionId is empty.')
+param regionDisplayName string = ''
+
+@description('Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.')
+param cooldownPeriodSeconds int = 60
+
+@description('Grace period for in-flight requests when a replica is being terminated. SignalR connections drain cleanly via the existing LeaveSession path during this window — 30s is comfortable for that and matches the plan.')
+param terminationGracePeriodSeconds int = 30
+
+@description('HTTP scale rule concurrentRequests threshold. With maxReplicas=1 and SessionService held in-memory (non-shardable), this is a single-replica trigger; lowering from the previous 100 to 50 makes the runtime react sooner to load spikes.')
+param concurrentRequestsPerReplica int = 50
+
 // Reference existing Container Apps Environment
-resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' existing = {
+resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-10-02-preview' existing = {
   name: containerAppsEnvironmentName
 }
 
@@ -50,8 +65,22 @@ resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' e
   name: containerRegistryName
 }
 
-// Container App
-resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
+// Merge the caller-provided env array with the regional env vars synthesised from
+// regionId / regionDisplayName. The regional pair takes precedence over any
+// duplicate names in `env` so a misconfigured caller can't shadow them.
+var regionalEnv = empty(regionId) ? [] : [
+  { name: 'Region__Id', value: regionId }
+  { name: 'Region__DisplayName', value: empty(regionDisplayName) ? regionId : regionDisplayName }
+]
+var effectiveEnv = concat(env, regionalEnv)
+
+// Container App.
+//
+// API version 2024-10-02-preview is required for properties.template.scale.cooldownPeriod
+// (the scale-to-zero cooldown knob). 2024-03-01 GA doesn't expose it. We accept the
+// preview risk because the only preview property we depend on is cooldownPeriod —
+// everything else is GA-stable.
+resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
   name: name
   location: location
   tags: tags
@@ -87,6 +116,9 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ]
     }
     template: {
+      // SignalR connections drain via the existing LeaveSession path during
+      // termination; this gives that path enough time before SIGKILL.
+      terminationGracePeriodSeconds: terminationGracePeriodSeconds
       containers: [
         {
           name: 'main'
@@ -95,18 +127,22 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             cpu: json(cpu)
             memory: memory
           }
-          env: env
+          env: effectiveEnv
         }
       ]
       scale: {
         minReplicas: minReplicas
         maxReplicas: maxReplicas
+        // Aggressive cooldown so regions return to zero shortly after the
+        // last picker visitor leaves, satisfying the scale-to-zero
+        // requirement without sacrificing in-session warmth.
+        cooldownPeriod: cooldownPeriodSeconds
         rules: [
           {
             name: 'http-rule'
             http: {
               metadata: {
-                concurrentRequests: '100'
+                concurrentRequests: string(concurrentRequestsPerReplica)
               }
             }
           }
