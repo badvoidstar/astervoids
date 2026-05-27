@@ -415,19 +415,20 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Configure Custom Domain (if enabled)
-        # Single-region only: binds CUSTOM_DOMAIN to the one container app
-        # with CNAME-based managed-cert validation (CNAME points directly
-        # at the container app FQDN, so Azure can confirm ownership and
-        # provision a DigiCert managed cert).
+        # Runs in three cases:
+        #   - Single-region production WITHOUT BYO cert vars set.
+        #   - Branch deploys (regardless of whether BYO vars are set —
+        #     branches always use the DigiCert managed-cert flow with
+        #     their per-branch subdomain; BYO is production-only because
+        #     attaching the cert-reader identity to the shared CAE is
+        #     done by production's bicep deploy and can't be re-done
+        #     safely from a branch deploy).
         #
-        # Multi-region cases are handled entirely by bicep:
-        #   - With BYO cert (CERT_KEY_VAULT_SECRET_URL set): bicep binds
-        #     the hostname with SniEnabled + the KV cert during provision.
-        #     This step is a no-op — skipped via the env-var guard below.
-        #   - Without BYO cert: the workflow's earlier fail-fast guard
-        #     aborts the deploy with a clear error (ACA managed certs
-        #     can't validate behind Traffic Manager).
-        if: env.CUSTOM_DOMAIN != '' && env.CERT_KEY_VAULT_SECRET_URL == '' && env.IS_MULTI_REGION != 'true'
+        # SKIPPED in:
+        #   - Single-region production WITH BYO cert (bicep handled binding).
+        #   - Multi-region production (fail-fast earlier if BYO missing;
+        #     otherwise bicep handled binding).
+        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && !(steps.vars.outputs.is_production == 'true' && env.CERT_KEY_VAULT_SECRET_URL != '')
         continue-on-error: true
         run: |
           echo "Configuring custom domain: $CUSTOM_DOMAIN (single-region managed-cert flow)"

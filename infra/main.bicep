@@ -335,37 +335,22 @@ resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if 
   name: sharedResourceGroupName
 }
 
-// Branch BYO cert — ensures the wildcard cert exists on the shared
-// production CAE BEFORE webBranch tries to bind its hostname to it.
-// Idempotent: production's own deploy creates the same resource with
-// identical properties; whichever deploys first wins, and subsequent
-// invocations are no-ops. Without this module, a branch deploy that
-// runs before production has been redeployed with BYO config (e.g. the
-// first time a developer enables CERT_KEY_VAULT_* vars) would fail with
-// "CertificateNotFound" because the cert simply doesn't exist on
-// cae-production yet.
-#disable-next-line BCP318
-module branchByoCert 'core/host/byo-cert.bicep' = if (isBranch && byoCertEnabled) {
-  name: 'byo-cert-branch-${environmentName}'
-  scope: sharedRg
-  params: {
-    environmentName: containerAppsEnvironmentName
-    name: certKeyVaultCertName
-    keyVaultUrl: certKeyVaultSecretUrl
-    identityResourceId: certReaderIdentityId
-    tags: union(tags, { 'azd-env-name': 'production' })
-  }
-}
-
-// Branch cert resource ID. The cert is materialised by branchByoCert above
-// (when BYO is enabled) — we reference its output so bicep dependency
-// resolution guarantees the cert exists before the container app tries
-// to bind to it. When BYO is disabled, the empty string falls through to
-// the legacy bindingType=Disabled flow in container-app.bicep.
-#disable-next-line BCP318
-var branchCertResourceId = (isBranch && byoCertEnabled) ? branchByoCert.outputs.certificateResourceId : ''
-
-// Branch Container App (uses existing shared infrastructure)
+// Branch Container App (uses existing shared infrastructure).
+//
+// Branches NEVER use BYO cert — only production does. Two reasons:
+//   1. The shared 'cae-production' CAE must have the user-assigned
+//      identity attached (properties.identity.userAssignedIdentities) before
+//      any cert resource on it can reference that identity. Production's
+//      deploy adds the identity; branches can't modify the existing CAE
+//      without risking property collisions.
+//   2. Per-branch subdomains (e.g. astervoids-mybranch.<domain>) are
+//      short-lived and work fine with DigiCert managed certs (CNAME-validated
+//      directly against the branch container app's FQDN — no intermediate
+//      hop, so managed-cert validation succeeds). The 5-7 min cert wait per
+//      branch is acceptable for ephemeral preview environments.
+// The workflow's 'Configure Custom Domain' step picks up the managed-cert
+// flow whenever certificateId is empty (legacy path), regardless of whether
+// BYO vars are set globally.
 module webBranch 'core/host/container-app.bicep' = if (isBranch) {
   name: 'web-${environmentName}'
   scope: sharedRg
@@ -380,14 +365,14 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     external: true
     minReplicas: 0
     maxReplicas: 1  // Limit branch deployments
-    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
-    certificateId: branchCertResourceId
+    customDomainName: useCustomDomain ? fullCustomDomain : ''
+    certificateId: ''  // branches always use legacy managed-cert flow
   }
 }
 
 // DNS records for branch custom domain (uses existing DNS zone in production RG).
-// Same BYO-cert short-circuit as production: skip asuid TXT when bicep is
-// binding the cert directly from KV.
+// Branches always use managed-cert flow → asuid TXT IS emitted with the
+// branch container app's customDomainVerificationId.
 module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain) {
   name: 'dns-records-${environmentName}'
   scope: sharedRg
@@ -395,7 +380,7 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: webBranch.outputs.fqdn
-    verificationToken: byoCertEnabled ? '' : webBranch.outputs.verificationId
+    verificationToken: webBranch.outputs.verificationId
   }
 }
 
