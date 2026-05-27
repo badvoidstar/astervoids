@@ -180,11 +180,12 @@ test('steady-state turn (rot consistent with chord) is unaffected by clamp', () 
 });
 
 test('wrap-around chord (currAngle straddles ±π) uses shortest path and stays monotone', () => {
-    // prevAngle just under +π, currAngle just over -π. dAngle should be
-    // computed as a small positive step across the seam, not a near-2π
+    // prevAngle just under +π, currAngle just over -π. The normalization
+    // in the interp function must compute dAngle as the shortest-path
+    // chord (+0.04 rad across the ±π seam), not the wrong-way near-2π
     // negative step.
     const prevAngle = Math.PI - 0.02;
-    const currAngle = -Math.PI + 0.02;     // wraps around to +Math.PI + 0.02 logically
+    const currAngle = -Math.PI + 0.02;     // shortest-path chord across the seam: +0.04 rad
     const prevRot = 0.01;
     const currRot = 0.01;
     const timeDiffMs = 100;
