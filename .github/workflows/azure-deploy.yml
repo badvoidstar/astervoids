@@ -201,6 +201,76 @@ jobs:
             azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
           fi
 
+      - name: Bootstrap BYO cert on shared CAE (branches only)
+        # Production deploys handle BYO cert + identity attachment via bicep
+        # (container-apps.bicep adds properties.identity.userAssignedIdentities
+        # on the CAE + a managedEnvironments/certificates resource referencing
+        # it). Branch deploys reference an EXISTING CAE via 'existing' and
+        # can't safely modify its properties through bicep without risking
+        # collisions, so we do the equivalent setup here via az CLI before
+        # bicep runs.
+        #
+        # Both operations are idempotent:
+        #   - `az containerapp env identity assign` is a no-op if already attached.
+        #   - The cert-existence check skips creation when the named cert is present.
+        # So this step is safe to run on every branch push regardless of whether
+        # production has already deployed with BYO (it has, → no-op; it hasn't, →
+        # creates both). After this step succeeds, bicep's webBranch module can
+        # bind the branch hostname to the cert with bindingType=SniEnabled.
+        if: |
+          steps.vars.outputs.is_production != 'true'
+          && env.CUSTOM_DOMAIN_NAME != ''
+          && env.CERT_KEY_VAULT_SECRET_URL != ''
+          && env.CERT_KEY_VAULT_CERT_NAME != ''
+          && env.CERT_READER_IDENTITY_ID != ''
+        run: |
+          # Single-region branches target 'cae-production'. After multi-region
+          # production is rolled out (REGIONS_JSON populated), this name will
+          # need to switch to 'cae-production-${primary-region}' — out of scope
+          # for this step's current single-region branch model.
+          CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
+          RG="${{ env.PRODUCTION_RG }}"
+
+          echo "::group::Bootstrap BYO cert on $CAE_NAME"
+
+          # Defensive check: the shared CAE must already exist (production
+          # owns its creation). If it doesn't, fail clearly — the branch
+          # deploy would fail later in confusing ways otherwise.
+          if ! az containerapp env show --resource-group "$RG" --name "$CAE_NAME" &>/dev/null; then
+            echo "::error::Shared CAE '$CAE_NAME' not found in '$RG'."
+            echo "::error::Production must be deployed first to create the CAE."
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # 1. Attach the user-assigned identity if not already attached.
+          # `identity assign` is a PATCH that adds the identity to the
+          # userAssignedIdentities collection; no-op if already present.
+          echo "Attaching identity $CERT_READER_IDENTITY_ID to CAE $CAE_NAME (idempotent)..."
+          az containerapp env identity assign \
+            --resource-group "$RG" \
+            --name "$CAE_NAME" \
+            --user-assigned "$CERT_READER_IDENTITY_ID" \
+            --output none
+
+          # 2. Create the cert resource on the CAE if it doesn't already exist.
+          CERT_EXISTS=$(az containerapp env certificate list \
+            --resource-group "$RG" --name "$CAE_NAME" \
+            --query "[?name=='$CERT_KEY_VAULT_CERT_NAME'].name" -o tsv 2>/dev/null || echo "")
+          if [ -z "$CERT_EXISTS" ]; then
+            echo "Cert '$CERT_KEY_VAULT_CERT_NAME' not present on CAE — creating from Key Vault..."
+            az containerapp env certificate create \
+              --resource-group "$RG" --name "$CAE_NAME" \
+              --certificate-name "$CERT_KEY_VAULT_CERT_NAME" \
+              --certificate-key-vault-url "$CERT_KEY_VAULT_SECRET_URL" \
+              --certificate-identity "$CERT_READER_IDENTITY_ID" \
+              --output none
+            echo "✅ Cert created"
+          else
+            echo "✅ Cert '$CERT_KEY_VAULT_CERT_NAME' already present on CAE — no action needed"
+          fi
+          echo "::endgroup::"
+
       - name: Provision and Deploy to Azure
         id: deploy
         run: |
@@ -415,20 +485,21 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Configure Custom Domain (if enabled)
-        # Runs in three cases:
-        #   - Single-region production WITHOUT BYO cert vars set.
-        #   - Branch deploys (regardless of whether BYO vars are set —
-        #     branches always use the DigiCert managed-cert flow with
-        #     their per-branch subdomain; BYO is production-only because
-        #     attaching the cert-reader identity to the shared CAE is
-        #     done by production's bicep deploy and can't be re-done
-        #     safely from a branch deploy).
-        #
-        # SKIPPED in:
-        #   - Single-region production WITH BYO cert (bicep handled binding).
-        #   - Multi-region production (fail-fast earlier if BYO missing;
-        #     otherwise bicep handled binding).
-        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && !(steps.vars.outputs.is_production == 'true' && env.CERT_KEY_VAULT_SECRET_URL != '')
+        # Runs ONLY for single-region production WITHOUT BYO cert vars.
+        # All other cases are handled in-band by bicep + the bootstrap step:
+        #   - Single-region production WITH BYO    → bicep binds via SNI.
+        #   - Multi-region production              → bicep + fail-fast guard.
+        #   - Branches WITH BYO                    → bootstrap step (above)
+        #                                            ensures cert + identity on
+        #                                            the shared CAE; bicep then
+        #                                            binds the branch hostname
+        #                                            via SNI. ~5 min saved vs
+        #                                            the legacy managed-cert flow.
+        #   - Branches WITHOUT BYO                 → this step runs, the
+        #                                            legacy DigiCert flow
+        #                                            creates + binds a managed
+        #                                            cert per branch.
+        if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && env.CERT_KEY_VAULT_SECRET_URL == ''
         continue-on-error: true
         run: |
           echo "Configuring custom domain: $CUSTOM_DOMAIN (single-region managed-cert flow)"

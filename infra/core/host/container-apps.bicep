@@ -40,10 +40,23 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
 }
 
 // Container Apps Environment
+//
+// When BYO cert is enabled, the CAE attaches the cert-reader user-assigned
+// managed identity so the child `certificates` resource below can reference
+// it via `certificateKeyVaultProperties.identity`. Without this attachment
+// Azure rejects cert creation with `ManagedEnvironmentIdentityNotExist`
+// — the identity must already be a principal of the environment before
+// any cert resource on it can name it.
 resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-10-02-preview' = {
   name: name
   location: location
   tags: tags
+  identity: byoCertEnabled ? {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${certReaderIdentityId}': {}
+    }
+  } : null
   properties: {
     appLogsConfiguration: {
       destination: 'log-analytics'
