@@ -1435,7 +1435,12 @@ reference / disaster recovery; you don't normally run them.
 #             also exposes it as an app setting under this name.)
 #
 #      Calendar reminder: rotate `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET`
-#      before the 6-month expiry, or the dashboard locks you out.
+#      before the 6-month expiry, or the dashboard locks you out. The
+#      scheduled workflow `.github/workflows/check-easy-auth-secret.yml`
+#      checks weekly and auto-opens a GitHub issue (with the rotation
+#      runbook from `.github/ISSUE_TEMPLATE/easy-auth-secret-rotation.md`)
+#      when < 30 days remain — set the repo variable `EASYAUTH_APP_ID` to
+#      the app reg's client ID to enable it.
 
 # 2. [BICEP-MANAGED — provided here for disaster recovery only]
 #    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
