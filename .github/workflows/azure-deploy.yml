@@ -369,13 +369,38 @@ jobs:
                 certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
               --output none
 
-            # Get the shared ACR name from the deployment outputs.
-            ACR_NAME=$(az deployment sub show \
+            # Fetch ALL outputs once, then look them up case-insensitively
+            # via jq. Azure ARM serializes output names through .NET's
+            # JsonNamingPolicy.CamelCase which lowercases all but the LAST
+            # char of leading acronyms (so `AZURE_CONTAINER_REGISTRY_NAME`
+            # comes back as `azurE_CONTAINER_REGISTRY_NAME`). JMESPath is
+            # case-sensitive, so the obvious `--query` calls return empty;
+            # using jq's `ascii_downcase` avoids hardcoding the mangled
+            # spelling and keeps the workflow robust to future ARM changes.
+            OUTPUTS_JSON=$(az deployment sub show \
               --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_NAME.value' -o tsv)
-            ACR_LOGIN_SERVER=$(az deployment sub show \
-              --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.AZURE_CONTAINER_REGISTRY_ENDPOINT.value' -o tsv)
+              --query 'properties.outputs' -o json)
+            get_out() {
+              # $1 = output name (case-insensitive); $2 = jq value selector
+              # (default '.value.value' for scalars; pass '.value.value | tostring'
+              # or similar for arrays). Returns first match or empty string.
+              local key_lc; key_lc=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+              local selector="${2:-.value.value}"
+              echo "$OUTPUTS_JSON" \
+                | jq -r --arg k "$key_lc" \
+                  "to_entries[] | select((.key | ascii_downcase) == \$k) | $selector" \
+                | head -1
+            }
+            get_out_json() {
+              # Same but returns the raw JSON value (for arrays/objects).
+              local key_lc; key_lc=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+              echo "$OUTPUTS_JSON" \
+                | jq -c --arg k "$key_lc" \
+                  'to_entries[] | select((.key | ascii_downcase) == $k) | .value.value'
+            }
+
+            ACR_NAME=$(get_out AZURE_CONTAINER_REGISTRY_NAME)
+            ACR_LOGIN_SERVER=$(get_out AZURE_CONTAINER_REGISTRY_ENDPOINT)
 
             IMAGE_TAG="${{ github.sha }}"
             IMAGE_NAME="astervoids-web:${IMAGE_TAG}"
@@ -399,18 +424,12 @@ jobs:
             done
 
             # Surface Traffic Manager FQDN + per-region details in the run log.
-            echo "Traffic Manager FQDN: $(az deployment sub show \
-              --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)"
+            echo "Traffic Manager FQDN: $(get_out TRAFFIC_MANAGER_FQDN)"
             echo "Per-region endpoints:"
-            az deployment sub show \
-              --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.REGION_ENDPOINTS.value' -o jsonc
+            get_out_json REGION_ENDPOINTS | jq .
 
             # Use the primary region's URI as the canonical deploy URL.
-            azd env set WEB_URI "$(az deployment sub show \
-              --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.WEB_URI.value' -o tsv)"
+            azd env set WEB_URI "$(get_out WEB_URI)"
             azd env set CONTAINER_APP_NAME "${{ env.CONTAINER_APP_PREFIX }}-production-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set CONTAINER_APPS_ENVIRONMENT "${{ env.CONTAINER_ENV_NAME }}-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set RESOURCE_GROUP "${{ env.PRODUCTION_RG }}"
@@ -697,14 +716,18 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "| Region | Container App | FQDN |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|---------------|------|" >> $GITHUB_STEP_SUMMARY
-            az deployment sub show \
+            # Re-fetch outputs JSON; same case-insensitive lookup pattern as
+            # the multi-region provision step above (Azure ARM lowerCamelCase
+            # mangles output names, JMESPath is case-sensitive).
+            SUMMARY_OUTPUTS=$(az deployment sub show \
               --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.REGION_ENDPOINTS.value[]' -o json \
-              | jq -r '.[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
+              --query 'properties.outputs' -o json)
+            echo "$SUMMARY_OUTPUTS" \
+              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "region_endpoints") | .value.value[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
               >> $GITHUB_STEP_SUMMARY
-            TM_FQDN=$(az deployment sub show \
-              --name "production-multi-${{ github.run_id }}" \
-              --query 'properties.outputs.TRAFFIC_MANAGER_FQDN.value' -o tsv)
+            TM_FQDN=$(echo "$SUMMARY_OUTPUTS" \
+              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "traffic_manager_fqdn") | .value.value' \
+              | head -1)
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Traffic Manager FQDN:** \`$TM_FQDN\` (CNAME the apex domain here)" >> $GITHUB_STEP_SUMMARY
           fi
