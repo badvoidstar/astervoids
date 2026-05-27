@@ -11,6 +11,8 @@ var builder = WebApplication.CreateBuilder(args);
 // Register configuration
 builder.Services.Configure<SessionSettings>(
     builder.Configuration.GetSection(SessionSettings.SectionName));
+builder.Services.Configure<RegionSettings>(
+    builder.Configuration.GetSection(RegionSettings.SectionName));
 
 // Register services
 builder.Services.AddSingleton<ISessionNameGenerator, FruitNameGenerator>();
@@ -38,7 +40,54 @@ builder.Services.AddResponseCompression(options =>
 // Read session settings for SignalR timeout configuration
 var sessionSettings = builder.Configuration.GetSection(SessionSettings.SectionName).Get<SessionSettings>() ?? new SessionSettings();
 
-// Add SignalR with MessagePack protocol (camelCase names to preserve JS client contract)
+// CORS for cross-region API calls and cross-region SignalR connections.
+//
+// The client needs to reach three resources on every configured region
+// hostname (not just its landing origin):
+//   1. /api/ping        — RTT measurement bursts
+//   2. /api/regions     — manifest discovery
+//   3. /api/sessions    — cross-region session-list aggregation
+//   4. /sessionHub      — spectator SignalR connections that subscribe to
+//                         OnSessionsChanged for live cross-region updates
+//                         (Phase 3), plus the join/create connection itself
+//                         when the user picks a non-landing region.
+//
+// SignalR requires AllowCredentials() (it uses sticky-session cookies) and
+// AllowAnyHeader() (the JS client sets custom headers during negotiation).
+// AllowCredentials + WithOrigins(specificOrigins) is the only safe pairing
+// — wildcard origin + credentials is rejected by browsers.
+//
+// Same-origin requests are unaffected by this policy. Allowed origins are
+// the hostnames listed in the Region manifest — they are static at
+// deployment time, so there is no broad wildcard.
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("RegionalApi", policy =>
+    {
+        var regions = builder.Configuration.GetSection(RegionSettings.SectionName)
+            .Get<RegionSettings>() ?? new RegionSettings();
+        var origins = regions.Regions
+            .Select(r => r.Hostname.TrimEnd('/'))
+            .Where(h => !string.IsNullOrEmpty(h))
+            .ToArray();
+        if (origins.Length > 0)
+        {
+            policy.WithOrigins(origins);
+        }
+        else
+        {
+            // No regions configured (local dev / single-region). SetIsOriginAllowed
+            // is compatible with AllowCredentials (unlike AllowAnyOrigin) and lets
+            // dev setups (e.g. multiple instances on localhost ports) work.
+            policy.SetIsOriginAllowed(_ => true);
+        }
+        policy.AllowAnyHeader();
+        policy.AllowAnyMethod();
+        policy.AllowCredentials();
+    });
+});
+
+
 //
 // Wire format optimization notes:
 // - WebSocket per-message compression (permessage-deflate) is NOT available through
@@ -76,6 +125,42 @@ builder.Services.AddSignalR(options =>
 });
 
 var app = builder.Build();
+
+// Regional endpoints registered FIRST so they respond the moment the HTTP listener
+// is up — critical for cold-start RTT measurement. The endpoints have no startup
+// dependencies (RegionSettings is bound at DI time, and /api/ping does no service
+// work) so they can answer before SignalR initialisation completes.
+//
+// CORS must run before these endpoints so cross-origin preflights succeed.
+app.UseCors("RegionalApi");
+
+// GET /api/ping — minimal latency probe. The client measures RTT by timing the
+// round trip; we return the server wall-clock so cold-start vs network-only RTT
+// is observable in telemetry. Cache-Control: no-store so no proxy/CDN can ever
+// short-circuit the round trip (which would lie about RTT).
+app.MapGet("/api/ping", (HttpContext ctx) =>
+{
+    ctx.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(new { now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+}).RequireCors("RegionalApi");
+
+// GET /api/regions — canonical region manifest. The client fetches this once
+// from its landing region and uses the result to populate its peer-region list.
+app.MapGet("/api/regions", (Microsoft.Extensions.Options.IOptions<RegionSettings> opts) =>
+{
+    var s = opts.Value;
+    return Results.Ok(new
+    {
+        regionId = s.Id,
+        displayName = s.DisplayName,
+        regions = s.Regions.Select(r => new
+        {
+            id = r.Id,
+            displayName = r.DisplayName,
+            hostname = r.Hostname.TrimEnd('/'),
+        }),
+    });
+}).RequireCors("RegionalApi");
 
 app.UseResponseCompression();
 app.UseDefaultFiles();
@@ -132,12 +217,41 @@ app.Use(async (context, next) =>
 
 app.UseStaticFiles();
 
-// Map SignalR hub
-app.MapHub<SessionHub>("/sessionHub");
+// Map SignalR hub. RequireCors so cross-origin spectator connections from
+// peer regions can negotiate + open the WebSocket.
+app.MapHub<SessionHub>("/sessionHub").RequireCors("RegionalApi");
 
 // Server monitoring metrics API endpoint
 app.MapGet("/api/srvmon", (ServerMetricsService metrics, ISessionService sessionService) =>
     Results.Ok(metrics.GetSnapshot(sessionService)));
+
+// GET /api/sessions — REST mirror of SessionHub.GetActiveSessions, stamped with this
+// region's id. The client polls this on every region (in parallel) to merge a unified
+// session list across regions without needing a SignalR connection.
+//
+// regionId is sourced from SessionInfo.RegionId (stamped by SessionService at
+// emit time), which matches the SessionListItem returned by the SignalR hub —
+// guaranteeing both code paths agree on the owning region for every session.
+app.MapGet("/api/sessions", (ISessionService sessionService,
+    Microsoft.Extensions.Options.IOptions<RegionSettings> regionOpts) =>
+{
+    var result = sessionService.GetActiveSessions();
+    return Results.Ok(new
+    {
+        regionId = regionOpts.Value.Id,
+        sessions = result.Sessions.Select(s => new
+        {
+            id = s.Id,
+            name = s.Name,
+            memberCount = s.MemberCount,
+            maxMembers = s.MaxMembers,
+            createdAt = s.CreatedAt,
+            regionId = s.RegionId,
+        }),
+        maxSessions = result.MaxSessions,
+        canCreateSession = result.CanCreateSession,
+    });
+}).RequireCors("RegionalApi");
 
 app.Run();
 

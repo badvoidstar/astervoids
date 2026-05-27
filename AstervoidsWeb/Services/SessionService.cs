@@ -39,6 +39,13 @@ public class SessionService : ISessionService
     private readonly int _maxSessions;
     private readonly int _maxMembersPerSession;
     private readonly bool _distributeOrphanedObjects;
+    /// <summary>
+    /// Region id stamped on every <see cref="SessionInfo"/> emitted by
+    /// <see cref="GetActiveSessions"/>. Default <c>"local"</c> applies when no
+    /// <see cref="RegionSettings"/> are bound — preserves single-region behaviour
+    /// for tests / standalone runs.
+    /// </summary>
+    private readonly string _regionId;
 
     public int MaxSessions => _maxSessions;
     public int MaxMembersPerSession => _maxMembersPerSession;
@@ -53,15 +60,24 @@ public class SessionService : ISessionService
         _maxSessions = 6;
         _maxMembersPerSession = 4;
         _distributeOrphanedObjects = true;
+        _regionId = "local";
     }
 
-    public SessionService(IOptions<SessionSettings> settings, ILogger<SessionService> logger, ISessionNameGenerator nameGenerator)
+    public SessionService(
+        IOptions<SessionSettings> settings,
+        ILogger<SessionService> logger,
+        ISessionNameGenerator nameGenerator,
+        IOptions<RegionSettings>? regionSettings = null)
     {
         _nameGenerator = nameGenerator;
         _maxSessions = settings.Value.MaxSessions;
         _maxMembersPerSession = settings.Value.MaxMembersPerSession;
         _distributeOrphanedObjects = settings.Value.DistributeOrphanedObjects;
         _logger = logger;
+        // RegionSettings is optional so legacy tests that only register
+        // SessionSettings continue to work; default "local" matches the
+        // parameter-less constructor's behaviour.
+        _regionId = regionSettings?.Value.Id ?? "local";
     }
 
     /// <summary>Creates a failed CreateSessionResult with the specified error message.</summary>
@@ -283,7 +299,7 @@ public class SessionService : ISessionService
     {
         var sessions = _sessions.Values
             .Where(s => !s.Members.IsEmpty)
-            .Select(s => new SessionInfo(s.Id, s.Name, s.Members.Count, _maxMembersPerSession, s.CreatedAt))
+            .Select(s => new SessionInfo(s.Id, s.Name, s.Members.Count, _maxMembersPerSession, s.CreatedAt, _regionId))
             .OrderByDescending(s => s.CreatedAt)
             .ToList();
 

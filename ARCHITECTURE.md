@@ -1271,6 +1271,325 @@ harness that the suite doesn't yet have. See Phase 2.2 deferral note.
   `spawn-extrapolation`, and `clock-offset` suites stay green at every
   phase.
 
+## Networking: Regional Deployment
+
+Astervoids can deploy to one or many Azure regions simultaneously. Every
+visitor sees every active session in every region; sessions live in
+exactly one region (no replication) and the client routes its Create/Join
+SignalR connection to the correct region's hub.
+
+### Architectural choices
+
+- **Independent regions, client-side merge.** Each region runs its own
+  in-memory `SessionService`; the client polls `GET /api/sessions` on
+  every region in parallel and merges the results. No central registry,
+  no cross-region writes — keeps the existing per-process state model
+  unchanged.
+- **Apex routing via Traffic Manager (DNS performance).** First-time
+  visitors land on their nearest region via apex CNAME → Traffic Manager
+  → regional FQDN. After the client downloads `region-service.js` it
+  takes over: pings every region, pins to its measured-best region.
+  Traffic Manager only needs to be "approximately right" for the initial
+  hit.
+- **Spectator SignalR connections (picker only).** While the start
+  screen is visible, the client opens one read-only SignalR connection
+  per region. Each region's hub still broadcasts `OnSessionsChanged` to
+  every connected client, so cross-region changes surface within
+  ~1 inter-region RTT (typically 50–200 ms). Connections close on
+  Join/Create/Solo and on `document.hidden` — backgrounded tabs must
+  NOT keep regions warm or scale-to-zero is defeated.
+- **Scale-to-zero everywhere.** Container Apps `minReplicas: 0` +
+  `cooldownPeriod: 60s` returns regions to zero ~1 min after the last
+  connection closes. Traffic Manager probes hit `/api/regions` (not
+  `/api/ping`) at 60 s intervals — slow enough that probes don't keep
+  regions warm.
+
+### Latency budget
+
+| Event | Single region (today) | Multi-region (this design) | Mechanism |
+|---|---|---|---|
+| Picker open, regions warm | ~1 RTT to origin | ~1 RTT to slowest region | parallel `/api/sessions` fan-out + parallel WS negotiate |
+| Picker open, regions cold | n/a | up to 15 s budget per region; `🔥 Warming up…` shown until first real sample | client-side cold-start detection (samples >1500 ms suppressed from EMA) |
+| Change in **same** region as visitor | ~1 LAN RTT (push) | ~1 LAN RTT (push) | unchanged `OnSessionsChanged` push |
+| Change in **other** region | n/a | ~1 inter-region RTT | spectator hub in that region pushes `OnSessionsChanged` |
+| Spectator WebSocket dropped | n/a | ≤30 s worst case, `↻` badge sooner | belt-and-suspenders REST 30 s repoll |
+| Ping column updates | n/a | first value ≤1 RTT after load; settled (`confidence === 1`) ~50 s later | RegionService bursts + EMA(α=0.3) + per-cell re-render |
+
+### Module layout
+
+```mermaid
+graph TB
+    BR["Browser"]
+    subgraph Client modules
+        RS["RegionService<br/>region-service.js<br/>Discovers regions · Progressive RTT bursts<br/>EMA · Cold-start handling · bestRegion hysteresis"]
+        SP["SpectatorClient<br/>spectator-client.js<br/>N read-only SignalR connections<br/>OnSessionsChanged → per-region refetch"]
+        SC["SessionClient<br/>session-client.js<br/>Single join connection · region-aware hub URL"]
+        MR["MultiRegionSessions<br/>(inline in index.html)<br/>Parallel /api/sessions fetch · Merge · Coalesce"]
+        UI["Session picker UI<br/>Region+Ping columns · 'Your region' banner<br/>'Create in <region>' button · Native <select>"]
+    end
+    subgraph Per-region server
+        API["GET /api/ping<br/>GET /api/regions<br/>GET /api/sessions"]
+        HUB["/sessionHub<br/>(CORS-enabled for cross-region)"]
+    end
+    TM["Azure Traffic Manager<br/>(apex CNAME · Performance routing)"]
+
+    BR -->|"first-load DNS"| TM
+    TM -->|"nearest region"| API
+    RS -->|"GET /api/regions, /api/ping × N"| API
+    MR -->|"GET /api/sessions × N"| API
+    SP -->|"WS × N (picker only)"| HUB
+    SC -->|"WS × 1 (joined region)"| HUB
+    SP -->|"sessionsChanged(regionId)"| MR
+    MR --> UI
+    RS --> UI
+```
+
+### Cold-start handling
+
+CAE scaling to zero means a visitor opening the picker after an idle
+period hits cold containers on the first ping. `RegionService` handles
+this honestly:
+
+1. First-ever ping per region uses 15 s timeout (vs 5 s for warm pings).
+2. If the first valid sample is > 1500 ms it's treated as container
+   start-up (emits `coldStart` event, **suppressed** from the EMA).
+3. State stays `'warming'` (`🔥 Warming up…` shown in the cell) until a
+   real sub-1500 ms sample lands. `bestRegion()` never picks a warming
+   region.
+4. Once a real sample arrives, state → `'measuring'` → `'settled'`.
+
+### Configuration
+
+- **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
+  Manifest in `appsettings.json` under `Region:Regions`. Empty manifest
+  triggers permissive same-origin CORS for local dev.
+- **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
+  single-region; non-empty = multi-region). Primary region (index 0)
+  owns the shared ACR + DNS zone.
+- **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
+  (empty by default). Set to a JSON array to enable multi-region prod.
+
+### Apex TLS via BYO cert (required for multi-region apex HTTPS)
+
+Azure Container Apps' free managed certificates have a hard requirement:
+the custom-domain CNAME must point **directly** at the container app's
+generated FQDN. Mapping to an intermediate CNAME — Traffic Manager, Front
+Door, Cloudflare — blocks managed-cert issuance entirely (see
+[Microsoft docs](https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates)).
+
+For multi-region production, the apex CNAME points at Traffic Manager, so
+managed certs can't validate. The fix: bring our own wildcard cert from
+Let's Encrypt, store it in Azure Key Vault, and have bicep bind it on
+every region's container app (and on branch container apps too, by reusing
+the same cert).
+
+The recommended automation is [keyvault-acmebot](https://github.com/shibayan/keyvault-acmebot)
+— an open-source Azure Function App that auto-issues and rotates Let's
+Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
+wildcard cert covers `<subdomain>.<domain>` (apex) AND all per-region /
+per-branch subdomains.
+
+#### One-time setup (~10 min)
+
+Steps 1 and 3 below are manual (one-time external setup that doesn't fit
+bicep). Steps 2, 4, and 5 are now bicep-managed — when you deploy `main`
+with `manageAcmebotPermissions: true` (the default), bicep provisions
+`id-acme-cert-reader` in `rg-production`, grants ACMEbot DNS Zone
+Contributor on the production DNS zone, and grants the cert reader Key
+Vault Certificate User on the ACMEbot KV. They're listed here for
+reference / disaster recovery; you don't normally run them.
+
+```bash
+# 1. [MANUAL, ONE-TIME] Deploy ACMEbot via its ARM template (use the README button):
+#    https://github.com/shibayan/keyvault-acmebot
+#    Pick: subscription, resource group (default: sg-acmebot), Key Vault name (default: kv-astervoids).
+#    Configure: DNS provider = Azure DNS, mailbox for Let's Encrypt notifications.
+#
+#    Enabling Easy Auth (REQUIRED before the dashboard works — the ARM
+#    template does NOT auto-enable it; visiting the dashboard pre-auth
+#    returns 401 with a JSON error body):
+#
+#      a. In the Azure Portal: Function App → Authentication → Add
+#         identity provider → Microsoft.
+#      b. App registration: "Create new app registration" with name
+#         `<acmebot-function-app>-easyauth`.
+#         IMPORTANT: pick "Workforce" tenant (default) — NOT "Customers"
+#         (B2C is a separate product and the Function App can't use it).
+#      c. Restrict access: "Require authentication". Unauthenticated
+#         request action: "HTTP 401 Unauthorized".
+#      d. After it saves, go to Entra ID → App registrations → find
+#         the new `<acmebot-function-app>-easyauth` app:
+#           • Authentication → enable "ID tokens (used for implicit
+#             and hybrid flows)" checkbox. Save. Without this you'll
+#             hit AADSTS700054 (response_type 'id_token' is not enabled).
+#           • Manifest → confirm `accessTokenAcceptedVersion: 2` and
+#             that the Function App's authsettingsV2 uses the v2 issuer
+#             URL `https://login.microsoftonline.com/<tenant-id>/v2.0`.
+#             (The Portal sometimes wires the v1 URL by default; v1
+#             rejects v2 tokens and you'll get login-loop 401s.)
+#           • Certificates & secrets → "New client secret" → 6-month
+#             expiry. Copy the value.
+#           • In the Function App → Configuration, set
+#             `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` to that value.
+#             (The portal stores it on the Authentication blade but
+#             also exposes it as an app setting under this name.)
+#
+#      Calendar reminder: rotate `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET`
+#      before the 6-month expiry, or the dashboard locks you out. The
+#      scheduled workflow `.github/workflows/check-easy-auth-secret.yml`
+#      checks weekly and auto-opens a GitHub issue (with the rotation
+#      runbook from `.github/ISSUE_TEMPLATE/easy-auth-secret-rotation.md`)
+#      when < 30 days remain — set the repo variable `EASYAUTH_APP_ID` to
+#      the app reg's client ID to enable it.
+
+# 2. [BICEP-MANAGED — provided here for disaster recovery only]
+#    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
+#    so it can write _acme-challenge TXT records for the DNS-01 challenge.
+DNS_ZONE_RG=rg-production
+DNS_ZONE_NAME=<your-domain.com>
+ACMEBOT_IDENTITY_ID=$(az functionapp identity show \
+  --resource-group sg-acmebot --name func-astervoids \
+  --query principalId -o tsv)
+az role assignment create \
+  --assignee "$ACMEBOT_IDENTITY_ID" \
+  --role "DNS Zone Contributor" \
+  --scope "$(az network dns zone show \
+    --resource-group "$DNS_ZONE_RG" --name "$DNS_ZONE_NAME" --query id -o tsv)"
+
+# 3. [MANUAL, ONE-TIME] Issue the wildcard cert via the ACMEbot dashboard:
+#    Open https://<acmebot-function-app>.azurewebsites.net/
+#    (the Polymind fork serves the dashboard at the ROOT URL, NOT /dashboard
+#    as the upstream wiki says — visiting /dashboard returns 404 / blank).
+#    Sign in with the Entra ID account that has access to the app reg from step 1.
+#    Click "Add" → enter "*.<your-domain.com>" → wait ~2 min.
+#    Cert lands in Key Vault as a secret (name it `wildcard-<sanitised-domain>`,
+#    where dots are replaced with dashes — e.g. wildcard-example-com).
+
+# 4. [BICEP-MANAGED — provided here for disaster recovery only]
+#    User-assigned identity that production CAEs use to read the cert from KV.
+az identity create \
+  --resource-group rg-production \
+  --name id-acme-cert-reader \
+  --location <primary-region>
+
+# 5. [BICEP-MANAGED — provided here for disaster recovery only]
+#    Grant the identity 'Key Vault Certificate User' role on the KV.
+CERT_READER_PRINCIPAL_ID=$(az identity show \
+  --resource-group rg-production --name id-acme-cert-reader \
+  --query principalId -o tsv)
+KV_NAME=kv-astervoids
+KV_ID=$(az keyvault show --name "$KV_NAME" --query id -o tsv)
+az role assignment create \
+  --assignee-object-id "$CERT_READER_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Certificate User" \
+  --scope "$KV_ID"
+
+# 6. [REQUIRED, ONE-TIME] Get the cert's Key Vault secret URL (versionless so renewals pick up automatically):
+KV_NAME=kv-astervoids
+CERT_NAME=wildcard-<sanitised-domain>  # whatever you named it in step 3
+CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
+
+# 7. [REQUIRED, ONE-TIME] Set GitHub repo variables so the workflow knows where to find everything.
+#    CERT_READER_IDENTITY_ID is OPTIONAL when manageAcmebotPermissions=true (production deploys
+#    look up the identity from bicep output). It IS required for branch deploys (the workflow's
+#    bootstrap step still reads the var). Set it for safety until all production deploys have
+#    run with the new bicep:
+CERT_READER_IDENTITY_ID=$(az identity show \
+  --resource-group rg-production --name id-acme-cert-reader \
+  --query id -o tsv)
+gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
+gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
+gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
+```
+
+##### Opting out of bicep-managed ACMEbot permissions
+
+If you'd rather manage the cert reader identity and role assignments
+yourself (e.g. they live in a different subscription or you have a
+stricter least-privilege flow), pass `manageAcmebotPermissions=false`
+when deploying. Bicep then expects:
+  - `certReaderIdentityId` param (or `CERT_READER_IDENTITY_ID` env var
+    that the workflow forwards) to be set to an existing identity's
+    resource ID.
+  - The identity already has Key Vault Certificate User on the BYO cert KV.
+  - ACMEbot already has DNS Zone Contributor on the production DNS zone.
+
+##### Cleaning up duplicate role assignments after first bicep-managed deploy
+
+If you previously ran steps 2, 4, and 5 manually (random-GUID-named role
+assignments), the first deploy with `manageAcmebotPermissions=true`
+creates a SECOND, deterministically-named assignment alongside each
+manual one. Both are functionally equivalent. To clean up:
+
+```bash
+# List both assignments for the cert reader on the KV — keep the one with
+# the deterministic GUID matching guid(scope, principalId, roleId), delete
+# the random-named one. Same drill for ACMEbot's DNS Zone Contributor.
+az role assignment list \
+  --assignee "$CERT_READER_PRINCIPAL_ID" \
+  --scope "$KV_ID" \
+  --query "[].{name:name,role:roleDefinitionName}" -o table
+az role assignment delete --ids <random-guid-assignment-id>
+```
+
+After step 7, the next deploy of `main` will:
+- Provision a `Microsoft.App/managedEnvironments/certificates` resource on every region's CAE referencing the KV secret URL + the reader identity.
+- Bind `<subdomain>.<domain>` on every region's container app with `bindingType: SniEnabled` pointing at that cert resource.
+- The legacy "Configure Custom Domain" workflow step short-circuits (`env.CERT_KEY_VAULT_SECRET_URL != ''` guard) — no DigiCert managed-cert provisioning happens.
+
+Same wildcard cert covers every branch deploy too (e.g. `astervoids-mybranch.<domain>` matches `*.<domain>`), so branch deploys also skip the cert provisioning wait — typically saving 5-7 minutes per branch deploy.
+
+#### Cert rotation
+
+ACMEbot rotates the cert in KV every ~60 days. Container Apps doesn't
+auto-detect new KV cert versions, so a rotation isn't picked up until the
+next deploy. Two practical options:
+
+1. **Redeploy on the next push to main** (typical). The bicep re-reads the
+   KV cert and updates the CAE cert resource.
+2. **Scheduled GitHub Action** (`on: schedule: cron: '0 4 * * 1'`) that
+   runs `az deployment sub create` once a week to pick up rotations.
+
+If you forget for >90 days, the cert expires and `<subdomain>.<domain>`
+serves a stale cert until you redeploy.
+
+### Key files
+
+- `AstervoidsWeb/Configuration/RegionSettings.cs` — manifest binding.
+- `AstervoidsWeb/Program.cs` — `/api/ping`, `/api/regions`,
+  `/api/sessions` + `RegionalApi` CORS policy.
+- `AstervoidsWeb/wwwroot/js/region-service.js` — progressive RTT.
+- `AstervoidsWeb/wwwroot/js/spectator-client.js` — multi-region SignalR.
+- `AstervoidsWeb/wwwroot/index.html` (Section 10) — picker + inline
+  `MultiRegionSessions` module + lifecycle wiring.
+- `infra/main.bicep` — `regions` loop, BYO cert plumbing.
+- `infra/core/network/traffic-manager.bicep` — apex Traffic Manager.
+- `infra/core/host/container-apps.bicep` — CAE + optional BYO cert resource
+  from Key Vault.
+- `infra/core/host/container-app.bicep` — container app + optional
+  `customDomains[bindingType: SniEnabled, certificateId]` binding to the
+  CAE's BYO cert.
+
+### Tests
+
+- `RegionEndpointsTests.cs` — `/api/ping` shape + Cache-Control,
+  `/api/regions` manifest + camelCase, `/api/sessions` regionId stamp,
+  CORS allow-list + reject untrusted origin.
+- `SessionServiceTests.cs` — default `RegionId = "local"`, configured
+  manifest stamps every emitted `SessionInfo`.
+- `PingBudgetTests.cs` — mean handler time < 5 ms over 200 iterations;
+  response body shape pinned to `{ now }`.
+- `AstervoidsWeb/region-service.test.mjs` — warm-up discard, cold-start
+  gating, EMA convergence, confidence monotonicity, `bestRegion`
+  hysteresis.
+- `AstervoidsWeb/spectator-client.test.mjs` — open/close per region,
+  exclude-by-hostname, push dispatch, connection-state transitions,
+  error tolerance.
+- `AstervoidsWeb/picker-freshness.test.mjs` — bootstrap merge,
+  per-region failure isolation, 250 ms push coalescing,
+  visibility-driven `stop()`, cold-region non-blocking render.
+
 ## Project Structure
 
 ```
