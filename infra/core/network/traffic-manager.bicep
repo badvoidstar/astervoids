@@ -52,13 +52,16 @@ param tags object = {}
 @description('Endpoints to register on the profile (one per region; see file header for entry shape).')
 param endpoints array
 
-@description('Probe interval in seconds. Default 60 — higher than the Traffic Manager default of 30 specifically so probes do NOT keep idle regions warm and defeat the scale-to-zero requirement.')
-param probeIntervalInSeconds int = 60
+@description('Probe interval in seconds. Must be one of {10, 30} per Azure Traffic Manager constraints (validated server-side; bicep doesn\'t catch it at build time). 30 = standard; 10 = fast probing (more responsive failover, higher KEEP-ALIVE pressure on origins). Note: each probe is an HTTPS GET to probePath on every endpoint, which counts as request activity and effectively keeps regions warm — TM `Performance` routing cannot omit health checks, so scale-to-zero between probes won\'t fully drain idle regions while this profile is enabled. Accept the tradeoff or switch routing method (e.g. Geographic) if cost matters.')
+@allowed([10, 30])
+param probeIntervalInSeconds int = 30
 
 @description('Number of consecutive failed probes before an endpoint is marked Degraded. Default 3 (Azure default).')
 param toleratedNumberOfFailures int = 3
 
-@description('Probe timeout in seconds. Default 9 (max allowed when intervalInSeconds is 60, per Azure docs: timeoutInSeconds must be < intervalInSeconds and ≤ 10).')
+@description('Probe timeout in seconds. Allowed range: 5-10 (Azure). Must be < intervalInSeconds when intervalInSeconds=30; must be exactly 9 when intervalInSeconds=10 (Azure fast-probing constraint). Default 9 covers both.')
+@minValue(5)
+@maxValue(10)
 param timeoutInSeconds int = 9
 
 @description('TTL (seconds) returned by Traffic Manager DNS responses. Low values respond to topology changes faster; higher values reduce DNS query load on Azure. 60s is the Azure default.')
