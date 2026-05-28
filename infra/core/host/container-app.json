@@ -1,0 +1,270 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "10047410768071712431"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container App"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for resources"
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags for resources"
+      }
+    },
+    "containerAppsEnvironmentName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container Apps Environment"
+      }
+    },
+    "containerRegistryName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Container Registry"
+      }
+    },
+    "imageName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Container image name (leave empty for initial deployment)"
+      }
+    },
+    "targetPort": {
+      "type": "int",
+      "defaultValue": 8080,
+      "metadata": {
+        "description": "Target port for the container"
+      }
+    },
+    "external": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Allow external ingress"
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 0,
+      "metadata": {
+        "description": "Minimum number of replicas"
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "Maximum number of replicas"
+      }
+    },
+    "cpu": {
+      "type": "string",
+      "defaultValue": "1.0",
+      "metadata": {
+        "description": "CPU cores allocated to the container"
+      }
+    },
+    "memory": {
+      "type": "string",
+      "defaultValue": "2Gi",
+      "metadata": {
+        "description": "Memory allocated to the container"
+      }
+    },
+    "env": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Environment variables for the container"
+      }
+    },
+    "customDomainName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Custom domain name (optional, e.g., app.yourdomain.com)"
+      }
+    },
+    "certificateId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "BYO cert (optional). Resource ID of a Microsoft.App/managedEnvironments/certificates resource on this apps CAE that should be bound to customDomainName with SNI. When empty AND customDomainName is set, the hostname is added unbound (Disabled) and the workflow then runs the legacy managed-cert flow to create + bind a DigiCert managed cert. When BOTH are set, this module emits the hostname binding with SniEnabled — no managed-cert workflow needed."
+      }
+    },
+    "regionId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Region id stamped into the running container as Region__Id (RegionSettings.Id). When empty, no Region__Id env var is injected and the container uses the value from appsettings.json (defaults to \"local\")."
+      }
+    },
+    "regionDisplayName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Human-readable region name stamped into the running container as Region__DisplayName (RegionSettings.DisplayName). Ignored when regionId is empty."
+      }
+    },
+    "additionalCustomDomain": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Additional FQDN to bind on this container app in addition to customDomainName. Used by multi-region production to bind both the apex hostname (shared across all regions for TM routing) AND a per-region subdomain (e.g. asteroids-westus2.bootyblocks.com) so the picker can directly target this region for RTT measurement and SignalR connections. Same certificateId is used for both bindings."
+      }
+    },
+    "regionsManifest": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Peer-region manifest stamped onto the running container as Region__Regions__N__{Id,DisplayName,Hostname} env vars. Empty list = no manifest injected (single-region path; the container falls back to the empty `Regions` list from appsettings, and the client synthesises a self-region from window.location.origin). Each entry shape: { id: \"westus2\", displayName: \"US West\", hostname: \"https://asteroids-westus2.bootyblocks.com\" } (hostname includes scheme, NO trailing slash)."
+      }
+    },
+    "apexHostname": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Externally reachable URL of the apex (Traffic-Manager-routed) entry point, e.g. `https://asteroids.bootyblocks.com`. Stamped as Region__ApexHostname so Program.cs adds it to CORS allowed-origins on this app. Required for multi-region: visitor browsers land on the apex first and then issue cross-origin requests (RTT pings, session list, SignalR negotiate) to every per-region hostname; without the apex in allowed-origins, the picker stalls in \"warming\" and Create fails. Empty for single-region and local-dev."
+      }
+    },
+    "cooldownPeriodSeconds": {
+      "type": "int",
+      "defaultValue": 60,
+      "metadata": {
+        "description": "Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.\n\nIMPORTANT — implicit coupling with SessionSettings.EmptyTimeoutSeconds (appsettings.json, default 60s):\n  When the last member leaves a session, SessionService keeps the session in memory for EmptyTimeoutSeconds so a returning member can rejoin. The container scale-down also runs in parallel using this `cooldownPeriodSeconds` timer. If `cooldownPeriodSeconds < EmptyTimeoutSeconds`, the container scales to zero BEFORE the empty session would have expired — annihilating the in-memory session and silently breaking the rejoin window. Keep cooldownPeriodSeconds >= EmptyTimeoutSeconds. Today both default to 60s, so they expire together (returning rejoin past 60s gets \"session not found\" either way)."
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "int",
+      "defaultValue": 30,
+      "metadata": {
+        "description": "Grace period for in-flight requests when a replica is being terminated. SignalR connections drain cleanly via the existing LeaveSession path during this window — 30s is comfortable for that and matches the plan."
+      }
+    },
+    "concurrentRequestsPerReplica": {
+      "type": "int",
+      "defaultValue": 50,
+      "metadata": {
+        "description": "HTTP scale rule concurrentRequests threshold. With maxReplicas=1 and SessionService held in-memory (non-shardable), this is a single-replica trigger; lowering from the previous 100 to 50 makes the runtime react sooner to load spikes."
+      }
+    }
+  },
+  "variables": {
+    "copy": [
+      {
+        "name": "manifestEnvNested",
+        "count": "[length(parameters('regionsManifest'))]",
+        "input": "[createArray(createObject('name', format('Region__Regions__{0}__Id', copyIndex('manifestEnvNested')), 'value', parameters('regionsManifest')[copyIndex('manifestEnvNested')].id), createObject('name', format('Region__Regions__{0}__DisplayName', copyIndex('manifestEnvNested')), 'value', parameters('regionsManifest')[copyIndex('manifestEnvNested')].displayName), createObject('name', format('Region__Regions__{0}__Hostname', copyIndex('manifestEnvNested')), 'value', parameters('regionsManifest')[copyIndex('manifestEnvNested')].hostname))]"
+      }
+    ],
+    "regionalEnv": "[if(empty(parameters('regionId')), createArray(), createArray(createObject('name', 'Region__Id', 'value', parameters('regionId')), createObject('name', 'Region__DisplayName', 'value', if(empty(parameters('regionDisplayName')), parameters('regionId'), parameters('regionDisplayName')))))]",
+    "apexEnv": "[if(empty(parameters('apexHostname')), createArray(), createArray(createObject('name', 'Region__ApexHostname', 'value', parameters('apexHostname'))))]",
+    "manifestEnv": "[flatten(variables('manifestEnvNested'))]",
+    "effectiveEnv": "[concat(parameters('env'), variables('regionalEnv'), variables('apexEnv'), variables('manifestEnv'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-10-02-preview",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppsEnvironmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": "[parameters('external')]",
+            "targetPort": "[parameters('targetPort')]",
+            "transport": "auto",
+            "allowInsecure": false,
+            "customDomains": "[concat(if(not(empty(parameters('customDomainName'))), createArray(if(empty(parameters('certificateId')), createObject('name', parameters('customDomainName'), 'bindingType', 'Disabled'), createObject('name', parameters('customDomainName'), 'bindingType', 'SniEnabled', 'certificateId', parameters('certificateId')))), createArray()), if(not(empty(parameters('additionalCustomDomain'))), createArray(if(empty(parameters('certificateId')), createObject('name', parameters('additionalCustomDomain'), 'bindingType', 'Disabled'), createObject('name', parameters('additionalCustomDomain'), 'bindingType', 'SniEnabled', 'certificateId', parameters('certificateId')))), createArray()))]"
+          },
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer]",
+              "username": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username]",
+              "passwordSecretRef": "registry-password"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "registry-password",
+              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value]"
+            }
+          ]
+        },
+        "template": {
+          "terminationGracePeriodSeconds": "[parameters('terminationGracePeriodSeconds')]",
+          "containers": [
+            {
+              "name": "main",
+              "image": "[if(not(empty(parameters('imageName'))), format('{0}/{1}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, parameters('imageName')), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]",
+              "resources": {
+                "cpu": "[json(parameters('cpu'))]",
+                "memory": "[parameters('memory')]"
+              },
+              "env": "[variables('effectiveEnv')]"
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]",
+            "cooldownPeriod": "[parameters('cooldownPeriodSeconds')]",
+            "rules": [
+              {
+                "name": "http-rule",
+                "http": {
+                  "metadata": {
+                    "concurrentRequests": "[string(parameters('concurrentRequestsPerReplica'))]"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "name": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "uri": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2024-10-02-preview').configuration.ingress.fqdn)]"
+    },
+    "id": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.App/containerApps', parameters('name'))]"
+    },
+    "fqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2024-10-02-preview').configuration.ingress.fqdn]"
+    },
+    "verificationId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('name')), '2024-10-02-preview').customDomainVerificationId]"
+    }
+  }
+}

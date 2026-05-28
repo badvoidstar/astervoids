@@ -1,0 +1,83 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "4959642392925796940"
+    }
+  },
+  "parameters": {
+    "dnsZoneName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the DNS zone"
+      }
+    },
+    "subdomain": {
+      "type": "string",
+      "metadata": {
+        "description": "Subdomain name (e.g., \"astervoids\" for astervoids.domain.com)"
+      }
+    },
+    "targetHostname": {
+      "type": "string",
+      "metadata": {
+        "description": "Target hostname for the CNAME record"
+      }
+    },
+    "verificationToken": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Single Container App customDomainVerificationId for managed-cert CNAME/HTTP validation (single-region path). Empty when BYO cert path is used (asuid TXT not emitted)."
+      }
+    },
+    "skipAsuid": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "When true, never emit the asuid TXT record regardless of verificationToken. Used by the BYO cert path: bicep binds the cert from Key Vault directly, so no managed-cert ownership validation runs and the TXT would just be dead weight."
+      }
+    }
+  },
+  "variables": {
+    "emitAsuid": "[and(not(parameters('skipAsuid')), not(empty(parameters('verificationToken'))))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/dnsZones/CNAME",
+      "apiVersion": "2018-05-01",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), parameters('subdomain'))]",
+      "properties": {
+        "TTL": 3600,
+        "CNAMERecord": {
+          "cname": "[parameters('targetHostname')]"
+        }
+      }
+    },
+    {
+      "condition": "[variables('emitAsuid')]",
+      "type": "Microsoft.Network/dnsZones/TXT",
+      "apiVersion": "2018-05-01",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), format('asuid.{0}', parameters('subdomain')))]",
+      "properties": {
+        "TTL": 3600,
+        "TXTRecords": [
+          {
+            "value": [
+              "[parameters('verificationToken')]"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "fqdn": {
+      "type": "string",
+      "value": "[format('{0}.{1}', parameters('subdomain'), parameters('dnsZoneName'))]"
+    }
+  }
+}

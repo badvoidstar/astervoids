@@ -224,10 +224,8 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction && !isMu
     minReplicas: 0
     maxReplicas: 1
     customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
-    #disable-next-line BCP318
-    certificateId: byoCertEnabled ? containerAppsProduction.outputs.byoCertResourceId : ''
+    certificateId: byoCertEnabled ? containerAppsProduction!.outputs.byoCertResourceId : ''
   }
-  dependsOn: [containerAppsProduction]
 }
 
 // ── Multi-region production (runs when regions array is non-empty) ──
@@ -373,8 +371,8 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !
   params: {
     dnsZoneName: customDomainName
     subdomain: customSubdomain
-    targetHostname: webProduction.outputs.fqdn
-    verificationToken: byoCertEnabled ? '' : webProduction.outputs.verificationId
+    targetHostname: webProduction!.outputs.fqdn
+    verificationToken: byoCertEnabled ? '' : webProduction!.outputs.verificationId
   }
   dependsOn: [dnsZone]
 }
@@ -415,17 +413,16 @@ module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) 
 // custom domain without BYO cert before bicep ever runs). Therefore the
 // asuid TXT record is always skipped here: bicep binds the cert from KV
 // directly, no managed-cert ownership validation runs.
-#disable-next-line BCP318
 module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMultiRegion && useCustomDomain) {
   name: 'dns-records-production-multi'
   scope: productionRg
   params: {
     dnsZoneName: customDomainName
     subdomain: customSubdomain
-    targetHostname: trafficManager.outputs.fqdn
+    targetHostname: trafficManager!.outputs.fqdn
     skipAsuid: true
   }
-  dependsOn: [dnsZone, trafficManager]
+  dependsOn: [dnsZone]
 }
 
 // ============================================================================
@@ -472,10 +469,8 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
     minReplicas: 0
     maxReplicas: 1
     customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
-    #disable-next-line BCP318
-    certificateId: byoCertEnabled ? containerAppsStandalone.outputs.byoCertResourceId : ''
+    certificateId: byoCertEnabled ? containerAppsStandalone!.outputs.byoCertResourceId : ''
   }
-  dependsOn: [containerAppsStandalone]
 }
 
 // ============================================================================
@@ -508,7 +503,11 @@ var branchCertResourceId = (isBranch && byoCertEnabled)
 // When BYO is NOT enabled, branches fall back to the legacy managed-cert
 // flow via the workflow's Configure Custom Domain step.
 module webBranch 'core/host/container-app.bicep' = if (isBranch) {
-  name: 'web-${environmentName}'
+  // Module deployment name is just a human-readable label in ARM; truncating
+  // environmentName here (capped at 64 chars by @maxLength) is sufficient
+  // headroom for the 'web-' prefix without exceeding the 64-char module
+  // name limit (BCP335).
+  name: take('web-${environmentName}', 64)
   scope: sharedRg
   params: {
     name: !empty(webServiceName) ? webServiceName : 'ca-web-${environmentName}'
@@ -531,13 +530,15 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
 // When BYO is disabled, emit the asuid TXT with the branch container app's
 // verificationId so the legacy managed-cert flow can validate ownership.
 module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain) {
-  name: 'dns-records-${environmentName}'
+  // Truncated for the same BCP335 reason as webBranch above (12-char prefix +
+  // up-to-64-char environmentName would exceed the module name limit).
+  name: take('dns-records-${environmentName}', 64)
   scope: sharedRg
   params: {
     dnsZoneName: customDomainName
     subdomain: customSubdomain
-    targetHostname: webBranch.outputs.fqdn
-    verificationToken: byoCertEnabled ? '' : webBranch.outputs.verificationId
+    targetHostname: webBranch!.outputs.fqdn
+    verificationToken: byoCertEnabled ? '' : webBranch!.outputs.verificationId
     skipAsuid: byoCertEnabled
   }
 }
@@ -549,28 +550,25 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
 // Common web app output expressions (DRY: each conditional module output is referenced once).
 // In multi-region production, the "primary" deployment is index 0 of the regions
 // array — that's what azd / CI tooling reports as the canonical WEB_URI.
-#disable-next-line BCP318
+// Each conditional module's `.outputs.x` is null-asserted with `!` because the
+// ternary structure already ensures we only read the branch that was deployed.
 var webUri = isProduction
-  ? (isMultiRegion ? webRegional[0].outputs.uri : webProduction.outputs.uri)
-  : (isStandalone ? webStandalone.outputs.uri : webBranch.outputs.uri)
-#disable-next-line BCP318
+  ? (isMultiRegion ? webRegional[0]!.outputs.uri : webProduction!.outputs.uri)
+  : (isStandalone ? webStandalone!.outputs.uri : webBranch!.outputs.uri)
 var webName = isProduction
-  ? (isMultiRegion ? webRegional[0].outputs.name : webProduction.outputs.name)
-  : (isStandalone ? webStandalone.outputs.name : webBranch.outputs.name)
-#disable-next-line BCP318
+  ? (isMultiRegion ? webRegional[0]!.outputs.name : webProduction!.outputs.name)
+  : (isStandalone ? webStandalone!.outputs.name : webBranch!.outputs.name)
 var webVerificationId = isProduction
-  ? (isMultiRegion ? webRegional[0].outputs.verificationId : webProduction.outputs.verificationId)
-  : (isStandalone ? webStandalone.outputs.verificationId : webBranch.outputs.verificationId)
+  ? (isMultiRegion ? webRegional[0]!.outputs.verificationId : webProduction!.outputs.verificationId)
+  : (isStandalone ? webStandalone!.outputs.verificationId : webBranch!.outputs.verificationId)
 
-#disable-next-line BCP318
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = isProduction
-  ? (isMultiRegion ? containerAppsRegional[0].outputs.registryLoginServer : containerAppsProduction.outputs.registryLoginServer)
-  : (isStandalone ? containerAppsStandalone.outputs.registryLoginServer : '${containerRegistryName}.azurecr.io')
+  ? (isMultiRegion ? containerAppsRegional[0]!.outputs.registryLoginServer : containerAppsProduction!.outputs.registryLoginServer)
+  : (isStandalone ? containerAppsStandalone!.outputs.registryLoginServer : '${containerRegistryName}.azurecr.io')
 output AZURE_CONTAINER_REGISTRY_NAME string = containerRegistryName
 output WEB_URI string = webUri
 output WEB_AZURE_URI string = webUri
-#disable-next-line BCP318
-output DNS_NAME_SERVERS array = (isProduction && useCustomDomain) ? dnsZone.outputs.nameServers : []
+output DNS_NAME_SERVERS array = (isProduction && useCustomDomain) ? dnsZone!.outputs.nameServers : []
 output CONTAINER_APP_NAME string = webName
 output CONTAINER_APPS_ENVIRONMENT string = containerAppsEnvironmentName
 output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? 'rg-${environmentName}' : sharedResourceGroupName)

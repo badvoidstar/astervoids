@@ -1,0 +1,101 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "13307008704565198438"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Location for the cert reader identity (typically the production primary region)."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to created resources."
+      }
+    },
+    "certReaderIdentityName": {
+      "type": "string",
+      "defaultValue": "id-acme-cert-reader",
+      "metadata": {
+        "description": "Name of the cert reader user-assigned identity to create. Default name is referenced by the workflow bootstrap step and by main.bicep, so override only if you fully control downstream consumers."
+      }
+    },
+    "dnsZoneName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Name of the DNS zone (in this module's resource group) to grant ACMEbot DNS Zone Contributor on. Empty string skips the DNS role assignment — useful when the zone is managed in a different RG or when the deployment has no custom domain."
+      }
+    },
+    "acmebotPrincipalId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Principal ID of the ACMEbot Function App's system-assigned identity. Required (non-empty) when dnsZoneName is non-empty. Pass via main.bicep using an `existing` reference on the ACMEbot site's `identity.principalId`."
+      }
+    }
+  },
+  "variables": {
+    "dnsZoneContributorRoleId": "befefa01-2a29-4197-83a8-272ff33ce314"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-07-31-preview",
+      "name": "[parameters('certReaderIdentityName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+    {
+      "condition": "[and(not(empty(parameters('dnsZoneName'))), not(empty(parameters('acmebotPrincipalId'))))]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Network/dnsZones', parameters('dnsZoneName'))]",
+      "name": "[guid(resourceId('Microsoft.Network/dnsZones', parameters('dnsZoneName')), parameters('acmebotPrincipalId'), variables('dnsZoneContributorRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('dnsZoneContributorRoleId'))]",
+        "principalId": "[parameters('acmebotPrincipalId')]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "certReaderIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the created/adopted cert reader identity. Wire this into container-apps.bicep as certReaderIdentityId."
+      },
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('certReaderIdentityName'))]"
+    },
+    "certReaderPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Principal (object) ID of the cert reader identity — pass to kv-cert-user-role.bicep so the KV role assignment targets the right principal."
+      },
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('certReaderIdentityName')), '2023-07-31-preview').principalId]"
+    },
+    "certReaderClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Client ID of the cert reader identity (rarely needed downstream — kept for symmetry with userAssignedIdentities output shape)."
+      },
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('certReaderIdentityName')), '2023-07-31-preview').clientId]"
+    },
+    "certReaderName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the cert reader identity (echo of input, useful for logging/diagnostics)."
+      },
+      "value": "[parameters('certReaderIdentityName')]"
+    }
+  }
+}

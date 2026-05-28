@@ -1,0 +1,158 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "7579255277221089109"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Traffic Manager profile (must be globally unique within trafficmanager.net)."
+      }
+    },
+    "relativeName": {
+      "type": "string",
+      "defaultValue": "[parameters('name')]",
+      "metadata": {
+        "description": "DNS relative name (a.k.a. profile FQDN prefix). Result FQDN: <relativeName>.trafficmanager.net. Defaults to `name` for simplicity."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to the profile resource."
+      }
+    },
+    "endpoints": {
+      "type": "array",
+      "metadata": {
+        "description": "Endpoints to register on the profile (one per region; see file header for entry shape)."
+      }
+    },
+    "probeIntervalInSeconds": {
+      "type": "int",
+      "defaultValue": 30,
+      "allowedValues": [
+        10,
+        30
+      ],
+      "metadata": {
+        "description": "Probe interval in seconds. Must be one of {10, 30} per Azure Traffic Manager constraints (validated server-side; bicep doesn't catch it at build time). 30 = standard; 10 = fast probing (more responsive failover, higher KEEP-ALIVE pressure on origins). Note: each probe is an HTTPS GET to probePath on every endpoint, which counts as request activity and effectively keeps regions warm — TM `Performance` routing cannot omit health checks, so scale-to-zero between probes won't fully drain idle regions while this profile is enabled. Accept the tradeoff or switch routing method (e.g. Geographic) if cost matters."
+      }
+    },
+    "toleratedNumberOfFailures": {
+      "type": "int",
+      "defaultValue": 3,
+      "metadata": {
+        "description": "Number of consecutive failed probes before an endpoint is marked Degraded. Default 3 (Azure default)."
+      }
+    },
+    "timeoutInSeconds": {
+      "type": "int",
+      "defaultValue": 9,
+      "minValue": 5,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Probe timeout in seconds. Allowed range: 5-10 (Azure). Must be < intervalInSeconds when intervalInSeconds=30; must be exactly 9 when intervalInSeconds=10 (Azure fast-probing constraint). Default 9 covers both."
+      }
+    },
+    "ttl": {
+      "type": "int",
+      "defaultValue": 60,
+      "metadata": {
+        "description": "TTL (seconds) returned by Traffic Manager DNS responses. Low values respond to topology changes faster; higher values reduce DNS query load on Azure. 60s is the Azure default."
+      }
+    },
+    "probePath": {
+      "type": "string",
+      "defaultValue": "/api/regions",
+      "metadata": {
+        "description": "Health probe path on each endpoint. Defaults to `/api/regions` — see module description for rationale."
+      }
+    },
+    "probePort": {
+      "type": "int",
+      "defaultValue": 443,
+      "metadata": {
+        "description": "Health probe port. 443 because every endpoint is HTTPS-only (matches container app ingress configuration)."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/trafficmanagerprofiles",
+      "apiVersion": "2022-04-01",
+      "name": "[parameters('name')]",
+      "location": "global",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "profileStatus": "Enabled",
+        "trafficRoutingMethod": "Performance",
+        "dnsConfig": {
+          "relativeName": "[parameters('relativeName')]",
+          "ttl": "[parameters('ttl')]"
+        },
+        "monitorConfig": {
+          "protocol": "HTTPS",
+          "port": "[parameters('probePort')]",
+          "path": "[parameters('probePath')]",
+          "intervalInSeconds": "[parameters('probeIntervalInSeconds')]",
+          "timeoutInSeconds": "[parameters('timeoutInSeconds')]",
+          "toleratedNumberOfFailures": "[parameters('toleratedNumberOfFailures')]"
+        },
+        "endpoints": []
+      }
+    },
+    {
+      "copy": {
+        "name": "regionEndpoints",
+        "count": "[length(parameters('endpoints'))]"
+      },
+      "type": "Microsoft.Network/trafficmanagerprofiles/ExternalEndpoints",
+      "apiVersion": "2022-04-01",
+      "name": "[format('{0}/{1}', parameters('name'), parameters('endpoints')[copyIndex()].name)]",
+      "properties": {
+        "endpointStatus": "Enabled",
+        "target": "[parameters('endpoints')[copyIndex()].target]",
+        "endpointLocation": "[parameters('endpoints')[copyIndex()].endpointLocation]",
+        "priority": "[add(copyIndex(), 1)]",
+        "weight": 1
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/trafficmanagerprofiles', parameters('name'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "fqdn": {
+      "type": "string",
+      "metadata": {
+        "description": "FQDN of the Traffic Manager profile (e.g. astervoids.trafficmanager.net). CNAME the apex domain to this hostname."
+      },
+      "value": "[reference(resourceId('Microsoft.Network/trafficmanagerprofiles', parameters('name')), '2022-04-01').dnsConfig.fqdn]"
+    },
+    "profileId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource id of the profile (useful for diagnostics / alert rule wiring)."
+      },
+      "value": "[resourceId('Microsoft.Network/trafficmanagerprofiles', parameters('name'))]"
+    },
+    "endpointIds": {
+      "type": "array",
+      "metadata": {
+        "description": "Endpoint ids in the order the input `endpoints` array was provided. Lets the caller correlate provisioned endpoints back to its regions array."
+      },
+      "copy": {
+        "count": "[length(parameters('endpoints'))]",
+        "input": "[resourceId('Microsoft.Network/trafficmanagerprofiles/ExternalEndpoints', parameters('name'), parameters('endpoints')[copyIndex()].name)]"
+      }
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "10907844510922975103"
+    }
+  },
+  "parameters": {
+    "dnsZoneName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the DNS zone (must already exist in the same RG as this module)."
+      }
+    },
+    "cnames": {
+      "type": "array",
+      "metadata": {
+        "description": "List of CNAME records to emit. Each entry: { name: \"asteroids-westus2\", target: \"ca-web-production-westus2.<unique>.westus2.azurecontainerapps.io\" }. Empty list = no records emitted (module is effectively a no-op)."
+      }
+    },
+    "domainVerificationId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Per-subscription customDomainVerificationId. When non-empty, an asuid.<name> TXT record is emitted alongside each CNAME so Azure accepts the hostname binding when bicep adds it to an existing app. When empty, no TXT records are emitted (CNAME-only)."
+      }
+    },
+    "ttl": {
+      "type": "int",
+      "defaultValue": 3600,
+      "metadata": {
+        "description": "TTL (seconds) for the emitted records. 3600 (1 hour) matches the apex record default and is short enough that a deploy-time mis-target gets corrected within an hour."
+      }
+    }
+  },
+  "resources": [
+    {
+      "copy": {
+        "name": "cnameRecords",
+        "count": "[length(parameters('cnames'))]"
+      },
+      "type": "Microsoft.Network/dnsZones/CNAME",
+      "apiVersion": "2018-05-01",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), parameters('cnames')[copyIndex()].name)]",
+      "properties": {
+        "TTL": "[parameters('ttl')]",
+        "CNAMERecord": {
+          "cname": "[parameters('cnames')[copyIndex()].target]"
+        }
+      }
+    },
+    {
+      "copy": {
+        "name": "asuidTxtRecords",
+        "count": "[length(if(empty(parameters('domainVerificationId')), createArray(), parameters('cnames')))]"
+      },
+      "type": "Microsoft.Network/dnsZones/TXT",
+      "apiVersion": "2018-05-01",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), format('asuid.{0}', if(empty(parameters('domainVerificationId')), createArray(), parameters('cnames'))[copyIndex()].name))]",
+      "properties": {
+        "TTL": "[parameters('ttl')]",
+        "TXTRecords": [
+          {
+            "value": [
+              "[parameters('domainVerificationId')]"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
