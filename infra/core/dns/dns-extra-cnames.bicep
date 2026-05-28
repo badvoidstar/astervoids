@@ -6,8 +6,8 @@
 // Why this exists separately from `dns-records.bicep`:
 //   `dns-records.bicep` unconditionally emits a CNAME for its `subdomain`
 //   parameter, so you can't reuse it just for the "additional" records
-//   without re-emitting the apex (which collides with the apex → Traffic
-//   Manager CNAME emitted later by `dns-records.bicep` itself).
+//   without re-emitting the apex CNAME (which would collide with the apex
+//   record emitted elsewhere in the deployment path).
 //
 // Why pre-creation matters:
 //   Azure rejects a container app's `customDomains[]` binding with
@@ -61,4 +61,3 @@ resource asuidTxtRecords 'Microsoft.Network/dnsZones/TXT@2018-05-01' = [for cnam
     ]
   }
 }]
-

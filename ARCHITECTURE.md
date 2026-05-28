@@ -1285,12 +1285,10 @@ SignalR connection to the correct region's hub.
   every region in parallel and merges the results. No central registry,
   no cross-region writes — keeps the existing per-process state model
   unchanged.
-- **Apex routing via Traffic Manager (DNS performance).** First-time
-  visitors land on their nearest region via apex CNAME → Traffic Manager
-  → regional FQDN. After the client downloads `region-service.js` it
-  takes over: pings every region, pins to its measured-best region.
-  Traffic Manager only needs to be "approximately right" for the initial
-  hit.
+- **Apex entrypoint via Static Web App.** First-time visitors land on the
+  static shell via apex CNAME → Static Web App. After the client downloads
+  `region-service.js` it takes over: pings every region and pins to its
+  measured-best region for API/SignalR traffic.
 - **Spectator SignalR connections (picker only).** While the start
   screen is visible, the client opens one read-only SignalR connection
   per region. Each region's hub still broadcasts `OnSessionsChanged` to
@@ -1300,9 +1298,9 @@ SignalR connection to the correct region's hub.
   NOT keep regions warm or scale-to-zero is defeated.
 - **Scale-to-zero everywhere.** Container Apps `minReplicas: 0` +
   `cooldownPeriod: 60s` returns regions to zero ~1 min after the last
-  connection closes. Traffic Manager probes hit `/api/regions` (not
-  `/api/ping`) at 60 s intervals — slow enough that probes don't keep
-  regions warm.
+  connection closes. In the static-apex path there is no Traffic Manager
+  probe loop hitting regional APIs, so idle regions are not kept warm by
+  DNS routing infrastructure.
 
 ### Latency budget
 
@@ -1331,10 +1329,10 @@ graph TB
         API["GET /api/ping<br/>GET /api/regions<br/>GET /api/sessions"]
         HUB["/sessionHub<br/>(CORS-enabled for cross-region)"]
     end
-    TM["Azure Traffic Manager<br/>(apex CNAME · Performance routing)"]
+    SA["Azure Static Web App<br/>(apex CNAME · no redirect shell)"]
 
-    BR -->|"first-load DNS"| TM
-    TM -->|"nearest region"| API
+    BR -->|"apex DNS + static shell"| SA
+    SA -->|"client RTT probing + region choice"| API
     RS -->|"GET /api/regions, /api/ping × N"| API
     MR -->|"GET /api/sessions × N"| API
     SP -->|"WS × N (picker only)"| HUB
@@ -1369,25 +1367,25 @@ this honestly:
 - **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
   (empty by default). Set to a JSON array to enable multi-region prod.
 
-### Apex TLS via BYO cert (required for multi-region apex HTTPS)
+### BYO wildcard cert for regional hostnames
 
 Azure Container Apps' free managed certificates have a hard requirement:
 the custom-domain CNAME must point **directly** at the container app's
-generated FQDN. Mapping to an intermediate CNAME — Traffic Manager, Front
-Door, Cloudflare — blocks managed-cert issuance entirely (see
+generated FQDN. That makes them awkward for this deployment's per-region
+custom hostnames, where we use a shared wildcard cert across regions and
+branches. (Reference:
 [Microsoft docs](https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates)).
 
-For multi-region production, the apex CNAME points at Traffic Manager, so
-managed certs can't validate. The fix: bring our own wildcard cert from
-Let's Encrypt, store it in Azure Key Vault, and have bicep bind it on
-every region's container app (and on branch container apps too, by reusing
-the same cert).
+For multi-region production, the apex now points at a Static Web App, while
+gameplay APIs/SignalR still target per-region ACA hostnames. We use a BYO
+wildcard cert in Key Vault and bind it on every region's container app (and
+on branch container apps too, by reusing the same cert).
 
 The recommended automation is [keyvault-acmebot](https://github.com/shibayan/keyvault-acmebot)
 — an open-source Azure Function App that auto-issues and rotates Let's
 Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
-wildcard cert covers `<subdomain>.<domain>` (apex) AND all per-region /
-per-branch subdomains.
+wildcard cert covers all per-region / per-branch ACA subdomains, while the
+apex hostname is bound on the Static Web App entrypoint.
 
 #### One-time setup (~10 min)
 
@@ -1564,7 +1562,8 @@ serves a stale cert until you redeploy.
 - `AstervoidsWeb/wwwroot/index.html` (Section 10) — picker + inline
   `MultiRegionSessions` module + lifecycle wiring.
 - `infra/main.bicep` — `regions` loop, BYO cert plumbing.
-- `infra/core/network/traffic-manager.bicep` — apex Traffic Manager.
+- `infra/core/host/static-web-app.bicep` — static apex entrypoint for
+  multi-region production.
 - `infra/core/host/container-apps.bicep` — CAE + optional BYO cert resource
   from Key Vault.
 - `infra/core/host/container-app.bicep` — container app + optional
@@ -1689,7 +1688,8 @@ astervoids/
 │   └── core/
 │       ├── host/
 │       │   ├── container-apps.bicep  # Container Apps Environment + ACR
-│       │   └── container-app.bicep   # Individual Container App module
+│       │   ├── container-app.bicep   # Individual Container App module
+│       │   └── static-web-app.bicep  # Static apex hosting (multi-region prod)
 │       └── dns/
 │           ├── dns-zone.bicep        # Azure DNS zone
 │           └── dns-records.bicep     # CNAME + TXT verification records
@@ -1712,7 +1712,7 @@ flowchart TB
     subgraph "Deployment Forms (IaC Matrix)"
         direction TB
         PROD1["Production single-region<br/>environmentName = 'production'<br/>REGIONS_JSON empty<br/>rg-production + single CAE/app path"]
-        PRODN["Production multi-region<br/>environmentName = 'production'<br/>REGIONS_JSON non-empty<br/>per-region CAE/apps + Traffic Manager"]
+        PRODN["Production multi-region<br/>environmentName = 'production'<br/>REGIONS_JSON non-empty<br/>static apex + per-region CAE/apps"]
         BRANCH["Branch (CI/CD preview)<br/>useSharedInfra = true<br/>Shares production RG/ACR/primary CAE<br/>Creates one Container App per branch"]
         STANDALONE["Standalone (local azd)<br/>Creates own resource group: rg-{env}<br/>Own ACR + CAE + Container App"]
     end

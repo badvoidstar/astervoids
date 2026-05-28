@@ -92,6 +92,8 @@ Add the following secrets to your GitHub repository (Settings → Secrets and va
 2. `AZURE_TENANT_ID` - Your Azure AD tenant ID (get it with `az account show --query tenantId -o tsv`)
 3. `AZURE_SUBSCRIPTION_ID` - Your subscription ID (get it with `az account show --query id -o tsv`)
 
+No separate Static Web Apps deployment token secret is required. The workflow fetches the SWA API token at runtime via Azure CLI using OIDC credentials.
+
 **Optional for custom domain:**
 4. `CUSTOM_DOMAIN_NAME` - Your root domain (e.g., `yourdomain.com`)
 5. `CUSTOM_SUBDOMAIN` - Subdomain for the app (e.g., `app`)
@@ -190,7 +192,7 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 | Deployment form | Trigger | Infra shape |
 |---|---|---|
 | Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path |
-| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Traffic Manager |
+| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Static Web App apex |
 | Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/primary CAE, creates branch app + DNS |
 | Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own ACR/CAE/app |
 

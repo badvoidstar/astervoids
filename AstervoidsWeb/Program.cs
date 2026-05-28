@@ -69,12 +69,12 @@ builder.Services.AddCors(options =>
         var regionOrigins = regions.Regions
             .Select(r => r.Hostname.TrimEnd('/'))
             .Where(h => !string.IsNullOrEmpty(h));
-        // Apex hostname is where every visitor lands first (Traffic Manager
-        // entry point). Browsers issue cross-origin requests from the apex
-        // to each per-region hostname for RTT pings, session list, and
-        // SignalR negotiate, so the apex MUST be in allowed origins on
-        // every regional app. Without this, the picker stalls in "warming"
-        // (RTT measurements blocked) and Create fails (hub negotiate blocked).
+        // Apex hostname is where every visitor lands first. Browsers issue
+        // cross-origin requests from the apex to each per-region hostname for
+        // RTT pings, session list, and SignalR negotiate, so the apex MUST be
+        // in allowed origins on every regional app. Without this, the picker
+        // stalls in "warming" (RTT measurements blocked) and Create fails
+        // (hub negotiate blocked).
         var apexOrigin = regions.ApexHostname.TrimEnd('/');
         var origins = regionOrigins
             .Concat(string.IsNullOrEmpty(apexOrigin) ? Array.Empty<string>() : new[] { apexOrigin })
