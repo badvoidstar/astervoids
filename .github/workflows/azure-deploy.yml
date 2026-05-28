@@ -600,8 +600,15 @@ jobs:
           echo "RESOURCE_GROUP=$(azd env get-values | grep '^RESOURCE_GROUP=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
           echo "IS_MULTI_REGION=${IS_MULTI_REGION}" >> $GITHUB_ENV
 
-          # Get custom domain from azd outputs
-          CUSTOM_DOMAIN=$(azd env get-values | grep '^CUSTOM_DOMAIN=' | cut -d'=' -f2 | tr -d '"')
+          # Resolve custom domain explicitly for multi-region (azd env outputs
+          # from direct `az deployment sub create` don't always carry
+          # CUSTOM_DOMAIN). Fall back to azd output for other paths.
+          if [ "$IS_MULTI_REGION" = "true" ] && [ -n "$CD_NAME" ] && [ -n "$CD_SUB" ]; then
+            CUSTOM_DOMAIN="${CD_SUB}.${CD_NAME}"
+            azd env set CUSTOM_DOMAIN "$CUSTOM_DOMAIN"
+          else
+            CUSTOM_DOMAIN=$(azd env get-values | grep '^CUSTOM_DOMAIN=' | cut -d'=' -f2 | tr -d '"')
+          fi
           if [ -n "$CUSTOM_DOMAIN" ]; then
             echo "CUSTOM_DOMAIN=$CUSTOM_DOMAIN" >> $GITHUB_ENV
           fi
@@ -635,12 +642,38 @@ jobs:
       - name: Bind static apex custom hostname (multi-region)
         if: steps.vars.outputs.is_production == 'true' && env.IS_MULTI_REGION == 'true' && env.CUSTOM_DOMAIN != '' && steps.deploy.outputs.static_web_app_name != ''
         run: |
-          echo "Binding static apex hostname '$CUSTOM_DOMAIN' on '${{ steps.deploy.outputs.static_web_app_name }}' (idempotent)."
-          az staticwebapp hostname set \
-            --name "${{ steps.deploy.outputs.static_web_app_name }}" \
+          SWA_NAME="${{ steps.deploy.outputs.static_web_app_name }}"
+          echo "Binding static apex hostname '$CUSTOM_DOMAIN' on '$SWA_NAME'."
+          MAX_RETRIES=20
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            status=$(az staticwebapp hostname show \
+              --name "$SWA_NAME" \
+              --resource-group "${{ env.PRODUCTION_RG }}" \
+              --hostname "$CUSTOM_DOMAIN" \
+              --query "status" -o tsv 2>/dev/null || echo "")
+            if [ "$status" = "Ready" ]; then
+              echo "✅ Static apex hostname is Ready"
+              exit 0
+            fi
+
+            echo "Attempt $attempt/$MAX_RETRIES: ensure hostname binding exists (current status: ${status:-missing})"
+            az staticwebapp hostname set \
+              --name "$SWA_NAME" \
+              --resource-group "${{ env.PRODUCTION_RG }}" \
+              --hostname "$CUSTOM_DOMAIN" \
+              --no-wait \
+              --output none || true
+
+            sleep 20
+          done
+
+          final_status=$(az staticwebapp hostname show \
+            --name "$SWA_NAME" \
             --resource-group "${{ env.PRODUCTION_RG }}" \
             --hostname "$CUSTOM_DOMAIN" \
-            --output table || true
+            --query "status" -o tsv 2>/dev/null || echo "missing")
+          echo "::error::Static apex hostname did not reach Ready. Final status: $final_status"
+          exit 1
 
       - name: Configure Custom Domain (if enabled)
         # Runs ONLY for single-region production WITHOUT BYO cert vars.
