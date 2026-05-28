@@ -71,8 +71,11 @@ jobs:
             echo ""
             echo "Checking: $APP"
             
-            # Skip production container app
-            if [ "$APP" = "${{ env.CONTAINER_APP_PREFIX }}-production" ]; then
+            # Skip production container apps:
+            # single-region → ca-web-production
+            # multi-region  → ca-web-production-<region> (e.g. ca-web-production-westus2)
+            if [ "$APP" = "${{ env.CONTAINER_APP_PREFIX }}-production" ] || \
+               [[ "$APP" == "${{ env.CONTAINER_APP_PREFIX }}-production-"* ]]; then
               echo "  -> Skipping production"
               continue
             fi
