@@ -111,6 +111,14 @@ resource existingRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' ex
 output environmentName string = containerAppsEnvironment.name
 output environmentId string = containerAppsEnvironment.id
 output registryName string = containerRegistryName
+
+// CAE's default domain (e.g. `ambitiousmeadow-cc2700d8.westus2.azurecontainerapps.io`).
+// Every container app deployed into this CAE gets its public FQDN as
+// `<app-name>.<defaultDomain>`. Exposed so callers can construct the
+// predictable FQDN BEFORE the container app resource is created — useful
+// for emitting DNS CNAMEs to satisfy custom hostname ownership validation
+// without a chicken-and-egg deploy order.
+output defaultDomain string = containerAppsEnvironment.properties.defaultDomain
 #disable-next-line BCP318
 output registryLoginServer string = createRegistry ? containerRegistry.properties.loginServer : existingRegistry.properties.loginServer
 
