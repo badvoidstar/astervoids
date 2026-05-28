@@ -49,6 +49,12 @@ param regionId string = ''
 @description('Human-readable region name stamped into the running container as Region__DisplayName (RegionSettings.DisplayName). Ignored when regionId is empty.')
 param regionDisplayName string = ''
 
+@description('Additional FQDN to bind on this container app in addition to customDomainName. Used by multi-region production to bind both the apex hostname (shared across all regions for TM routing) AND a per-region subdomain (e.g. asteroids-westus2.example.com) so the picker can directly target this region for RTT measurement and SignalR connections. Same certificateId is used for both bindings.')
+param additionalCustomDomain string = ''
+
+@description('Peer-region manifest stamped onto the running container as Region__Regions__N__{Id,DisplayName,Hostname} env vars. Empty list = no manifest injected (single-region path; the container falls back to the empty `Regions` list from appsettings, and the client synthesises a self-region from window.location.origin). Each entry shape: { id: "westus2", displayName: "US West", hostname: "https://asteroids-westus2.example.com" } (hostname includes scheme, NO trailing slash).')
+param regionsManifest array = []
+
 @description('Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.\n\nIMPORTANT — implicit coupling with SessionSettings.EmptyTimeoutSeconds (appsettings.json, default 60s):\n  When the last member leaves a session, SessionService keeps the session in memory for EmptyTimeoutSeconds so a returning member can rejoin. The container scale-down also runs in parallel using this `cooldownPeriodSeconds` timer. If `cooldownPeriodSeconds < EmptyTimeoutSeconds`, the container scales to zero BEFORE the empty session would have expired — annihilating the in-memory session and silently breaking the rejoin window. Keep cooldownPeriodSeconds >= EmptyTimeoutSeconds. Today both default to 60s, so they expire together (returning rejoin past 60s gets "session not found" either way).')
 param cooldownPeriodSeconds int = 60
 
@@ -69,13 +75,22 @@ resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' e
 }
 
 // Merge the caller-provided env array with the regional env vars synthesised from
-// regionId / regionDisplayName. The regional pair takes precedence over any
-// duplicate names in `env` so a misconfigured caller can't shadow them.
+// regionId / regionDisplayName, and with the peer-region manifest synthesised
+// from regionsManifest. The regional pair takes precedence over any duplicate
+// names in `env` so a misconfigured caller can't shadow them. The manifest
+// entries use IConfiguration's __ separator so RegionSettings.Regions binds
+// correctly (List<RegionEndpoint>).
 var regionalEnv = empty(regionId) ? [] : [
   { name: 'Region__Id', value: regionId }
   { name: 'Region__DisplayName', value: empty(regionDisplayName) ? regionId : regionDisplayName }
 ]
-var effectiveEnv = concat(env, regionalEnv)
+var manifestEnvNested = [for (r, i) in regionsManifest: [
+  { name: 'Region__Regions__${i}__Id', value: r.id }
+  { name: 'Region__Regions__${i}__DisplayName', value: r.displayName }
+  { name: 'Region__Regions__${i}__Hostname', value: r.hostname }
+]]
+var manifestEnv = flatten(manifestEnvNested)
+var effectiveEnv = concat(env, regionalEnv, manifestEnv)
 
 // Container App.
 //
@@ -96,27 +111,44 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
         targetPort: targetPort
         transport: 'auto'
         allowInsecure: false
-        // Add custom domain without certificate first to allow DNS verification
-        // Custom domain binding strategy
-        //   - No customDomainName:           empty array (no binding)
-        //   - customDomainName + no cert:    Disabled binding (hostname known but no TLS;
-        //                                     workflow's Configure Custom Domain step then
-        //                                     creates a managed cert + flips to SniEnabled)
-        //   - customDomainName + certId:     SniEnabled binding tied to the BYO cert from
-        //                                     Key Vault (no workflow cert provisioning needed —
-        //                                     bicep handles it end-to-end). Same shape works
-        //                                     for production single-region, multi-region, and
-        //                                     branch deploys: they all reference the same cert.
-        customDomains: !empty(customDomainName) ? [
-          empty(certificateId) ? {
-            name: customDomainName
-            bindingType: 'Disabled'
-          } : {
-            name: customDomainName
-            bindingType: 'SniEnabled'
-            certificateId: certificateId
-          }
-        ] : []
+        // Custom domain binding strategy:
+        //   - No customDomainName:                empty array (no binding).
+        //   - customDomainName + no cert:         Disabled binding (hostname known but no TLS;
+        //                                          workflow's Configure Custom Domain step then
+        //                                          creates a managed cert + flips to SniEnabled).
+        //   - customDomainName + certId:          SniEnabled binding tied to the BYO cert from
+        //                                          Key Vault (no workflow cert provisioning needed —
+        //                                          bicep handles it end-to-end). Same shape works
+        //                                          for production single-region, multi-region, and
+        //                                          branch deploys: they all reference the same cert.
+        //   - additionalCustomDomain (when set):  Adds a SECOND binding for the per-region subdomain
+        //                                          using the SAME certificateId (the wildcard cert
+        //                                          covers it). Used by multi-region production so
+        //                                          the picker can target THIS region directly while
+        //                                          the apex hostname remains shared across regions
+        //                                          for Traffic Manager routing.
+        customDomains: concat(
+          !empty(customDomainName) ? [
+            empty(certificateId) ? {
+              name: customDomainName
+              bindingType: 'Disabled'
+            } : {
+              name: customDomainName
+              bindingType: 'SniEnabled'
+              certificateId: certificateId
+            }
+          ] : [],
+          !empty(additionalCustomDomain) ? [
+            empty(certificateId) ? {
+              name: additionalCustomDomain
+              bindingType: 'Disabled'
+            } : {
+              name: additionalCustomDomain
+              bindingType: 'SniEnabled'
+              certificateId: certificateId
+            }
+          ] : []
+        )
       }
       registries: [
         {
