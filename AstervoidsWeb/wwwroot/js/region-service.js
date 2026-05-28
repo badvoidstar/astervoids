@@ -278,17 +278,39 @@ const RegionService = (function () {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    function getWindowBootstrap() {
+        if (typeof window === 'undefined') return null;
+        const b = window.ASTERVOIDS_REGION_BOOTSTRAP;
+        if (!b || !Array.isArray(b.regions) || b.regions.length === 0) return null;
+        return b;
+    }
+
     /**
-     * Fetch the region manifest from the current origin and initialise per-region
-     * state. Does NOT start measurements — call `start()` for that. Calling
-     * `load()` again replaces the manifest atomically (useful for tests or for
-     * an admin tool that hot-reloads regions in dev).
+     * Fetch the region manifest (or use injected bootstrap data) and initialise
+     * per-region state. Does NOT start measurements — call `start()` for that.
+     * Calling `load()` again replaces the manifest atomically.
+     *
+     * Backward compatible signatures:
+     *   - load()                    -> same-origin /api/regions (or window bootstrap)
+     *   - load('https://origin')    -> fetch from override origin + /api/regions
+     *   - load({ bootstrap, originOverride })
      */
-    async function load(originOverride) {
-        const url = (originOverride ?? '') + CONFIG.REGIONS_ENDPOINT;
-        const res = await fetch(url, { cache: 'no-store' });
-        if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
-        const body = await res.json();
+    async function load(options) {
+        const opts = (typeof options === 'string')
+            ? { originOverride: options }
+            : (options || {});
+        const body = opts.bootstrap
+            ? {
+                regionId: opts.bootstrap.regionId ?? null,
+                displayName: opts.bootstrap.displayName ?? null,
+                regions: opts.bootstrap.regions ?? [],
+            }
+            : (getWindowBootstrap() || await (async () => {
+                const url = (opts.originOverride ?? '') + CONFIG.REGIONS_ENDPOINT;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
+                return res.json();
+            })());
         regions.length = 0;
         for (const r of body.regions ?? []) {
             regions.push({
