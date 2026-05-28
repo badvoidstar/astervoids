@@ -121,6 +121,8 @@ var containerAppsEnvironmentName = isStandalone
 // Determine if custom domain should be configured
 var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
 var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}' : ''
+var staticApexEnabled = isMultiRegion && useCustomDomain
+var staticApexName = take('swa-${customSubdomain}-${uniqueString(subscription().subscriptionId, customDomainName)}', 40)
 
 // Tags for all resources
 var tags = {
@@ -317,22 +319,16 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     external: true
     minReplicas: 0
     maxReplicas: 1
-    // BYO cert binds TWO hostnames on every regional app:
-    //   - customDomainName (= apex, e.g. asteroids.bootyblocks.com): shared
-    //     across all regions for Traffic Manager routing. SNI handshake
-    //     for the apex needs to succeed on whichever region TM steers
-    //     traffic to, so all three regions bind it. Ownership validated
-    //     because the apex already has a CNAME (the existing one from
-    //     a prior deploy, or it'll exist after dnsRecordsProductionMultiRegion
-    //     runs and Azure re-validates on next reconcile).
+    // BYO cert binds per-region custom domain on every regional app:
     //   - additionalCustomDomain (= per-region subdomain, e.g.
     //     asteroids-westus2.bootyblocks.com): unique per region, used by
     //     the picker to measure RTT and open SignalR connections to a
     //     specific region. Wildcard cert covers both. Ownership validated
     //     via the CNAME emitted by dnsRecordsPerRegion above.
-    // When BYO is not configured, both stay empty and the workflow's
+    // The apex custom domain is now served by the Static Web App entrypoint.
+    // When BYO is not configured, this stays empty and the workflow's
     // legacy managed-cert flow runs per-region instead.
-    customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    customDomainName: ''
     additionalCustomDomain: byoCertEnabled && useCustomDomain ? '${customSubdomain}-${r.name}.${customDomainName}' : ''
     #disable-next-line BCP318
     certificateId: byoCertEnabled ? containerAppsRegional[i].outputs.byoCertResourceId : ''
@@ -341,7 +337,7 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     // Every region ships the SAME manifest so the client can fetch
     // /api/regions from any landing region and get the full peer list.
     regionsManifest: regionsManifest
-    // Visitors land on the apex (TM) first and then issue cross-origin
+    // Visitors land on the static apex first and then issue cross-origin
     // requests to per-region hostnames — apex MUST be in CORS allowed-
     // origins or the picker stalls in "warming" and Create fails.
     apexHostname: useCustomDomain ? 'https://${fullCustomDomain}' : ''
@@ -377,49 +373,31 @@ module dnsRecordsProduction 'core/dns/dns-records.bicep' = if (isProduction && !
   dependsOn: [dnsZone]
 }
 
-// ── Traffic Manager apex routing (multi-region production only) ──────────────
-// Profile FQDN: <profileName>.trafficmanager.net. The apex custom domain (if
-// configured) CNAMEs to this profile so a first-time visitor hits their nearest
-// region. After load, the client takes over via per-region hostnames.
-//
-// `relativeName` must be globally unique within trafficmanager.net — using a
-// uniqueString suffix keyed on the subscription + 'astervoids' avoids
-// collisions when multiple subscriptions deploy the same template.
-var trafficManagerRelativeName = 'astervoids-${uniqueString(subscription().subscriptionId, 'astervoids-tm')}'
-
-#disable-next-line BCP318
-module trafficManager 'core/network/traffic-manager.bicep' = if (isMultiRegion) {
-  name: 'traffic-manager'
+// ── Static apex entrypoint (multi-region production + custom domain) ──────────
+// Instead of apex -> Traffic Manager, apex now points at a Static Web App.
+// The browser stays on the apex URL while the picker routes API/SignalR
+// calls directly to per-region hostnames.
+module staticApex 'core/host/static-web-app.bicep' = if (staticApexEnabled) {
+  name: 'static-apex'
   scope: productionRg
   params: {
-    name: trafficManagerRelativeName
-    relativeName: trafficManagerRelativeName
+    name: staticApexName
+    location: location
     tags: tags
-    endpoints: [for (r, i) in (isMultiRegion ? regions : []): {
-      name: r.name
-      target: webRegional[i].outputs.fqdn
-      endpointLocation: r.location
-    }]
   }
-  dependsOn: [webRegional]
 }
 
-// DNS records for production custom domain (multi-region path).
-// CNAMEs the user's custom subdomain to the Traffic Manager FQDN so a
-// browser visiting `<customSubdomain>.<customDomainName>` is DNS-routed to
-// the nearest healthy region. Multi-region custom domain ALWAYS uses BYO
-// cert (ACA managed certs can't validate behind an intermediate CNAME like
-// Traffic Manager — the workflow's fail-fast guard rejects multi-region +
-// custom domain without BYO cert before bicep ever runs). Therefore the
-// asuid TXT record is always skipped here: bicep binds the cert from KV
-// directly, no managed-cert ownership validation runs.
-module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMultiRegion && useCustomDomain) {
+// DNS records for production custom domain (multi-region static-apex path).
+// CNAMEs the user's custom subdomain to the Static Web App default hostname.
+// asuid TXT is skipped because this hostname is not bound on ACA.
+module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (staticApexEnabled) {
   name: 'dns-records-production-multi'
   scope: productionRg
   params: {
     dnsZoneName: customDomainName
     subdomain: customSubdomain
-    targetHostname: trafficManager!.outputs.fqdn
+    #disable-next-line BCP318
+    targetHostname: staticApex!.outputs.defaultHostname
     skipAsuid: true
   }
   dependsOn: [dnsZone]
@@ -576,7 +554,9 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
 // Each conditional module's `.outputs.x` is null-asserted with `!` because the
 // ternary structure already ensures we only read the branch that was deployed.
 var webUri = isProduction
-  ? (isMultiRegion ? webRegional[0]!.outputs.uri : webProduction!.outputs.uri)
+  ? (isMultiRegion
+    ? (staticApexEnabled ? 'https://${fullCustomDomain}' : webRegional[0]!.outputs.uri)
+    : webProduction!.outputs.uri)
   : (isStandalone ? webStandalone!.outputs.uri : webBranch!.outputs.uri)
 var webName = isProduction
   ? (isMultiRegion ? webRegional[0]!.outputs.name : webProduction!.outputs.name)
@@ -623,6 +603,16 @@ output REGION_ENDPOINTS array = [for (r, i) in (isMultiRegion ? regions : []): {
   verificationId: webRegional[i].outputs.verificationId
 }]
 
-@description('FQDN of the multi-region Traffic Manager profile (CNAME the apex domain here). Empty string when single-region.')
+@description('FQDN of the Static Web App default hostname used by the production multi-region apex CNAME. Empty string when not using the static-apex path.')
 #disable-next-line BCP318
-output TRAFFIC_MANAGER_FQDN string = isMultiRegion ? trafficManager.outputs.fqdn : ''
+output STATIC_WEB_APP_DEFAULT_HOSTNAME string = staticApexEnabled ? staticApex.outputs.defaultHostname : ''
+
+@description('Static Web App resource name for production multi-region apex hosting. Empty string when not using the static-apex path.')
+#disable-next-line BCP318
+output STATIC_WEB_APP_NAME string = staticApexEnabled ? staticApex.outputs.name : ''
+
+@description('Canonical region manifest for static-apex clients. Each entry uses the per-region custom-domain hostname.')
+output STATIC_APEX_REGION_MANIFEST array = regionsManifest
+
+@description('Legacy output retained for backward compatibility. Empty string on static-apex path.')
+output TRAFFIC_MANAGER_FQDN string = ''
