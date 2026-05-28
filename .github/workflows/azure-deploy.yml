@@ -502,7 +502,9 @@ jobs:
             if [ -z "$STATIC_REGION_MANIFEST" ]; then
               STATIC_REGION_MANIFEST='[]'
             fi
-            STATIC_DIR=$(mktemp -d)
+            STATIC_DIR="$GITHUB_WORKSPACE/.tmp/static-apex"
+            rm -rf "$STATIC_DIR"
+            mkdir -p "$STATIC_DIR"
             cp -R AstervoidsWeb/wwwroot/. "$STATIC_DIR"/
             BOOTSTRAP_JSON=$(jq -c -n --argjson regions "$STATIC_REGION_MANIFEST" \
               '{ regionId: null, displayName: null, regions: $regions }')
