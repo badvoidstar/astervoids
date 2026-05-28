@@ -55,6 +55,9 @@ param additionalCustomDomain string = ''
 @description('Peer-region manifest stamped onto the running container as Region__Regions__N__{Id,DisplayName,Hostname} env vars. Empty list = no manifest injected (single-region path; the container falls back to the empty `Regions` list from appsettings, and the client synthesises a self-region from window.location.origin). Each entry shape: { id: "westus2", displayName: "US West", hostname: "https://asteroids-westus2.example.com" } (hostname includes scheme, NO trailing slash).')
 param regionsManifest array = []
 
+@description('Externally reachable URL of the apex (Traffic-Manager-routed) entry point, e.g. `https://asteroids.example.com`. Stamped as Region__ApexHostname so Program.cs adds it to CORS allowed-origins on this app. Required for multi-region: visitor browsers land on the apex first and then issue cross-origin requests (RTT pings, session list, SignalR negotiate) to every per-region hostname; without the apex in allowed-origins, the picker stalls in "warming" and Create fails. Empty for single-region and local-dev.')
+param apexHostname string = ''
+
 @description('Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.\n\nIMPORTANT — implicit coupling with SessionSettings.EmptyTimeoutSeconds (appsettings.json, default 60s):\n  When the last member leaves a session, SessionService keeps the session in memory for EmptyTimeoutSeconds so a returning member can rejoin. The container scale-down also runs in parallel using this `cooldownPeriodSeconds` timer. If `cooldownPeriodSeconds < EmptyTimeoutSeconds`, the container scales to zero BEFORE the empty session would have expired — annihilating the in-memory session and silently breaking the rejoin window. Keep cooldownPeriodSeconds >= EmptyTimeoutSeconds. Today both default to 60s, so they expire together (returning rejoin past 60s gets "session not found" either way).')
 param cooldownPeriodSeconds int = 60
 
@@ -84,13 +87,16 @@ var regionalEnv = empty(regionId) ? [] : [
   { name: 'Region__Id', value: regionId }
   { name: 'Region__DisplayName', value: empty(regionDisplayName) ? regionId : regionDisplayName }
 ]
+var apexEnv = empty(apexHostname) ? [] : [
+  { name: 'Region__ApexHostname', value: apexHostname }
+]
 var manifestEnvNested = [for (r, i) in regionsManifest: [
   { name: 'Region__Regions__${i}__Id', value: r.id }
   { name: 'Region__Regions__${i}__DisplayName', value: r.displayName }
   { name: 'Region__Regions__${i}__Hostname', value: r.hostname }
 ]]
 var manifestEnv = flatten(manifestEnvNested)
-var effectiveEnv = concat(env, regionalEnv, manifestEnv)
+var effectiveEnv = concat(env, regionalEnv, apexEnv, manifestEnv)
 
 // Container App.
 //
