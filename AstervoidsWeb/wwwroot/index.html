@@ -7558,13 +7558,20 @@
             const regionName = getCreateRegionDisplayName(regionId);
             const bestRegionId = window.RegionService ? window.RegionService.bestRegion() : null;
             const usingBestDefault = !sessionPicker.userOverrodeCreateRegion && regionId && bestRegionId && regionId === bestRegionId;
+            const multiRegion = sessionPicker.regions.length > 1;
+            // Static-apex mode has no same-origin /sessionHub, so the initial
+            // SessionClient.connect() can be offline while Create is still fully
+            // functional via explicit region-targeted connect in handleCreateSession().
+            const canCreateNow = canCreate && (multiRegion ? !!getCreateRegionHostname() : connected);
             btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
                 ? `Create in ${regionName}${usingBestDefault ? ' (Best)' : ''}`
                 : 'Create';
-            btnLeaveCreate.disabled = !connected || !canCreate;
+            btnLeaveCreate.disabled = !canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
-            if (!canCreate && connected) {
+            if (!canCreate) {
                 btnLeaveCreate.title = 'Maximum sessions reached';
+            } else if (!canCreateNow && multiRegion) {
+                btnLeaveCreate.title = 'Waiting for region routing information';
             } else if (regionName && sessionPicker.regions.length > 1) {
                 btnLeaveCreate.title = usingBestDefault
                     ? `Create a new session hosted in ${regionName} (currently your best RTT region)`
