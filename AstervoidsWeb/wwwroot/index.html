@@ -7492,7 +7492,7 @@
             const rttText = ping.state === 'warming' || ping.valueMs == null
                 ? 'warming…'
                 : `${Math.round(ping.valueMs)} ms`;
-            const bestTag = r.id === bestId ? ' ★ best' : '';
+            const bestTag = r.id === bestId ? ' ★ best ★' : '';
             opt.textContent = `${r.displayName} · ${rttText}${bestTag}`;
             if (r.id === desired) opt.selected = true;
             sel.appendChild(opt);
@@ -7556,15 +7556,13 @@
             // (essential on touch where hover tooltips don't exist).
             const regionId = getCreateRegionId();
             const regionName = getCreateRegionDisplayName(regionId);
-            const bestRegionId = window.RegionService ? window.RegionService.bestRegion() : null;
-            const usingBestDefault = !sessionPicker.userOverrodeCreateRegion && regionId && bestRegionId && regionId === bestRegionId;
             const multiRegion = sessionPicker.regions.length > 1;
             // Static-apex mode has no same-origin /sessionHub, so the initial
             // SessionClient.connect() can be offline while Create is still fully
             // functional via explicit region-targeted connect in handleCreateSession().
             const canCreateNow = canCreate && (multiRegion ? !!getCreateRegionHostname() : connected);
             btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
-                ? `Create in ${regionName}${usingBestDefault ? ' (Best)' : ''}`
+                ? `Create in ${regionName}`
                 : 'Create';
             btnLeaveCreate.disabled = !canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
@@ -7573,9 +7571,7 @@
             } else if (!canCreateNow && multiRegion) {
                 btnLeaveCreate.title = 'Waiting for region routing information';
             } else if (regionName && sessionPicker.regions.length > 1) {
-                btnLeaveCreate.title = usingBestDefault
-                    ? `Create a new session hosted in ${regionName} (currently your best RTT region)`
-                    : `Create a new session hosted in ${regionName}`;
+                btnLeaveCreate.title = `Create a new session hosted in ${regionName}`;
             } else {
                 btnLeaveCreate.title = '';
             }
