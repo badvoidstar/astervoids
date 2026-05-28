@@ -37,6 +37,21 @@ public class RegionSettings
     /// client can fetch it once from any landing region and then fan out.
     /// </summary>
     public List<RegionEndpoint> Regions { get; set; } = new();
+
+    /// <summary>
+    /// Externally reachable URL of the apex (Traffic-Manager-routed) entry point,
+    /// e.g. <c>https://asteroids.bootyblocks.com</c>. This is where every visitor's
+    /// browser lands first — Traffic Manager DNS-routes them to the nearest healthy
+    /// region from there. The apex hostname is NOT itself a "region" (you can't
+    /// ping it for per-region RTT — every region's TM endpoint answers it), so it
+    /// is kept out of <see cref="Regions"/> to avoid double-counting in the picker.
+    /// It DOES need to be in CORS allowed-origins on every regional app, however,
+    /// because the visitor's browser issues cross-origin requests FROM the apex
+    /// TO each per-region hostname (RTT pings, session list, SignalR negotiate).
+    /// Empty in single-region / local-dev where there's no apex distinct from
+    /// the serving hostname.
+    /// </summary>
+    public string ApexHostname { get; set; } = "";
 }
 
 /// <summary>

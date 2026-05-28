@@ -343,6 +343,10 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     // Every region ships the SAME manifest so the client can fetch
     // /api/regions from any landing region and get the full peer list.
     regionsManifest: regionsManifest
+    // Visitors land on the apex (TM) first and then issue cross-origin
+    // requests to per-region hostnames — apex MUST be in CORS allowed-
+    // origins or the picker stalls in "warming" and Create fails.
+    apexHostname: useCustomDomain ? 'https://${fullCustomDomain}' : ''
   }
   // dependsOn dnsRecordsPerRegion so the per-region CNAMEs exist before
   // Azure validates the additionalCustomDomain binding on this app.
