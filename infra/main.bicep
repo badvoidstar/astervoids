@@ -81,6 +81,9 @@ param acmebotKeyVaultName string = 'kv-astervoids'
 @description('Resource group containing the ACMEbot Key Vault. Defaults to sg-acmebot (matches the upstream ARM template). The KV typically lives in the same RG as ACMEbot itself.')
 param acmebotKeyVaultResourceGroup string = 'sg-acmebot'
 
+@description('Per-subscription customDomainVerificationId (a 64-char hex string). When set, the multi-region bicep path emits per-region asuid TXT records so Azure accepts the additional custom hostname bindings on each regional container app without "InvalidCustomHostNameValidation" errors. Read from any existing container app via `az containerapp show ... --query properties.customDomainVerificationId -o tsv` — the value is the same across every app in a subscription, so the workflow can pull it from a known-stable app (e.g. ca-web-production) and forward it here. Empty by default — leave unset on greenfield deploys that have no existing apps to read from yet.')
+param domainVerificationId string = ''
+
 // Determine deployment path
 var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
@@ -289,6 +292,7 @@ module dnsRecordsPerRegion 'core/dns/dns-extra-cnames.bicep' = if (isMultiRegion
   scope: productionRg
   params: {
     dnsZoneName: customDomainName
+    domainVerificationId: domainVerificationId
     cnames: [for (r, i) in manifestRegions: {
       name: '${customSubdomain}-${r.name}'
       #disable-next-line BCP318
