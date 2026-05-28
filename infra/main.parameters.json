@@ -25,6 +25,9 @@
     },
     "certReaderIdentityId": {
       "value": "${CERT_READER_IDENTITY_ID=}"
+    },
+    "domainVerificationId": {
+      "value": "${DOMAIN_VERIFICATION_ID=}"
     }
   }
 }
