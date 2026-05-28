@@ -7608,7 +7608,28 @@
         if (sessionPicker.currentSessionId) {
             const currentSession = sessionPicker.sessions.find(s => s.id === sessionPicker.currentSessionId);
             if (!currentSession) {
-                // Session was deleted - leave lobby state
+                // In multi-region mode, the merged view is built region-by-region
+                // as each /api/sessions fetch resolves (applyMerged fires once per
+                // region completion). During the window immediately after a
+                // successful Create, the session's owning region's slice may
+                // still be in-flight while peer slices have already returned —
+                // the merge transiently omits the just-created session. Firing
+                // handleLeaveLobby here would tear down the brand-new session
+                // (and trigger a same-origin reconnect that routes via Traffic
+                // Manager to the default region, defeating the user's pick).
+                //
+                // The SignalR connection to the session's owning region is the
+                // authoritative source of session liveness. If the session
+                // actually ended, the connection drops → onDisconnected fires
+                // → attemptAutoRejoin / returnToStartScreen handles it
+                // correctly. So skip the heuristic in multi-region.
+                if (sessionPicker.regions.length > 1) {
+                    renderSessionList();
+                    updatePickerButtons();
+                    return;
+                }
+                // Single-region: only data source is /api/sessions; if the
+                // session disappeared from it, the lobby UI should reflect that.
                 handleLeaveLobby('Session ended');
                 return;
             }
