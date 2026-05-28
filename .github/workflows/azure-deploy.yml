@@ -197,6 +197,43 @@ jobs:
             fi
           fi
 
+          # Seed DOMAIN_VERIFICATION_ID so bicep can emit asuid TXT before
+          # branch custom hostname binding is attempted. Azure validates
+          # ownership during app create; missing asuid causes
+          # InvalidCustomHostNameValidation failures.
+          if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+            DOMAIN_VERIFICATION_ID=""
+            PRIMARY_REGION_NAME=$(echo "$REGIONS_JSON" | jq -r '.[0].name' 2>/dev/null || true)
+            for CANDIDATE in "ca-web-production-${PRIMARY_REGION_NAME}" "ca-web-production" "${{ env.CONTAINER_APP_PREFIX }}-${{ steps.vars.outputs.sanitized_branch }}"; do
+              [ -n "$CANDIDATE" ] || continue
+              DOMAIN_VERIFICATION_ID=$(az containerapp show \
+                --name "$CANDIDATE" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --query 'properties.customDomainVerificationId' \
+                -o tsv 2>/dev/null || echo "")
+              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
+                echo "Using customDomainVerificationId from $CANDIDATE (length: ${#DOMAIN_VERIFICATION_ID})"
+                break
+              fi
+            done
+            if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
+              azd env set DOMAIN_VERIFICATION_ID "$DOMAIN_VERIFICATION_ID"
+            else
+              echo "::warning::Could not resolve customDomainVerificationId from existing container apps."
+            fi
+
+            # BYO + branch custom hostname needs the asuid token up-front.
+            if [ "${{ steps.vars.outputs.is_production }}" != "true" ] \
+              && [ -n "$CERT_KEY_VAULT_SECRET_URL" ] \
+              && [ -n "$CERT_KEY_VAULT_CERT_NAME" ] \
+              && [ -n "$CERT_READER_IDENTITY_ID" ] \
+              && [ -z "$DOMAIN_VERIFICATION_ID" ]; then
+              echo "::error::Branch BYO custom-domain deploy requires DOMAIN_VERIFICATION_ID, but none was found."
+              echo "::error::Resolve by ensuring at least one container app exists in ${{ env.PRODUCTION_RG }} and exposes properties.customDomainVerificationId."
+              exit 1
+            fi
+          fi
+
           # BYO TLS cert (optional) — passed through to bicep when all three
           # vars are set. azd reads these via main.parameters.json env-var
           # substitution (see infra/main.parameters.json).
@@ -495,7 +532,8 @@ jobs:
                   customSubdomain="$CD_SUB" \
                   certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
                   certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
-                  certReaderIdentityId="$CERT_READER_IDENTITY_ID"
+                  certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
+                  domainVerificationId="$(azd env get-values | grep '^DOMAIN_VERIFICATION_ID=' | cut -d'=' -f2 | tr -d '\"')"
 
               # Re-verify after the fallback deployment.
               if ! az containerapp show \

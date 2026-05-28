@@ -416,15 +416,13 @@
         }
         .ping-confidence span.lit { background: currentColor; }
 
-        /* "Your region" banner above the session list. Truncates with
-           ellipsis on narrow viewports so it never wraps and pushes the
-           list off-screen. */
+        /* Regional warning banner (only shown for degraded states). */
         #region-banner {
             width: 100%;
             font-size: 11px;
-            color: #b8d4ff;
-            background: rgba(60, 90, 140, 0.18);
-            border: 1px solid rgba(120, 160, 220, 0.35);
+            color: #ffd7a8;
+            background: rgba(80, 36, 18, 0.88);
+            border: 1px solid rgba(255, 182, 109, 0.5);
             border-radius: 4px;
             padding: 6px 10px;
             margin-bottom: 10px;
@@ -444,27 +442,31 @@
         .region-select-row {
             width: 100%;
             display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 6px;
+            flex-direction: column;
+            align-items: stretch;
+            gap: 6px;
+            margin-bottom: 8px;
         }
         .region-select-row label {
-            font-size: 10px;
-            color: #888;
+            font-size: 11px;
+            color: #a8b3c7;
             text-transform: uppercase;
             letter-spacing: 1px;
-            white-space: nowrap;
         }
         #create-region-select {
-            flex: 1;
             min-height: 44px;
-            background: transparent;
-            border: 1px solid #555;
+            width: 100%;
+            background: rgba(10, 16, 30, 0.92);
+            border: 1px solid #56698f;
             color: #fff;
             font-family: 'Courier New', monospace;
             font-size: 13px;
-            padding: 4px 8px;
+            padding: 6px 10px;
             border-radius: 4px;
+        }
+        #create-region-select option {
+            background: #101829;
+            color: #fff;
         }
         #create-region-select:disabled {
             opacity: 0.5;
@@ -722,7 +724,7 @@
                 <div id="session-list"></div>
                 <div id="picker-buttons">
                     <div class="region-select-row" id="create-region-row" style="display: none;">
-                        <label for="create-region-select">Region:</label>
+                        <label for="create-region-select">Host region</label>
                         <select id="create-region-select"></select>
                     </div>
                     <div class="button-row">
@@ -7452,21 +7454,11 @@
     function renderRegionBanner() {
         const banner = sessionPicker.regionBannerEl;
         if (!banner) return;
-        const regions = sessionPicker.regions;
-        if (regions.length === 0) {
-            banner.style.display = 'none';
-            return;
-        }
-        const bestId = window.RegionService ? window.RegionService.bestRegion() : null;
-        if (!bestId) {
-            banner.style.display = '';
-            banner.textContent = '📡 Measuring regions…';
-            return;
-        }
-        const ping = pingForRegion(bestId);
-        banner.style.display = '';
-        const valueText = ping.valueMs == null ? '—' : `${Math.round(ping.valueMs)} ms`;
-        banner.textContent = `📍 You're closest to ${regionDisplayName(bestId)} (${valueText})`;
+        // Closest-region messaging now lives directly in the picker select/button
+        // to avoid a separate banner row in the layout. Keep this element hidden
+        // unless a warning (e.g. stale region connection) needs to be shown.
+        banner.style.display = 'none';
+        banner.textContent = '';
     }
 
     function renderCreateRegionSelector() {
@@ -7486,6 +7478,7 @@
         const desired = sessionPicker.selectedCreateRegion
             || (window.RegionService && window.RegionService.bestRegion())
             || regions[0].id;
+        const bestId = (window.RegionService && window.RegionService.bestRegion()) || null;
         // Rebuild options only when the region list or RTTs changed enough to
         // matter. The text format must include live RTT so touch users can
         // see latency INSIDE the native sheet (no hover tooltip available).
@@ -7497,7 +7490,8 @@
             const rttText = ping.state === 'warming' || ping.valueMs == null
                 ? 'warming…'
                 : `${Math.round(ping.valueMs)} ms`;
-            opt.textContent = `${r.displayName} · ${rttText}`;
+            const bestTag = r.id === bestId ? ' ★ best' : '';
+            opt.textContent = `${r.displayName} · ${rttText}${bestTag}`;
             if (r.id === desired) opt.selected = true;
             sel.appendChild(opt);
         }
@@ -7560,15 +7554,19 @@
             // (essential on touch where hover tooltips don't exist).
             const regionId = getCreateRegionId();
             const regionName = getCreateRegionDisplayName(regionId);
+            const bestRegionId = window.RegionService ? window.RegionService.bestRegion() : null;
+            const usingBestDefault = !sessionPicker.userOverrodeCreateRegion && regionId && bestRegionId && regionId === bestRegionId;
             btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
-                ? `Create in ${regionName}`
+                ? `Create in ${regionName}${usingBestDefault ? ' (Best)' : ''}`
                 : 'Create';
             btnLeaveCreate.disabled = !connected || !canCreate;
             btnLeaveCreate.className = 'picker-btn';
             if (!canCreate && connected) {
                 btnLeaveCreate.title = 'Maximum sessions reached';
             } else if (regionName && sessionPicker.regions.length > 1) {
-                btnLeaveCreate.title = `Create a new session hosted in ${regionName}`;
+                btnLeaveCreate.title = usingBestDefault
+                    ? `Create a new session hosted in ${regionName} (currently your best RTT region)`
+                    : `Create a new session hosted in ${regionName}`;
             } else {
                 btnLeaveCreate.title = '';
             }

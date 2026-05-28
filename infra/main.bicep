@@ -482,6 +482,13 @@ resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if 
   name: sharedResourceGroupName
 }
 
+resource branchContainerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-10-02-preview' existing = if (isBranch) {
+  name: containerAppsEnvironmentName
+  scope: sharedRg
+}
+
+var branchContainerAppName = !empty(webServiceName) ? webServiceName : 'ca-web-${environmentName}'
+
 // Branch cert resource ID. When BYO is enabled, branches bind their custom
 // hostname to the SAME wildcard cert that production uses, parented on the
 // shared CAE. The cert is materialised by:
@@ -495,6 +502,22 @@ resource sharedRg 'Microsoft.Resources/resourceGroups@2022-09-01' existing = if 
 var branchCertResourceId = (isBranch && byoCertEnabled)
   ? '/subscriptions/${subscription().subscriptionId}/resourceGroups/${sharedResourceGroupName}/providers/Microsoft.App/managedEnvironments/${containerAppsEnvironmentName}/certificates/${certKeyVaultCertName}'
   : ''
+
+// For BYO branch deploys, emit DNS records BEFORE creating the app so custom
+// hostname validation succeeds at app-create time.
+module dnsRecordsBranchByo 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain && byoCertEnabled) {
+  // Truncated for the same BCP335 reason as webBranch above.
+  name: take('dns-records-byo-${environmentName}', 64)
+  scope: sharedRg
+  params: {
+    dnsZoneName: customDomainName
+    subdomain: customSubdomain
+    #disable-next-line BCP318
+    targetHostname: '${branchContainerAppName}.${branchContainerAppsEnvironment!.properties.defaultDomain}'
+    verificationToken: domainVerificationId
+    skipAsuid: false
+  }
+}
 
 // Branch Container App (uses existing shared infrastructure).
 // When BYO cert is enabled, branches bind their per-branch subdomain
@@ -510,7 +533,7 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
   name: take('web-${environmentName}', 64)
   scope: sharedRg
   params: {
-    name: !empty(webServiceName) ? webServiceName : 'ca-web-${environmentName}'
+    name: branchContainerAppName
     location: location
     tags: union(tags, { 'azd-service-name': 'web-${environmentName}' })  // Unique tag per branch
     containerAppsEnvironmentName: containerAppsEnvironmentName
@@ -523,13 +546,13 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     customDomainName: useCustomDomain ? fullCustomDomain : ''
     certificateId: branchCertResourceId
   }
+  dependsOn: [dnsRecordsBranchByo]
 }
 
 // DNS records for branch custom domain (uses existing DNS zone in production RG).
-// When BYO is enabled, skip the asuid TXT (no managed-cert validation runs).
-// When BYO is disabled, emit the asuid TXT with the branch container app's
+// Non-BYO path: emit the asuid TXT with the branch container app's
 // verificationId so the legacy managed-cert flow can validate ownership.
-module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain) {
+module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustomDomain && !byoCertEnabled) {
   // Truncated for the same BCP335 reason as webBranch above (12-char prefix +
   // up-to-64-char environmentName would exceed the module name limit).
   name: take('dns-records-${environmentName}', 64)
@@ -538,8 +561,8 @@ module dnsRecordsBranch 'core/dns/dns-records.bicep' = if (isBranch && useCustom
     dnsZoneName: customDomainName
     subdomain: customSubdomain
     targetHostname: webBranch!.outputs.fqdn
-    verificationToken: byoCertEnabled ? '' : webBranch!.outputs.verificationId
-    skipAsuid: byoCertEnabled
+    verificationToken: webBranch!.outputs.verificationId
+    skipAsuid: false
   }
 }
 
