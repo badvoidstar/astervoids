@@ -122,7 +122,7 @@ When you push to any branch, the workflow automatically:
 1. Builds and tests the application
 2. Deploys to a branch-specific Container App
 3. Creates DNS records for a branch-specific subdomain
-4. Configures HTTPS with a managed certificate
+4. Binds HTTPS using the shared BYO wildcard certificate (when BYO cert variables are configured)
 
 ### Subdomain Naming
 
@@ -154,7 +154,7 @@ When a branch is deleted from GitHub:
 1. The cleanup workflow triggers automatically
 2. Deletes the branch's Container App
 3. Removes DNS records (CNAME and TXT)
-4. Removes the managed certificate
+4. Leaves shared production certificate resources intact
 
 **Note:** The main branch cleanup is blocked to prevent accidental deletion of production.
 
@@ -177,7 +177,7 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 - Builds the solution
 - Runs tests
 
-### Deploy Job (main branch only)
+### Deploy Job (push + manual dispatch)
 - Installs Azure Developer CLI (azd)
 - Authenticates to Azure using OIDC (federated credentials)
 - Authenticates azd using GitHub's federated credential provider
@@ -185,15 +185,23 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 - Deploys the containerized application to Azure Container Apps
 - Outputs the deployment URL
 
+### Deployment Matrix (IaC paths)
+
+| Deployment form | Trigger | Infra shape |
+|---|---|---|
+| Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path |
+| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Traffic Manager |
+| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/primary CAE, creates branch app + DNS |
+| Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own ACR/CAE/app |
+
 ## Customization
 
-### Environment Variables
+### Repository Variables and Secrets
 
-You can customize the deployment by modifying these variables in the workflow file:
+Primary CI/CD customization points are configured in GitHub repository settings:
 
-- `AZURE_ENV_NAME`: The environment name (default: `production`)
-- `DOTNET_VERSION`: The .NET SDK version (default: `10.0.x`)
-- `AZURE_LOCATION`: The Azure region (default: `eastus`)
+- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`
+- Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`
 
 ### Infrastructure
 

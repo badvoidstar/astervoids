@@ -34,8 +34,8 @@ env:
   #
   #   [
   #     {"name":"westus2","location":"westus2","displayName":"US West"},
-  #     {"name":"northeurope","location":"northeurope","displayName":"Europe (Dublin)"},
-  #     {"name":"japaneast","location":"japaneast","displayName":"Asia (Tokyo)"}
+  #     {"name":"northeurope","location":"northeurope","displayName":"Europe"},
+  #     {"name":"japaneast","location":"japaneast","displayName":"Asia"}
   #   ]
   #
   # The first entry is the "primary" region — it owns the shared ACR and

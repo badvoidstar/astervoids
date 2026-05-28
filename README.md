@@ -14,7 +14,9 @@ docker-compose -f AstervoidsWeb/docker-compose.yml up --build
 
 ## Continuous Integration/Deployment (CI/CD)
 
-This project includes a GitHub Actions workflow that automatically builds and deploys to Azure Container Apps when code is pushed to the `main` branch.
+This project includes a GitHub Actions workflow that automatically:
+- builds/tests on pull requests to `main`
+- deploys on pushes to any branch (`main` production, non-`main` branch previews)
 
 **Setup Instructions:** See [CICD_SETUP.md](CICD_SETUP.md) for detailed setup instructions.
 

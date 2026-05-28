@@ -6,44 +6,47 @@
 # Run locally with hot reload
 dotnet watch run --project AstervoidsWeb/AstervoidsWeb.csproj
 
-# Build solution
+# Build solution (same config used in CI)
 dotnet build astervoids.sln --configuration Release
 
-# Run all tests
-dotnet test astervoids.sln
+# C# test suite
+dotnet test astervoids.sln --configuration Release --no-build
 
-# Run a single test
+# Run a single C# test
 dotnet test AstervoidsWeb.Tests --filter "FullyQualifiedName~SessionServiceTests.CreateSession_ShouldCreateSessionWithFruitName"
 
-# Run via Docker
+# Run a single JS test file (Node's built-in test runner)
+node --test AstervoidsWeb/region-service.test.mjs
+
+# Infra template smoke check (used by CI)
+az bicep build --file infra/main.bicep
+
+# Local container run
 docker-compose -f AstervoidsWeb/docker-compose.yml up --build
 ```
 
-## Architecture
+There is no dedicated lint command in this repository today; CI validates with build + tests + bicep compile.
 
-### Overview
-A multiplayer Astervoids game with real-time synchronization via SignalR.
+## High-Level Architecture
 
-- **Frontend**: Single HTML5 Canvas file (`AstervoidsWeb/wwwroot/index.html`) with embedded CSS/JS - no build step
-- **Backend**: ASP.NET Core (.NET 10.0) with SignalR hub for real-time multiplayer
-- **Infrastructure**: Azure Container Apps via Bicep templates (`infra/`)
-
-### Multiplayer Session Model
-- `SessionService` manages game sessions (max 6 concurrent, max 4 players each)
-- Sessions have a **Server** (first player, authoritative) and **Clients** (other players)
-- If the Server leaves, the oldest Client is automatically promoted
-- `ObjectService` handles synchronized game objects with optimistic concurrency (version numbers)
-- SignalR hub (`/sessionHub`) broadcasts state changes to all session members
-
-### Deployment Model
-- Production deploys from `main` branch to its own resource group
-- Feature branches deploy as separate Container Apps within the production resource group
-- Use `azd deploy` for quick code changes (~24 sec), `azd up` for full provision + deploy
+- **Frontend runtime**: `AstervoidsWeb/wwwroot/index.html` is the game runtime (render loop, gameplay, picker UI). Supporting modules under `wwwroot/js/` handle transport and regional behavior (`session-client.js`, `object-sync.js`, `region-service.js`, `spectator-client.js`).
+- **Realtime backend**: ASP.NET Core app in `AstervoidsWeb/` with `SessionHub` (`/sessionHub`) for multiplayer events. `SessionService` owns session/member lifecycle; `ObjectService` owns object CRUD/version checks.
+- **Regional discovery + routing**:
+  - Server exposes `/api/regions`, `/api/ping`, and `/api/sessions` in `Program.cs`.
+  - Client measures RTT per region (`region-service.js`), opens spectator hub connections per region while in picker (`spectator-client.js`), merges cross-region sessions, and routes create/join to the owning region.
+- **Infrastructure/deploy topology**:
+  - `infra/main.bicep` drives all deploy paths.
+  - `main` can run multi-region production (per-region CAE + app + Traffic Manager).
+  - Branch deploys are single-region and reuse production shared infra.
+  - CI/CD lives in `.github/workflows/azure-deploy.yml`.
 
 ## Key Conventions
 
-- Single HTML file for frontend - all game logic is inline, no bundler or transpiler
-- Tests use xUnit with FluentAssertions and Moq
-- Result pattern for service operations: `CreateSessionResult`, `JoinSessionResult`, etc.
-- Thread-safe collections (`ConcurrentDictionary`) for session/member/object storage
-- Sessions are named with fruit names for human-readable identification
+- **Frontend editing model**: Core gameplay/picker behavior is intentionally inline in `index.html`; do not introduce a bundler/transpile step.
+- **Service result pattern**: Backend operations return typed result objects (`CreateSessionResult`, `JoinSessionResult`, etc.) instead of throwing for normal control flow.
+- **Session authority model**: First member is `Server`; if server leaves, oldest remaining client is promoted. Session-scoped objects migrate ownership on member departure; member-scoped objects are removed.
+- **Wire/transport boundary**:
+  - SignalR + MessagePack is the only realtime transport.
+  - `SessionClient` owns hub connection concerns; `ObjectSync` owns batching/delta/reconciliation; gameplay code should not bypass these layers.
+- **Region naming source of truth**: Picker-facing region labels come from deployment configuration (`REGIONS_JSON`/`Region__*`), not hardcoded UI strings.
+- **Tests in two stacks**: C# tests are in `AstervoidsWeb.Tests/`; JS behavior/regression tests are `*.test.mjs` under `AstervoidsWeb/`.
