@@ -1,0 +1,43 @@
+WARNING: C:\Users\scott\aiplay\astervoids\infra\main.bicep(230,15) : Warning no-unnecessary-dependson: Remove unnecessary dependsOn entry 'containerAppsProduction'. [https://aka.ms/bicep/linter-diagnostics#no-unnecessary-dependson]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(376,34) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(377,59) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(425,35) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(428,24) : Warning no-unnecessary-dependson: Remove unnecessary dependsOn entry 'trafficManager'. [https://aka.ms/bicep/linter-diagnostics#no-unnecessary-dependson]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(478,15) : Warning no-unnecessary-dependson: Remove unnecessary dependsOn entry 'containerAppsStandalone'. [https://aka.ms/bicep/linter-diagnostics#no-unnecessary-dependson]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(511,9) : Warning BCP335: The provided value can have a length as large as 68 and may be too long to assign to a target with a configured maximum length of 64. [https://aka.ms/bicep/core-diagnostics#BCP335]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(534,9) : Warning BCP335: The provided value can have a length as large as 76 and may be too long to assign to a target with a configured maximum length of 64. [https://aka.ms/bicep/core-diagnostics#BCP335]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(539,30) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(540,55) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(554,64) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(555,34) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(555,58) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(558,65) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(559,34) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(559,59) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(562,75) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(563,34) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(563,69) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(567,100) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+C:\Users\scott\aiplay\astervoids\infra\main.bicep(568,44) : Warning BCP318: The value of type "module | null" may be null at the start of the deployment, which would cause this access expression (and the overall deployment with it) to fail. [https://aka.ms/bicep/core-diagnostics#BCP318]
+
+
