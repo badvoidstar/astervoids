@@ -7839,11 +7839,11 @@
     }
 
     // Connect to session hub
-    async function connectToSessionHub(force = false) {
+    async function connectToSessionHub(force = false, hubHostname = '') {
         setPickerStatus('Connecting...', 'connecting');
 
         try {
-            const success = await SessionClient.connect(force);
+            const success = await SessionClient.connect(force, hubHostname);
             if (success) {
                 // Initialize ObjectSync after connection
                 ObjectSync.init();
@@ -8125,7 +8125,7 @@
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
                 if (targetHostname) {
-                    await SessionClient.connect(true, targetHostname);
+                    await connectToSessionHub(true, targetHostname);
                 }
             }
 
@@ -8184,7 +8184,7 @@
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
                 if (targetHostname) {
-                    await SessionClient.connect(true, targetHostname);
+                    await connectToSessionHub(true, targetHostname);
                 }
             }
 
