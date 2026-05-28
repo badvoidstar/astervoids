@@ -1709,19 +1709,20 @@ astervoids/
 
 ```mermaid
 flowchart TB
-    subgraph "Three Deployment Paths"
+    subgraph "Deployment Forms (IaC Matrix)"
         direction TB
-        PROD["Production<br/>environmentName = 'production'<br/>Creates own resource group: rg-production<br/>Full infra: ACR + CAE + Container App<br/>Optional: DNS zone + custom domain"]
-        BRANCH["Branch (CI/CD)<br/>useSharedInfra = true<br/>Uses production's resource group<br/>Shares ACR + CAE<br/>Creates new Container App per branch"]
-        STANDALONE["Standalone (local dev)<br/>Creates own resource group: rg-{env}<br/>Full infra: own ACR + CAE + Container App"]
+        PROD1["Production single-region<br/>environmentName = 'production'<br/>REGIONS_JSON empty<br/>rg-production + single CAE/app path"]
+        PRODN["Production multi-region<br/>environmentName = 'production'<br/>REGIONS_JSON non-empty<br/>per-region CAE/apps + Traffic Manager"]
+        BRANCH["Branch (CI/CD preview)<br/>useSharedInfra = true<br/>Shares production RG/ACR/primary CAE<br/>Creates one Container App per branch"]
+        STANDALONE["Standalone (local azd)<br/>Creates own resource group: rg-{env}<br/>Own ACR + CAE + Container App"]
     end
 
     subgraph "CI/CD Pipeline (azure-deploy.yml)"
         direction TB
-        TRIGGER["Trigger: push to main or PR branches"]
-        BUILD["Build & Test: dotnet build/test"]
-        DOCKER["Docker: build + push to ACR"]
-        DEPLOY["Deploy: azd provision + deploy"]
+        TRIGGER["Trigger:<br/>push any branch<br/>PR to main (build/test only)<br/>workflow_dispatch"]
+        BUILD["Build & Test"]
+        DOCKER["Container build + push"]
+        DEPLOY["Deploy path selected by branch + REGIONS_JSON"]
         CLEANUP["cleanup-orphans.yml:<br/>Remove Container Apps for<br/>deleted/merged branches"]
     end
 
@@ -1733,7 +1734,8 @@ flowchart TB
     end
 
     TRIGGER --> BUILD --> DOCKER --> DEPLOY
-    DEPLOY --> PROD
+    DEPLOY --> PROD1
+    DEPLOY --> PRODN
     DEPLOY --> BRANCH
 ```
 
