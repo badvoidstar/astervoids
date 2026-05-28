@@ -273,6 +273,31 @@ var regionsManifest = [for r in manifestRegions: {
   hostname: 'https://${customSubdomain}-${r.name}.${customDomainName}'
 }]
 
+// Per-region CNAME records emitted BEFORE the regional container apps so
+// custom hostname ownership validation succeeds when each app binds its
+// per-region subdomain. We construct the predictable app FQDN
+// (<app-name>.<cae-default-domain>) from the CAE's defaultDomain output
+// without needing the app to exist yet, breaking the chicken-and-egg
+// (app needs CNAME to bind; CNAME needs app FQDN to target).
+//
+// Without this pre-creation, Azure rejects the app's customDomains
+// binding with InvalidCustomHostNameValidation ("A TXT record pointing
+// from asuid.<subdomain> to <verificationId> was not found").
+#disable-next-line BCP318
+module dnsRecordsPerRegion 'core/dns/dns-extra-cnames.bicep' = if (isMultiRegion && useCustomDomain) {
+  name: 'dns-records-per-region'
+  scope: productionRg
+  params: {
+    dnsZoneName: customDomainName
+    cnames: [for (r, i) in manifestRegions: {
+      name: '${customSubdomain}-${r.name}'
+      #disable-next-line BCP318
+      target: 'ca-web-production-${r.name}.${containerAppsRegional[i].outputs.defaultDomain}'
+    }]
+  }
+  dependsOn: [dnsZone, containerAppsRegional]
+}
+
 @batchSize(1)
 module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegion ? regions : []): {
   name: 'web-production-${r.name}'
@@ -294,11 +319,15 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     //   - customDomainName (= apex, e.g. asteroids.example.com): shared
     //     across all regions for Traffic Manager routing. SNI handshake
     //     for the apex needs to succeed on whichever region TM steers
-    //     traffic to, so all three regions bind it.
+    //     traffic to, so all three regions bind it. Ownership validated
+    //     because the apex already has a CNAME (the existing one from
+    //     a prior deploy, or it'll exist after dnsRecordsProductionMultiRegion
+    //     runs and Azure re-validates on next reconcile).
     //   - additionalCustomDomain (= per-region subdomain, e.g.
     //     asteroids-westus2.example.com): unique per region, used by
     //     the picker to measure RTT and open SignalR connections to a
-    //     specific region. Wildcard cert covers both.
+    //     specific region. Wildcard cert covers both. Ownership validated
+    //     via the CNAME emitted by dnsRecordsPerRegion above.
     // When BYO is not configured, both stay empty and the workflow's
     // legacy managed-cert flow runs per-region instead.
     customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
@@ -311,7 +340,9 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     // /api/regions from any landing region and get the full peer list.
     regionsManifest: regionsManifest
   }
-  dependsOn: [containerAppsRegional]
+  // dependsOn dnsRecordsPerRegion so the per-region CNAMEs exist before
+  // Azure validates the additionalCustomDomain binding on this app.
+  dependsOn: [containerAppsRegional, dnsRecordsPerRegion]
 }]
 
 // DNS Zone for custom domain (production only)
@@ -385,19 +416,8 @@ module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMult
     subdomain: customSubdomain
     targetHostname: trafficManager.outputs.fqdn
     skipAsuid: true
-    // Per-region CNAMEs alongside the apex → TM record. Each one points
-    // a per-region subdomain (e.g. asteroids-westus2.example.com) at
-    // the corresponding container app's azurecontainerapps.io FQDN. These
-    // are what the picker uses to measure RTT and target a specific
-    // region for create/join. Inlined as a for-expression because the
-    // CNAME targets are webRegional outputs (deploy-time values, not
-    // permitted in a `var` for-body — BCP182).
-    additionalCnames: [for (r, i) in manifestRegions: {
-      name: '${customSubdomain}-${r.name}'
-      target: webRegional[i].outputs.fqdn
-    }]
   }
-  dependsOn: [dnsZone, trafficManager, webRegional]
+  dependsOn: [dnsZone, trafficManager]
 }
 
 // ============================================================================
