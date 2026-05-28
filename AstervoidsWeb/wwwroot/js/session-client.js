@@ -749,6 +749,15 @@ const SessionClient = (function() {
     };
 })();
 
+// Attach to window for cross-script discovery in classic <script> context.
+// Top-level `const X = (function(){})()` in classic scripts is NOT auto-attached
+// to window (only reachable by bare name from sibling scripts via script-level
+// lexical scope). Code that uses `if (window.SessionClient)` as a feature
+// detection idiom would silently fail without this.
+if (typeof window !== 'undefined') {
+    window.SessionClient = SessionClient;
+}
+
 // Export for module systems if available
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = SessionClient;
