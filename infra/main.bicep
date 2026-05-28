@@ -254,6 +254,25 @@ module containerAppsRegional 'core/host/container-apps.bicep' = [for (r, i) in (
   }
 }]
 
+// Per-region computed values (multi-region + BYO custom domain only).
+// Builds two derived collections used by the modules below:
+//
+//   regionsManifest: stamped onto every container app's env vars as
+//     Region__Regions__N__{Id,DisplayName,Hostname} so the /api/regions
+//     endpoint returns the canonical peer list. Hostname is the BYO
+//     per-region URL (covered by the wildcard cert).
+//
+//   perRegionCnames: extra CNAME records in the DNS zone, one per region,
+//     pointing each per-region subdomain at the corresponding container
+//     app's azurecontainerapps.io FQDN. Resolved at deploy time from
+//     webRegional outputs.
+var manifestRegions = (isMultiRegion && useCustomDomain) ? regions : []
+var regionsManifest = [for r in manifestRegions: {
+  id: r.name
+  displayName: r.?displayName ?? r.name
+  hostname: 'https://${customSubdomain}-${r.name}.${customDomainName}'
+}]
+
 @batchSize(1)
 module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegion ? regions : []): {
   name: 'web-production-${r.name}'
@@ -271,15 +290,26 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     external: true
     minReplicas: 0
     maxReplicas: 1
-    // BYO cert: every region's container app binds the SAME wildcard
-    // hostname using its CAE's cert resource. When BYO is not configured,
-    // customDomainName is empty so the workflow's legacy managed-cert flow
-    // runs per-region instead (with TXT/CNAME validation as appropriate).
+    // BYO cert binds TWO hostnames on every regional app:
+    //   - customDomainName (= apex, e.g. asteroids.bootyblocks.com): shared
+    //     across all regions for Traffic Manager routing. SNI handshake
+    //     for the apex needs to succeed on whichever region TM steers
+    //     traffic to, so all three regions bind it.
+    //   - additionalCustomDomain (= per-region subdomain, e.g.
+    //     asteroids-westus2.bootyblocks.com): unique per region, used by
+    //     the picker to measure RTT and open SignalR connections to a
+    //     specific region. Wildcard cert covers both.
+    // When BYO is not configured, both stay empty and the workflow's
+    // legacy managed-cert flow runs per-region instead.
     customDomainName: byoCertEnabled && useCustomDomain ? fullCustomDomain : ''
+    additionalCustomDomain: byoCertEnabled && useCustomDomain ? '${customSubdomain}-${r.name}.${customDomainName}' : ''
     #disable-next-line BCP318
     certificateId: byoCertEnabled ? containerAppsRegional[i].outputs.byoCertResourceId : ''
     regionId: r.name
     regionDisplayName: r.?displayName ?? r.name
+    // Every region ships the SAME manifest so the client can fetch
+    // /api/regions from any landing region and get the full peer list.
+    regionsManifest: regionsManifest
   }
   dependsOn: [containerAppsRegional]
 }]
@@ -355,8 +385,19 @@ module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (isMult
     subdomain: customSubdomain
     targetHostname: trafficManager.outputs.fqdn
     skipAsuid: true
+    // Per-region CNAMEs alongside the apex → TM record. Each one points
+    // a per-region subdomain (e.g. asteroids-westus2.bootyblocks.com) at
+    // the corresponding container app's azurecontainerapps.io FQDN. These
+    // are what the picker uses to measure RTT and target a specific
+    // region for create/join. Inlined as a for-expression because the
+    // CNAME targets are webRegional outputs (deploy-time values, not
+    // permitted in a `var` for-body — BCP182).
+    additionalCnames: [for (r, i) in manifestRegions: {
+      name: '${customSubdomain}-${r.name}'
+      target: webRegional[i].outputs.fqdn
+    }]
   }
-  dependsOn: [dnsZone, trafficManager]
+  dependsOn: [dnsZone, trafficManager, webRegional]
 }
 
 // ============================================================================
