@@ -298,6 +298,38 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
         }
     });
 
+    test('load() prefers window-injected bootstrap manifest over /api/regions fetch', async () => {
+        const originalFetch = globalThis.fetch;
+        const originalWindow = globalThis.window;
+        globalThis.fetch = async () => {
+            throw new Error('fetch must not be called when bootstrap manifest is injected');
+        };
+        globalThis.window = {
+            ...(originalWindow || {}),
+            ASTERVOIDS_REGION_BOOTSTRAP: {
+                regionId: null,
+                displayName: null,
+                regions: [
+                    { id: 'westus2', displayName: 'US West', hostname: 'https://asteroids-westus2.example.com/' },
+                    { id: 'northeurope', displayName: 'Europe', hostname: 'https://asteroids-northeurope.example.com' },
+                ],
+            },
+        };
+        try {
+            await RegionService.load();
+            const regions = RegionService.getRegions();
+            assert.equal(regions.length, 2);
+            assert.equal(regions[0].hostname, 'https://asteroids-westus2.example.com',
+                'bootstrap hostnames are normalised the same as /api/regions payloads');
+            assert.equal(RegionService.getLocalRegionId(), null,
+                'static apex is not itself a gameplay region, so regionId can remain null');
+        } finally {
+            RegionService.stop();
+            globalThis.fetch = originalFetch;
+            globalThis.window = originalWindow;
+        }
+    });
+
     test('bootstrap burst feeds EMA and advances state out of warming', async () => {
         // 1 warm-up sample (discarded) + 2 measured samples = burst. Stub returns
         // a consistent ~50ms latency by advancing the fake clock between t0

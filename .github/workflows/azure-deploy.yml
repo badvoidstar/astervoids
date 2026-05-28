@@ -46,8 +46,8 @@ env:
   # When all three are set, bicep binds <subdomain>.<domain> on every region
   # (and every branch deploy) to a Key Vault-stored certificate — no per-app
   # DigiCert managed-cert provisioning runs. Recommended path for multi-region
-  # where the apex CNAME must point at Traffic Manager (which blocks ACA
-  # managed-cert validation). See ARCHITECTURE.md "Apex TLS via BYO cert".
+  # where per-region ACA hostnames are bound with one shared wildcard cert.
+  # See ARCHITECTURE.md "BYO wildcard cert for regional hostnames".
   #
   # When ANY is empty, falls back to the legacy DigiCert managed-cert flow
   # (works in single-region only; multi-region apex TLS will fail).
@@ -360,12 +360,13 @@ jobs:
           elif [ "$IS_MULTI_REGION" = "true" ]; then
             # ── Production multi-region ───────────────────────────────────
             # We bypass `azd up` because azd doesn't know about per-region
-            # container apps. Instead:
+            # container apps + static-apex publish. Instead:
             #   1. Run bicep directly with regions=<JSON>, which provisions
-            #      per-region CAEs + container apps + Traffic Manager.
+            #      per-region CAEs/apps + Static Web App apex.
             #   2. Build the Docker image once.
             #   3. Push it to the shared ACR.
             #   4. Update each region's container app to point at the new image.
+            #   5. Publish static apex assets + region bootstrap manifest.
             # Each region's container app already has Region__Id env var
             # baked in by the bicep template; only the image tag changes
             # on subsequent deploys.
@@ -374,19 +375,15 @@ jobs:
             PRIMARY_LOCATION=$(echo "$REGIONS_JSON" | jq -r '.[0].location')
 
             # ── Fail-fast: multi-region + custom domain REQUIRES BYO cert ──
-            # ACA managed certs can't validate behind an intermediate CNAME
-            # like Traffic Manager (Microsoft Container Apps docs:
-            # https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates#free-certificate-requirements).
-            # Without a Key Vault-backed BYO cert, the apex hostname would
-            # bind but never serve a valid TLS cert. Surface this BEFORE
-            # any infra is provisioned so the operator catches the
-            # misconfiguration in seconds, not after a ~10 min deploy.
+            # Even with static apex hosting, gameplay traffic still targets
+            # per-region ACA custom hostnames (<subdomain>-<region>.<domain>).
+            # We bind those with a shared wildcard cert from Key Vault.
             if [ -n "$CD_NAME" ] && [ -z "$CERT_KEY_VAULT_SECRET_URL" ]; then
               echo "::error::Multi-region with a custom domain requires BYO cert vars."
               echo "::error::  CUSTOM_DOMAIN_NAME is set ('$CD_NAME') but CERT_KEY_VAULT_SECRET_URL is empty."
-              echo "::error::  Azure Container Apps managed certs cannot validate behind Traffic Manager."
+              echo "::error::  Regional ACA hostnames require wildcard BYO cert wiring."
               echo "::error::  Set vars.CERT_KEY_VAULT_SECRET_URL, vars.CERT_KEY_VAULT_CERT_NAME, and"
-              echo "::error::  vars.CERT_READER_IDENTITY_ID. See ARCHITECTURE.md -> 'Apex TLS via BYO cert'."
+              echo "::error::  vars.CERT_READER_IDENTITY_ID. See ARCHITECTURE.md -> 'BYO wildcard cert for regional hostnames'."
               exit 1
             fi
 
@@ -486,8 +483,11 @@ jobs:
               echo "::endgroup::"
             done
 
-            # Surface Traffic Manager FQDN + per-region details in the run log.
-            echo "Traffic Manager FQDN: $(get_out TRAFFIC_MANAGER_FQDN)"
+            # Surface static apex + per-region details in the run log.
+            STATIC_WEB_APP_NAME=$(get_out STATIC_WEB_APP_NAME)
+            STATIC_WEB_APP_DEFAULT_HOSTNAME=$(get_out STATIC_WEB_APP_DEFAULT_HOSTNAME)
+            echo "Static Web App: ${STATIC_WEB_APP_NAME:-<none>}"
+            echo "Static apex default hostname: ${STATIC_WEB_APP_DEFAULT_HOSTNAME:-<none>}"
             echo "Per-region endpoints:"
             get_out_json REGION_ENDPOINTS | jq .
 
@@ -496,6 +496,21 @@ jobs:
             azd env set CONTAINER_APP_NAME "${{ env.CONTAINER_APP_PREFIX }}-production-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set CONTAINER_APPS_ENVIRONMENT "${{ env.CONTAINER_ENV_NAME }}-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set RESOURCE_GROUP "${{ env.PRODUCTION_RG }}"
+
+            # Build the static apex payload from wwwroot + generated region bootstrap.
+            STATIC_REGION_MANIFEST=$(get_out_json STATIC_APEX_REGION_MANIFEST)
+            if [ -z "$STATIC_REGION_MANIFEST" ]; then
+              STATIC_REGION_MANIFEST='[]'
+            fi
+            STATIC_DIR=$(mktemp -d)
+            cp -R AstervoidsWeb/wwwroot/. "$STATIC_DIR"/
+            BOOTSTRAP_JSON=$(jq -c -n --argjson regions "$STATIC_REGION_MANIFEST" \
+              '{ regionId: null, displayName: null, regions: $regions }')
+            printf 'window.ASTERVOIDS_REGION_BOOTSTRAP = %s;\n' "$BOOTSTRAP_JSON" > "$STATIC_DIR/region-bootstrap.js"
+            echo "Prepared static apex payload at $STATIC_DIR"
+            echo "static_web_app_name=$STATIC_WEB_APP_NAME" >> $GITHUB_OUTPUT
+            echo "static_web_app_default_hostname=$STATIC_WEB_APP_DEFAULT_HOSTNAME" >> $GITHUB_OUTPUT
+            echo "static_deploy_dir=$STATIC_DIR" >> $GITHUB_OUTPUT
           else
             # Branch: provision with azd, then deploy with az cli to specific container app
             # First, provision the infrastructure
@@ -591,11 +606,46 @@ jobs:
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Get static apex deploy token (multi-region)
+        id: swa_publish
+        if: steps.vars.outputs.is_production == 'true' && env.IS_MULTI_REGION == 'true' && steps.deploy.outputs.static_web_app_name != ''
+        run: |
+          TOKEN=$(az staticwebapp secrets list \
+            --name "${{ steps.deploy.outputs.static_web_app_name }}" \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --query "properties.apiKey" -o tsv)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Failed to fetch Static Web App deployment token via az staticwebapp secrets list."
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "api_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Publish static apex payload (multi-region)
+        if: steps.vars.outputs.is_production == 'true' && env.IS_MULTI_REGION == 'true' && steps.deploy.outputs.static_web_app_name != ''
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          action: upload
+          app_location: ${{ steps.deploy.outputs.static_deploy_dir }}
+          skip_app_build: true
+          azure_static_web_apps_api_token: ${{ steps.swa_publish.outputs.api_token }}
+
+      - name: Bind static apex custom hostname (multi-region)
+        if: steps.vars.outputs.is_production == 'true' && env.IS_MULTI_REGION == 'true' && env.CUSTOM_DOMAIN != '' && steps.deploy.outputs.static_web_app_name != ''
+        run: |
+          echo "Binding static apex hostname '$CUSTOM_DOMAIN' on '${{ steps.deploy.outputs.static_web_app_name }}' (idempotent)."
+          az staticwebapp hostname set \
+            --name "${{ steps.deploy.outputs.static_web_app_name }}" \
+            --resource-group "${{ env.PRODUCTION_RG }}" \
+            --hostname "$CUSTOM_DOMAIN" \
+            --output table || true
+
       - name: Configure Custom Domain (if enabled)
         # Runs ONLY for single-region production WITHOUT BYO cert vars.
         # All other cases are handled in-band by bicep + the bootstrap step:
         #   - Single-region production WITH BYO    → bicep binds via SNI.
-        #   - Multi-region production              → bicep + fail-fast guard.
+        #   - Multi-region production              → bicep + static-apex publish
+        #                                            steps above (no ACA managed-cert flow).
         #   - Branches WITH BYO                    → bootstrap step (above)
         #                                            ensures cert + identity on
         #                                            the shared CAE; bicep then
@@ -772,8 +822,8 @@ jobs:
             echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Multi-region: list per-region container apps + Traffic Manager FQDN
-          # so reviewers can spot-check each regional endpoint from the summary.
+          # Multi-region: list per-region container apps + static apex host info
+          # so reviewers can spot-check each endpoint from the summary.
           if [ "$IS_MULTI_REGION" = "true" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Multi-region rollout:** $(echo "$REGIONS_JSON" | jq 'length') regions" >> $GITHUB_STEP_SUMMARY
@@ -789,11 +839,11 @@ jobs:
             echo "$SUMMARY_OUTPUTS" \
               | jq -r 'to_entries[] | select((.key | ascii_downcase) == "region_endpoints") | .value.value[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
               >> $GITHUB_STEP_SUMMARY
-            TM_FQDN=$(echo "$SUMMARY_OUTPUTS" \
-              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "traffic_manager_fqdn") | .value.value' \
+            SWA_FQDN=$(echo "$SUMMARY_OUTPUTS" \
+              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "static_web_app_default_hostname") | .value.value' \
               | head -1)
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Traffic Manager FQDN:** \`$TM_FQDN\` (CNAME the apex domain here)" >> $GITHUB_STEP_SUMMARY
+            echo "**Static apex default host:** \`$SWA_FQDN\` (apex CNAME target)" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
