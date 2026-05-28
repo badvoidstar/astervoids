@@ -353,6 +353,31 @@ jobs:
               exit 1
             fi
 
+            # Per-subscription customDomainVerificationId. Read from any
+            # existing container app — it's the same value across every
+            # app in the subscription. We try the primary-region app first
+            # (post-rollout state), then the legacy single-region app
+            # (pre-rollout state). Empty result means greenfield with no
+            # existing apps; bicep will skip per-region asuid TXT records
+            # and CNAME-only validation is used (which may need a 2nd
+            # bicep pass for hostname binding to succeed on first deploy).
+            PRIMARY_REGION_NAME=$(echo "$REGIONS_JSON" | jq -r '.[0].name')
+            DOMAIN_VERIFICATION_ID=""
+            for CANDIDATE in "ca-web-production-${PRIMARY_REGION_NAME}" "ca-web-production"; do
+              DOMAIN_VERIFICATION_ID=$(az containerapp show \
+                --name "$CANDIDATE" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --query 'properties.customDomainVerificationId' \
+                -o tsv 2>/dev/null || echo "")
+              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
+                echo "Pulled customDomainVerificationId from $CANDIDATE (length: ${#DOMAIN_VERIFICATION_ID})"
+                break
+              fi
+            done
+            if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
+              echo "::warning::No existing container app found to extract customDomainVerificationId from. Per-region asuid TXT records will be skipped (CNAME-only mode). First multi-region deploy with custom domain on a greenfield subscription may need a second bicep pass for hostname binding to succeed."
+            fi
+
             echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
             az deployment sub create \
               --name "production-multi-${{ github.run_id }}" \
@@ -367,6 +392,7 @@ jobs:
                 certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
                 certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
                 certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
+                domainVerificationId="$DOMAIN_VERIFICATION_ID" \
               --output none
 
             # Fetch ALL outputs once, then look them up case-insensitively
