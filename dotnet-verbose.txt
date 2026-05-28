@@ -1,0 +1,452 @@
+Build started 5/27/2026 6:48:11 PM.
+     1>Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" on node 1 (Restore target(s)).
+     1>ValidateSolutionConfiguration:
+         Building solution configuration "Release|Any CPU".
+       _GetAllRestoreProjectPathItems:
+         Determining projects to restore...
+     1>Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" (1) is building "C:\Users\scott\aiplay\astervoids\AstervoidsWeb\AstervoidsWeb.csproj" (2:6) on node 1 (_GenerateProjectRestoreGraph target(s)).
+     2>AddPrunePackageReferences:
+         Loading prune package data from PrunePackageData folder
+         Failed to load prune package data from PrunePackageData folder, loading from targeting packs instead
+     1>Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" (1) is building "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (3:5) on node 2 (_GenerateProjectRestoreGraph target(s)).
+     3>AddPrunePackageReferences:
+         Loading prune package data from PrunePackageData folder
+         Failed to load prune package data from PrunePackageData folder, loading from targeting packs instead
+     2>AddPrunePackageReferences:
+         Looking for targeting packs in C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref
+         Pack directories found: C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.8
+     3>AddPrunePackageReferences:
+         Looking for targeting packs in C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref
+         Pack directories found: C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.8
+     2>AddPrunePackageReferences:
+         Found package overrides file C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.8\data\PackageOverrides.txt
+         Loading prune package data from PrunePackageData folder
+         Failed to load prune package data from PrunePackageData folder, loading from targeting packs instead
+         Looking for targeting packs in C:\Program Files\dotnet\packs\Microsoft.AspNetCore.App.Ref
+         Pack directories found: C:\Program Files\dotnet\packs\Microsoft.AspNetCore.App.Ref\10.0.8
+         Found package overrides file C:\Program Files\dotnet\packs\Microsoft.AspNetCore.App.Ref\10.0.8\data\PackageOverrides.txt
+     3>AddPrunePackageReferences:
+         Found package overrides file C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.8\data\PackageOverrides.txt
+     2>Done Building Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb\AstervoidsWeb.csproj" (_GenerateProjectRestoreGraph target(s)).
+     3>Done Building Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (_GenerateProjectRestoreGraph target(s)).
+     1>Restore:
+         X.509 certificate chain validation will use the default trust store selected by .NET for code signing.
+         X.509 certificate chain validation will use the default trust store selected by .NET for timestamping.
+         Assets file has not changed. Skipping assets file writing. Path: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\project.assets.json
+         Assets file has not changed. Skipping assets file writing. Path: C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\obj\project.assets.json
+         Restored C:\Users\scott\aiplay\astervoids\AstervoidsWeb\AstervoidsWeb.csproj (in 63 ms).
+         Restored C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj (in 64 ms).
+         
+         NuGet Config files used:
+             C:\Users\scott\AppData\Roaming\NuGet\NuGet.Config
+         
+         Feeds used:
+             https://api.nuget.org/v3/index.json
+         All projects are up-to-date for restore.
+     1>Done Building Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" (Restore target(s)).
+   1:2>Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" on node 1 (VSTest target(s)).
+     1>ValidateSolutionConfiguration:
+         Building solution configuration "Release|Any CPU".
+   1:2>Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" (1:2) is building "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (3:6) on node 2 (VSTest target(s)).
+     3>BuildProject:
+         Build started, please wait...
+   3:6>Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (3:6) is building "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (3:7) on node 2 (default targets).
+   3:7>Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (3:7) is building "C:\Users\scott\aiplay\astervoids\AstervoidsWeb\AstervoidsWeb.csproj" (2:9) on node 1 (default targets).
+     2>GenerateTargetFrameworkMonikerAttribute:
+       Skipping target "GenerateTargetFrameworkMonikerAttribute" because all output files are up-to-date with respect to the input files.
+       CoreGenerateAssemblyInfo:
+       Skipping target "CoreGenerateAssemblyInfo" because all output files are up-to-date with respect to the input files.
+       _DiscoverMvcApplicationParts:
+       Skipping target "_DiscoverMvcApplicationParts" because all output files are up-to-date with respect to the input files.
+       _GenerateSourceLinkFile:
+         Source Link file 'obj\Release\net10.0\AstervoidsWeb.sourcelink.json' is up-to-date.
+       CoreCompile:
+       Skipping target "CoreCompile" because all output files are up-to-date with respect to the input files.
+       _CreateAppHost:
+       Skipping target "_CreateAppHost" because all output files are up-to-date with respect to the input files.
+       _ProcessScopedCssFiles:
+       Skipping target "_ProcessScopedCssFiles" because it has no outputs.
+       _ProcessScopedCssFiles:
+       Skipping target "_ProcessScopedCssFiles" because it has no outputs.
+       ResolveBuildCompressedStaticWebAssetsConfiguration:
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\h1x1em6gin-{0}-pq8wtf5tl3-pq8wtf5tl3.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\debug\index.html'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\u4a1ra3q0n-{0}-1v7hvbw6aw-1v7hvbw6aw.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\favicon.svg'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\z6sbrz5hyp-{0}-l7gfv5wfyb-l7gfv5wfyb.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\spectator-client.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\2klf2b53uh-{0}-yae0pf39g6-yae0pf39g6.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\guid-utils.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\sw16d4usc7-{0}-zmf9z0gt8e-zmf9z0gt8e.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\msgpack-codec.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\j4q2rijjhx-{0}-9fa38twrzc-9fa38twrzc.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\object-sync.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\bz7cfh4t9w-{0}-jit1nrc6u1-jit1nrc6u1.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\session-client.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\c4tibw30av-{0}-5um4higwz5-5um4higwz5.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\schema-codec.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\8pgokvc5vw-{0}-227872fq3e-227872fq3e.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\region-service.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\27lw8ud7kd-{0}-8sab9lzydt-8sab9lzydt.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\signalr-protocol-msgpack.min.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\av7rx7em46-{0}-utxhn3x38l-utxhn3x38l.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\signalr-protocol-msgpack.min.js.map'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\ye9a540er5-{0}-ap8wluut4l-ap8wluut4l.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\signalr.min.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\k11uu00dax-{0}-88x07tg1uz-88x07tg1uz.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\index.html'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\rrtemfqxjc-{0}-02i8oor0se-02i8oor0se.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\sync-payload.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\glnkaql1sq-{0}-7626ry7sdm-7626ry7sdm.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\js\wire-enum.js'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\kdnvxf1b7m-{0}-u4lal1nrb6-u4lal1nrb6.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\manifest.json'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\965zzx35pg-{0}-dtdyx9rzt1-dtdyx9rzt1.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\session-test.html'.
+         Accepted compressed asset 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\lmyvmx4amv-{0}-84ga8gob66-84ga8gob66.gz' for 'C:\Users\scott\aiplay\astervoids\AstervoidsWeb\wwwroot\srvmon\index.html'.
+         Resolved 18 compressed assets for 18 candidate assets.
+       ResolveBuildCompressedStaticWebAssets:
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\h1x1em6gin-{0}-pq8wtf5tl3-pq8wtf5tl3.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\u4a1ra3q0n-{0}-1v7hvbw6aw-1v7hvbw6aw.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\z6sbrz5hyp-{0}-l7gfv5wfyb-l7gfv5wfyb.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\2klf2b53uh-{0}-yae0pf39g6-yae0pf39g6.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\sw16d4usc7-{0}-zmf9z0gt8e-zmf9z0gt8e.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\j4q2rijjhx-{0}-9fa38twrzc-9fa38twrzc.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\bz7cfh4t9w-{0}-jit1nrc6u1-jit1nrc6u1.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\c4tibw30av-{0}-5um4higwz5-5um4higwz5.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\8pgokvc5vw-{0}-227872fq3e-227872fq3e.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\27lw8ud7kd-{0}-8sab9lzydt-8sab9lzydt.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\av7rx7em46-{0}-utxhn3x38l-utxhn3x38l.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\ye9a540er5-{0}-ap8wluut4l-ap8wluut4l.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\k11uu00dax-{0}-88x07tg1uz-88x07tg1uz.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\rrtemfqxjc-{0}-02i8oor0se-02i8oor0se.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\glnkaql1sq-{0}-7626ry7sdm-7626ry7sdm.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\kdnvxf1b7m-{0}-u4lal1nrb6-u4lal1nrb6.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\965zzx35pg-{0}-dtdyx9rzt1-dtdyx9rzt1.gz
+         Processing compressed asset: C:\Users\scott\aiplay\astervoids\AstervoidsWeb\obj\Release\net10.0\compressed\lmyvmx4amv-{0}-84ga8gob66-84ga8gob66.gz
+       _BuildCopyStaticWebAssetsPreserveNewest:
+       Skipping target "_BuildCopyStaticWebAssetsPreserveNewest" because it has no outputs.
+       _CopyOutOfDateSourceItemsToOutputDirectory:
+       Skipping target "_CopyOutOfDateSourceItemsToOutputDirectory" because all output files are up-to-date with respect to the input files.
+       GenerateBuildDependencyFile:
+       Skipping target "GenerateBuildDependencyFile" because all output files are up-to-date with respect to the input files.
+       GenerateBuildRuntimeConfigurationFiles:
+       Skipping target "GenerateBuildRuntimeConfigurationFiles" because all output files are up-to-date with respect to the input files.
+       CopyFilesToOutputDirectory:
+         AstervoidsWeb -> C:\Users\scott\aiplay\astervoids\AstervoidsWeb\bin\Release\net10.0\AstervoidsWeb.dll
+     2>Done Building Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb\AstervoidsWeb.csproj" (default targets).
+     3>GenerateTargetFrameworkMonikerAttribute:
+       Skipping target "GenerateTargetFrameworkMonikerAttribute" because all output files are up-to-date with respect to the input files.
+       CoreGenerateAssemblyInfo:
+       Skipping target "CoreGenerateAssemblyInfo" because all output files are up-to-date with respect to the input files.
+       _GenerateSourceLinkFile:
+         Source Link file 'obj\Release\net10.0\AstervoidsWeb.Tests.sourcelink.json' is up-to-date.
+       CoreCompile:
+       Skipping target "CoreCompile" because all output files are up-to-date with respect to the input files.
+       _CopyOutOfDateSourceItemsToOutputDirectory:
+       Building target "_CopyOutOfDateSourceItemsToOutputDirectory" partially, because some output files are out of date with respect to their input files.
+         Copying file from "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\obj\Release\net10.0\MvcTestingAppManifest.json" to "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\bin\Release\net10.0\MvcTestingAppManifest.json".
+       GenerateBuildDependencyFile:
+       Skipping target "GenerateBuildDependencyFile" because all output files are up-to-date with respect to the input files.
+       GenerateBuildRuntimeConfigurationFiles:
+       Skipping target "GenerateBuildRuntimeConfigurationFiles" because all output files are up-to-date with respect to the input files.
+       CopyFilesToOutputDirectory:
+         AstervoidsWeb.Tests -> C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\bin\Release\net10.0\AstervoidsWeb.Tests.dll
+       _MvcCopyDependencyFiles:
+         Copying file from "C:\Users\scott\aiplay\astervoids\AstervoidsWeb\bin\Release\net10.0\AstervoidsWeb.deps.json" to "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\bin\Release\net10.0\AstervoidsWeb.deps.json".
+     3>Done Building Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (default targets).
+     3>BuildProject:
+         Build completed.
+         
+Test run for C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\bin\Release\net10.0\AstervoidsWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.8)
+[xUnit.net 00:00:00.08]   Discovering: AstervoidsWeb.Tests
+[xUnit.net 00:00:00.19]   Discovered:  AstervoidsWeb.Tests
+[xUnit.net 00:00:00.23]   Starting:    AstervoidsWeb.Tests
+     Warning:
+     The component "Fluent Assertions" is governed by the rules defined in the Xceed License Agreement and
+     the Xceed Fluent Assertions Community License. You may use Fluent Assertions free of charge for
+     non-commercial use only. An active subscription is required to use Fluent Assertions for commercial use.
+     Please contact Xceed Sales mailto:sales@xceed.com to acquire a subscription at a very low cost.
+     A paid commercial license supports the development and continued increasing support of
+     Fluent Assertions users under both commercial and community licenses. Help us
+     keep Fluent Assertions at the forefront of unit testing.
+     For more information, visit https://xceed.com/products/unit-testing/fluent-assertions/
+  Passed AstervoidsWeb.Tests.SessionCleanupServiceTests.RejoinAfterLastLeave_FindsSchemasStillRegistered [30 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.GetSchema_SchemaId0_AlwaysReturnsNull [30 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_ShouldCreateObjectWithCorrectAffiliation [35 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_2pi_HandlesMultiRotationInput [30 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_NullableGuid_PresentCase_RoundTrips [30 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.Replace_ByOwner_IsAtomic [35 ms]
+  Passed AstervoidsWeb.Tests.ReplaceAfterEvictTest.JoinWithEvict_ReplaceObjectWorksOnAdoptedAsteroid [34 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_AsteroidUpdate_OnlyAngle [32 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_NonExistentSession_ShouldFail [34 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.Guid_RoundTrip_ProducesSameValue [34 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_BytesField_LengthIsLittleEndianU32 [< 1 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_BulletUpdate_GuidField [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_PromotionAndMigrationAligned_PromotedMemberCanReceiveObjects [40 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16w_RoundTrip_AtCanonicalValues [< 1 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_NullableGuid_NullCase [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.UpdateObject_AfterDeletion_ShouldReturnNull [1 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_AsteroidUpdate_AllFields [< 1 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_StringField_Utf8Length [< 1 ms]
+  Passed AstervoidsWeb.Tests.SchemaCrossWireFixturesTests.Fixture_ShipUpdate_MixedTypes [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16s_ClampsOutOfRange [1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_2pi_RoundTrip_AcrossCircle [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.Promotion_IsDeterministic_OldestMemberByJoinedAt [2 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_NullableGuid_NullCase_OneByte [2 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_WireSize_BitmaskPlus2 [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_MemberScopedObjectsDeleted_SessionScopedMigrated [3 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.UpdateObjects_AllObjectsShareCallLevelValidAt [3 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ExplicitLeave_ThenDisconnect_RemovesMemberOnlyOnce [2 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.ParseFromMetadata_NoSchemasKey_ReturnsEmpty [5 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.DeltaEncoding_OnlyChangedQuantizedFieldEmitted [2 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.ParseFromMetadata_NullMetadata_ReturnsEmpty [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_BitmaskCoversFieldCount [2 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16w_WireSize_BitmaskPlus2 [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.GetObjectCountByType_ShouldCountMatchingObjects [1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16s_WireSize_BitmaskPlus2 [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.ClearSession_RemovesAll [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_WithOwnerMemberId_ShouldSetDifferentOwner [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_RoundTrip_AtCanonicalValues [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_OmittedFields_AreNotInDecodedDict [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_ShouldReturnSessionWithMetadata [6 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16w_PreservesWrapExtensionRegionThatQ16WouldClamp [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.UpdateObject_ShouldMergeData [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.ParseFromMetadata_StringMapEntries_BuildsSchemas [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.MixedQuantizedSchema_PacksAndDecodesCorrectly [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.GetSchema_UnknownSession_ReturnsNull [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.AsteroidUpdateQuantizedSchema_TotalBodyIs7Bytes [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.DeleteObject_ShouldRemoveObject [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.ParseFromMetadata_RoundTripsThroughSetSessionSchemas [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_2pi_WrapsNegativeAngle [1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.LeaveSession_LastMemberLeaves_RemainingMemberIdsIsEmpty [4 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16w_ClampsOutOfRange [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16s_RoundTrip_AcrossSignedRange [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_2pi_WrapsExactly2PiToZero [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_ClampsOutOfRange [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q8_WireSize_BitmaskPlus1 [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q8_RoundTrip_WithCoarseTolerance [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecQuantizeTests.Q16_FixedHexFixture_AsteroidUpdate [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetActiveSessions_ShouldReturnAllSessions [5 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_StaleMemberEvicted_NewMemberBecomesServer [3 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_EmptySession_ShouldClearLastMemberLeftAt [2 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_EmptySession_ShouldBecomeServer [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetSessionByConnectionId_ShouldReturnSession [1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_NoClients_ShouldKeepSessionForTimeout [4 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetActiveSessions_DefaultRegionId_IsLocal_OnParameterlessConstructor [2 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.ReplaceObject_ShouldStampAllChildrenWithValidatedValidAt [11 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.DeleteObject_AlreadyDeleted_ShouldReturnFalseAndNotCorruptSession [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ConcurrentJoins_NearCapacity_AdmitOnlyAllowedNumber [7 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_ShouldStoreClientValidAt_WhenWithinSanityBounds [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_ReturnsEvictionInfo_WithDeletedAndMigratedObjects [2 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RejoinNonEmptySession_DoesNotAdoptObjects [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_NewMemberCanUpdateAdoptedObjects [1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_NullMetadata_ShouldDefaultToEmptyDictionary [3 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RapidServerChanges_ShouldAlwaysHaveOneServer [1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_SessionFull_ShouldFail [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_WithThreeClients_MigratedObjectVersionsIncremented [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_MultiplayerSession_SessionScopedObjectsMigratedToRemainingMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.ForceDestroySession_ShouldRemoveSessionAndMembers [1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_MemberScopedObjectsDeleted [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.Promotion_WithMultipleClients_AlwaysProducesExactlyOneServer [1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetAllSessions_ShouldIncludeEmptySessions [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.ConcurrentCollision_TwoBulletsHitSameAsteroid_SecondDeleteIsSafe [5 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RejoinEmptySession_NewMemberCanUpdateAdoptedObjects [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_WithMultipleClients_ShouldPromoteOneClient [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.MemberDeparture_MigratedObject_ShouldRefreshUpdatedAt [1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_WhileAlreadyInSession_ShouldFail [1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_MultiplayerSession_MemberScopedObjectsDeletedAndReported [9 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.ForceDestroySession_NonExistentSession_ShouldReturnNull [8 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_ShouldFallBackToServerReceiveTime_WhenClientStampOutOfBounds [8 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_InvalidSession_ShouldReturnNull [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.MemberDeparture_MultipleObjectsMigrated_EachHasCorrectVersion [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.LeaveSession_RemainingMemberIds_IncludesPromotedMember [1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_WithInvalidOwnerMemberId_ShouldReturnNull [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_ShouldCreateSessionWithFruitName [1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_SoloSession_EvictionInfoReturned_ObjectsAdoptedAfter [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.MemberDeparture_MigratedObjects_ShouldIncludeNewVersion [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.LeaveSession_LastMemberLeaves_ShouldKeepSessionForTimeout [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.CreateObject_ClientCreatesObject_ShouldHaveClientAffiliation [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_MultipleSessions_ShouldHaveUniqueFruitNames [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.UpdateObject_ShouldEnforceMonotonicCap_AgainstPreviousValidAt [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.UpdateObjects_ShouldBatchUpdate [< 1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.DeleteObject_NonExistent_ShouldReturnNull [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.Snapshot_ConcurrentUpdates_DoesNotThrowAndReturnsStableData [13 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.MemberDeparture_ClientLeaves_SessionScopedObjectsMigrated [1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.DeleteRacingWithOwnershipMigration_OldOwnerCannotDeleteAfterMigration [1 ms]
+  Passed AstervoidsWeb.Tests.ObjectServiceTests.GetSessionObjects_ShouldReturnAllObjects [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ConcurrentJoinsAndLeaves_ShouldMaintainSessionIntegrity [4 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetActiveSessions_StampsConfiguredRegionId_WhenRegionSettingsBound [3 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ClientLeaves_ShouldNotAffectServerRole [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.LastMemberLeaves_MemberScopedObjectsDeleted_SessionScopedRetained [1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_WhileAlreadyInSession_ShouldFail [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ForceDestroySession_PredicateReturnsFalse_DoesNotDestroySession [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.JoinSession_ShouldAddMemberAsClient [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ObjectInfo_DataIsCloned_MutatingReturnedDictDoesNotAffectStoredObject [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_ShouldStoreMetadata [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.EncodeDict_NullRegistry_FallsBackToLegacyDict [83 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_ExceedsMaxSessions_ShouldFail [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.LeaveSession_ClientLeaves_ShouldNotPromote [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.LeaveSession_ServerLeaves_ShouldPromoteClient [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Encode_ShipUpdate_MatchesFixture [80 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.CreateSession_CreatorShouldBeServer [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Encode_SmallInts_AsInt32_FromCSharpSide [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_DoesNotEvictSameConnection [3 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.ForceDestroySession_EmptySession_ShouldReturnEmptyConnectionIds [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Encode_Simple_TwoDoubles_MatchesFixture [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_SessionVersionShouldIncrement [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionServiceTests.GetMemberByConnectionId_ShouldReturnMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RejoinEmptySession_AdoptedObjectsHaveIncrementedVersion [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_EvictionPromotesServerWhenServerEvicted [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ServerLeave_WithConcurrentJoins_LeavesAtMostOneServer [3 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_DoesNotEvictDifferentMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.UpdateRacingWithOwnershipMigration_OldOwnerCannotUpdateAfterMigration [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.OperationsOnDestroyedSession_FailCleanly [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.JoinRacingWithDestroy_ResolvesCleanly [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.ServerLeaves_WithThreeClients_SessionScopedObjectsDistributedToAllRemaining [1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.Replace_ByNonOwner_FailsAndLeavesObjectIntact [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ForceDestroySession_IsIdempotent [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RejoinEmptySession_MemberScopedObjectsNotAdopted [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_OrphanedObjectsAdopted [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_MultiplayerSession_EvictsOnlyTargetMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.JoinWithEvict_NoEvictionInfo_WhenNoEvictionNeeded [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.RejoinEmptySession_OrphanedSessionScopedObjectsAdoptedByNewMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.ServerPromotionTests.LeaveSession_RemainingMemberIds_ExcludesDepartedMember [< 1 ms]
+  Passed AstervoidsWeb.Tests.ConcurrencyTests.ConcurrentUpdates_SameOwner_BothSucceed [3 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Decode_RoundTrips_PreservesValueTypes [9 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Encode_StringGuid_AsStr8 [1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCrossWireFixturesTests.Encode_NullValue_AsNil [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.GetAllSchemas_ReturnsAllRegistered [56 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_BoolField_OneByte [58 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.EncodeDict_RegisteredPositionalSchema_EmitsPositionalBytes [21 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.ReplacementObjectSpec_DefaultsSchemaIdToZero [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.SetSessionSchemas_StoresAndRetrieves [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncSchemaRegistryTests.SetSessionSchemas_OverwritesPreviousSet [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.EncodeDict_SchemaId0_AlwaysFallsBackToLegacyMessagePack [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.EncodeDict_PositionalRoundTripsBitForBitViaDecode [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.ObjectService_CreateObject_PersistsInboundSchemaId [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.ObjectService_CreateObject_DefaultsSchemaIdToZero [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.EncodeDict_UnregisteredSchema_FallsBackToLegacyDictDefensively [< 1 ms]
+  Passed AstervoidsWeb.Tests.SyncPayloadCodecRegistryTests.ObjectService_ReplaceObject_PropagatesPerSpecSchemaId [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Decode_TruncatedBody_ThrowsClearError [14 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Decode_TruncatedBitmask_ThrowsClearError [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_BytesField_RoundTrips [1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Schema_RejectsId0 [1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_StringField_LengthPrefixIsLittleEndian [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Schema_RejectsDuplicateFieldNames [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_NullValueOnNonNullableSlot_ProducesCanonicalBytes [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Schema_RejectsUnknownTypeTag [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_GuidField_RoundTrips [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Schema_RejectsTooManyFields [2 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_AllFieldsPresent_RoundTripsBackToDict [< 1 ms]
+  Passed AstervoidsWeb.Tests.PositionalSchemaCodecTests.Encode_NullValueOnNonNullableSlot_TreatedAsAbsent [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase4_AsteroidUpdate_PerFrame_Positional [133 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.MemberLeftInfo_RoundTrip_NullPromotion [97 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.BinaryGuid_IsSmallerThan_StringGuid [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase5_OnObjectsUpdated_3Asteroids_Quantized [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_BulletUpdate_PerFrame_WithPendingHit [< 1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.IEnumerableGuid_RoundTrip [5 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.CreateSessionResponse_RoundTrip [7 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.NullableGuid_HasValue_RoundTrip [1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.GuidList_RoundTrip [1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.Guid_Serializes_As_16Bytes_Binary [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionCleanupServiceTests.CleanupExpiredSessions_LeavesActiveSessionsAlone [114 ms]
+  Passed AstervoidsWeb.Tests.SessionCleanupServiceTests.LastMemberLeave_KeepsSchemaRegistryIntact_ForRejoinPath [1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_JoinSessionResponse_4Asteroids_2Ships [21 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_ShipUpdate_PerFrame [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase5_ShipUpdate_PerFrame_Quantized [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_ShipInfo_FullCreate [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase4_ShipUpdate_PerFrame_Positional [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_UpdateObjectsResponse_3Versions [3 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_OnObjectsUpdated_3Asteroids [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionCleanupServiceTests.CleanupExpiredSessions_DestroysEmptySession_AndClearsSchemaRegistry [10 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase5_OnObjectsUpdated_MixedSession_Quantized [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_AsteroidInfo_FullCreate [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase4_OnObjectsUpdated_3Asteroids_Positional [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_ObjectEvent_ShipStateChanged [3 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.UpdateObjects_ShouldFallBackToServerTimestamp_WhenClientStampOutOfBounds [169 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase4_AsteroidUpdate_DeltaOnly_Positional [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_AsteroidUpdate_PerFrame [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Baseline_OnObjectsUpdated_MixedSession [< 1 ms]
+  Passed AstervoidsWeb.Tests.WireSizeBenchTests.Phase5_AsteroidUpdate_PerFrame_Quantized [< 1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.JoinSessionResponse_RoundTrip [25 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.JoinSession_SnapshotIncludesJoiningMember [13 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.JoinSession_WithEviction_BroadcastsEvictionBeforeAddingJoinerToGroup [5 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.UpdateObjects_ShouldFallBackToServerTimestamp_WhenClientStampOmitted [2 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.JoinSession_AddsToGroupBeforeSnapshot_ConcurrentObjectIncludedInSnapshot [4 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.Ping_ShouldSucceedWithoutSessionMembership [3 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.CreateObject_ShouldFallBackToServerTimestamp_WhenClientStampOutOfBounds [4 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.MemberLeftInfo_RoundTrip_WithPromotion [28 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.Guid_Empty_RoundTrip [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.JoinSession_ShouldReturnMaterializedSessionSnapshot [3 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.Ping_ShouldReturnUtcMillisecondsCloseToNow [2 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.ObjectReplacedEvent_RoundTrip [6 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.ObjectMigration_RoundTrip [< 1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.NullableGuid_Null_RoundTrip [< 1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.ObjectInfo_RoundTrip [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.ReplaceObject_ShouldUseClientValidAt_WhenWithinSanityBounds [5 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.ObjectInfo_WithBinaryGuids_IsSmallerThan_WithStringGuids [1 ms]
+  Passed AstervoidsWeb.Tests.BinaryGuidFormatterTests.Guid_Deserializes_From_String [< 1 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.UpdateObjects_ShouldUseClientValidAt_WhenWithinSanityBounds [2 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.ReplaceObject_ShouldFallBackToServerTimestamp_WhenClientStampOmitted [2 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.ReplaceObject_ShouldFallBackToServerTimestamp_WhenClientStampOutOfBounds [2 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.CreateObject_BroadcastsArgsAsMultiplePositionalArguments [2 ms]
+info: AstervoidsWeb.Services.SessionCleanupService[0]
+      Session cleanup service started. Empty timeout: 60s, Absolute timeout: 20min
+info: AstervoidsWeb.Services.SessionCleanupService[0]
+      Session cleanup service started. Empty timeout: 60s, Absolute timeout: 20min
+info: AstervoidsWeb.Services.SessionCleanupService[0]
+      Session cleanup service started. Empty timeout: 60s, Absolute timeout: 20min
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0]
+      Hosting environment: Development
+info: Microsoft.Hosting.Lifetime[0]
+      Content root path: C:\Users\scott\aiplay\astervoids\AstervoidsWeb
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0]
+      Hosting environment: Development
+info: Microsoft.Hosting.Lifetime[0]
+      Content root path: C:\Users\scott\aiplay\astervoids\AstervoidsWeb
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0]
+      Hosting environment: Development
+info: Microsoft.Hosting.Lifetime[0]
+      Content root path: C:\Users\scott\aiplay\astervoids\AstervoidsWeb
+  Passed AstervoidsWeb.Tests.SessionHubTests.JoinSession_AddsToGroupBeforeCapturingSnapshot [6 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.GetSessionState_ShouldReturnMaterializedSnapshot [4 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.CreateObject_ShouldUseClientValidAt_WhenWithinSanityBounds [2 ms]
+  Passed AstervoidsWeb.Tests.SessionHubTests.CreateObject_ShouldFallBackToServerTimestamp_WhenClientStampOmitted [2 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.ETagsForDifferentFiles_AreDifferent [329 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetPing_ReturnsOk_WithNowTimestamp [332 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_WithMatchingIfNoneMatch_Returns304WithNoBody(path: "/index.html") [5 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_WithMatchingIfNoneMatch_Returns304WithNoBody(path: "/manifest.json") [1 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_StaticFile_ReturnsOk_WithETagAndNoCacheHeader(path: "/index.html") [3 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_StaticFile_ReturnsOk_WithETagAndNoCacheHeader(path: "/manifest.json") [8 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetRegions_ReturnsLocalRegionAndManifest [17 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_AllowCrossRegionOrigin(path: "/api/regions") [9 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_WithNonMatchingIfNoneMatch_Returns200WithBody(path: "/index.html") [10 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_WithNonMatchingIfNoneMatch_Returns200WithBody(path: "/manifest.json") [1 ms]
+  Passed AstervoidsWeb.Tests.PingBudgetTests.GetPing_MeanLatency_StaysWithinBudget [366 ms]
+info: Microsoft.Hosting.Lifetime[0]
+      Application is shutting down...
+info: Microsoft.Hosting.Lifetime[0]
+      Application is shutting down...
+info: AstervoidsWeb.Services.SessionService[0]
+      Session created: Pear (66bfb839-eba7-419c-a98a-c8a77ad5b273) by 8925e69d-e22e-44be-9210-05dd66f3733d
+info: AstervoidsWeb.Services.SessionService[0]
+      Member 8925e69d-e22e-44be-9210-05dd66f3733d left session Pear (66bfb839-eba7-419c-a98a-c8a77ad5b273). Deleted 0 objects, migrated 0 objects.
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_AllowCrossRegionOrigin(path: "/api/sessions") [9 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_AllowCrossRegionOrigin(path: "/api/ping") [< 1 ms]
+  Passed AstervoidsWeb.Tests.StaticFileCachingTests.Get_Root_HasSameETagAsIndexHtml [9 ms]
+  Passed AstervoidsWeb.Tests.PingBudgetTests.GetPing_ResponseShape_HasOnlyTheNowField [7 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_RejectUntrustedOrigin(path: "/api/regions") [3 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_RejectUntrustedOrigin(path: "/api/sessions") [1 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.RegionalEndpoints_RejectUntrustedOrigin(path: "/api/ping") [1 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetSessions_StampsRegionIdOnEverySession [9 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetPing_SetsCacheControlNoStore [1 ms]
+info: Microsoft.Hosting.Lifetime[0]
+      Application is shutting down...
+[xUnit.net 00:00:00.68]   Finished:    AstervoidsWeb.Tests
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetSessions_ReturnsEmptyListAndRegionIdStamp_WhenNoSessions [3 ms]
+  Passed AstervoidsWeb.Tests.RegionEndpointsTests.GetRegions_UsesCamelCasePropertyNames [2 ms]
+
+Test Run Successful.
+Total tests: 246
+     Passed: 246
+ Total time: 1.2425 Seconds
+     3>Done Building Project "C:\Users\scott\aiplay\astervoids\AstervoidsWeb.Tests\AstervoidsWeb.Tests.csproj" (VSTest target(s)).
+     1>Done Building Project "C:\Users\scott\aiplay\astervoids\astervoids.sln" (VSTest target(s)).
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:04.09
