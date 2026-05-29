@@ -28,6 +28,9 @@
     },
     "domainVerificationId": {
       "value": "${DOMAIN_VERIFICATION_ID=}"
+    },
+    "regions": {
+      "value": "${REGIONS_JSON=[]}"
     }
   }
 }

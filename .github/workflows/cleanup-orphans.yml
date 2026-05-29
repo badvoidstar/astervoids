@@ -137,11 +137,21 @@ jobs:
                 
                 # Delete managed certificate
                 CERT_NAME="cert-${BRANCH_SUBDOMAIN}-${DOMAIN_NAME//./-}"
-                az containerapp env certificate delete \
+                CAE_CANDIDATES=$(az containerapp env list \
                   --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --name "${{ env.CONTAINER_ENV_NAME }}" \
-                  --certificate "$CERT_NAME" \
-                  --yes 2>/dev/null || echo "  -> Certificate not found"
+                  --query "[?name=='${{ env.CONTAINER_ENV_NAME }}' || starts_with(name, '${{ env.CONTAINER_ENV_NAME }}-')].name" \
+                  -o tsv 2>/dev/null || echo "")
+                if [ -z "$CAE_CANDIDATES" ]; then
+                  echo "  -> No shared CAE found for cert cleanup"
+                else
+                  for CAE in $CAE_CANDIDATES; do
+                    az containerapp env certificate delete \
+                      --resource-group "${{ env.PRODUCTION_RG }}" \
+                      --name "$CAE" \
+                      --certificate "$CERT_NAME" \
+                      --yes 2>/dev/null || true
+                  done
+                fi
               fi
             fi
           done
@@ -168,10 +178,12 @@ jobs:
           DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
           SUBDOMAIN_PREFIX="${{ secrets.CUSTOM_SUBDOMAIN }}"
           
-          # Get list of active container apps (excluding production)
+          # Get list of active container apps.
+          # Keep production variants in this set so their DNS suffixes are
+          # treated as protected and never considered orphaned.
           ACTIVE_APPS=$(az containerapp list \
             --resource-group "${{ env.PRODUCTION_RG }}" \
-            --query "[?starts_with(name, '${{ env.CONTAINER_APP_PREFIX }}-') && name != '${{ env.CONTAINER_APP_PREFIX }}-production'].name" \
+            --query "[?starts_with(name, '${{ env.CONTAINER_APP_PREFIX }}-')].name" \
             -o tsv 2>/dev/null || echo "")
           
           # Build list of expected subdomain suffixes from active apps
@@ -194,6 +206,10 @@ jobs:
           for CNAME in $CNAME_RECORDS; do
             # Extract suffix (e.g., "astervoids-feature-test" -> "feature-test")
             SUFFIX="${CNAME#${SUBDOMAIN_PREFIX}-}"
+            if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
+              echo "  Protected CNAME: $CNAME (production)"
+              continue
+            fi
             
             # Check if this suffix matches an active container app
             IS_ACTIVE=false
@@ -226,6 +242,10 @@ jobs:
           for TXT in $TXT_RECORDS; do
             # Extract suffix (e.g., "asuid.astervoids-feature-test" -> "feature-test")
             SUFFIX="${TXT#asuid.${SUBDOMAIN_PREFIX}-}"
+            if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
+              echo "  Protected TXT: $TXT (production)"
+              continue
+            fi
             
             IS_ACTIVE=false
             for ACTIVE in $ACTIVE_SUFFIXES; do
@@ -248,40 +268,45 @@ jobs:
           # Scan certificates for orphans
           echo ""
           echo "Scanning certificates..."
-          CERTS=$(az containerapp env certificate list \
+          CAE_CANDIDATES=$(az containerapp env list \
             --resource-group "${{ env.PRODUCTION_RG }}" \
-            --name "${{ env.CONTAINER_ENV_NAME }}" \
-            --query "[?starts_with(name, 'cert-${SUBDOMAIN_PREFIX}-') && name != 'cert-${SUBDOMAIN_PREFIX}-${DOMAIN_NAME//./-}'].name" \
+            --query "[?name=='${{ env.CONTAINER_ENV_NAME }}' || starts_with(name, '${{ env.CONTAINER_ENV_NAME }}-')].name" \
             -o tsv 2>/dev/null || echo "")
-          
-          for CERT in $CERTS; do
-            [ -z "$CERT" ] && continue
-            
-            # Extract suffix from cert name
-            DOMAIN_SUFFIX="${DOMAIN_NAME//./-}"
-            TEMP="${CERT#cert-${SUBDOMAIN_PREFIX}-}"
-            SUFFIX="${TEMP%-${DOMAIN_SUFFIX}}"
-            
-            IS_ACTIVE=false
-            for ACTIVE in $ACTIVE_SUFFIXES; do
-              if [ "$SUFFIX" = "$ACTIVE" ]; then
-                IS_ACTIVE=true
-                break
+          for CAE in $CAE_CANDIDATES; do
+            CERTS=$(az containerapp env certificate list \
+              --resource-group "${{ env.PRODUCTION_RG }}" \
+              --name "$CAE" \
+              --query "[?starts_with(name, 'cert-${SUBDOMAIN_PREFIX}-') && name != 'cert-${SUBDOMAIN_PREFIX}-${DOMAIN_NAME//./-}'].name" \
+              -o tsv 2>/dev/null || echo "")
+            for CERT in $CERTS; do
+              [ -z "$CERT" ] && continue
+              DOMAIN_SUFFIX="${DOMAIN_NAME//./-}"
+              TEMP="${CERT#cert-${SUBDOMAIN_PREFIX}-}"
+              SUFFIX="${TEMP%-${DOMAIN_SUFFIX}}"
+              if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
+                echo "  Protected cert on $CAE: $CERT (production)"
+                continue
+              fi
+              IS_ACTIVE=false
+              for ACTIVE in $ACTIVE_SUFFIXES; do
+                if [ "$SUFFIX" = "$ACTIVE" ]; then
+                  IS_ACTIVE=true
+                  break
+                fi
+              done
+              if [ "$IS_ACTIVE" = "false" ]; then
+                echo "  Orphan certificate on $CAE: $CERT"
+                if az containerapp env certificate delete \
+                  --resource-group "${{ env.PRODUCTION_RG }}" \
+                  --name "$CAE" \
+                  --certificate "$CERT" \
+                  --yes 2>&1; then
+                  echo "  -> Deleted"
+                else
+                  echo "  -> Failed to delete (may still be bound to a domain)"
+                fi
               fi
             done
-            
-            if [ "$IS_ACTIVE" = "false" ]; then
-              echo "  Orphan certificate: $CERT"
-              if az containerapp env certificate delete \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --name "${{ env.CONTAINER_ENV_NAME }}" \
-                --certificate "$CERT" \
-                --yes 2>&1; then
-                echo "  -> Deleted"
-              else
-                echo "  -> Failed to delete (may still be bound to a domain)"
-              fi
-            fi
           done
           
           echo ""
