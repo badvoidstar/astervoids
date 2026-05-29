@@ -1664,7 +1664,7 @@ astervoids/
 │   │   └── HubDtos.cs          # [MessagePackObject] request/response DTOs (camelCase keys)
 │   │
 │   └── wwwroot/
-│       ├── index.html          # Single-file game: HTML5 Canvas + CSS + JS (~5400 lines)
+│       ├── index.html          # Single-file game: HTML5 Canvas + CSS + JS runtime
 │       ├── session-test.html   # Session management test harness
 │       ├── manifest.json       # PWA web app manifest
 │       ├── debug/
@@ -1681,7 +1681,7 @@ astervoids/
 │           ├── signalr.min.js                     # SignalR client library (local copy)
 │           └── signalr-protocol-msgpack.min.js    # MessagePack protocol for SignalR client
 │
-├── AstervoidsWeb.Tests/        # xUnit test project (~115 tests)
+├── AstervoidsWeb.Tests/        # xUnit test project (backend/unit/integration tests)
 │   ├── AstervoidsWeb.Tests.csproj   # Test dependencies: xUnit, FluentAssertions, Moq
 │   ├── TestBase.cs                  # Shared helpers: CreateTestSession / CreateTestSessionWithClient
 │   ├── SessionServiceTests.cs       # Session create/join/leave/naming
@@ -1693,7 +1693,7 @@ astervoids/
 │   └── SessionHubTests.cs           # SessionHub unit tests
 │
 ├── infra/                      # Azure infrastructure (Bicep IaC)
-│   ├── main.bicep              # Three deployment paths: production, branch, standalone
+│   ├── main.bicep              # Four deployment forms: prod single, prod multi, branch shared-infra, standalone
 │   ├── main.parameters.json    # Environment parameters
 │   ├── enable-custom-domain.ps1 # Custom domain setup script
 │   ├── CUSTOM_DOMAIN_SETUP.md  # Custom domain documentation
@@ -1702,6 +1702,11 @@ astervoids/
 │       │   ├── container-apps.bicep  # Container Apps Environment + ACR
 │       │   ├── container-app.bicep   # Individual Container App module
 │       │   └── static-web-app.bicep  # Static apex hosting (multi-region prod)
+│       ├── security/
+│       │   ├── acmebot-permissions.bicep # id-acme-cert-reader + DNS role for ACMEbot
+│       │   └── kv-cert-user-role.bicep   # KV Certificate User role assignment on ACMEbot KV
+│       ├── network/
+│       │   └── traffic-manager.bicep      # Legacy/optional Traffic Manager module (not in static-apex path)
 │       └── dns/
 │           ├── dns-zone.bicep        # Azure DNS zone
 │           └── dns-records.bicep     # CNAME + TXT verification records
@@ -1713,8 +1718,9 @@ astervoids/
     ├── scripts/
     │   └── sanitize-branch-name.sh # Branch name sanitization for deployments
     └── workflows/
-        ├── azure-deploy.yml        # CI/CD: build, test, provision, deploy
-        └── cleanup-orphans.yml     # Cleanup orphaned branch deployments
+        ├── azure-deploy.yml            # CI/CD: build, test, provision, deploy
+        ├── cleanup-orphans.yml         # Cleanup orphaned branch deployments
+        └── check-easy-auth-secret.yml  # ACMEbot Easy Auth secret expiry monitor
 ```
 
 ## Infrastructure & Deployment
