@@ -140,15 +140,33 @@ Branch names are sanitized for DNS compatibility:
 
 ### Resource Naming
 
-| Resource | Production | Branch (feature/login) |
-|----------|------------|------------------------|
-| Container App | `ca-web-production` | `ca-web-feature-login` |
-| Subdomain | `app.domain.com` | `app-feature-login.domain.com` |
+| Resource | Production single-region | Production multi-region | Branch (feature/login) |
+|---|---|---|---|
+| Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login` |
+| Container Apps Environment | `cae-production` | `cae-production-<primary-region>` and peers | shared production CAE (`cae-production` or `cae-production-<primary-region>`) |
+| Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login.domain.com` |
 
 ### Prerequisites for Branch Deployments
 
 1. **Production must be deployed first** - Branch deployments use the shared Container Apps Environment created by the production deployment
 2. **Custom domain secrets configured** - `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must be set
+
+### Greenfield expectations
+
+- `main` deploys are expected to work from a clean app-stack state (no pre-existing app resource groups) when required inputs are supplied.
+- Branch deploys are expected to provision from scratch against shared production infra and clean up completely when the branch is removed.
+
+### Optional ACMEbot behavior
+
+- ACMEbot integration is optional. Deployments do not require ACMEbot itself when BYO cert inputs are supplied.
+- In production, `manageAcmebotPermissions=true` lets IaC provision the cert-reader identity and ACMEbot-related role assignments.
+- If you set `manageAcmebotPermissions=false`, supply/maintain equivalent permissions manually.
+
+### Legacy hygiene and protected resources
+
+- The cleanup workflow only targets branch-ephemeral resources (`ca-web-<branch>`, matching branch DNS/cert artifacts).
+- Production resources (`ca-web-production` and `ca-web-production-*`, production DNS/certs) are protected from automated deletion.
+- Legacy resources no longer referenced by IaC (for example old Traffic Manager profiles) should be removed intentionally via a manual ops cleanup pass.
 
 ### Automatic Cleanup
 
@@ -191,9 +209,9 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 
 | Deployment form | Trigger | Infra shape |
 |---|---|---|
-| Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path |
-| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Static Web App apex |
-| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/primary CAE, creates branch app + DNS |
+| Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path (greenfield-capable) |
+| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Static Web App apex (greenfield-capable) |
+| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared CAE, creates branch app + DNS from scratch |
 | Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own ACR/CAE/app |
 
 ## Customization

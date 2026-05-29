@@ -103,6 +103,7 @@ var byoCertEnabled = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertNam
 // blocks below execute unchanged.
 var isMultiRegion = isProduction && length(regions) > 0
 var primaryRegion = isMultiRegion ? regions[0] : { name: '', location: location, displayName: '' }
+var sharedInfraPrimaryRegionName = length(regions) > 0 ? regions[0].name : ''
 
 // For branch deployments, use production's shared infrastructure
 var sharedResourceGroupName = 'rg-production'
@@ -116,7 +117,9 @@ var containerRegistryName = isStandalone
 // existing branch deploy flows still find a valid environment.
 var containerAppsEnvironmentName = isStandalone
   ? 'cae-${environmentName}'
-  : (isMultiRegion ? 'cae-production-${primaryRegion.name}' : 'cae-production')
+  : (isProduction
+    ? (isMultiRegion ? 'cae-production-${primaryRegion.name}' : 'cae-production')
+    : (isBranch && !empty(sharedInfraPrimaryRegionName) ? 'cae-production-${sharedInfraPrimaryRegionName}' : 'cae-production'))
 
 // Determine if custom domain should be configured
 var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)

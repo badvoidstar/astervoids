@@ -1367,7 +1367,19 @@ this honestly:
 - **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
   (empty by default). Set to a JSON array to enable multi-region prod.
 
-### BYO wildcard cert for regional hostnames
+  ### Deployment permutation contract
+
+  The deployment paths are expected to remain reproducible from IaC inputs:
+
+  - **`main` + empty `REGIONS_JSON`** → production single-region (greenfield-capable).
+  - **`main` + non-empty `REGIONS_JSON`** → production multi-region static-apex path (greenfield-capable).
+  - **non-`main` + shared infra** → branch preview deploys from scratch against shared production infra.
+  - **non-`main` + standalone** → isolated env in its own resource group.
+
+  Cleanup automation must only remove branch-ephemeral resources and never delete
+  production resources by name-pattern collision.
+
+  ### BYO wildcard cert for regional hostnames
 
 Azure Container Apps' free managed certificates have a hard requirement:
 the custom-domain CNAME must point **directly** at the container app's
