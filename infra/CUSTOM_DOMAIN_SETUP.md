@@ -1,132 +1,93 @@
-# Custom Domain HTTPS Setup
+# Custom Domain + TLS Setup
 
 ## Overview
-Custom domain configuration for Azure Container Apps requires DNS verification to be in place before the domain can be added. The deployment handles this in two phases:
 
-1. **Phase 1 (Automated)**: Deploy the app without custom domain, create DNS zone and verification records
-2. **Phase 2 (Automated with retry)**: Add custom domain and enable HTTPS after DNS propagates
+Custom-domain behavior now depends on deployment form and certificate mode:
 
-## Prerequisites: GitHub Secrets
+1. **Single-region production (`main`, empty `REGIONS_JSON`)**
+   - Supports legacy managed-cert flow (DigiCert via Azure Container Apps), or BYO cert.
+2. **Multi-region production (`main`, non-empty `REGIONS_JSON`)**
+   - Uses **static apex** hosting (Static Web App for `<subdomain>.<domain>`).
+   - Regional gameplay endpoints use per-region hostnames (`<subdomain>-<region>.<domain>`).
+   - If custom domain is enabled, this path is expected to run with **BYO wildcard cert**.
+3. **Branch previews (non-`main`)**
+   - Reuse production shared infra/CAE and bind branch hostnames with the shared wildcard cert when BYO vars are set.
 
-To enable custom domain support, you must configure these GitHub Secrets:
+## Required Secrets and Variables
 
-| Secret | Example Value | Description |
-|--------|---------------|-------------|
-| `CUSTOM_DOMAIN_NAME` | `yourdomain.com` | Your root domain name |
-| `CUSTOM_SUBDOMAIN` | `app` | Subdomain for the application |
+### Secrets
 
-If these secrets are not set, the deployment will succeed but skip custom domain configuration entirely.
+| Name | Purpose |
+|---|---|
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC auth for workflow |
+| `CUSTOM_DOMAIN_NAME` | Root domain (example: `example.com`) |
+| `CUSTOM_SUBDOMAIN` | Base subdomain (example: `app`) |
 
-**To add secrets:** Go to your repo → Settings → Secrets and variables → Actions → New repository secret
+### Optional BYO cert variables (recommended for multi-region and branch previews)
 
-## How It Works
+| Variable | Purpose |
+|---|---|
+| `CERT_KEY_VAULT_SECRET_URL` | Versionless KV secret URL for wildcard cert |
+| `CERT_KEY_VAULT_CERT_NAME` | Certificate resource name used on CAE(s) |
+| `CERT_READER_IDENTITY_ID` | Cert-reader user-assigned identity resource ID (required for branch BYO bootstrap) |
 
-### Initial Deployment
-When you deploy to the `production` environment with secrets configured, the workflow:
-1. Creates the Container App (without custom domain)
-2. Creates the Azure DNS Zone for your domain
-3. Creates DNS records:
-   - CNAME record: `<subdomain>.<yourdomain.com>` → Container App FQDN
-   - TXT record: `asuid.<subdomain>.<yourdomain.com>` → Domain verification ID
+## ACMEbot Relationship
 
-### Custom Domain Setup
-After the base deployment, the workflow attempts to:
-1. Add the custom hostname to the Container App
-2. Create a managed SSL certificate
-3. Bind the certificate to enable HTTPS
+This repository does **not** deploy ACMEbot itself. ACMEbot (Function App + Key Vault) is a one-time external setup, commonly via:
+- https://github.com/shibayan/keyvault-acmebot
 
-**Note**: This step uses `continue-on-error: true` because DNS propagation may not be complete on the first deployment. Subsequent deployments will succeed once DNS has propagated.
+What IaC in this repo can manage (production path, default `manageAcmebotPermissions=true`):
 
-## DNS Configuration
+- Creates/adopts `id-acme-cert-reader` in `rg-production`.
+- Grants **DNS Zone Contributor** on the production DNS zone to ACMEbot's managed identity.
+- Grants **Key Vault Certificate User** on the ACMEbot Key Vault to `id-acme-cert-reader`.
 
-### If Using Azure DNS (Recommended)
-The deployment automatically creates the DNS zone and records. You need to configure your domain registrar to use Azure's name servers:
+If you set `manageAcmebotPermissions=false`, you must manage those permissions and identity wiring yourself.
 
-```
-ns1-XX.azure-dns.com
-ns2-XX.azure-dns.net
-ns3-XX.azure-dns.org
-ns4-XX.azure-dns.info
-```
+## External Dependencies (Outside This IaC)
 
-The name servers are output after deployment as `DNS_NAME_SERVERS`.
+These dependencies are outside this repository's infra templates, but still required for working custom domains:
 
-### If Using External DNS
-If your domain is hosted elsewhere, you need to manually create:
+- **Domain registrar delegation**: if using Azure DNS Zone resources created by this repo, your registrar must delegate the domain to Azure DNS name servers.
+- **External DNS hosting**: if DNS is hosted outside Azure DNS, you must create and maintain equivalent CNAME/TXT records yourself.
+- **ACMEbot lifecycle**: ACMEbot deployment, auth, and app secrets are external to this repo; this repo only wires permissions/consumption.
 
-1. **CNAME Record**:
-   - Name: `<your-subdomain>` (e.g., `app`)
-   - Value: `<container-app-fqdn>` (e.g., `ca-web-production.redfield-xxxxx.eastus.azurecontainerapps.io`)
+### Azure DNS name server delegation (required when using Azure DNS zone)
 
-2. **TXT Record** (for domain verification):
-   - Name: `asuid.<your-subdomain>` (e.g., `asuid.app`)
-   - Value: The `DOMAIN_VERIFICATION_ID` from deployment output
-
-## Manual Custom Domain Setup
-
-If the automated setup fails (e.g., DNS not propagated yet), run manually:
+After deployment, get the zone's name servers and configure them at your registrar:
 
 ```powershell
-# From the repository root
-.\infra\enable-custom-domain.ps1 `
-    -ResourceGroup "rg-production" `
-    -ContainerAppName "ca-web-production" `
-    -EnvironmentName "cae-production" `
-    -CustomDomain "app.yourdomain.com"
+az network dns zone show `
+  --resource-group rg-production `
+  --name <your-domain> `
+  --query nameServers -o tsv
 ```
 
-Or using Azure CLI:
+Until delegation is complete and propagated, custom-domain verification/certificate binding can fail even if the app deploy succeeds.
 
-```bash
-# 1. Add hostname
-az containerapp hostname add \
-    --resource-group rg-production \
-    --name ca-web-production \
-    --hostname app.yourdomain.com
+## How Deployments Handle Custom Domains
 
-# 2. Create certificate
-az containerapp env certificate create \
-    --resource-group rg-production \
-    --name cae-production \
-    --certificate-name cert-app-yourdomain-com \
-    --hostname app.yourdomain.com \
-    --validation-method CNAME
+### BYO cert path
 
-# 3. Bind certificate
-az containerapp hostname bind \
-    --resource-group rg-production \
-    --name ca-web-production \
-    --hostname app.yourdomain.com \
-    --environment cae-production \
-    --validation-method CNAME
-```
+When BYO vars are set, bicep creates/uses `Microsoft.App/managedEnvironments/certificates` on each relevant CAE and binds hostnames with `bindingType: SniEnabled`.
 
-## Troubleshooting
+- Production single-region: binds `<subdomain>.<domain>`.
+- Production multi-region: binds `<subdomain>-<region>.<domain>` on each regional app; apex is served by Static Web App.
+- Branch previews: workflow bootstraps cert resource on shared CAE (if needed), then bicep binds `<subdomain>-<branch>.<domain>`.
 
-### "TXT record not found" Error
-This means DNS verification records haven't propagated yet. Solutions:
-- Wait 5-15 minutes and re-run the deployment
-- Verify DNS records are correctly configured at your registrar
-- Check if you're using Azure DNS name servers
+The legacy "Configure Custom Domain" managed-cert step is skipped when BYO vars are provided.
 
-### Check DNS Propagation
-```bash
-# Check TXT record (replace with your domain)
-nslookup -type=TXT asuid.app.yourdomain.com
+### Managed-cert path (legacy)
 
-# Check CNAME record  
-nslookup app.yourdomain.com
-```
+If BYO vars are not set, workflow falls back to `az containerapp env certificate create` + hostname bind in the single-region flow. This mode is not the intended path for multi-region custom-domain rollouts.
 
-### View Current Configuration
-```bash
-# List hostnames on container app
-az containerapp hostname list \
-    --resource-group rg-production \
-    --name ca-web-production
+## DNS Expectations
 
-# List certificates in environment
-az containerapp env certificate list \
-    --resource-group rg-production \
-    --name cae-production
-```
+- **Single-region custom domain**: CNAME `<subdomain>.<domain>` -> container app hostname.
+- **Multi-region static apex**: CNAME `<subdomain>.<domain>` -> Static Web App default hostname; each regional hostname CNAME points to its regional container app.
+- **BYO + additional hostnames**: `asuid.<host>` TXT records may be emitted/required for hostname validation depending on flow and whether `domainVerificationId` is available.
+- **Registrar + propagation dependency**: TXT/CNAME records must be visible from public DNS resolvers before hostname verification and cert operations succeed.
+
+## Cert Rotation
+
+ACMEbot rotates the wildcard certificate in Key Vault, but Container Apps picks up new versions on redeploy. A regular production redeploy (or scheduled deployment) is required to refresh bound cert material.
