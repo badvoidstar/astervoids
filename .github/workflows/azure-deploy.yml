@@ -447,7 +447,7 @@ jobs:
               done
             fi
             if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
-              echo "::warning::No existing app or CAE found to extract customDomainVerificationId before first pass."
+              echo "::warning::No existing app or CAE found to extract customDomainVerificationId. asuid TXT records will be skipped (CNAME-only). A second deploy may be needed to bind hostnames."
             fi
 
             echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
