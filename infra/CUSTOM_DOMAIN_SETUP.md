@@ -44,6 +44,27 @@ What IaC in this repo can manage (production path, default `manageAcmebotPermiss
 
 If you set `manageAcmebotPermissions=false`, you must manage those permissions and identity wiring yourself.
 
+## External Dependencies (Outside This IaC)
+
+These dependencies are outside this repository's infra templates, but still required for working custom domains:
+
+- **Domain registrar delegation**: if using Azure DNS Zone resources created by this repo, your registrar must delegate the domain to Azure DNS name servers.
+- **External DNS hosting**: if DNS is hosted outside Azure DNS, you must create and maintain equivalent CNAME/TXT records yourself.
+- **ACMEbot lifecycle**: ACMEbot deployment, auth, and app secrets are external to this repo; this repo only wires permissions/consumption.
+
+### Azure DNS name server delegation (required when using Azure DNS zone)
+
+After deployment, get the zone's name servers and configure them at your registrar:
+
+```powershell
+az network dns zone show `
+  --resource-group rg-production `
+  --name <your-domain> `
+  --query nameServers -o tsv
+```
+
+Until delegation is complete and propagated, custom-domain verification/certificate binding can fail even if the app deploy succeeds.
+
 ## How Deployments Handle Custom Domains
 
 ### BYO cert path
@@ -65,6 +86,7 @@ If BYO vars are not set, workflow falls back to `az containerapp env certificate
 - **Single-region custom domain**: CNAME `<subdomain>.<domain>` -> container app hostname.
 - **Multi-region static apex**: CNAME `<subdomain>.<domain>` -> Static Web App default hostname; each regional hostname CNAME points to its regional container app.
 - **BYO + additional hostnames**: `asuid.<host>` TXT records may be emitted/required for hostname validation depending on flow and whether `domainVerificationId` is available.
+- **Registrar + propagation dependency**: TXT/CNAME records must be visible from public DNS resolvers before hostname verification and cert operations succeed.
 
 ## Cert Rotation
 
