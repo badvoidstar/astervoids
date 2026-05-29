@@ -173,6 +173,9 @@ jobs:
           
           # Set location
           azd env set AZURE_LOCATION westus2
+          # Pass through region matrix so non-production shared-infra deploys
+          # can resolve the primary shared CAE deterministically.
+          azd env set REGIONS_JSON "${REGIONS_JSON:-[]}"
           
           # For branch deployments, set resource group to production's resource group
           # This tells azd deploy where to find the container app
@@ -216,6 +219,22 @@ jobs:
                 break
               fi
             done
+            # Fallback: the value is subscription-scoped and available on the
+            # shared CAE even when no container apps exist yet.
+            if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
+              SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
+              if [ -n "$PRIMARY_REGION_NAME" ]; then
+                SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}-${PRIMARY_REGION_NAME}"
+              fi
+              DOMAIN_VERIFICATION_ID=$(az containerapp env show \
+                --name "$SHARED_CAE_NAME" \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --query 'properties.customDomainConfiguration.customDomainVerificationId' \
+                -o tsv 2>/dev/null || echo "")
+              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
+                echo "Using customDomainVerificationId from $SHARED_CAE_NAME (length: ${#DOMAIN_VERIFICATION_ID})"
+              fi
+            fi
             if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
               azd env set DOMAIN_VERIFICATION_ID "$DOMAIN_VERIFICATION_ID"
             else
@@ -267,10 +286,13 @@ jobs:
         if: steps.vars.outputs.is_production != 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
         run: |
           # Single-region branches target 'cae-production'. After multi-region
-          # production is rolled out (REGIONS_JSON populated), this name will
-          # need to switch to 'cae-production-${primary-region}' — out of scope
-          # for this step's current single-region branch model.
+          # production is rolled out (REGIONS_JSON populated), branches target
+          # the primary shared CAE (cae-production-<primary-region>).
+          PRIMARY_REGION_NAME=$(echo "$REGIONS_JSON" | jq -r '.[0].name' 2>/dev/null || true)
           CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
+          if [ -n "$PRIMARY_REGION_NAME" ] && [ "$PRIMARY_REGION_NAME" != "null" ]; then
+            CAE_NAME="${{ env.CONTAINER_ENV_NAME }}-${PRIMARY_REGION_NAME}"
+          fi
           RG="${{ env.PRODUCTION_RG }}"
 
           echo "::group::Bootstrap BYO cert on $CAE_NAME"
@@ -425,10 +447,11 @@ jobs:
               done
             fi
             if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
-              echo "::warning::No existing app or CAE found to extract customDomainVerificationId. asuid TXT records will be skipped (CNAME-only). A second deploy may be needed to bind hostnames."
+              echo "::warning::No existing app or CAE found to extract customDomainVerificationId before first pass."
             fi
 
             echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
+            set +e
             az deployment sub create \
               --name "production-multi-${{ github.run_id }}" \
               --location "$PRIMARY_LOCATION" \
@@ -444,6 +467,39 @@ jobs:
                 certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
                 domainVerificationId="$DOMAIN_VERIFICATION_ID" \
               --output none
+            DEPLOY_RC=$?
+            set -e
+            if [ "$DEPLOY_RC" -ne 0 ]; then
+              if [ -n "$CD_NAME" ] && [ -z "$DOMAIN_VERIFICATION_ID" ]; then
+                echo "::warning::First multi-region deploy pass failed without domainVerificationId. Retrying once after reading it from the new shared CAE."
+                DOMAIN_VERIFICATION_ID=$(az containerapp env show \
+                  --name "cae-production-${PRIMARY_REGION_NAME}" \
+                  --resource-group "${{ env.PRODUCTION_RG }}" \
+                  --query 'properties.customDomainConfiguration.customDomainVerificationId' \
+                  -o tsv 2>/dev/null || echo "")
+                if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
+                  echo "::error::Retry aborted: could not resolve customDomainVerificationId from cae-production-${PRIMARY_REGION_NAME}."
+                  exit "$DEPLOY_RC"
+                fi
+                az deployment sub create \
+                  --name "production-multi-${{ github.run_id }}" \
+                  --location "$PRIMARY_LOCATION" \
+                  --template-file infra/main.bicep \
+                  --parameters \
+                    environmentName=production \
+                    location="$PRIMARY_LOCATION" \
+                    customDomainName="$CD_NAME" \
+                    customSubdomain="$CD_SUB" \
+                    regions="$REGIONS_JSON" \
+                    certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
+                    certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
+                    certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
+                    domainVerificationId="$DOMAIN_VERIFICATION_ID" \
+                  --output none
+              else
+                exit "$DEPLOY_RC"
+              fi
+            fi
 
             # Fetch ALL outputs once, then look them up case-insensitively
             # via jq. Azure ARM serializes output names through .NET's
@@ -561,6 +617,7 @@ jobs:
                   environmentName="${SANITIZED_BRANCH}" \
                   location=westus2 \
                   useSharedInfra=true \
+                  regions="$REGIONS_JSON" \
                   customDomainName="$CD_NAME" \
                   customSubdomain="$CD_SUB" \
                   certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
