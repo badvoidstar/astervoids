@@ -7003,20 +7003,36 @@
     // displays). Locals are smoothed separately by render interpolation.
     function repositionDeadReckonedRemotes() {
         if (!isDeterministicMode() || !isSessionMode()) return;
+        // Safety net: an object we OWN must never be dead-reckoned — we simulate
+        // it locally, and overwriting its pose from the (clamp-frozen) reckon
+        // state would freeze it. The migration handler clears dead-reckon state
+        // on the normal handoff, but ownership can also change via a
+        // reconciliation snapshot (object-sync sets ownerMemberId without
+        // touching DeadReckon) if a client missed the OnMemberLeft broadcast.
+        // Clearing here makes "owned ⇒ not dead-reckoned" hold for every path.
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const ownedByUs = (syncId) => {
+            if (!syncId || !myMemberId) return false;
+            const o = ObjectSync.getObject(syncId);
+            return !!o && o.ownerMemberId === myMemberId;
+        };
         for (const b of game.bullets) {
             if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
+                if (ownedByUs(b.syncObjectId)) { DeadReckon.remove(b.syncObjectId); continue; }
                 const r = DeadReckon.getReckoned(b.syncObjectId);
                 if (r) b.fromSyncData(r);
             }
         }
         for (const a of game.astervoids) {
             if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
+                if (ownedByUs(a.syncObjectId)) { DeadReckon.remove(a.syncObjectId); continue; }
                 const r = DeadReckon.getReckoned(a.syncObjectId);
                 if (r) a.fromSyncData(r);
             }
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
             if (DeadReckon.states.has(id)) {
+                if (ownedByUs(id)) { DeadReckon.remove(id); continue; }
                 const r = DeadReckon.getReckoned(id);
                 if (r) ship.fromSyncData(r);
             }
