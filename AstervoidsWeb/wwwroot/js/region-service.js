@@ -116,8 +116,10 @@ const RegionService = (function () {
     /**
      * Fold a fresh burst-minimum into a region's measurement state.
      *
-     * - `state === 'warming'` and sample > COLD_START_THRESHOLD_MS → sample is
-     *   discarded, state stays warming, returns {state, coldStart: true}.
+     * - FIRST attempt only, sample > COLD_START_THRESHOLD_MS → treated as
+     *   container wake-up: sample is discarded, state stays warming, returns
+     *   {state, coldStart: true}. `lastSampleAt` is stamped so the suppression
+     *   fires AT MOST ONCE.
      * - `state === 'warming'` and sample ≤ threshold → first real RTT; state
      *   advances to `'measuring'`, EMA seeded with the sample.
      * - Otherwise → EMA-update displayed value; advance to `'settled'` once
@@ -126,8 +128,17 @@ const RegionService = (function () {
      * Pure function: takes the previous state and a sample, returns next state.
      */
     function applyBurstSample(prev, sampleMs, nowMs, cfg = CONFIG) {
-        // Cold-start guard: only relevant on the very first sample.
-        if (prev.sampleCount === 0 && sampleMs > cfg.COLD_START_THRESHOLD_MS) {
+        // Cold-start guard: fires AT MOST ONCE, on the genuine first measurement
+        // attempt (lastSampleAt == null), to absorb container wake-up latency.
+        //
+        // Keying the guard only on `sampleCount === 0` was a bug: a cold-start
+        // sample is intentionally NOT counted (sampleCount stays 0), so the
+        // guard re-fired on every following sample. Any region whose real RTT
+        // is consistently above COLD_START_THRESHOLD_MS — a geographically
+        // distant region, or *every* region on a slow/mobile link — had each
+        // sample discarded as "container start" and was stuck 'warming' forever.
+        // Once we've recorded one attempt, later slow samples are honest RTT.
+        if (prev.sampleCount === 0 && prev.lastSampleAt == null && sampleMs > cfg.COLD_START_THRESHOLD_MS) {
             return {
                 next: { ...prev, lastSampleAt: nowMs },  // record attempt without polluting EMA
                 coldStart: true,
