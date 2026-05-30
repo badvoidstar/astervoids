@@ -95,6 +95,27 @@ describe('applyBurstSample cold-start handling', () => {
             'after first measurement, no sample is ever rejected as cold-start');
         assert.notEqual(next.valueMs, prev.valueMs, 'EMA must update');
     });
+
+    test('a region with consistently high RTT leaves warming after one suppression', () => {
+        // Regression: the cold-start guard must fire AT MOST ONCE. A cold-start
+        // sample does NOT increment sampleCount, so a guard keyed only on
+        // sampleCount === 0 re-fired forever for any region whose real RTT is
+        // above the threshold (a far region, or every region on a slow link),
+        // leaving it 'warming' permanently. After the first suppression the
+        // second slow sample must be accepted as honest (high) RTT.
+        let prev = initialRttState();
+        const first = applyBurstSample(prev, 2000, 1700000000000);
+        assert.equal(first.coldStart, true, 'first slow sample is suppressed as container wake-up');
+        assert.equal(first.next.state, 'warming');
+
+        const second = applyBurstSample(first.next, 1800, 1700000005000);
+        assert.equal(second.coldStart, false,
+            'second slow sample must NOT be re-classified as cold-start — suppression fires once');
+        assert.equal(second.next.state, 'measuring',
+            'region leaves warming and shows its real (high) RTT instead of staying warming forever');
+        assert.equal(second.next.valueMs, 1800, 'the real RTT seeds the EMA');
+        assert.equal(second.next.sampleCount, 1);
+    });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
