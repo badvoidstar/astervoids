@@ -500,3 +500,65 @@ test('snap: without the flag a small reset would blend (regression guard)', () =
     assert.ok(Math.abs(r.sample(tReset) - displayedBeforeReset) < 1e-9,
         'no-snap path blends from the old pose (continuous handoff)');
 });
+
+// ── Ownership migration: clear dead-reckon state so local sim isn't re-pinned ─
+//
+// In deterministic mode repositionDeadReckonedRemotes() overwrites an object's
+// pose with its dead-reckoned (clamp-frozen) extrapolation EVERY render frame as
+// long as the object id is still present in DeadReckon.states. When ownership
+// migrates to us we begin simulating the object locally (asteroid.update steps
+// it by v·dt); if the stale dead-reckon state isn't dropped, the reposition pass
+// pins the object back to the frozen pose and it appears stationary until it is
+// destroyed (shooting it spawns split children with fresh ids — not in
+// DeadReckon.states — so they move, matching the observed symptom).
+
+// Minimal model of the migration handoff + per-frame reposition overwrite.
+function makeMigrationModel() {
+    const states = new Map();        // id -> { frozenX } (dead-reckon clamp)
+    const owned = new Set();
+    const objX = new Map();          // local simulated x
+    function observeRemote(id, frozenX, startX) {
+        states.set(id, { frozenX });
+        objX.set(id, startX);
+    }
+    // The bug: reposition pins any object still in `states` to its frozen pose.
+    function reposition() {
+        for (const [id] of objX) {
+            if (states.has(id)) objX.set(id, states.get(id).frozenX);
+        }
+    }
+    function simulateLocalOwned(dt, vx) {
+        for (const id of owned) objX.set(id, objX.get(id) + vx * dt);
+    }
+    // The fix: on migration to us, drop the dead-reckon state.
+    function migrateToUs(id, clearDeadReckon) {
+        owned.add(id);
+        if (clearDeadReckon) states.delete(id);
+    }
+    return { observeRemote, reposition, simulateLocalOwned, migrateToUs,
+             getX: (id) => objX.get(id) };
+}
+
+test('migration: without clearing dead-reckon state the owned object freezes', () => {
+    const m = makeMigrationModel();
+    m.observeRemote('a', /* frozenX */ 0.5, /* startX */ 0.5);
+    m.migrateToUs('a', /* clearDeadReckon */ false); // BUG path
+    // We now own it and simulate it forward, but reposition re-pins it.
+    for (let f = 0; f < 10; f++) {
+        m.simulateLocalOwned(1, 0.01);
+        m.reposition();
+    }
+    assert.equal(m.getX('a'), 0.5, 'stale dead-reckon state pins the object (frozen)');
+});
+
+test('migration: clearing dead-reckon state lets local simulation move the object', () => {
+    const m = makeMigrationModel();
+    m.observeRemote('a', /* frozenX */ 0.5, /* startX */ 0.5);
+    m.migrateToUs('a', /* clearDeadReckon */ true); // FIX path
+    for (let f = 0; f < 10; f++) {
+        m.simulateLocalOwned(1, 0.01);
+        m.reposition();
+    }
+    assert.ok(Math.abs(m.getX('a') - 0.6) < 1e-9,
+        'local simulation advances the object once it is no longer dead-reckoned');
+});
