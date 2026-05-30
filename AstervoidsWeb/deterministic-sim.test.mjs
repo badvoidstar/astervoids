@@ -273,20 +273,26 @@ test('reckon: a fresh authoritative packet snaps (resets recvPerf baseline)', ()
     assert.equal(snapped.y, 0.7);
 });
 
-// ── Dead-reckon baseline anchoring (the snap-back / "stuck bullet" fix) ──────
+// ── Dead-reckon baseline anchoring (arrival-anchored: render authoritative truth)
 //
-// A packet is already stale when it lands. DeadReckon.updateState anchors its
-// recvPerf at the instant the snapshot was AUTHORED by its owner (validAt,
-// mapped into the receiver's performance.now() domain via validAtToPerfNow),
-// NOT at arrival. With validAt-anchoring, getReckoned always projects straight
-// through to "now", so the displayed position is a function of render time
-// ALONE — independent of which packet is current and of that packet's transit
-// latency. This is what makes successive packets hand off continuously.
+// DeadReckon.updateState anchors recvPerf at ARRIVAL (performance.now() when the
+// packet's version change is applied), NOT at the owner's authoring instant.
+// getReckoned then projects forward only by the inter-packet gap (0..send
+// interval), so a replica renders the AUTHORITATIVE position the owner sent and
+// dead-reckons just enough to bridge to the next packet.
 //
-// Anchoring at arrival instead injects each packet's transit jitter directly
-// into the displayed position. Bullets emit an update every frame (high packet
-// rate), so that jitter is severe and per-packet: the replica lurches forward
-// then snaps back every frame — the "barely travels, stuck in a loop" bug.
+// The rejected alternative — anchoring at the authoring instant (validAt mapped
+// to perf-now) — projects every replica straight through to "now" (predicting
+// the owner's present pose). That makes a freshly-spawned object pop in already
+// advanced from its spawn point and keeps an expiring object travelling past
+// where the owner's copy died until the delete lands: the "spawn ahead" /
+// "over-travel" artifacts. Arrival-anchoring trades a constant ~latency lag for
+// rendering only authoritative truth, matching the deterministic design intent.
+//
+// Continuity across successive packets does NOT depend on the anchor: as long as
+// each new snapshot's base has advanced by the real elapsed motion, the handoff
+// is seamless. The earlier "stuck bullet" sawtooth was a frozen base (a wire
+// decode bug), not an anchoring problem.
 
 // Model the baseline choice: validAt-anchored uses the authoring perf time;
 // arrival-anchored uses the (latency-delayed) arrival perf time.
@@ -299,29 +305,35 @@ function reckonAt(authoredPerf, arrivalPerf, frame, anchor, renderPerf, stepMs, 
     return reckon(state, renderPerf, stepMs, 1000, () => 0, () => vyPerFrame).y;
 }
 
-test('reckon baseline: validAt-anchoring is latency-invariant (continuous handoff)', () => {
-    const stepMs = 1000 / 60;
-    const vy = -0.01; // moving "up" one unit-hundredth per frame
-    const T = 6 * stepMs; // a single render instant
-    // Two packets describing the SAME true motion, authored at different frames
-    // and arriving with DIFFERENT latencies (jitter). Under validAt-anchoring
-    // both must reckon to the identical displayed position at render time T —
-    // i.e. switching from one packet's extrapolation to the next is seamless.
-    const a = reckonAt(3 * stepMs, 3 * stepMs + 5, 3, 'validAt', T, stepMs, vy);
-    const b = reckonAt(5 * stepMs, 5 * stepMs + 40, 5, 'validAt', T, stepMs, vy);
-    assert.ok(Math.abs(a - b) < 1e-9, `expected continuous handoff, got ${a} vs ${b}`);
-    // And the displayed value depends only on render time: 0.5 + vy*(T/stepMs).
-    assert.ok(Math.abs(a - (0.5 + vy * (T / stepMs))) < 1e-9);
-});
-
-test('reckon baseline: arrival-anchoring injects per-packet latency jitter (regression guard)', () => {
+test('reckon baseline: arrival-anchoring renders the authoritative pose at arrival (no spawn-ahead)', () => {
     const stepMs = 1000 / 60;
     const vy = -0.01;
-    const T = 6 * stepMs;
-    // Same two packets, but anchored at arrival. The differing transit latencies
-    // (5ms vs 40ms) now show up as a discontinuity at the handoff — the visible
-    // forward/back lurch the fix removes.
-    const a = reckonAt(3 * stepMs, 3 * stepMs + 5, 3, 'arrival', T, stepMs, vy);
-    const b = reckonAt(5 * stepMs, 5 * stepMs + 40, 5, 'arrival', T, stepMs, vy);
-    assert.ok(Math.abs(a - b) > 1e-4, `arrival-anchoring should diverge under jitter, got ${a} vs ${b}`);
+    // A fresh packet authored at frame 3 lands at arrival; we render AT arrival.
+    // The displayed position must equal the authored base exactly — the replica
+    // appears where the owner sent it (e.g. a bullet at its muzzle), not ahead.
+    const arrival = 3 * stepMs + 40; // 40ms transit
+    const y = reckonAt(3 * stepMs, arrival, 3, 'arrival', arrival, stepMs, vy);
+    assert.ok(Math.abs(y - (0.5 + vy * 3)) < 1e-9, `expected authored base, got ${y}`);
+    // validAt-anchoring at the same instant would instead lead by the transit
+    // latency (40ms ≈ 2.4 frames) — the spawn-ahead the fix removes.
+    const lead = reckonAt(3 * stepMs, arrival, 3, 'validAt', arrival, stepMs, vy);
+    assert.ok(Math.abs(lead - y) > 1e-4, `validAt should lead the authoritative pose, got ${lead} vs ${y}`);
+});
+
+test('reckon baseline: arrival-anchoring hands off continuously when the base advances', () => {
+    const stepMs = 1000 / 60;
+    const vy = -0.01;
+    const latency = 40; // constant transit (the real fix is the advancing base)
+    // Packet 1 authored@frame3 arrives@(3*step+latency); packet 2 authored@frame6
+    // arrives@(6*step+latency). At a render instant just before packet 2 lands,
+    // packet 1 reckons to base1 + vy*(elapsed). When packet 2 lands its base has
+    // advanced by exactly vy*3 frames, so the displayed value is continuous.
+    const arrival1 = 3 * stepMs + latency;
+    const arrival2 = 6 * stepMs + latency;
+    const justBefore = arrival2 - 1e-6;
+    const before = reckonAt(3 * stepMs, arrival1, 3, 'arrival', justBefore, stepMs, vy);
+    const after = reckonAt(6 * stepMs, arrival2, 6, 'arrival', arrival2, stepMs, vy);
+    // The gap between the two displayed positions is sub-frame (no lurch/sawtooth)
+    // because base2 - base1 = vy*3 ≈ the motion over the (arrival2-arrival1) gap.
+    assert.ok(Math.abs(after - before) < Math.abs(vy) + 1e-9, `expected continuous handoff, got ${before} vs ${after}`);
 });
