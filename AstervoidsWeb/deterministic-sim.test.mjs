@@ -34,9 +34,7 @@ function interpNormalized(prev, curr, alpha) {
     let d = curr - prev;
     if (d > 0.5) d -= 1;
     else if (d < -0.5) d += 1;
-    let v = prev + d * alpha;
-    v -= Math.floor(v);
-    return v;
+    return prev + d * alpha;
 }
 function interpAngle(prev, curr, alpha) {
     let d = curr - prev;
@@ -140,13 +138,23 @@ test('interpNormalized: short way across wrap boundary 0.05 -> 0.95', () => {
     assert.ok(Math.abs(v - 0.025) < 1e-9, `got ${v}`);
 });
 
-test('interpNormalized: result always re-wrapped into [0,1)', () => {
+test('interpNormalized: stays wrap-continuous near edges without snapping inward', () => {
+    // The blended value may sit slightly outside [0,1) near a wrap (that is the
+    // whole point: an object glides just off one edge before the sim wraps it).
+    // It must never sweep the long way around, so it stays within a small band.
     for (let p = 0; p < 1; p += 0.13) {
         for (let c = 0; c < 1; c += 0.17) {
             const v = interpNormalized(p, c, 0.5);
-            assert.ok(v >= 0 && v < 1, `value ${v} out of range`);
+            assert.ok(v > -0.5 && v < 1.5, `value ${v} swept too far`);
         }
     }
+});
+
+test('interpNormalized: an object just past the right edge is NOT teleported left', () => {
+    // prev 0.99 -> curr 1.02 (still gliding off the right edge, no wrap). The
+    // interpolated value must remain just past 1.0, not be clamped back to ~0.
+    const v = interpNormalized(0.99, 1.02, 0.5);
+    assert.ok(v > 1.0 && v < 1.05, `expected just past right edge, got ${v}`);
 });
 
 test('interpAngle: shortest arc across -pi/pi seam', () => {
