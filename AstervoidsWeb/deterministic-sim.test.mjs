@@ -375,8 +375,8 @@ function makeReckoner(stepMs, tau, maxFrames = 30) {
         }
         return raw;
     }
-    function update(now, angle, rotationSpeed) {
-        const displayed = state ? sample(now) : null;
+    function update(now, angle, rotationSpeed, snap) {
+        const displayed = (!snap && state) ? sample(now) : null;
         state = { angle, rotationSpeed, recvPerf: now };
         if (displayed != null && tau > 0) {
             const fresh = reckonRaw(now);
@@ -456,4 +456,47 @@ test('smoothing: disabled (tau=0) snaps immediately', () => {
     r.update(2 * gap, trueStopAngle, 0);
     // With smoothing off, the replica is exactly the authoritative angle (snap).
     assert.equal(r.sample(2 * gap), trueStopAngle);
+});
+
+test('snap: intentional teleport (respawn) jumps instead of blending', () => {
+    const stepMs = 1000 / 60;
+    const tau = 90;
+    const omega = 0.05;
+    const gap = 8 * stepMs;
+    const r = makeReckoner(stepMs, tau);
+
+    // Steady rotation builds up extrapolation overshoot, just like before a stop.
+    r.update(0, 0, omega);
+    r.update(gap, omega * (gap / stepMs), omega);
+    const tReset = 2 * gap;
+    const displayedBeforeReset = r.sample(tReset);
+
+    // Respawn pose is discontinuous (e.g. angle reset to the spawn heading) and
+    // arrives WITH the snap flag set: no decaying offset is seeded, so the very
+    // first sample is the authoritative angle — no glide from the old pose.
+    const spawnAngle = -Math.PI / 2;
+    assert.ok(Math.abs(displayedBeforeReset - spawnAngle) > 0.1, 'precondition: poses differ');
+    r.update(tReset, spawnAngle, 0, /* snap */ true);
+    assert.equal(r.sample(tReset), spawnAngle,
+        'snap must place the replica exactly at the authoritative spawn pose');
+    // And it stays put (no residual offset decaying in over the next frames).
+    assert.equal(r.sample(tReset + 5 * stepMs), spawnAngle);
+});
+
+test('snap: without the flag a small reset would blend (regression guard)', () => {
+    const stepMs = 1000 / 60;
+    const tau = 90;
+    const omega = 0.05;
+    const gap = 8 * stepMs;
+    const r = makeReckoner(stepMs, tau);
+    r.update(0, 0, omega);
+    r.update(gap, omega * (gap / stepMs), omega);
+    const tReset = 2 * gap;
+    const displayedBeforeReset = r.sample(tReset);
+    const spawnAngle = -Math.PI / 2;
+    // Same reset WITHOUT snap: a decaying offset is seeded, so the first sample
+    // stays at the old displayed pose and eases over — the artifact snap fixes.
+    r.update(tReset, spawnAngle, 0, /* snap */ false);
+    assert.ok(Math.abs(r.sample(tReset) - displayedBeforeReset) < 1e-9,
+        'no-snap path blends from the old pose (continuous handoff)');
 });

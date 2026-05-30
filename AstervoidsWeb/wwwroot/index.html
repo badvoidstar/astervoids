@@ -1737,12 +1737,18 @@
         // thrust start/stop) the extrapolation and the new snapshot disagree;
         // that error is captured here and decayed smoothly by getReckoned rather
         // than snapped — this is what removes the rotation overshoot/rubberband.
-        updateState(id, data, baselinePerf) {
+        // `snap` forces an immediate, blend-free jump to the authoritative pose
+        // for INTENTIONAL discontinuities (e.g. ship death/respawn to the spawn
+        // point). The kinematic SNAP_DIST guard below only catches LARGE jumps;
+        // an intentional teleport can be small (dying near center), so the game
+        // layer signals it explicitly via this flag.
+        updateState(id, data, baselinePerf, snap) {
             const now = performance.now();
             // Where the replica is CURRENTLY displayed (old extrapolation plus
             // any in-flight correction), captured BEFORE installing the new
             // snapshot so we can blend out the difference rather than jump.
-            const displayed = this.states.has(id) ? this._reckonAt(id, now) : null;
+            // An explicit snap skips this so no decaying offset is seeded.
+            const displayed = (!snap && this.states.has(id)) ? this._reckonAt(id, now) : null;
             this.states.set(id, {
                 x: data.x,
                 y: data.y,
@@ -4956,9 +4962,17 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    // Intentional respawn teleport: the invulnerability counter
+                    // only ever decreases during play and jumps back up to its
+                    // max on Ship.reset(). A jump UP means death/respawn, so we
+                    // snap to the spawn pose instead of gliding the replica there.
+                    const existingShip = game.multiplayer.remoteShips.get(obj.id);
+                    const prevInvuln = existingShip ? existingShip.invulnerable : undefined;
+                    const isTeleport = typeof prevInvuln === 'number'
+                        && (obj.data.invulnerable || 0) > prevInvuln;
                     // Arrival-anchored: render authoritative truth, dead-reckon
                     // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.updateState(obj.id, obj.data, undefined, isTeleport);
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
