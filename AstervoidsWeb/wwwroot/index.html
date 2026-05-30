@@ -4732,7 +4732,15 @@
             remoteShips: new Map(),   // objectId -> Ship instance for remote players
             gameStateObjectId: null,  // ObjectSync ID for shared game state
             isAuthority: false,       // True if this client is the Server (authority)
-            processedPendingBullets: new Set()  // Track pendingHit bullets we've already processed
+            processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
+            // Object ids present in the session snapshot at the moment we joined.
+            // These are pre-existing/steady-state (or orphaned) objects that we may
+            // adopt — but they were authored before we joined and must NOT be
+            // spawn-projected forward (that projection is only valid for split
+            // children spawned during our own active membership). Without this,
+            // adopting an idle orphan (e.g. joining an emptied session we were
+            // spectating) jumps it forward by up to MAX_EXTRAPOLATION of velocity.
+            joinSnapshotObjectIds: new Set()
         },
         // Cosmetic astervoids for start screen (separate from game astervoids)
         cosmeticAstervoids: [],
@@ -5164,6 +5172,7 @@
                     // interpolator handles that automatically via snap[0]
                     // anchored at validAt on the unified axis.)
                     if (obj.validAt != null && !obj.spawnHandled
+                        && !game.multiplayer.joinSnapshotObjectIds.has(obj.id)
                         && RemoteObjects.isClockOffsetInitialized()) {
                         const stalenessSec = RemoteObjects.computeSpawnStaleness(
                             RemoteObjects.serverNowMs(), obj.validAt);
@@ -8694,6 +8703,10 @@
 
             const result = await SessionClient.joinSession(sessionId);
             if (result) {
+                // Record pre-existing object ids so we don't spawn-project
+                // adopted orphans (e.g. entering an emptied session).
+                game.multiplayer.joinSnapshotObjectIds = new Set(
+                    (result.session.objects || []).map(o => o.id));
                 // Enter lobby state (not playing yet)
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -8760,6 +8773,9 @@
                 seed: generateSessionSeed(),
             });
             if (result) {
+                // Newly created session: no pre-existing objects to guard.
+                game.multiplayer.joinSnapshotObjectIds = new Set(
+                    (result.session.objects || []).map(o => o.id));
                 // Enter lobby state as server
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -9133,6 +9149,10 @@
                     setPickerStatus(`Reconnecting... (joining session)`, 'error');
                     const result = await SessionClient.joinSession(sessionId, oldMemberId);
                     if (result) {
+                        // Record pre-existing object ids so re-adopted orphans
+                        // aren't spawn-projected on rejoin.
+                        game.multiplayer.joinSnapshotObjectIds = new Set(
+                            (result.session.objects || []).map(o => o.id));
                         _log('[Rejoin] Success! Session:', result.session.name,
                             'Role:', result.member.role, 'Objects:', result.session.objects?.length);
                         setPickerStatus('Reconnected!', 'connected');
