@@ -386,7 +386,7 @@ function makeReckoner(stepMs, tau, maxFrames = 30) {
             smooth = null;
         }
     }
-    return { update, sample };
+    return { update, sample, resting: () => (state ? state.angle : null) };
 }
 
 test('smoothing: rotation stop eases back to truth instead of snapping', () => {
@@ -561,4 +561,35 @@ test('migration: clearing dead-reckon state lets local simulation move the objec
     }
     assert.ok(Math.abs(m.getX('a') - 0.6) < 1e-9,
         'local simulation advances the object once it is no longer dead-reckoned');
+});
+
+// ── Game over: rest at the authoritative base, not the extrapolation ─────────
+//
+// repositionDeadReckonedRemotes() runs every render frame regardless of game
+// state. In game over the owner stops simulating/sending, so getReckoned() keeps
+// extrapolating the last snapshot forward to the clamp — and each member, having
+// observed the snapshot at a different instant, drifts ahead by a different
+// amount, so their resting poses disagree. getResting() returns the raw base
+// snapshot (frames=0), which is identical for every member.
+
+test('game over: extrapolation diverges across members but resting agrees', () => {
+    const stepMs = 1000 / 60;
+    const omega = 0.05;
+    // Two members receive the SAME authoritative snapshot (angle 1.0, spinning)
+    // but render it at different "now" offsets (different latency/timing).
+    const a = makeReckoner(stepMs, 90);
+    const b = makeReckoner(stepMs, 90);
+    a.update(0, 1.0, omega);
+    b.update(0, 1.0, omega);
+
+    // While still extrapolating, the two members disagree (drift apart).
+    const aExtrap = a.sample(10 * stepMs);
+    const bExtrap = b.sample(4 * stepMs);
+    assert.ok(Math.abs(aExtrap - bExtrap) > 1e-6,
+        'precondition: forward extrapolation diverges between members');
+
+    // At game over both rest at the base snapshot — identical, no drift.
+    assert.equal(a.resting(), 1.0);
+    assert.equal(b.resting(), 1.0);
+    assert.equal(a.resting(), b.resting());
 });

@@ -1835,6 +1835,26 @@
             return this._reckonAt(id, performance.now());
         },
 
+        // Authoritative RESTING pose: the latest snapshot with NO forward
+        // extrapolation and NO correction smoothing. Used when motion must stop
+        // and every session member must converge to the identical pose (game
+        // over). Extrapolating instead (getReckoned) would drift each member
+        // forward by a different, latency-dependent amount up to the
+        // DEADRECKON_MAX_FRAMES clamp, so resting positions would disagree.
+        getResting(id) {
+            const s = this.states.get(id);
+            if (!s) return null;
+            const out = {
+                x: s.x,
+                y: s.y,
+                velocityX: s.velocityX,
+                velocityY: s.velocityY,
+                rotationSpeed: s.rotationSpeed,
+            };
+            if (s.angle !== null) out.angle = s.angle;
+            return out;
+        },
+
         remove(id) { this.states.delete(id); this.lastVersions.delete(id); this.smooth.delete(id); },
         clear() { this.states.clear(); this.lastVersions.clear(); this.smooth.clear(); },
     };
@@ -7003,6 +7023,12 @@
     // displays). Locals are smoothed separately by render interpolation.
     function repositionDeadReckonedRemotes() {
         if (!isDeterministicMode() || !isSessionMode()) return;
+        // Game over: motion stops and every member must come to rest at the same
+        // authoritative pose. Use the un-extrapolated base snapshot instead of
+        // dead-reckoning forward (which would drift each member ahead by a
+        // latency-dependent amount up to the clamp, so they'd disagree).
+        const frozen = isGameOver();
+        const poseOf = (id) => frozen ? DeadReckon.getResting(id) : DeadReckon.getReckoned(id);
         // Safety net: an object we OWN must never be dead-reckoned — we simulate
         // it locally, and overwriting its pose from the (clamp-frozen) reckon
         // state would freeze it. The migration handler clears dead-reckon state
@@ -7019,21 +7045,21 @@
         for (const b of game.bullets) {
             if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
                 if (ownedByUs(b.syncObjectId)) { DeadReckon.remove(b.syncObjectId); continue; }
-                const r = DeadReckon.getReckoned(b.syncObjectId);
+                const r = poseOf(b.syncObjectId);
                 if (r) b.fromSyncData(r);
             }
         }
         for (const a of game.astervoids) {
             if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
                 if (ownedByUs(a.syncObjectId)) { DeadReckon.remove(a.syncObjectId); continue; }
-                const r = DeadReckon.getReckoned(a.syncObjectId);
+                const r = poseOf(a.syncObjectId);
                 if (r) a.fromSyncData(r);
             }
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
             if (DeadReckon.states.has(id)) {
                 if (ownedByUs(id)) { DeadReckon.remove(id); continue; }
-                const r = DeadReckon.getReckoned(id);
+                const r = poseOf(id);
                 if (r) ship.fromSyncData(r);
             }
         }
