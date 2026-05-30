@@ -1688,7 +1688,19 @@
         // re-seed the snapshot when the authoritative version actually changes.
         lastVersions: new Map(),
 
-        updateState(id, data) {
+        // `baselinePerf` is the performance.now()-domain instant the snapshot
+        // was AUTHORED by its owner (derived from the owner-stamped validAt via
+        // RemoteObjects.validAtToPerfNow), NOT the instant it arrived here. This
+        // is critical: a packet is already ~RTT/2 stale when it lands, so the
+        // position it carries describes where the owner WAS, not where it is
+        // now. Anchoring extrapolation at arrival (performance.now()) snaps the
+        // replica back by that staleness on every packet — for a fast bullet
+        // that backward snap can equal a whole send-interval of travel, leaving
+        // it visibly stuck (advance a frame, jump back, repeat). Anchoring at
+        // the authoring instant makes getReckoned project straight through to
+        // "now", so successive packets are continuous and only correct
+        // prediction error. Falls back to arrival time when no timing is known.
+        updateState(id, data, baselinePerf) {
             this.states.set(id, {
                 x: data.x,
                 y: data.y,
@@ -1696,7 +1708,9 @@
                 velocityX: data.velocityX || 0,
                 velocityY: data.velocityY || 0,
                 rotationSpeed: data.rotationSpeed || 0,
-                recvPerf: performance.now(),
+                recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
+                    ? baselinePerf
+                    : performance.now(),
             });
         },
 
@@ -4853,7 +4867,7 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
@@ -5045,7 +5059,7 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
@@ -5157,7 +5171,7 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {

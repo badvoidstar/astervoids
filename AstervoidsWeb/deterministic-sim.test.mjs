@@ -272,3 +272,56 @@ test('reckon: a fresh authoritative packet snaps (resets recvPerf baseline)', ()
     assert.equal(snapped.x, 0.42);
     assert.equal(snapped.y, 0.7);
 });
+
+// ── Dead-reckon baseline anchoring (the snap-back / "stuck bullet" fix) ──────
+//
+// A packet is already stale when it lands. DeadReckon.updateState anchors its
+// recvPerf at the instant the snapshot was AUTHORED by its owner (validAt,
+// mapped into the receiver's performance.now() domain via validAtToPerfNow),
+// NOT at arrival. With validAt-anchoring, getReckoned always projects straight
+// through to "now", so the displayed position is a function of render time
+// ALONE — independent of which packet is current and of that packet's transit
+// latency. This is what makes successive packets hand off continuously.
+//
+// Anchoring at arrival instead injects each packet's transit jitter directly
+// into the displayed position. Bullets emit an update every frame (high packet
+// rate), so that jitter is severe and per-packet: the replica lurches forward
+// then snaps back every frame — the "barely travels, stuck in a loop" bug.
+
+// Model the baseline choice: validAt-anchored uses the authoring perf time;
+// arrival-anchored uses the (latency-delayed) arrival perf time.
+function reckonAt(authoredPerf, arrivalPerf, frame, anchor, renderPerf, stepMs, vyPerFrame) {
+    const y0 = 0.5;
+    const yAuthored = y0 + vyPerFrame * frame; // owner pose at authoring instant
+    const recvPerf = anchor === 'validAt' ? authoredPerf : arrivalPerf;
+    const state = { x: 0, y: yAuthored, angle: null, velocityX: 0, velocityY: 1, rotationSpeed: 0, recvPerf };
+    // velToDeltaY is identity * vyPerFrame so each elapsed frame adds vyPerFrame.
+    return reckon(state, renderPerf, stepMs, 1000, () => 0, () => vyPerFrame).y;
+}
+
+test('reckon baseline: validAt-anchoring is latency-invariant (continuous handoff)', () => {
+    const stepMs = 1000 / 60;
+    const vy = -0.01; // moving "up" one unit-hundredth per frame
+    const T = 6 * stepMs; // a single render instant
+    // Two packets describing the SAME true motion, authored at different frames
+    // and arriving with DIFFERENT latencies (jitter). Under validAt-anchoring
+    // both must reckon to the identical displayed position at render time T —
+    // i.e. switching from one packet's extrapolation to the next is seamless.
+    const a = reckonAt(3 * stepMs, 3 * stepMs + 5, 3, 'validAt', T, stepMs, vy);
+    const b = reckonAt(5 * stepMs, 5 * stepMs + 40, 5, 'validAt', T, stepMs, vy);
+    assert.ok(Math.abs(a - b) < 1e-9, `expected continuous handoff, got ${a} vs ${b}`);
+    // And the displayed value depends only on render time: 0.5 + vy*(T/stepMs).
+    assert.ok(Math.abs(a - (0.5 + vy * (T / stepMs))) < 1e-9);
+});
+
+test('reckon baseline: arrival-anchoring injects per-packet latency jitter (regression guard)', () => {
+    const stepMs = 1000 / 60;
+    const vy = -0.01;
+    const T = 6 * stepMs;
+    // Same two packets, but anchored at arrival. The differing transit latencies
+    // (5ms vs 40ms) now show up as a discontinuity at the handoff — the visible
+    // forward/back lurch the fix removes.
+    const a = reckonAt(3 * stepMs, 3 * stepMs + 5, 3, 'arrival', T, stepMs, vy);
+    const b = reckonAt(5 * stepMs, 5 * stepMs + 40, 5, 'arrival', T, stepMs, vy);
+    assert.ok(Math.abs(a - b) > 1e-4, `arrival-anchoring should diverge under jitter, got ${a} vs ${b}`);
+});
