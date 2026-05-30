@@ -5199,6 +5199,40 @@
             } else {
                 bullet.fromSyncData(obj.data);
             }
+
+            // ── TEMP DIAGNOSTIC (remove after root-cause) ───────────────────
+            // Enable with: window.ASTERVOIDS_DEBUG = true; window.__BULLET_TRACE = true
+            // Captures the exact dead-reckon inputs/outputs for each remote
+            // bullet so we can see whether the authoritative base is advancing,
+            // whether velocity survives on the wire, and whether the clock is
+            // initialized. Throttled to ~50 samples per bullet.
+            if (window.ASTERVOIDS_DEBUG && window.__BULLET_TRACE && isDeterministicMode()) {
+                window.__bulletTrace = window.__bulletTrace || new Map();
+                let rec = window.__bulletTrace.get(obj.id);
+                if (!rec) { rec = { n: 0, t0: performance.now() }; window.__bulletTrace.set(obj.id, rec); }
+                if (rec.n < 50) {
+                    const s = DeadReckon.states.get(obj.id);
+                    const now = performance.now();
+                    const stepMs = 1000 / CONFIG.TARGET_FPS;
+                    const frames = s ? (now - s.recvPerf) / stepMs : null;
+                    console.log('[BTRACE]',
+                        'id=' + String(obj.id).slice(-4),
+                        'n=' + rec.n,
+                        't=' + (now - rec.t0).toFixed(0),
+                        'ver=' + obj.version,
+                        'baseX=' + obj.data.x?.toFixed(5),
+                        'baseY=' + obj.data.y?.toFixed(5),
+                        'vx=' + obj.data.velocityX,
+                        'vy=' + obj.data.velocityY,
+                        'validAt=' + obj.validAt,
+                        'recvPerf=' + (s ? s.recvPerf.toFixed(1) : 'none'),
+                        'frames=' + (frames != null ? frames.toFixed(2) : 'none'),
+                        'rckX=' + interpolated?.x?.toFixed(5),
+                        'rckY=' + interpolated?.y?.toFixed(5),
+                        'clkInit=' + RemoteObjects.isClockOffsetInitialized());
+                    rec.n++;
+                }
+            }
         }
         
         // Remove remote bullets that no longer exist in sync
