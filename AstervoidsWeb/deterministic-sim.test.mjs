@@ -337,3 +337,123 @@ test('reckon baseline: arrival-anchoring hands off continuously when the base ad
     // because base2 - base1 = vy*3 ≈ the motion over the (arrival2-arrival1) gap.
     assert.ok(Math.abs(after - before) < Math.abs(vy) + 1e-9, `expected continuous handoff, got ${before} vs ${after}`);
 });
+
+// ── Correction-decay smoothing (projective velocity blending) ───────────────
+//
+// getReckoned extrapolates angle as base + rotationSpeed*frames. When the owner
+// STOPS rotating, the replica has already projected past the true angle by up to
+// rotationSpeed*sendGap (the gap — and thus the overshoot — grows with latency).
+// Without smoothing the stop packet snaps the replica back: visible rubberband.
+// DeadReckon instead seeds a decaying angular offset = (displayed − fresh) on
+// each new snapshot and bleeds it out over DEADRECKON_SMOOTH_MS, so the replica
+// eases back to truth. In steady rotation the extrapolation already agrees with
+// the next snapshot, so the offset is ~0 and adds no lag.
+
+function shortestAngleDelta(target, current) {
+    const d = target - current;
+    return Math.atan2(Math.sin(d), Math.cos(d));
+}
+
+// Minimal mirror of DeadReckon's angular path with correction smoothing.
+function makeReckoner(stepMs, tau, maxFrames = 30) {
+    let state = null;        // { angle, rotationSpeed, recvPerf }
+    let smooth = null;       // { da, t0 }
+    function reckonRaw(now) {
+        if (!state) return null;
+        let frames = stepMs > 0 ? (now - state.recvPerf) / stepMs : 0;
+        if (!(frames > 0)) frames = 0;
+        if (frames > maxFrames) frames = maxFrames;
+        return state.angle + state.rotationSpeed * frames;
+    }
+    function sample(now) {
+        const raw = reckonRaw(now);
+        if (raw == null) return null;
+        if (smooth) {
+            const k = tau > 0 ? Math.exp(-(now - smooth.t0) / tau) : 0;
+            if (k <= 1e-3) smooth = null;
+            else return raw + smooth.da * k;
+        }
+        return raw;
+    }
+    function update(now, angle, rotationSpeed) {
+        const displayed = state ? sample(now) : null;
+        state = { angle, rotationSpeed, recvPerf: now };
+        if (displayed != null && tau > 0) {
+            const fresh = reckonRaw(now);
+            const da = shortestAngleDelta(displayed, fresh);
+            smooth = (da !== 0) ? { da, t0: now } : null;
+        } else {
+            smooth = null;
+        }
+    }
+    return { update, sample };
+}
+
+test('smoothing: rotation stop eases back to truth instead of snapping', () => {
+    const stepMs = 1000 / 60;
+    const tau = 90;
+    const omega = 0.05;       // rad per frame while rotating
+    const gap = 8 * stepMs;   // high-latency send gap → big pre-stop overshoot
+    const r = makeReckoner(stepMs, tau);
+
+    // Steady rotation: two snapshots whose bases advance by exactly omega*gap.
+    r.update(0, 0, omega);
+    r.update(gap, omega * (gap / stepMs), omega);
+    // Just before the stop packet, the replica has extrapolated forward assuming
+    // rotation continued (base 0.4 at t=gap, +omega per frame).
+    const tStop = 2 * gap;
+    const displayedBeforeStop = r.sample(tStop); // = 0.4 + omega*8 = 0.8 (overshoot)
+    // The owner actually stopped EARLIER than the replica predicted: it rotated a
+    // little past 0.4 and halted at 0.5, so the extrapolation overshot by 0.3.
+    const trueStopAngle = 0.5;
+
+    // Stop packet: rotationSpeed → 0, base = true stop angle.
+    r.update(tStop, trueStopAngle, 0);
+    const atStop = r.sample(tStop);
+    // No snap: the displayed value at the stop instant equals where the replica
+    // already was (continuous), NOT the raw authoritative angle.
+    assert.ok(Math.abs(atStop - displayedBeforeStop) < 1e-9,
+        `expected continuous handoff at stop, got ${atStop} vs ${displayedBeforeStop}`);
+    assert.ok(atStop > trueStopAngle, 'replica starts beyond the true stop angle (the overshoot)');
+
+    // Over the next frames it decays monotonically toward truth, never past it.
+    let prev = atStop;
+    for (let f = 1; f <= 30; f++) {
+        const v = r.sample(tStop + f * stepMs);
+        assert.ok(v <= prev + 1e-12, `must not move further from truth at frame ${f}`);
+        assert.ok(v >= trueStopAngle - 1e-9, `must not undershoot past truth at frame ${f}`);
+        prev = v;
+    }
+    // Settled within a few tau.
+    assert.ok(Math.abs(r.sample(tStop + 6 * tau) - trueStopAngle) < 1e-3, 'settles at the true angle');
+});
+
+test('smoothing: steady rotation adds no offset (no lag)', () => {
+    const stepMs = 1000 / 60;
+    const omega = 0.05;
+    const gap = 4 * stepMs;
+    const r = makeReckoner(stepMs, 90);
+    r.update(0, 0, omega);
+    // Each subsequent snapshot's base advanced by exactly omega*(gap/stepMs):
+    // the extrapolation already predicted it, so the seeded offset is ~0 and the
+    // sampled angle equals the pure extrapolation (latency-bounded, no rubberband).
+    for (let i = 1; i <= 5; i++) {
+        const base = omega * (gap / stepMs) * i;
+        r.update(i * gap, base, omega);
+        const sampled = r.sample(i * gap);
+        assert.ok(Math.abs(sampled - base) < 1e-9, `steady-state offset should be ~0 at packet ${i}`);
+    }
+});
+
+test('smoothing: disabled (tau=0) snaps immediately', () => {
+    const stepMs = 1000 / 60;
+    const omega = 0.05;
+    const gap = 8 * stepMs;
+    const r = makeReckoner(stepMs, 0); // disabled
+    r.update(0, 0, omega);
+    r.update(gap, omega * (gap / stepMs), omega);
+    const trueStopAngle = omega * (gap / stepMs) * 1.5;
+    r.update(2 * gap, trueStopAngle, 0);
+    // With smoothing off, the replica is exactly the authoritative angle (snap).
+    assert.equal(r.sample(2 * gap), trueStopAngle);
+});

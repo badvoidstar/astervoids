@@ -1161,6 +1161,19 @@
         // past its last authoritative packet before holding position. Bounds
         // divergence on packet loss; the next authoritative packet snaps it.
         DEADRECKON_MAX_FRAMES: 30,
+        // Deterministic mode only: projective-velocity-blending time constant
+        // (ms) for absorbing extrapolation error. When a new authoritative
+        // packet disagrees with the replica's current extrapolation — e.g. the
+        // owner STOPS rotating and the replica had projected past the true
+        // angle — the difference is decayed to zero over ~this window instead of
+        // snapping. Kills the rotation overshoot/rubberband at motion start/stop
+        // (exaggerated at high latency, where the larger send gap produces a
+        // larger pre-correction overshoot). ~0 in steady state, so it adds no
+        // lag to smooth motion. Set 0 to disable (hard snap).
+        DEADRECKON_SMOOTH_MS: 90,
+        // Normalized positional correction beyond which we SNAP instead of
+        // sweeping (wrap-seam crossing or respawn teleport guard).
+        DEADRECKON_SNAP_DIST: 0.2,
         
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1687,6 +1700,12 @@
         // Parallel version gate (mirrors RemoteObjects.lastVersions) so we only
         // re-seed the snapshot when the authoritative version actually changes.
         lastVersions: new Map(),
+        // Per-id visual error being decayed to zero (projective velocity
+        // blending). Seeded whenever a new snapshot disagrees with the replica's
+        // current on-screen extrapolation, and bled out over
+        // CONFIG.DEADRECKON_SMOOTH_MS so corrections ease in instead of snapping.
+        // Shape: { dx, dy, da, t0 } (da = signed shortest angular error).
+        smooth: new Map(),
 
         // `baselinePerf` is the performance.now()-domain instant this snapshot
         // becomes the integration baseline. Callers anchor at ARRIVAL (omit the
@@ -1711,7 +1730,19 @@
         // motion (which it does once the wire delivers an advancing base), the
         // handoff is seamless. The earlier "stuck bullet" sawtooth was a frozen
         // base (a wire-decode bug), not an anchoring problem.
+        //
+        // Steady-state extrapolation is exact for constant velocity/rotation, so
+        // each new snapshot agrees with the current extrapolation and seeds a
+        // ~zero correction (no added lag). At a motion DISCONTINUITY (rotation or
+        // thrust start/stop) the extrapolation and the new snapshot disagree;
+        // that error is captured here and decayed smoothly by getReckoned rather
+        // than snapped — this is what removes the rotation overshoot/rubberband.
         updateState(id, data, baselinePerf) {
+            const now = performance.now();
+            // Where the replica is CURRENTLY displayed (old extrapolation plus
+            // any in-flight correction), captured BEFORE installing the new
+            // snapshot so we can blend out the difference rather than jump.
+            const displayed = this.states.has(id) ? this._reckonAt(id, now) : null;
             this.states.set(id, {
                 x: data.x,
                 y: data.y,
@@ -1721,17 +1752,38 @@
                 rotationSpeed: data.rotationSpeed || 0,
                 recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
                     ? baselinePerf
-                    : performance.now(),
+                    : now,
             });
+            const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+            if (displayed && tau > 0) {
+                const fresh = this._reckonRaw(id, now);
+                if (fresh) {
+                    let dx = displayed.x - fresh.x;
+                    let dy = displayed.y - fresh.y;
+                    let da = (displayed.angle != null && fresh.angle != null)
+                        ? shortestAngleDelta(displayed.angle, fresh.angle)
+                        : 0;
+                    // Wrap-seam / respawn guard: a big positional jump means the
+                    // object crossed the normalized wrap boundary or teleported —
+                    // snap there instead of sweeping the replica across the field.
+                    const snapDist = CONFIG.DEADRECKON_SNAP_DIST;
+                    if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) { dx = 0; dy = 0; }
+                    if (dx !== 0 || dy !== 0 || da !== 0) {
+                        this.smooth.set(id, { dx, dy, da, t0: now });
+                        return;
+                    }
+                }
+            }
+            this.smooth.delete(id);
         },
 
-        // Return a sync-data-shaped object posed at the dead-reckoned transform,
-        // or null when no authoritative state has been seen yet.
-        getReckoned(id) {
+        // Raw constant-velocity/rotation extrapolation of `id` at perf instant
+        // `nowPerf`, with NO correction smoothing applied.
+        _reckonRaw(id, nowPerf) {
             const s = this.states.get(id);
             if (!s) return null;
             const stepMs = 1000 / CONFIG.TARGET_FPS;
-            let frames = stepMs > 0 ? (performance.now() - s.recvPerf) / stepMs : 0;
+            let frames = stepMs > 0 ? (nowPerf - s.recvPerf) / stepMs : 0;
             if (!(frames > 0)) frames = 0;
             if (frames > CONFIG.DEADRECKON_MAX_FRAMES) frames = CONFIG.DEADRECKON_MAX_FRAMES;
             const out = {
@@ -1751,8 +1803,34 @@
             return out;
         },
 
-        remove(id) { this.states.delete(id); this.lastVersions.delete(id); },
-        clear() { this.states.clear(); this.lastVersions.clear(); },
+        // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
+        _reckonAt(id, nowPerf) {
+            const out = this._reckonRaw(id, nowPerf);
+            if (!out) return null;
+            const e = this.smooth.get(id);
+            if (e) {
+                const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+                const k = tau > 0 ? Math.exp(-(nowPerf - e.t0) / tau) : 0;
+                if (k <= 1e-3) {
+                    this.smooth.delete(id);
+                } else {
+                    out.x += e.dx * k;
+                    out.y += e.dy * k;
+                    if (out.angle !== undefined) out.angle += e.da * k;
+                }
+            }
+            return out;
+        },
+
+        // Return a sync-data-shaped object posed at the dead-reckoned transform
+        // (with correction smoothing), or null when no authoritative state has
+        // been seen yet.
+        getReckoned(id) {
+            return this._reckonAt(id, performance.now());
+        },
+
+        remove(id) { this.states.delete(id); this.lastVersions.delete(id); this.smooth.delete(id); },
+        clear() { this.states.clear(); this.lastVersions.clear(); this.smooth.clear(); },
     };
 
     // ============================================
