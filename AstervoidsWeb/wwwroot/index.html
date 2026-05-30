@@ -1688,18 +1688,29 @@
         // re-seed the snapshot when the authoritative version actually changes.
         lastVersions: new Map(),
 
-        // `baselinePerf` is the performance.now()-domain instant the snapshot
-        // was AUTHORED by its owner (derived from the owner-stamped validAt via
-        // RemoteObjects.validAtToPerfNow), NOT the instant it arrived here. This
-        // is critical: a packet is already ~RTT/2 stale when it lands, so the
-        // position it carries describes where the owner WAS, not where it is
-        // now. Anchoring extrapolation at arrival (performance.now()) snaps the
-        // replica back by that staleness on every packet — for a fast bullet
-        // that backward snap can equal a whole send-interval of travel, leaving
-        // it visibly stuck (advance a frame, jump back, repeat). Anchoring at
-        // the authoring instant makes getReckoned project straight through to
-        // "now", so successive packets are continuous and only correct
-        // prediction error. Falls back to arrival time when no timing is known.
+        // `baselinePerf` is the performance.now()-domain instant this snapshot
+        // becomes the integration baseline. Callers anchor at ARRIVAL (omit the
+        // argument → defaults to performance.now()): getReckoned then projects
+        // forward only by the inter-packet gap (0..send-interval), so the
+        // replica renders the AUTHORITATIVE position the owner actually sent and
+        // dead-reckons just far enough to bridge to the next packet.
+        //
+        // We deliberately do NOT anchor at the owner's authoring instant
+        // (validAt mapped via validAtToPerfNow). Authoring-anchoring projects
+        // every replica straight through to "now" — i.e. predicts the owner's
+        // present pose — which makes a freshly-spawned object pop in already
+        // advanced from its spawn point and keeps an expiring object travelling
+        // past where the owner's copy died until the delete packet lands
+        // (visible "spawn ahead" / "over-travel"). Arrival-anchoring trades a
+        // constant ~latency positional lag for rendering only authoritative
+        // truth, matching the deterministic design intent (no extrapolation
+        // beyond short gap-bridging; correct on the next packet).
+        //
+        // Continuity across successive packets does NOT depend on the anchor:
+        // as long as each new snapshot's base has advanced by the real elapsed
+        // motion (which it does once the wire delivers an advancing base), the
+        // handoff is seamless. The earlier "stuck bullet" sawtooth was a frozen
+        // base (a wire-decode bug), not an anchoring problem.
         updateState(id, data, baselinePerf) {
             this.states.set(id, {
                 x: data.x,
@@ -4867,7 +4878,9 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data);
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
@@ -5059,7 +5072,9 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data);
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
@@ -5171,7 +5186,9 @@
             // Deterministic mode uses dead reckoning; legacy uses interpolation.
             if (isDeterministicMode()) {
                 if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
-                    DeadReckon.updateState(obj.id, obj.data, RemoteObjects.validAtToPerfNow(obj.validAt));
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data);
                     DeadReckon.lastVersions.set(obj.id, obj.version);
                 }
             } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
