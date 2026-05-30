@@ -6784,13 +6784,19 @@
 
     // Interpolate a normalized [0,1) coordinate, taking the short way around the
     // toroidal playfield so a wrap from ~1→~0 doesn't sweep across the screen.
+    // Wrap-aware linear interpolation between two normalized coordinates.
+    // Positions live in [-margin, 1+margin] (objects glide just off one edge
+    // before wrapping), so we must NOT clamp the result into [0,1): doing so
+    // teleports an object sitting just past an edge back across the screen.
+    // We only correct for the case where the sim wrapped between prev and curr
+    // (a jump > 0.5) so the blend follows the short toroidal path instead of
+    // sweeping the whole axis. The slightly-out-of-range result renders
+    // correctly (drawn just off the edge) and the next step snaps it.
     function interpNormalized(prev, curr, alpha) {
         let d = curr - prev;
         if (d > 0.5) d -= 1;
         else if (d < -0.5) d += 1;
-        let v = prev + d * alpha;
-        v -= Math.floor(v); // re-wrap into [0,1)
-        return v;
+        return prev + d * alpha;
     }
 
     // Shortest-arc angular interpolation.
