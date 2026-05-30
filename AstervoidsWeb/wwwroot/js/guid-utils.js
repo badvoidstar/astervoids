@@ -53,6 +53,17 @@ const GuidUtils = (function() {
 
         // Recurse into arrays
         if (Array.isArray(value)) {
+            // SyncPayload envelope: [schemaId:number, data:byte[]]. The data slot
+            // is an opaque payload that may legitimately be exactly 16 bytes long
+            // (e.g. a positional schema or a small delta dict that encodes to 16
+            // bytes). Treating it as a .NET binary Guid here would corrupt it
+            // before SyncPayload.unwrap gets a chance to decode it. Leave such
+            // envelopes untouched so the downstream unwrap sees the real bytes.
+            // (Member-sequence pairs are [guidBytes, long] = [Uint8Array, number],
+            // which do NOT match this shape, so their Guid is still converted.)
+            if (value.length === 2 && typeof value[0] === 'number' && value[1] instanceof Uint8Array) {
+                return value;
+            }
             for (let i = 0; i < value.length; i++) {
                 value[i] = transformBinaryGuids(value[i]);
             }
