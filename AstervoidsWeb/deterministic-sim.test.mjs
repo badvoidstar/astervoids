@@ -30,10 +30,10 @@ function makeSeededRandom(seed) {
 }
 
 // ── Render interpolation (mirrors interpNormalized / interpAngle) ───────────
-function interpNormalized(prev, curr, alpha) {
+function interpNormalized(prev, curr, alpha, range = 1) {
     let d = curr - prev;
-    if (d > 0.5) d -= 1;
-    else if (d < -0.5) d += 1;
+    if (d > 0.5) d -= range;
+    else if (d < -0.5) d += range;
     return prev + d * alpha;
 }
 function interpAngle(prev, curr, alpha) {
@@ -155,6 +155,31 @@ test('interpNormalized: an object just past the right edge is NOT teleported lef
     // interpolated value must remain just past 1.0, not be clamped back to ~0.
     const v = interpNormalized(0.99, 1.02, 0.5);
     assert.ok(v > 1.0 && v < 1.05, `expected just past right edge, got ${v}`);
+});
+
+test('interpNormalized: across a wrap, motion stays forward (no one-frame backward hitch)', () => {
+    // margin 0.02 -> wrap span range = 1.04. Object at 1.02 moving +0.03 wraps
+    // to 0.01. Interpolating with range=1.04 must carry it FORWARD past 1.02
+    // (toward 1.05/off-edge), never backward to ~1.01.
+    const range = 1.04;
+    const vMid = interpNormalized(1.02, 0.01, 0.5, range);
+    assert.ok(vMid > 1.02, `expected forward motion past 1.02, got ${vMid}`);
+    // Monotonic forward across the whole alpha sweep.
+    let last = 1.02;
+    for (let a = 0; a <= 1.0001; a += 0.1) {
+        const v = interpNormalized(1.02, 0.01, a, range);
+        assert.ok(v >= last - 1e-9, `non-monotonic at alpha ${a}: ${v} < ${last}`);
+        last = v;
+    }
+});
+
+test('interpNormalized: bare range=1 leaves a backward error at the seam (regression guard)', () => {
+    // Demonstrates why the range argument matters: with range=1 the same wrap
+    // drifts backward (1.02 -> 1.01), which is the one-frame hitch we fixed.
+    const vBad = interpNormalized(1.02, 0.01, 0.5, 1);
+    assert.ok(vBad < 1.02, 'sanity: range=1 regresses (backward)');
+    const vGood = interpNormalized(1.02, 0.01, 0.5, 1.04);
+    assert.ok(vGood > 1.02, 'range=1.04 corrects it (forward)');
 });
 
 test('interpAngle: shortest arc across -pi/pi seam', () => {
