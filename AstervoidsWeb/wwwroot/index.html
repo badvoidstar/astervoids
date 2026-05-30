@@ -1154,8 +1154,8 @@
         // interpolation/extrapolation) or 'deterministic' (owner-authoritative
         // fixed-timestep sim; remotes apply authoritative state + dead reckoning).
         // Locked into session metadata at create time so every member of a
-        // session runs the same mode. URL/env override: ?cfg.SIM_MODE=deterministic
-        SIM_MODE: 'legacy',
+        // session runs the same mode. URL/env override: ?cfg.SIM_MODE=legacy
+        SIM_MODE: 'deterministic',
         // Deterministic mode only: maximum number of 60fps-equivalent frames a
         // remote replica may dead-reckon (extrapolate by constant velocity)
         // past its last authoritative packet before holding position. Bounds
