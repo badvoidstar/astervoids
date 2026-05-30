@@ -6849,6 +6849,13 @@
         const saved = [];
         for (const o of objs) {
             if (typeof o._prevX !== 'number' || typeof o._prevY !== 'number') continue;
+            // Skip dead-reckoned remote objects: they are already positioned
+            // smoothly to "now" by DeadReckon.getReckoned every frame. Blending
+            // them between fixed-step snapshots double-smooths (adds lag) and,
+            // at a wrap seam, pulls them backward — visible as a remote bullet
+            // that fails to travel its full path. Render interpolation is only
+            // for objects THIS client simulates in discrete fixed steps.
+            if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) continue;
             saved.push([o, o.x, o.y, o.angle]);
             const r = wrapRadiusFor(o);
             o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
@@ -6861,6 +6868,35 @@
             drawFn();
         } finally {
             for (const [o, x, y, a] of saved) { o.x = x; o.y = y; o.angle = a; }
+        }
+    }
+
+    // Reposition every dead-reckoned remote object (ships, asteroids, bullets)
+    // from its DeadReckon state at the current instant. Dead reckoning is
+    // continuous (extrapolates to performance.now()), so calling this once per
+    // RENDER frame gives remotes smooth motion at the display refresh rate,
+    // independent of the fixed 60 Hz sim cadence. Without it, remotes would
+    // only move on frames where a sim step runs (visible stutter on >60 Hz
+    // displays). Locals are smoothed separately by render interpolation.
+    function repositionDeadReckonedRemotes() {
+        if (!isDeterministicMode() || !isSessionMode()) return;
+        for (const b of game.bullets) {
+            if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
+                const r = DeadReckon.getReckoned(b.syncObjectId);
+                if (r) b.fromSyncData(r);
+            }
+        }
+        for (const a of game.astervoids) {
+            if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
+                const r = DeadReckon.getReckoned(a.syncObjectId);
+                if (r) a.fromSyncData(r);
+            }
+        }
+        for (const [id, ship] of game.multiplayer.remoteShips) {
+            if (DeadReckon.states.has(id)) {
+                const r = DeadReckon.getReckoned(id);
+                if (r) ship.fromSyncData(r);
+            }
         }
     }
 
@@ -7095,6 +7131,11 @@
      *   legacy mode it is always 1 (draw current state directly).
      */
     function renderScene(alpha) {
+        // Refresh dead-reckoned remotes to the current instant every render
+        // frame so they move smoothly at the display rate (the fixed-step sim
+        // only refreshes them at 60 Hz). No-op in legacy / solo.
+        repositionDeadReckonedRemotes();
+
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
