@@ -1149,6 +1149,18 @@
     const CONFIG = {
         // Timing settings
         TARGET_FPS: 60,             // Target frame rate for physics
+
+        // Simulation mode: 'legacy' (asymmetric per-object sim with network
+        // interpolation/extrapolation) or 'deterministic' (owner-authoritative
+        // fixed-timestep sim; remotes apply authoritative state + dead reckoning).
+        // Locked into session metadata at create time so every member of a
+        // session runs the same mode. URL/env override: ?cfg.SIM_MODE=deterministic
+        SIM_MODE: 'legacy',
+        // Deterministic mode only: maximum number of 60fps-equivalent frames a
+        // remote replica may dead-reckon (extrapolate by constant velocity)
+        // past its last authoritative packet before holding position. Bounds
+        // divergence on packet loss; the next authoritative packet snaps it.
+        DEADRECKON_MAX_FRAMES: 30,
         
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1495,6 +1507,7 @@
 
     const SESSION_CONFIG_KEYS = [
         'FRACTURE_ENABLED',
+        'SIM_MODE',
     ];
 
     function snapshotConfigValues(config, keys) {
@@ -1573,7 +1586,149 @@
     function adoptSessionConfig(metadata, config = CONFIG) {
         restoreLocalConfigBaseline(config);
         applySessionConfigMetadata(metadata, config);
+        adoptSessionSim(metadata);
     }
+
+    // ── Deterministic simulation mode ───────────────────────────────────────
+    // The simulation mode and its RNG seed are locked at session creation and
+    // carried in opaque session metadata (alongside `config` and `schemas`).
+    // All members of a session therefore run the same mode against the same
+    // seed. In solo play they derive from local CONFIG. This lives entirely in
+    // the game layer; the sync layer and backend never inspect it.
+    const SIM_MODES = Object.freeze({
+        LEGACY: 'legacy',
+        DETERMINISTIC: 'deterministic',
+    });
+    const VALID_SIM_MODES = new Set(Object.values(SIM_MODES));
+
+    function normalizeSimMode(raw) {
+        if (typeof raw === 'string') {
+            const normalized = raw.toLowerCase();
+            if (VALID_SIM_MODES.has(normalized)) return normalized;
+        }
+        return SIM_MODES.LEGACY;
+    }
+
+    // Generate a 32-bit unsigned seed for a new session. Create-path only, so
+    // crypto (when available) or Math.random is fine — gameplay never calls this.
+    function generateSessionSeed() {
+        if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+            const buf = new Uint32Array(1);
+            window.crypto.getRandomValues(buf);
+            return buf[0] >>> 0;
+        }
+        return (Math.floor(Math.random() * 0x100000000)) >>> 0;
+    }
+
+    // Active simulation runtime. In a session these are adopted from the
+    // session's locked metadata; in solo play from local CONFIG.
+    const simRuntime = {
+        mode: SIM_MODES.LEGACY,
+        seed: 0,
+    };
+
+    function isDeterministicMode() {
+        return simRuntime.mode === SIM_MODES.DETERMINISTIC;
+    }
+
+    // Adopt the simulation mode + seed from session metadata (joiner / creator
+    // echo). Mode comes from the round-tripped config knob; seed is a dedicated
+    // top-level metadata field stamped at create.
+    function adoptSessionSim(metadata) {
+        const cfg = metadata && typeof metadata === 'object' ? metadata.config : undefined;
+        const rawMode = cfg && typeof cfg === 'object' ? cfg.SIM_MODE : CONFIG.SIM_MODE;
+        simRuntime.mode = normalizeSimMode(rawMode);
+        const rawSeed = metadata && typeof metadata === 'object' ? metadata.seed : undefined;
+        simRuntime.seed = Number.isFinite(rawSeed) ? (rawSeed >>> 0) : 0;
+        simRng.reseed(simRuntime.seed);
+    }
+
+    // Adopt the simulation mode + seed for solo (non-session) play from local
+    // CONFIG, generating a fresh seed each solo session.
+    function adoptSoloSim() {
+        simRuntime.mode = normalizeSimMode(CONFIG.SIM_MODE);
+        simRuntime.seed = generateSessionSeed();
+        simRng.reseed(simRuntime.seed);
+    }
+
+    // Deterministic gameplay RNG, seeded from the session/solo seed. Consumed
+    // ONLY on the authoritative path (the client that owns a spawn/fracture) so
+    // that remotes — which receive explicit results over the wire and never
+    // re-derive them — do not draw from and thus desynchronize this stream.
+    // In legacy mode the simRandom* helpers fall through to Math.random.
+    const simRng = {
+        _next: makeSeededRandom(1),
+        reseed(seed) { this._next = makeSeededRandom((seed >>> 0) || 1); },
+        next() { return this._next(); },
+        range(min, max) { return this._next() * (max - min) + min; },
+        nextSeed() { return (this._next() * 0x100000000) >>> 0; },
+    };
+
+    // Mode-aware randomness: deterministic stream in deterministic mode,
+    // Math.random in legacy mode. Use these on gameplay-state-affecting paths
+    // that run on the authoritative client.
+    function simRandom() {
+        return isDeterministicMode() ? simRng.next() : Math.random();
+    }
+    function simRandomRange(min, max) {
+        return isDeterministicMode() ? simRng.range(min, max) : randomRange(min, max);
+    }
+
+    // ── Dead-reckoning replica (deterministic mode only) ────────────────────
+    // Replaces the legacy snapshot interpolation/extrapolation for remote
+    // objects. Stores only the latest authoritative kinematic state per object
+    // and advances it by constant velocity/rotation to cover the round-trip
+    // time until the next authoritative packet, which snaps it. Bounded by
+    // CONFIG.DEADRECKON_MAX_FRAMES so packet loss can't fling a replica away.
+    // No hermite, no adaptive delay — accuracy comes from the owner being the
+    // single source of truth plus short, deterministic forward integration.
+    const DeadReckon = {
+        states: new Map(),
+        // Parallel version gate (mirrors RemoteObjects.lastVersions) so we only
+        // re-seed the snapshot when the authoritative version actually changes.
+        lastVersions: new Map(),
+
+        updateState(id, data) {
+            this.states.set(id, {
+                x: data.x,
+                y: data.y,
+                angle: (data.angle !== undefined ? data.angle : null),
+                velocityX: data.velocityX || 0,
+                velocityY: data.velocityY || 0,
+                rotationSpeed: data.rotationSpeed || 0,
+                recvPerf: performance.now(),
+            });
+        },
+
+        // Return a sync-data-shaped object posed at the dead-reckoned transform,
+        // or null when no authoritative state has been seen yet.
+        getReckoned(id) {
+            const s = this.states.get(id);
+            if (!s) return null;
+            const stepMs = 1000 / CONFIG.TARGET_FPS;
+            let frames = stepMs > 0 ? (performance.now() - s.recvPerf) / stepMs : 0;
+            if (!(frames > 0)) frames = 0;
+            if (frames > CONFIG.DEADRECKON_MAX_FRAMES) frames = CONFIG.DEADRECKON_MAX_FRAMES;
+            const out = {
+                x: s.x,
+                y: s.y,
+                velocityX: s.velocityX,
+                velocityY: s.velocityY,
+                rotationSpeed: s.rotationSpeed,
+            };
+            if (frames > 0) {
+                out.x = s.x + velocityToNormalizedDeltaX(s.velocityX) * frames;
+                out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
+            }
+            if (s.angle !== null) {
+                out.angle = s.angle + s.rotationSpeed * frames;
+            }
+            return out;
+        },
+
+        remove(id) { this.states.delete(id); this.lastVersions.delete(id); },
+        clear() { this.states.clear(); this.lastVersions.clear(); },
+    };
 
     // ============================================
     // SECTION 1B: MULTIPLAYER CONSTANTS
@@ -4694,8 +4849,14 @@
             
             currentRemoteIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4707,8 +4868,10 @@
                 game.multiplayer.remoteShips.set(obj.id, remoteShip);
             }
             
-            // Apply interpolated state for smooth rendering (position/angle)
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth rendering (position/angle)
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 remoteShip.fromSyncData(interpolated);
             } else {
@@ -4725,6 +4888,7 @@
             if (!currentRemoteIds.has(objectId)) {
                 game.multiplayer.remoteShips.delete(objectId);
                 RemoteObjects.remove(objectId);
+                DeadReckon.remove(objectId);
             }
         }
     }
@@ -4779,6 +4943,7 @@
         game.astervoids = [];
         game.bullets = [];
         RemoteObjects.clear();
+        DeadReckon.clear();
         ObjectSync.clear();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
@@ -4876,8 +5041,14 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4892,8 +5063,10 @@
                 game.astervoids.push(asteroid);
             }
             
-            // Apply interpolated state for smooth movement
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth movement
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 asteroid.fromSyncData(interpolated);
             } else {
@@ -4912,6 +5085,7 @@
                              a.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
                 AudioSystem.playExplosion(size);
                 RemoteObjects.remove(a.syncObjectId);
+                DeadReckon.remove(a.syncObjectId);
                 return false;
             }
             return true;
@@ -4979,8 +5153,14 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4996,8 +5176,10 @@
                 AudioSystem.playFire();
             }
             
-            // Apply interpolated state for smooth movement
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth movement
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 bullet.fromSyncData(interpolated);
             } else {
@@ -5013,6 +5195,7 @@
             // Remove remote bullets that are gone from sync
             if (b.syncObjectId && !currentSyncIds.has(b.syncObjectId)) {
                 RemoteObjects.remove(b.syncObjectId);
+                DeadReckon.remove(b.syncObjectId);
                 return false;
             }
             return true;
@@ -5214,6 +5397,13 @@
         // Track whether we're entering an in-progress game vs starting fresh.
         // Used to guard state resets and wave spawning below.
         let freshGameStart = true;
+
+        // Solo play: adopt simulation mode + a fresh seed from local CONFIG.
+        // Session mode adopts mode + seed from locked session metadata at
+        // create/join time (before init runs), so don't override it here.
+        if (!isSessionMode()) {
+            adoptSoloSim();
+        }
         
         // Determine if we're the authority (Server role in session mode)
         if (isSessionMode()) {
@@ -5369,24 +5559,35 @@
         const refX = game.ship ? game.ship.x : 0.5;
         const refY = game.ship ? game.ship.y : 0.5;
         
-        // Keep trying until we find a safe spawn point (all in normalized coords)
+        // Keep trying until we find a safe spawn point (all in normalized coords).
+        // simRandom() yields the deterministic stream in deterministic mode and
+        // Math.random in legacy mode; this runs only on the authoritative spawner.
         do {
-            x = Math.random();  // 0-1
-            y = Math.random();  // 0-1
+            x = simRandom();  // 0-1
+            y = simRandom();  // 0-1
         } while (normalizedDistance(x, y, refX, refY) < CONFIG.SPAWN_MIN_DISTANCE);
         
         // Random velocity direction
-        const angle = Math.random() * Math.PI * 2;
+        const angle = simRandom() * Math.PI * 2;
         const speed = (CONFIG.ASTEROID_BASE_SPEED + 
-                       Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
+                       simRandom() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
                       game.speedMultiplier;
         
+        // In deterministic mode, derive the shape seed and spin from the same
+        // deterministic stream so the authoritative asteroid is fully reproducible
+        // (remotes receive seed/vertices/angle/rotationSpeed verbatim over sync).
+        const shapeSeed = isDeterministicMode() ? simRng.nextSeed() : null;
         const asteroid = new Asteroid(
             x, y,
             CONFIG.INITIAL_ASTEROID_RADIUS,
             Math.cos(angle) * speed,
-            Math.sin(angle) * speed
+            Math.sin(angle) * speed,
+            shapeSeed
         );
+        if (isDeterministicMode()) {
+            asteroid.angle = simRandom() * Math.PI * 2;
+            asteroid.rotationSpeed = simRandomRange(-0.02, 0.02);
+        }
         
         // In session mode, let OnObjectCreated → updateAstervoidsFromSync handle local state
         // In solo mode, push directly to game state
@@ -6560,6 +6761,93 @@
      * Main game loop - called every frame
      * @param {number} timestamp - Current time from requestAnimationFrame
      */
+    // Deterministic fixed-timestep scheduler state. Only used when
+    // isDeterministicMode() is true; legacy mode keeps the variable-dt path.
+    const fixedStep = {
+        accumulatorMs: 0,
+        // Render interpolation factor in [0,1): fraction of a step elapsed
+        // since the last simulated tick. Renderers blend prev→curr by this.
+        alpha: 1,
+    };
+    // Cap simulation steps per frame to prevent a spiral of death when the tab
+    // is backgrounded or a frame stalls; backlog beyond this is dropped.
+    const MAX_SIM_STEPS_PER_FRAME = 5;
+    // Hard clamp on accumulated time fed into the fixed-step loop (ms).
+    const MAX_ACCUMULATED_MS = 250;
+
+    // ── Render interpolation (deterministic mode only) ──────────────────────
+    // The fixed-step sim advances in discrete ticks; to keep motion smooth on
+    // displays running faster than the sim rate we blend each renderable's
+    // previous tick pose toward its current pose by `alpha` (the fraction of a
+    // step elapsed). This is purely visual and never feeds back into the sim.
+    // Legacy mode never calls these (alpha is always 1).
+
+    // Interpolate a normalized [0,1) coordinate, taking the short way around the
+    // toroidal playfield so a wrap from ~1→~0 doesn't sweep across the screen.
+    function interpNormalized(prev, curr, alpha) {
+        let d = curr - prev;
+        if (d > 0.5) d -= 1;
+        else if (d < -0.5) d += 1;
+        let v = prev + d * alpha;
+        v -= Math.floor(v); // re-wrap into [0,1)
+        return v;
+    }
+
+    // Shortest-arc angular interpolation.
+    function interpAngle(prev, curr, alpha) {
+        let d = curr - prev;
+        d = Math.atan2(Math.sin(d), Math.cos(d));
+        return prev + d * alpha;
+    }
+
+    // Capture each local renderable's current pose as its "previous" pose at the
+    // start of a sim step, so the renderer can blend prev→curr afterward.
+    function snapshotRenderState() {
+        if (game.ship) {
+            game.ship._prevX = game.ship.x;
+            game.ship._prevY = game.ship.y;
+            game.ship._prevAngle = game.ship.angle;
+        }
+        for (const a of game.astervoids) {
+            a._prevX = a.x; a._prevY = a.y; a._prevAngle = a.angle;
+        }
+        for (const b of game.bullets) {
+            b._prevX = b.x; b._prevY = b.y;
+        }
+        for (const c of game.cosmeticAstervoids) {
+            c._prevX = c.x; c._prevY = c.y; c._prevAngle = c.angle;
+        }
+    }
+
+    // Run `drawFn` with every local renderable temporarily posed at its
+    // interpolated transform, restoring true sim state afterward. No-op (draws
+    // current state directly) in legacy mode or when alpha has reached 1.
+    function withLocalRenderInterpolation(alpha, drawFn) {
+        if (!isDeterministicMode() || alpha >= 1) { drawFn(); return; }
+        const objs = [];
+        if (game.ship) objs.push(game.ship);
+        for (const a of game.astervoids) objs.push(a);
+        for (const b of game.bullets) objs.push(b);
+        if (game.state === 'start' && !isSessionMode()) {
+            for (const c of game.cosmeticAstervoids) objs.push(c);
+        }
+        const saved = [];
+        for (const o of objs) {
+            if (typeof o._prevX !== 'number' || typeof o._prevY !== 'number') continue;
+            saved.push([o, o.x, o.y, o.angle]);
+            o.x = interpNormalized(o._prevX, o.x, alpha);
+            o.y = interpNormalized(o._prevY, o.y, alpha);
+            if (typeof o.angle === 'number' && typeof o._prevAngle === 'number') {
+                o.angle = interpAngle(o._prevAngle, o.angle, alpha);
+            }
+        }
+        try {
+            drawFn();
+        } finally {
+            for (const [o, x, y, a] of saved) { o.x = x; o.y = y; o.angle = a; }
+        }
+    }
+
     function gameLoop(timestamp) {
         // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
         if (!game.lastFrameTime) game.lastFrameTime = timestamp;
@@ -6579,13 +6867,62 @@
         // still runs so the player sees the frozen game under the overlay.
         const frozenForReconnect = isSessionMode() && game.connectionLost;
 
-        // Tick ObjectSync frame counter for frame-count-based network sends
+        // Tick ObjectSync frame counter for frame-count-based network sends.
+        // This is wall-clock cadence (network flush), not a sim step, so it
+        // runs once per rendered frame in both modes.
         if (isSessionMode() && !frozenForReconnect) {
             ObjectSync.tick(elapsed / 1000);
         }
-        
+
         // --- UPDATE PHASE ---
-        
+        if (isDeterministicMode()) {
+            // Fixed-timestep accumulator: advance the sim in whole 1/TARGET_FPS
+            // steps (dt = 1.0 each) so physics is frame-rate independent and
+            // reproducible. Leftover fraction becomes the render interpolation
+            // alpha. The legacy variable-dt path is preserved in the else branch.
+            fixedStep.accumulatorMs = Math.min(
+                fixedStep.accumulatorMs + elapsed,
+                MAX_ACCUMULATED_MS
+            );
+            let steps = 0;
+            while (fixedStep.accumulatorMs >= targetFrameTime && steps < MAX_SIM_STEPS_PER_FRAME) {
+                runSimulationStep(1.0, frozenForReconnect);
+                fixedStep.accumulatorMs -= targetFrameTime;
+                steps++;
+            }
+            if (steps === MAX_SIM_STEPS_PER_FRAME) {
+                // Dropped the remaining backlog to avoid a spiral of death.
+                fixedStep.accumulatorMs = 0;
+            }
+            fixedStep.alpha = targetFrameTime > 0
+                ? Math.min(fixedStep.accumulatorMs / targetFrameTime, 1)
+                : 1;
+        } else {
+            // Legacy: single variable-dt update per rendered frame.
+            runSimulationStep(dt, frozenForReconnect);
+            fixedStep.alpha = 1;
+        }
+
+        // --- RENDER PHASE ---
+        renderScene(fixedStep.alpha);
+
+        // Request next frame
+        requestAnimationFrame(gameLoop);
+    }
+
+    /**
+     * Advance the simulation by one logic step.
+     * @param {number} dt - Delta-time multiplier (1.0 = one 60fps frame). In
+     *   deterministic mode this is always 1.0; in legacy mode it varies.
+     * @param {boolean} frozenForReconnect - When true, gameplay is frozen.
+     */
+    function runSimulationStep(dt, frozenForReconnect) {
+        // Deterministic mode: capture pre-step poses so the renderer can blend
+        // toward the post-step poses for smooth motion between fixed ticks.
+        if (isDeterministicMode()) {
+            snapshotRenderState();
+        }
+
         // Handle player input
         if (!frozenForReconnect) {
             handleInput(dt);
@@ -6733,9 +7070,15 @@
             updateGameStateFromSync();
             updateHUD();
         }
-        
-        // --- RENDER PHASE ---
-        
+    }
+
+    /**
+     * Render the current scene.
+     * @param {number} alpha - Render interpolation factor in [0,1]; in
+     *   deterministic mode renderables blend prev→curr transforms by this, in
+     *   legacy mode it is always 1 (draw current state directly).
+     */
+    function renderScene(alpha) {
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -6754,27 +7097,32 @@
             ctx.translate(game.viewport.x, game.viewport.y);
         }
         
-        // Draw cosmetic astervoids only on start screen when not in session
-        if (game.state === 'start' && !isSessionMode()) {
-            drawAsteroidsBatched(ctx, game.cosmeticAstervoids);
-        }
-        
-        // Draw game entities (now in gameplay coordinates)
-        drawAsteroidsBatched(ctx, game.astervoids);
-        game.bullets.forEach(bullet => bullet.draw(ctx));
-        
-        // Draw ships
-        if (game.state !== 'start') {
-            // Draw remote ships in multiplayer (including during lobby live preview)
-            if (isSessionMode()) {
-                drawRemoteShips(ctx);
+        // Draw local renderables with deterministic-mode render interpolation
+        // (no-op pass-through in legacy mode). Remote ships read from their own
+        // replication state and are drawn untouched inside the callback.
+        withLocalRenderInterpolation(alpha, () => {
+            // Draw cosmetic astervoids only on start screen when not in session
+            if (game.state === 'start' && !isSessionMode()) {
+                drawAsteroidsBatched(ctx, game.cosmeticAstervoids);
             }
-            
-            // Draw local ship (only when present — spectators have no ship)
-            if (game.ship) {
-                game.ship.draw(ctx);
+
+            // Draw game entities (now in gameplay coordinates)
+            drawAsteroidsBatched(ctx, game.astervoids);
+            game.bullets.forEach(bullet => bullet.draw(ctx));
+
+            // Draw ships
+            if (game.state !== 'start') {
+                // Draw remote ships in multiplayer (including during lobby live preview)
+                if (isSessionMode()) {
+                    drawRemoteShips(ctx);
+                }
+
+                // Draw local ship (only when present — spectators have no ship)
+                if (game.ship) {
+                    game.ship.draw(ctx);
+                }
             }
-        }
+        });
         
         // Show/hide gameplay text overlays (HTML for crisp rendering at all DPIs)
         if (game.state === 'waveDelay') {
@@ -6806,9 +7154,6 @@
         // coords so it sits on top of gameplay and isn't clipped by the
         // aspect-locked viewport. No-op on desktop / when no anchor is held.
         drawStickAnchors(ctx);
-        
-        // Request next frame
-        requestAnimationFrame(gameLoop);
     }
 
     // ============================================
@@ -8190,6 +8535,7 @@
                 aspectRatio: currentAspectRatio,
                 config: buildSessionConfigMetadata(),
                 schemas: WIREOPT_SCHEMAS,
+                seed: generateSessionSeed(),
             });
             if (result) {
                 // Enter lobby state as server
