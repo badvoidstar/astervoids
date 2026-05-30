@@ -241,3 +241,58 @@ test('continuity: receiver bracket-extrapolates to same x as local-owner spawn p
         'spawn projection (local owner) and bracket extrapolation (receiver) yield identical x');
     assert.equal(projected.y, extrapolated.y);
 });
+
+// ── Adopt-branch gate: suppress spawn projection for join-snapshot orphans ──
+//
+// Mirror of the gate in updateAstervoidsFromSync's adopt branch:
+//   project iff obj.validAt != null && !obj.spawnHandled
+//            && !joinSnapshotObjectIds.has(obj.id) && clockReady
+// Split children spawned during active membership ARE projected (they were
+// moving since validAt). Orphans present in the join snapshot are NOT — they
+// sat idle while the session was empty, so projecting them forward by up to
+// MAX_EXTRAPOLATION of velocity would teleport them on adoption.
+
+function shouldSpawnProject(obj, joinSnapshotObjectIds, clockReady = true) {
+    return obj.validAt != null
+        && !obj.spawnHandled
+        && !joinSnapshotObjectIds.has(obj.id)
+        && clockReady;
+}
+
+test('adopt gate: split child spawned after join IS projected', () => {
+    const joinIds = new Set(['orphan-1', 'orphan-2']);
+    const child = { id: 'child-fresh', validAt: 1250 };
+    assert.equal(shouldSpawnProject(child, joinIds), true);
+});
+
+test('adopt gate: orphan present at join is NOT projected (no teleport)', () => {
+    const joinIds = new Set(['orphan-1', 'orphan-2']);
+    const orphan = { id: 'orphan-1', validAt: 1000 };
+    assert.equal(shouldSpawnProject(orphan, joinIds), false);
+});
+
+test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected', () => {
+    // Demonstrates the bug the gate prevents: an idle orphan whose validAt is
+    // seconds old would clamp to +MAX_EXTRAPOLATION and jump forward.
+    const validAt = 1000;
+    const serverNow = 9000; // 8s idle
+    const staleness = computeSpawnStaleness(serverNow, validAt);
+    assert.equal(staleness, 1.0, 'clamps to MAX_EXTRAPOLATION');
+    const data = { x: 0.5, y: 0, velocityX: 200, velocityY: 0, angle: 0, rotationSpeed: 0 };
+    const projected = projectSpawnDataNoWrap(data, staleness);
+    assert.equal(projected.x, 200.5, 'WOULD jump forward by 1s of velocity if projected');
+    // The gate prevents this: orphan is in the join snapshot set.
+    const joinIds = new Set(['orphan-idle']);
+    assert.equal(shouldSpawnProject({ id: 'orphan-idle', validAt }, joinIds), false);
+});
+
+test('adopt gate: spawnHandled flag still suppresses re-projection', () => {
+    const joinIds = new Set();
+    const obj = { id: 'child', validAt: 1250, spawnHandled: true };
+    assert.equal(shouldSpawnProject(obj, joinIds), false);
+});
+
+test('adopt gate: missing validAt suppresses projection', () => {
+    const joinIds = new Set();
+    assert.equal(shouldSpawnProject({ id: 'x', validAt: null }, joinIds), false);
+});
