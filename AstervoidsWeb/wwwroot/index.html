@@ -9298,6 +9298,22 @@
             // observers (their bracket slope deviates only slightly when
             // the seed is omitted, which is well below the visual threshold
             // for the velocities and delays this game uses).
+            //
+            // Deterministic mode: when WE become the new owner we must drop
+            // the object's dead-reckon state. repositionDeadReckonedRemotes()
+            // re-pins any object still in DeadReckon.states to its (clamped,
+            // and thus eventually frozen) extrapolated pose every render
+            // frame — which would overwrite the position our own
+            // asteroid.update(dt) just simulated, leaving the asteroid
+            // stationary until it is destroyed. Clearing the replication
+            // state hands the object cleanly to local simulation.
+            const myMemberId = SessionClient.getCurrentMember()?.id;
+            for (const migration of info.migratedObjects) {
+                if (migration.newOwnerId === myMemberId) {
+                    DeadReckon.remove(migration.objectId);
+                    RemoteObjects.remove(migration.objectId);
+                }
+            }
         }
     });
 
