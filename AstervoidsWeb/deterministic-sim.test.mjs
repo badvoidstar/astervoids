@@ -695,17 +695,19 @@ test('legacy game over settle: motion is monotonic toward the target (no oversho
     }
 });
 
-// ── Legacy game over: keep ingesting the owner's late snapshots ──────────────
+// ── Game over: keep ingesting the owner's late snapshots (both modes) ────────
 //
 // When the GameState owner is a DIFFERENT member from the object's owner, the
 // owner keeps simulating and broadcasting after the fatal collision until it
 // itself learns of game over (a round-trip later). The gameplay sync pass that
-// feeds RemoteObjects is gated by lives > 0, so each member stops ingesting at
-// the moment ITS own lives hit 0 — a per-member time. If members froze at the
-// last snapshot they happened to ingest, their resting poses would disagree.
-// repositionLegacyRemotesAtRest fixes this by re-ingesting the owner's latest
-// broadcast (held in ObjectSync regardless of local game state) every frame, so
-// every member converges to the owner's TRUE final snapshot.
+// feeds the replication buffer (RemoteObjects in legacy, DeadReckon in
+// deterministic) is gated by lives > 0, so each member stops ingesting at the
+// moment ITS own lives hit 0 — a per-member time. If members froze at the last
+// snapshot they happened to ingest, their resting poses would disagree. Both
+// repositionLegacyRemotesAtRest and repositionDeadReckonedRemotes fix this by
+// re-ingesting the owner's latest broadcast (held in ObjectSync regardless of
+// local game state) every frame, so every member converges to the owner's TRUE
+// final snapshot.
 
 // Models ObjectSync: always holds the owner's most recently *received* snapshot
 // (network receive is independent of the local member's game state).
@@ -758,4 +760,50 @@ test('legacy game over: late owner snapshots are re-ingested so members converge
     assert.deepEqual(a.resting(), { x: 0.30 }, 'member A reaches the owner\'s final snapshot');
     assert.deepEqual(b.resting(), { x: 0.30 }, 'member B reaches the owner\'s final snapshot');
     assert.deepEqual(a.resting(), b.resting(), 'both members converge to the identical snapshot');
+});
+
+// Deterministic-specific: DeadReckon.getResting reads the RAW base snapshot
+// (states.get(id)), with no extrapolation and no smoothing offset, so a
+// re-ingested packet becomes the resting pose verbatim. Mirror that here to
+// confirm late re-ingestion converges members that stopped at different
+// versions (the GameState-owner-vs-object-owner case in deterministic mode).
+function makeDeadReckonMember(syncStub) {
+    const states = new Map(); // id -> raw snapshot (what getResting returns)
+    const lastVersions = new Map();
+    const id = 'obj';
+    return {
+        gameplayIngestUpTo(v) {
+            const cur = syncStub.get();
+            if (cur && cur.version <= v && cur.version !== lastVersions.get(id)) {
+                states.set(id, { ...cur.data }); // DeadReckon.updateState installs base
+                lastVersions.set(id, cur.version);
+            }
+        },
+        reingestAtRest() {
+            const cur = syncStub.get();
+            if (cur && cur.version !== lastVersions.get(id)) {
+                states.set(id, { ...cur.data });
+                lastVersions.set(id, cur.version);
+            }
+        },
+        getResting: () => states.get(id) || null, // raw base, no extrapolation
+    };
+}
+
+test('deterministic game over: re-ingested base snapshot converges members', () => {
+    const sync = makeObjectSyncStub();
+    const a = makeDeadReckonMember(sync);
+    const b = makeDeadReckonMember(sync);
+
+    sync.broadcast(1, { x: 0.4, y: 0.1, velocityX: 0.01 }); a.gameplayIngestUpTo(1); b.gameplayIngestUpTo(1);
+    sync.broadcast(2, { x: 0.5, y: 0.1, velocityX: 0.01 }); b.gameplayIngestUpTo(2);
+    sync.broadcast(3, { x: 0.6, y: 0.1, velocityX: 0 }); // owner's final, now at rest
+
+    assert.notDeepEqual(a.getResting(), b.getResting()); // precondition: diverged
+
+    for (let f = 0; f < 2; f++) { a.reingestAtRest(); b.reingestAtRest(); }
+
+    assert.deepEqual(a.getResting(), { x: 0.6, y: 0.1, velocityX: 0 });
+    assert.deepEqual(a.getResting(), b.getResting(),
+        'both members rest at the owner\'s final authoritative snapshot');
 });
