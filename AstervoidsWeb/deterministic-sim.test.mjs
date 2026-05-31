@@ -594,90 +594,103 @@ test('game over: extrapolation diverges across members but resting agrees', () =
     assert.equal(a.resting(), b.resting());
 });
 
-// ── Legacy game over: settle onto the latest snapshot without a pop ──────────
+// ── Legacy game over: ease onto the shared snapshot without a pop ────────────
 //
 // Legacy remotes render from RemoteObjects.getInterpolated at
-// (renderTime - adaptiveDelay), where the delay is per-member (latency/jitter
-// dependent). While the owner keeps sending, that lag is invisible. At game over
-// the owner stops sending; getInterpolated then EXTRAPOLATES past the last
-// snapshot by a per-member amount, so members diverge. RemoteObjects.getSettling
-// instead interpolates toward the latest snapshot but never extrapolates past
-// it: as renderTime advances each member glides up to the (shared) latest
-// snapshot and holds, converging exactly. Because game over is synchronized with
-// the owner's final snapshot, at the transition each member is still rendering in
-// the past (target < latest.t), so settling == the current displayed pose — no
-// discontinuous pop. Mirror model below.
+// (renderTime - adaptiveDelay): a per-member delay, so each member displays the
+// object at a different offset from the authoritative snapshot. At game over the
+// owner stops sending. Pinning straight to the snapshot (getSettling) converges
+// every member but POPS, because game over is detected ~one round-trip after the
+// final snapshot, by which point each replica has drifted off it. So
+// repositionLegacyRemotesAtRest EASES the visible transform toward the snapshot
+// with a frame-rate-independent exponential decay: the first game-over frame
+// doesn't move (k = 0), then every member glides onto the identical shared pose
+// and holds. Mirror models below.
 
-// Minimal model of a legacy remote: a stream of authoritative snapshots plus a
-// per-member interpolation delay. interp() extrapolates past the latest snapshot
-// (the divergence source); settle() clamps at the latest snapshot (no extrap).
+// Per-member view of one object: a stream of snapshots + an interpolation delay.
+// displayed(now) is the (delayed) pose the member currently shows; target() is
+// the shared authoritative snapshot all members must converge to.
 function makeLegacyRemote(delayMs) {
     const snaps = []; // { t, x }
-    const maxExtrapMs = 2000; // RemoteObjects MAX_EXTRAPOLATION cap
-    function sample(now, clampToLatest) {
-        const target = now - delayMs;
-        if (snaps.length === 0) return null;
-        if (target <= snaps[0].t) return snaps[0].x;
-        const last = snaps[snaps.length - 1];
-        if (target >= last.t) {
-            if (clampToLatest) return last.x; // settle: hold at latest snapshot
-            // Extrapolate forward along the last segment's velocity, capped
-            // (matches _baseInterpolated). Each member extrapolates a different
-            // amount → divergence.
-            if (snaps.length < 2) return last.x;
-            const prev = snaps[snaps.length - 2];
-            const v = (last.x - prev.x) / (last.t - prev.t);
-            const dt = Math.min(target - last.t, maxExtrapMs);
-            return last.x + v * dt;
-        }
-        for (let i = 1; i < snaps.length; i++) {
-            if (snaps[i].t >= target) {
-                const p = snaps[i - 1], q = snaps[i];
-                const f = (target - p.t) / (q.t - p.t);
-                return p.x + (q.x - p.x) * f;
-            }
-        }
-        return last.x;
-    }
     return {
         push: (t, x) => snaps.push({ t, x }),
-        interp: (now) => sample(now, /* clampToLatest */ false),
-        settle: (now) => sample(now, /* clampToLatest */ true),
-        latest: () => (snaps.length ? snaps[snaps.length - 1].x : null),
+        displayed(now) {
+            const target = now - delayMs;
+            if (snaps.length === 0) return null;
+            if (target <= snaps[0].t) return snaps[0].x;
+            const last = snaps[snaps.length - 1];
+            if (target >= last.t) return last.x;
+            for (let i = 1; i < snaps.length; i++) {
+                if (snaps[i].t >= target) {
+                    const p = snaps[i - 1], q = snaps[i];
+                    return p.x + (q.x - p.x) * ((target - p.t) / (q.t - p.t));
+                }
+            }
+            return last.x;
+        },
+        target: () => (snaps.length ? snaps[snaps.length - 1].x : null),
     };
 }
 
-test('legacy game over: extrapolation diverges but settling converges, no pop', () => {
+// Mirror of repositionLegacyRemotesAtRest's frame-rate-independent ease (1-D).
+// k = 1 - exp(-dt/tau); pose += (target - pose) * k. First frame dt = 0 ⇒ k = 0.
+function makeSettler(startPose, tau) {
+    let pose = startPose;
+    let active = false;
+    return {
+        step(dtMs, target) {
+            const k = active && tau > 0 && dtMs > 0 ? 1 - Math.exp(-dtMs / tau) : (tau <= 0 ? 1 : 0);
+            active = true;
+            pose += (target - pose) * k;
+            return pose;
+        },
+        get: () => pose,
+    };
+}
+
+test('legacy game over: members ease onto one shared pose, no first-frame pop', () => {
     const stepMs = 1000 / 60;
     const vx = 0.01; // per ms
-    // Two members observe the SAME authoritative snapshots but apply different
-    // adaptive interpolation delays (e.g. different RTT/jitter buffers).
+    const tau = 140;
+    // Two members observe the SAME snapshots but with different interpolation
+    // delays, so they DISPLAY the object at different poses (the divergence).
     const a = makeLegacyRemote(2 * stepMs);
-    const b = makeLegacyRemote(7 * stepMs);
+    const b = makeLegacyRemote(9 * stepMs);
     const lastSentT = 20 * stepMs;
-    for (let t = 0; t <= lastSentT; t += stepMs) {
-        const x = vx * t;
-        a.push(t, x);
-        b.push(t, x);
+    for (let t = 0; t <= lastSentT; t += stepMs) { a.push(t, vx * t); b.push(t, vx * t); }
+
+    const goNow = lastSentT + 8 * stepMs; // game over detected a few frames later
+    const aStart = a.displayed(goNow);
+    const bStart = b.displayed(goNow);
+    assert.ok(Math.abs(aStart - bStart) > 1e-6,
+        'precondition: members display the object at different poses at game over');
+
+    const target = a.target(); // shared authoritative snapshot (== b.target())
+    assert.equal(a.target(), b.target());
+
+    const sa = makeSettler(aStart, tau);
+    const sb = makeSettler(bStart, tau);
+
+    // First game-over frame: no movement (k = 0) — no pop.
+    assert.equal(sa.step(0, target), aStart);
+    assert.equal(sb.step(0, target), bStart);
+
+    // Subsequent frames ease toward the shared target and converge.
+    for (let f = 0; f < 240; f++) { sa.step(stepMs, target); sb.step(stepMs, target); }
+    assert.ok(Math.abs(sa.get() - target) < 1e-6, 'member A settles onto the shared snapshot');
+    assert.ok(Math.abs(sb.get() - target) < 1e-6, 'member B settles onto the shared snapshot');
+    assert.ok(Math.abs(sa.get() - sb.get()) < 1e-9, 'both members converge to the identical pose');
+});
+
+test('legacy game over settle: motion is monotonic toward the target (no overshoot)', () => {
+    const tau = 140, stepMs = 1000 / 60, target = 1.0;
+    const s = makeSettler(0, tau);
+    let prev = s.step(0, target); // k=0 → stays at 0
+    assert.equal(prev, 0);
+    for (let f = 0; f < 120; f++) {
+        const cur = s.step(stepMs, target);
+        assert.ok(cur >= prev - 1e-12 && cur <= target + 1e-12,
+            'each step moves toward the target without overshooting');
+        prev = cur;
     }
-
-    // No pop at the game-over transition: it lands right after the final
-    // snapshot, so both members are still interpolating in the past (target <
-    // latest.t). Settling returns exactly the current interpolated pose.
-    const tTransition = lastSentT + stepMs; // ~one frame after the last snapshot
-    assert.ok(Math.abs(a.settle(tTransition) - a.interp(tTransition)) < 1e-12,
-        'settling must not jump away from the current pose at game over (no pop)');
-    assert.ok(Math.abs(b.settle(tTransition) - b.interp(tTransition)) < 1e-12,
-        'settling must not jump away from the current pose at game over (no pop)');
-
-    // Long after game over: extrapolation has carried the members to DIFFERENT
-    // poses (the bug), while settling has glided both onto the shared latest
-    // snapshot and held — exact convergence.
-    const now = lastSentT + 30 * stepMs;
-    assert.ok(Math.abs(a.interp(now) - b.interp(now)) > 1e-6,
-        'precondition: extrapolation diverges between members');
-    assert.equal(a.settle(now), vx * lastSentT);
-    assert.equal(b.settle(now), vx * lastSentT);
-    assert.equal(a.settle(now), b.settle(now));
-    assert.equal(a.settle(now), a.latest());
 });
