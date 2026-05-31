@@ -2735,6 +2735,23 @@
         },
 
         /**
+         * Authoritative RESTING pose: the latest authoritative snapshot's data
+         * with NO interpolation delay and NO extrapolation. Used when motion must
+         * stop and every session member must converge to the identical pose (game
+         * over). Interpolating/extrapolating instead renders each member at a
+         * different time offset (the per-member adaptive delay, then extrapolation
+         * once the owner stops sending), so their frozen poses would disagree.
+         * Mirrors DeadReckon.getResting for the deterministic path.
+         * @param {string} objectId - Object ID
+         * @returns {object|null} Latest snapshot data, or null if none seen.
+         */
+        getResting(objectId) {
+            const state = this.states.get(objectId);
+            if (!state || state.snapshots.length === 0) return null;
+            return state.snapshots[state.snapshots.length - 1].data;
+        },
+
+        /**
          * Base interpolation: snapshot bracket-search + Hermite blend.
          *
          * After validAt unification the single-snap and multi-snap regimes
@@ -7074,6 +7091,41 @@
         }
     }
 
+    // Legacy mode: pin remote objects to their authoritative resting pose during
+    // game over so every member converges to the same frozen state.
+    //
+    // During play, legacy remotes are positioned by the gameplay sync pass
+    // (updateAstervoidsFromSync / updateRemoteShips / updateBulletsFromSync),
+    // which only runs while game.lives > 0. At game over that pass stops and the
+    // owner stops sending updates, so each member is left frozen at whatever
+    // RemoteObjects.getInterpolated last produced — a pose delayed by that
+    // member's own adaptive interpolation buffer, so members disagree. Re-pin
+    // every remote object to RemoteObjects.getResting (the latest authoritative
+    // snapshot, no delay/extrapolation), the single reference all members share.
+    // Owned objects have no RemoteObjects snapshot (getResting → null) and are
+    // left at their locally-simulated frozen pose, which equals what the owner
+    // last broadcast, so they converge too. Deterministic mode handles the same
+    // requirement in repositionDeadReckonedRemotes via DeadReckon.getResting.
+    function repositionLegacyRemotesAtRest() {
+        if (isDeterministicMode() || !isSessionMode() || !isGameOver()) return;
+        for (const b of game.bullets) {
+            if (b.syncObjectId) {
+                const r = RemoteObjects.getResting(b.syncObjectId);
+                if (r) b.fromSyncData(r);
+            }
+        }
+        for (const a of game.astervoids) {
+            if (a.syncObjectId) {
+                const r = RemoteObjects.getResting(a.syncObjectId);
+                if (r) a.fromSyncData(r);
+            }
+        }
+        for (const [id, ship] of game.multiplayer.remoteShips) {
+            const r = RemoteObjects.getResting(id);
+            if (r) ship.fromSyncData(r);
+        }
+    }
+
     function gameLoop(timestamp) {
         // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
         if (!game.lastFrameTime) game.lastFrameTime = timestamp;
@@ -7309,6 +7361,9 @@
         // frame so they move smoothly at the display rate (the fixed-step sim
         // only refreshes them at 60 Hz). No-op in legacy / solo.
         repositionDeadReckonedRemotes();
+        // Legacy mode: converge remotes to the shared authoritative resting pose
+        // during game over (the gameplay sync pass has stopped). No-op otherwise.
+        repositionLegacyRemotesAtRest();
 
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
