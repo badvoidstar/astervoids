@@ -7131,6 +7131,13 @@
     // at their local frozen pose, which equals the last broadcast snapshot, so
     // they converge too. Deterministic mode handles the same requirement in
     // repositionDeadReckonedRemotes.
+    //
+    // CRUCIAL for the "GameState owner != object owner" case: the settle loop
+    // ALSO keeps ingesting the owner's latest broadcast into RemoteObjects (see
+    // the note inside `settle`). Otherwise each member would freeze at whatever
+    // snapshot it last ingested before its own lives hit 0 — a per-member moment
+    // that differs by a round-trip from the owner's actual final snapshot — and
+    // the resting poses would diverge even with the ease applied.
     const legacyGameOverSettle = { active: false, lastTime: 0 };
 
     function easeRemoteTowardRest(obj, target, k) {
@@ -7165,6 +7172,7 @@
             return;
         }
         const now = performance.now();
+        const myMemberId = SessionClient.getCurrentMember()?.id;
         // Frame-rate-independent exponential blend factor. The first game-over
         // frame has dt = 0 ⇒ k = 0 (no jump); thereafter k eases toward 1.
         let dtMs = legacyGameOverSettle.active ? (now - legacyGameOverSettle.lastTime) : 0;
@@ -7174,6 +7182,28 @@
         const tau = CONFIG.LEGACY_GAMEOVER_SETTLE_MS;
         const k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
         const settle = (obj, syncId) => {
+            // Keep ingesting the owner's latest broadcast into RemoteObjects.
+            //
+            // Game over stops the gameplay sync pass (updateAstervoidsFromSync /
+            // updateRemoteShips / updateBulletsFromSync, all gated by lives > 0),
+            // which is the ONLY thing that feeds RemoteObjects.states. But the
+            // object's owner keeps simulating and broadcasting until ITS OWN lives
+            // hit 0 — and when the GameState owner is a different member, the owner
+            // learns of game over a round-trip later, so it emits more snapshots
+            // after the fatal collision. Each member stops ingesting at the moment
+            // ITS own lives reach 0 (a per-member time), so without re-ingesting
+            // here every member would freeze RemoteObjects at a DIFFERENT snapshot
+            // and the resting poses would disagree. ObjectSync keeps receiving the
+            // owner's updates regardless of local game state, so pull the latest
+            // version in: once the owner finally stops, every member converges to
+            // the same authoritative final snapshot.
+            const syncObj = ObjectSync.getObject(syncId);
+            if (syncObj && syncObj.ownerMemberId !== myMemberId
+                && syncObj.version !== RemoteObjects.lastVersions.get(syncId)) {
+                RemoteObjects.updateState(syncId, syncObj.data, syncObj.ownerMemberId,
+                    syncObj.validAt, syncObj.arrivalServerTime);
+                RemoteObjects.lastVersions.set(syncId, syncObj.version);
+            }
             const target = RemoteObjects.getSettling(syncId, now);
             if (target) easeRemoteTowardRest(obj, target, k);
         };
