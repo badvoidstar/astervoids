@@ -593,3 +593,78 @@ test('game over: extrapolation diverges across members but resting agrees', () =
     assert.equal(b.resting(), 1.0);
     assert.equal(a.resting(), b.resting());
 });
+
+// ── Legacy game over: converge to the latest snapshot, not delayed interp ─────
+//
+// Legacy remotes render from RemoteObjects.getInterpolated at
+// (renderTime - adaptiveDelay), where the delay is per-member (latency/jitter
+// dependent). While the owner keeps sending, that lag is invisible. At game over
+// the owner stops sending and the gameplay sync pass stops running, so each
+// member freezes at its own delayed interpolation pose — and because the delays
+// differ, the frozen poses disagree. RemoteObjects.getResting returns the latest
+// authoritative snapshot data (no delay, no extrapolation), identical for every
+// member, so repositionLegacyRemotesAtRest converges them. Mirror model below.
+
+// Minimal model of a legacy remote: a stream of authoritative snapshots plus a
+// per-member interpolation delay. interp() samples the position the member would
+// have shown at (now - delay) by linear interpolation; resting() returns the
+// latest snapshot value directly.
+function makeLegacyRemote(delayMs) {
+    const snaps = []; // { t, x }
+    const maxExtrapMs = 2000; // RemoteObjects MAX_EXTRAPOLATION cap
+    return {
+        push: (t, x) => snaps.push({ t, x }),
+        interp(now) {
+            const target = now - delayMs;
+            if (snaps.length === 0) return null;
+            if (target <= snaps[0].t) return snaps[0].x;
+            const last = snaps[snaps.length - 1];
+            if (target >= last.t) {
+                // Past the latest snapshot: extrapolate forward along the last
+                // segment's velocity, capped (matches _baseInterpolated). Each
+                // member extrapolates by a different amount → divergence.
+                if (snaps.length < 2) return last.x;
+                const prev = snaps[snaps.length - 2];
+                const v = (last.x - prev.x) / (last.t - prev.t);
+                const dt = Math.min(target - last.t, maxExtrapMs);
+                return last.x + v * dt;
+            }
+            for (let i = 1; i < snaps.length; i++) {
+                if (snaps[i].t >= target) {
+                    const p = snaps[i - 1], q = snaps[i];
+                    const f = (target - p.t) / (q.t - p.t);
+                    return p.x + (q.x - p.x) * f;
+                }
+            }
+            return last.x;
+        },
+        resting: () => (snaps.length ? snaps[snaps.length - 1].x : null),
+    };
+}
+
+test('legacy game over: delayed interpolation diverges but resting agrees', () => {
+    const stepMs = 1000 / 60;
+    const vx = 0.01; // per ms
+    // Two members observe the SAME authoritative snapshots but apply different
+    // adaptive interpolation delays (e.g. different RTT/jitter buffers).
+    const a = makeLegacyRemote(2 * stepMs);
+    const b = makeLegacyRemote(7 * stepMs);
+    const lastSentT = 20 * stepMs;
+    for (let t = 0; t <= lastSentT; t += stepMs) {
+        const x = vx * t;
+        a.push(t, x);
+        b.push(t, x);
+    }
+    // Game over: owner stops sending after lastSentT. Members keep rendering;
+    // their delayed interpolation samples freeze at DIFFERENT poses.
+    const now = lastSentT + 30 * stepMs;
+    const aInterp = a.interp(now);
+    const bInterp = b.interp(now);
+    assert.ok(Math.abs(aInterp - bInterp) > 1e-6,
+        'precondition: delayed interpolation freezes members at different poses');
+
+    // Re-pinning to the latest authoritative snapshot converges them exactly.
+    assert.equal(a.resting(), vx * lastSentT);
+    assert.equal(b.resting(), vx * lastSentT);
+    assert.equal(a.resting(), b.resting());
+});
