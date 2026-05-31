@@ -1149,6 +1149,39 @@
     const CONFIG = {
         // Timing settings
         TARGET_FPS: 60,             // Target frame rate for physics
+
+        // Simulation mode: 'legacy' (asymmetric per-object sim with network
+        // interpolation/extrapolation) or 'deterministic' (owner-authoritative
+        // fixed-timestep sim; remotes apply authoritative state + dead reckoning).
+        // Locked into session metadata at create time so every member of a
+        // session runs the same mode. URL/env override: ?cfg.SIM_MODE=legacy
+        SIM_MODE: 'deterministic',
+        // Deterministic mode only: maximum number of 60fps-equivalent frames a
+        // remote replica may dead-reckon (extrapolate by constant velocity)
+        // past its last authoritative packet before holding position. Bounds
+        // divergence on packet loss; the next authoritative packet snaps it.
+        DEADRECKON_MAX_FRAMES: 30,
+        // Deterministic mode only: projective-velocity-blending time constant
+        // (ms) for absorbing extrapolation error. When a new authoritative
+        // packet disagrees with the replica's current extrapolation — e.g. the
+        // owner STOPS rotating and the replica had projected past the true
+        // angle — the difference is decayed to zero over ~this window instead of
+        // snapping. Kills the rotation overshoot/rubberband at motion start/stop
+        // (exaggerated at high latency, where the larger send gap produces a
+        // larger pre-correction overshoot). ~0 in steady state, so it adds no
+        // lag to smooth motion. Set 0 to disable (hard snap).
+        DEADRECKON_SMOOTH_MS: 90,
+        // Normalized positional correction beyond which we SNAP instead of
+        // sweeping (wrap-seam crossing or respawn teleport guard).
+        DEADRECKON_SNAP_DIST: 0.2,
+        // Legacy mode only: time constant (ms) for easing remote objects onto
+        // their authoritative resting pose when the game enters the game-over
+        // state. Game over is detected ~one network round-trip after the owner's
+        // final snapshot, by which point the replica has interpolation-lagged or
+        // extrapolated away from that snapshot — so pinning directly would pop.
+        // Instead the visible transform decays toward the shared snapshot over
+        // ~this window, giving a smooth, convergent stop. 0 = hard snap.
+        LEGACY_GAMEOVER_SETTLE_MS: 140,
         
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1495,6 +1528,7 @@
 
     const SESSION_CONFIG_KEYS = [
         'FRACTURE_ENABLED',
+        'SIM_MODE',
     ];
 
     function snapshotConfigValues(config, keys) {
@@ -1573,7 +1607,265 @@
     function adoptSessionConfig(metadata, config = CONFIG) {
         restoreLocalConfigBaseline(config);
         applySessionConfigMetadata(metadata, config);
+        adoptSessionSim(metadata);
     }
+
+    // ── Deterministic simulation mode ───────────────────────────────────────
+    // The simulation mode and its RNG seed are locked at session creation and
+    // carried in opaque session metadata (alongside `config` and `schemas`).
+    // All members of a session therefore run the same mode against the same
+    // seed. In solo play they derive from local CONFIG. This lives entirely in
+    // the game layer; the sync layer and backend never inspect it.
+    const SIM_MODES = Object.freeze({
+        LEGACY: 'legacy',
+        DETERMINISTIC: 'deterministic',
+    });
+    const VALID_SIM_MODES = new Set(Object.values(SIM_MODES));
+
+    function normalizeSimMode(raw) {
+        if (typeof raw === 'string') {
+            const normalized = raw.toLowerCase();
+            if (VALID_SIM_MODES.has(normalized)) return normalized;
+        }
+        return SIM_MODES.LEGACY;
+    }
+
+    // Generate a 32-bit unsigned seed for a new session. Create-path only, so
+    // crypto (when available) or Math.random is fine — gameplay never calls this.
+    function generateSessionSeed() {
+        if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+            const buf = new Uint32Array(1);
+            window.crypto.getRandomValues(buf);
+            return buf[0] >>> 0;
+        }
+        return (Math.floor(Math.random() * 0x100000000)) >>> 0;
+    }
+
+    // Active simulation runtime. In a session these are adopted from the
+    // session's locked metadata; in solo play from local CONFIG.
+    const simRuntime = {
+        mode: SIM_MODES.LEGACY,
+        seed: 0,
+    };
+
+    function isDeterministicMode() {
+        return simRuntime.mode === SIM_MODES.DETERMINISTIC;
+    }
+
+    // Adopt the simulation mode + seed from session metadata (joiner / creator
+    // echo). Mode comes from the round-tripped config knob; seed is a dedicated
+    // top-level metadata field stamped at create.
+    function adoptSessionSim(metadata) {
+        const cfg = metadata && typeof metadata === 'object' ? metadata.config : undefined;
+        const rawMode = cfg && typeof cfg === 'object' ? cfg.SIM_MODE : CONFIG.SIM_MODE;
+        simRuntime.mode = normalizeSimMode(rawMode);
+        const rawSeed = metadata && typeof metadata === 'object' ? metadata.seed : undefined;
+        simRuntime.seed = Number.isFinite(rawSeed) ? (rawSeed >>> 0) : 0;
+        simRng.reseed(simRuntime.seed);
+    }
+
+    // Adopt the simulation mode + seed for solo (non-session) play from local
+    // CONFIG, generating a fresh seed each solo session.
+    function adoptSoloSim() {
+        simRuntime.mode = normalizeSimMode(CONFIG.SIM_MODE);
+        simRuntime.seed = generateSessionSeed();
+        simRng.reseed(simRuntime.seed);
+    }
+
+    // Deterministic gameplay RNG, seeded from the session/solo seed. Consumed
+    // ONLY on the authoritative path (the client that owns a spawn/fracture) so
+    // that remotes — which receive explicit results over the wire and never
+    // re-derive them — do not draw from and thus desynchronize this stream.
+    // In legacy mode the simRandom* helpers fall through to Math.random.
+    const simRng = {
+        _next: makeSeededRandom(1),
+        reseed(seed) { this._next = makeSeededRandom((seed >>> 0) || 1); },
+        next() { return this._next(); },
+        range(min, max) { return this._next() * (max - min) + min; },
+        nextSeed() { return (this._next() * 0x100000000) >>> 0; },
+    };
+
+    // Mode-aware randomness: deterministic stream in deterministic mode,
+    // Math.random in legacy mode. Use these on gameplay-state-affecting paths
+    // that run on the authoritative client.
+    function simRandom() {
+        return isDeterministicMode() ? simRng.next() : Math.random();
+    }
+    function simRandomRange(min, max) {
+        return isDeterministicMode() ? simRng.range(min, max) : randomRange(min, max);
+    }
+
+    // ── Dead-reckoning replica (deterministic mode only) ────────────────────
+    // Replaces the legacy snapshot interpolation/extrapolation for remote
+    // objects. Stores only the latest authoritative kinematic state per object
+    // and advances it by constant velocity/rotation to cover the round-trip
+    // time until the next authoritative packet, which snaps it. Bounded by
+    // CONFIG.DEADRECKON_MAX_FRAMES so packet loss can't fling a replica away.
+    // No hermite, no adaptive delay — accuracy comes from the owner being the
+    // single source of truth plus short, deterministic forward integration.
+    const DeadReckon = {
+        states: new Map(),
+        // Parallel version gate (mirrors RemoteObjects.lastVersions) so we only
+        // re-seed the snapshot when the authoritative version actually changes.
+        lastVersions: new Map(),
+        // Per-id visual error being decayed to zero (projective velocity
+        // blending). Seeded whenever a new snapshot disagrees with the replica's
+        // current on-screen extrapolation, and bled out over
+        // CONFIG.DEADRECKON_SMOOTH_MS so corrections ease in instead of snapping.
+        // Shape: { dx, dy, da, t0 } (da = signed shortest angular error).
+        smooth: new Map(),
+
+        // `baselinePerf` is the performance.now()-domain instant this snapshot
+        // becomes the integration baseline. Callers anchor at ARRIVAL (omit the
+        // argument → defaults to performance.now()): getReckoned then projects
+        // forward only by the inter-packet gap (0..send-interval), so the
+        // replica renders the AUTHORITATIVE position the owner actually sent and
+        // dead-reckons just far enough to bridge to the next packet.
+        //
+        // We deliberately do NOT anchor at the owner's authoring instant
+        // (validAt mapped via validAtToPerfNow). Authoring-anchoring projects
+        // every replica straight through to "now" — i.e. predicts the owner's
+        // present pose — which makes a freshly-spawned object pop in already
+        // advanced from its spawn point and keeps an expiring object travelling
+        // past where the owner's copy died until the delete packet lands
+        // (visible "spawn ahead" / "over-travel"). Arrival-anchoring trades a
+        // constant ~latency positional lag for rendering only authoritative
+        // truth, matching the deterministic design intent (no extrapolation
+        // beyond short gap-bridging; correct on the next packet).
+        //
+        // Continuity across successive packets does NOT depend on the anchor:
+        // as long as each new snapshot's base has advanced by the real elapsed
+        // motion (which it does once the wire delivers an advancing base), the
+        // handoff is seamless. The earlier "stuck bullet" sawtooth was a frozen
+        // base (a wire-decode bug), not an anchoring problem.
+        //
+        // Steady-state extrapolation is exact for constant velocity/rotation, so
+        // each new snapshot agrees with the current extrapolation and seeds a
+        // ~zero correction (no added lag). At a motion DISCONTINUITY (rotation or
+        // thrust start/stop) the extrapolation and the new snapshot disagree;
+        // that error is captured here and decayed smoothly by getReckoned rather
+        // than snapped — this is what removes the rotation overshoot/rubberband.
+        // `snap` forces an immediate, blend-free jump to the authoritative pose
+        // for INTENTIONAL discontinuities (e.g. ship death/respawn to the spawn
+        // point). The kinematic SNAP_DIST guard below only catches LARGE jumps;
+        // an intentional teleport can be small (dying near center), so the game
+        // layer signals it explicitly via this flag.
+        updateState(id, data, baselinePerf, snap) {
+            const now = performance.now();
+            // Where the replica is CURRENTLY displayed (old extrapolation plus
+            // any in-flight correction), captured BEFORE installing the new
+            // snapshot so we can blend out the difference rather than jump.
+            // An explicit snap skips this so no decaying offset is seeded.
+            const displayed = (!snap && this.states.has(id)) ? this._reckonAt(id, now) : null;
+            this.states.set(id, {
+                x: data.x,
+                y: data.y,
+                angle: (data.angle !== undefined ? data.angle : null),
+                velocityX: data.velocityX || 0,
+                velocityY: data.velocityY || 0,
+                rotationSpeed: data.rotationSpeed || 0,
+                recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
+                    ? baselinePerf
+                    : now,
+            });
+            const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+            if (displayed && tau > 0) {
+                const fresh = this._reckonRaw(id, now);
+                if (fresh) {
+                    let dx = displayed.x - fresh.x;
+                    let dy = displayed.y - fresh.y;
+                    let da = (displayed.angle != null && fresh.angle != null)
+                        ? shortestAngleDelta(displayed.angle, fresh.angle)
+                        : 0;
+                    // Wrap-seam / respawn guard: a big positional jump means the
+                    // object crossed the normalized wrap boundary or teleported —
+                    // snap there instead of sweeping the replica across the field.
+                    const snapDist = CONFIG.DEADRECKON_SNAP_DIST;
+                    if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) { dx = 0; dy = 0; }
+                    if (dx !== 0 || dy !== 0 || da !== 0) {
+                        this.smooth.set(id, { dx, dy, da, t0: now });
+                        return;
+                    }
+                }
+            }
+            this.smooth.delete(id);
+        },
+
+        // Raw constant-velocity/rotation extrapolation of `id` at perf instant
+        // `nowPerf`, with NO correction smoothing applied.
+        _reckonRaw(id, nowPerf) {
+            const s = this.states.get(id);
+            if (!s) return null;
+            const stepMs = 1000 / CONFIG.TARGET_FPS;
+            let frames = stepMs > 0 ? (nowPerf - s.recvPerf) / stepMs : 0;
+            if (!(frames > 0)) frames = 0;
+            if (frames > CONFIG.DEADRECKON_MAX_FRAMES) frames = CONFIG.DEADRECKON_MAX_FRAMES;
+            const out = {
+                x: s.x,
+                y: s.y,
+                velocityX: s.velocityX,
+                velocityY: s.velocityY,
+                rotationSpeed: s.rotationSpeed,
+            };
+            if (frames > 0) {
+                out.x = s.x + velocityToNormalizedDeltaX(s.velocityX) * frames;
+                out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
+            }
+            if (s.angle !== null) {
+                out.angle = s.angle + s.rotationSpeed * frames;
+            }
+            return out;
+        },
+
+        // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
+        _reckonAt(id, nowPerf) {
+            const out = this._reckonRaw(id, nowPerf);
+            if (!out) return null;
+            const e = this.smooth.get(id);
+            if (e) {
+                const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+                const k = tau > 0 ? Math.exp(-(nowPerf - e.t0) / tau) : 0;
+                if (k <= 1e-3) {
+                    this.smooth.delete(id);
+                } else {
+                    out.x += e.dx * k;
+                    out.y += e.dy * k;
+                    if (out.angle !== undefined) out.angle += e.da * k;
+                }
+            }
+            return out;
+        },
+
+        // Return a sync-data-shaped object posed at the dead-reckoned transform
+        // (with correction smoothing), or null when no authoritative state has
+        // been seen yet.
+        getReckoned(id) {
+            return this._reckonAt(id, performance.now());
+        },
+
+        // Authoritative RESTING pose: the latest snapshot with NO forward
+        // extrapolation and NO correction smoothing. Used when motion must stop
+        // and every session member must converge to the identical pose (game
+        // over). Extrapolating instead (getReckoned) would drift each member
+        // forward by a different, latency-dependent amount up to the
+        // DEADRECKON_MAX_FRAMES clamp, so resting positions would disagree.
+        getResting(id) {
+            const s = this.states.get(id);
+            if (!s) return null;
+            const out = {
+                x: s.x,
+                y: s.y,
+                velocityX: s.velocityX,
+                velocityY: s.velocityY,
+                rotationSpeed: s.rotationSpeed,
+            };
+            if (s.angle !== null) out.angle = s.angle;
+            return out;
+        },
+
+        remove(id) { this.states.delete(id); this.lastVersions.delete(id); this.smooth.delete(id); },
+        clear() { this.states.clear(); this.lastVersions.clear(); this.smooth.clear(); },
+    };
 
     // ============================================
     // SECTION 1B: MULTIPLAYER CONSTANTS
@@ -2451,6 +2743,24 @@
         },
 
         /**
+         * Settling pose for game over: interpolate toward the latest snapshot
+         * but DO NOT extrapolate past it. As renderTime advances the replica
+         * glides from its current (delayed) pose up to the latest authoritative
+         * snapshot and then holds there — a smooth, pop-free stop. Because the
+         * snapshot is shared, every member converges to the identical pose.
+         * Contrast getInterpolated, which extrapolates past the latest snapshot
+         * (per-member overshoot → divergence) once the owner stops sending.
+         * @param {string} objectId - Object ID
+         * @param {number} renderTime - Current render timestamp
+         * @returns {object|null} Settling state, or null if not tracked.
+         */
+        getSettling(objectId, renderTime) {
+            const state = this.states.get(objectId);
+            if (!state || state.snapshots.length === 0) return null;
+            return this._baseInterpolated(state, renderTime, /* clampToLatest */ true);
+        },
+
+        /**
          * Base interpolation: snapshot bracket-search + Hermite blend.
          *
          * After validAt unification the single-snap and multi-snap regimes
@@ -2463,7 +2773,7 @@
          * either the next snapshot lands or extrapolation kicks in. No
          * model switch, no renderError smoother needed.
          */
-        _baseInterpolated(state, renderTime) {
+        _baseInterpolated(state, renderTime, clampToLatest = false) {
             const snapshots = state.snapshots;
             const latest = snapshots[snapshots.length - 1];
 
@@ -2479,8 +2789,15 @@
                 return snapshots[0].data;
             }
 
-            // After the newest snapshot: extrapolate with velocity cap
+            // After the newest snapshot: extrapolate with velocity cap — unless
+            // clamped (game over), where motion must stop and every member must
+            // converge to the SAME pose. Extrapolation would carry each member a
+            // latency-dependent amount past the last snapshot, so they'd disagree;
+            // clamping holds at the shared authoritative snapshot instead.
             if (targetTime >= latest.time) {
+                if (clampToLatest) {
+                    return latest.data;
+                }
                 const extraTime = Math.min((targetTime - latest.time) / 1000, CONFIG.MAX_EXTRAPOLATION);
                 const refDim = getReferenceDimension();
                 const r = this.getBoundingRadius(latest.data);
@@ -4448,7 +4765,15 @@
             remoteShips: new Map(),   // objectId -> Ship instance for remote players
             gameStateObjectId: null,  // ObjectSync ID for shared game state
             isAuthority: false,       // True if this client is the Server (authority)
-            processedPendingBullets: new Set()  // Track pendingHit bullets we've already processed
+            processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
+            // Object ids present in the session snapshot at the moment we joined.
+            // These are pre-existing/steady-state (or orphaned) objects that we may
+            // adopt — but they were authored before we joined and must NOT be
+            // spawn-projected forward (that projection is only valid for split
+            // children spawned during our own active membership). Without this,
+            // adopting an idle orphan (e.g. joining an emptied session we were
+            // spectating) jumps it forward by up to MAX_EXTRAPOLATION of velocity.
+            joinSnapshotObjectIds: new Set()
         },
         // Cosmetic astervoids for start screen (separate from game astervoids)
         cosmeticAstervoids: [],
@@ -4694,8 +5019,24 @@
             
             currentRemoteIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    // Intentional respawn teleport: the invulnerability counter
+                    // only ever decreases during play and jumps back up to its
+                    // max on Ship.reset(). A jump UP means death/respawn, so we
+                    // snap to the spawn pose instead of gliding the replica there.
+                    const existingShip = game.multiplayer.remoteShips.get(obj.id);
+                    const prevInvuln = existingShip ? existingShip.invulnerable : undefined;
+                    const isTeleport = typeof prevInvuln === 'number'
+                        && (obj.data.invulnerable || 0) > prevInvuln;
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data, undefined, isTeleport);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4707,8 +5048,10 @@
                 game.multiplayer.remoteShips.set(obj.id, remoteShip);
             }
             
-            // Apply interpolated state for smooth rendering (position/angle)
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth rendering (position/angle)
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 remoteShip.fromSyncData(interpolated);
             } else {
@@ -4725,6 +5068,7 @@
             if (!currentRemoteIds.has(objectId)) {
                 game.multiplayer.remoteShips.delete(objectId);
                 RemoteObjects.remove(objectId);
+                DeadReckon.remove(objectId);
             }
         }
     }
@@ -4779,6 +5123,7 @@
         game.astervoids = [];
         game.bullets = [];
         RemoteObjects.clear();
+        DeadReckon.clear();
         ObjectSync.clear();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
@@ -4860,6 +5205,7 @@
                     // interpolator handles that automatically via snap[0]
                     // anchored at validAt on the unified axis.)
                     if (obj.validAt != null && !obj.spawnHandled
+                        && !game.multiplayer.joinSnapshotObjectIds.has(obj.id)
                         && RemoteObjects.isClockOffsetInitialized()) {
                         const stalenessSec = RemoteObjects.computeSpawnStaleness(
                             RemoteObjects.serverNowMs(), obj.validAt);
@@ -4876,8 +5222,16 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4892,8 +5246,10 @@
                 game.astervoids.push(asteroid);
             }
             
-            // Apply interpolated state for smooth movement
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth movement
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 asteroid.fromSyncData(interpolated);
             } else {
@@ -4912,6 +5268,7 @@
                              a.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
                 AudioSystem.playExplosion(size);
                 RemoteObjects.remove(a.syncObjectId);
+                DeadReckon.remove(a.syncObjectId);
                 return false;
             }
             return true;
@@ -4979,8 +5336,16 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to interpolation when version changes
-            if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
+            // Only feed new sync data to replication when version changes.
+            // Deterministic mode uses dead reckoning; legacy uses interpolation.
+            if (isDeterministicMode()) {
+                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(obj.id, obj.data);
+                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                }
+            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
                 RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
                 RemoteObjects.lastVersions.set(obj.id, obj.version);
             }
@@ -4996,8 +5361,10 @@
                 AudioSystem.playFire();
             }
             
-            // Apply interpolated state for smooth movement
-            const interpolated = RemoteObjects.getInterpolated(obj.id, renderTime);
+            // Apply replicated state for smooth movement
+            const interpolated = isDeterministicMode()
+                ? DeadReckon.getReckoned(obj.id)
+                : RemoteObjects.getInterpolated(obj.id, renderTime);
             if (interpolated) {
                 bullet.fromSyncData(interpolated);
             } else {
@@ -5013,6 +5380,7 @@
             // Remove remote bullets that are gone from sync
             if (b.syncObjectId && !currentSyncIds.has(b.syncObjectId)) {
                 RemoteObjects.remove(b.syncObjectId);
+                DeadReckon.remove(b.syncObjectId);
                 return false;
             }
             return true;
@@ -5214,6 +5582,13 @@
         // Track whether we're entering an in-progress game vs starting fresh.
         // Used to guard state resets and wave spawning below.
         let freshGameStart = true;
+
+        // Solo play: adopt simulation mode + a fresh seed from local CONFIG.
+        // Session mode adopts mode + seed from locked session metadata at
+        // create/join time (before init runs), so don't override it here.
+        if (!isSessionMode()) {
+            adoptSoloSim();
+        }
         
         // Determine if we're the authority (Server role in session mode)
         if (isSessionMode()) {
@@ -5369,24 +5744,35 @@
         const refX = game.ship ? game.ship.x : 0.5;
         const refY = game.ship ? game.ship.y : 0.5;
         
-        // Keep trying until we find a safe spawn point (all in normalized coords)
+        // Keep trying until we find a safe spawn point (all in normalized coords).
+        // simRandom() yields the deterministic stream in deterministic mode and
+        // Math.random in legacy mode; this runs only on the authoritative spawner.
         do {
-            x = Math.random();  // 0-1
-            y = Math.random();  // 0-1
+            x = simRandom();  // 0-1
+            y = simRandom();  // 0-1
         } while (normalizedDistance(x, y, refX, refY) < CONFIG.SPAWN_MIN_DISTANCE);
         
         // Random velocity direction
-        const angle = Math.random() * Math.PI * 2;
+        const angle = simRandom() * Math.PI * 2;
         const speed = (CONFIG.ASTEROID_BASE_SPEED + 
-                       Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
+                       simRandom() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
                       game.speedMultiplier;
         
+        // In deterministic mode, derive the shape seed and spin from the same
+        // deterministic stream so the authoritative asteroid is fully reproducible
+        // (remotes receive seed/vertices/angle/rotationSpeed verbatim over sync).
+        const shapeSeed = isDeterministicMode() ? simRng.nextSeed() : null;
         const asteroid = new Asteroid(
             x, y,
             CONFIG.INITIAL_ASTEROID_RADIUS,
             Math.cos(angle) * speed,
-            Math.sin(angle) * speed
+            Math.sin(angle) * speed,
+            shapeSeed
         );
+        if (isDeterministicMode()) {
+            asteroid.angle = simRandom() * Math.PI * 2;
+            asteroid.rotationSpeed = simRandomRange(-0.02, 0.02);
+        }
         
         // In session mode, let OnObjectCreated → updateAstervoidsFromSync handle local state
         // In solo mode, push directly to game state
@@ -6560,6 +6946,301 @@
      * Main game loop - called every frame
      * @param {number} timestamp - Current time from requestAnimationFrame
      */
+    // Deterministic fixed-timestep scheduler state. Only used when
+    // isDeterministicMode() is true; legacy mode keeps the variable-dt path.
+    const fixedStep = {
+        accumulatorMs: 0,
+        // Render interpolation factor in [0,1): fraction of a step elapsed
+        // since the last simulated tick. Renderers blend prev→curr by this.
+        alpha: 1,
+    };
+    // Cap simulation steps per frame to prevent a spiral of death when the tab
+    // is backgrounded or a frame stalls; backlog beyond this is dropped.
+    const MAX_SIM_STEPS_PER_FRAME = 5;
+    // Hard clamp on accumulated time fed into the fixed-step loop (ms).
+    const MAX_ACCUMULATED_MS = 250;
+
+    // ── Render interpolation (deterministic mode only) ──────────────────────
+    // The fixed-step sim advances in discrete ticks; to keep motion smooth on
+    // displays running faster than the sim rate we blend each renderable's
+    // previous tick pose toward its current pose by `alpha` (the fraction of a
+    // step elapsed). This is purely visual and never feeds back into the sim.
+    // Legacy mode never calls these (alpha is always 1).
+
+    // Interpolate a normalized [0,1) coordinate, taking the short way around the
+    // toroidal playfield so a wrap from ~1→~0 doesn't sweep across the screen.
+    // Wrap-aware linear interpolation between two normalized coordinates.
+    // Positions live in [-margin, 1+margin] (objects glide just off one edge
+    // before wrapping), so we must NOT clamp the result into [0,1): doing so
+    // teleports an object sitting just past an edge back across the screen.
+    // When the sim wrapped between prev and curr the value jumps by the full
+    // wrap span `range` (= 1 + 2*margin, NOT 1), so we correct by `range` to
+    // recover the true forward motion; correcting by a bare 1.0 leaves a
+    // `2*margin` backward error that shows as a one-frame hitch at the seam.
+    function interpNormalized(prev, curr, alpha, range = 1) {
+        let d = curr - prev;
+        if (d > 0.5) d -= range;
+        else if (d < -0.5) d += range;
+        return prev + d * alpha;
+    }
+
+    // Shortest-arc angular interpolation.
+    function interpAngle(prev, curr, alpha) {
+        let d = curr - prev;
+        d = Math.atan2(Math.sin(d), Math.cos(d));
+        return prev + d * alpha;
+    }
+
+    // Capture each local renderable's current pose as its "previous" pose at the
+    // start of a sim step, so the renderer can blend prev→curr afterward.
+    function snapshotRenderState() {
+        if (game.ship) {
+            game.ship._prevX = game.ship.x;
+            game.ship._prevY = game.ship.y;
+            game.ship._prevAngle = game.ship.angle;
+        }
+        for (const a of game.astervoids) {
+            a._prevX = a.x; a._prevY = a.y; a._prevAngle = a.angle;
+        }
+        for (const b of game.bullets) {
+            b._prevX = b.x; b._prevY = b.y;
+        }
+        for (const c of game.cosmeticAstervoids) {
+            c._prevX = c.x; c._prevY = c.y; c._prevAngle = c.angle;
+        }
+    }
+
+    // The toroidal wrap span for an object on each axis (1 + 2*margin), where
+    // margin mirrors the per-object value used by wrapNormalized in update().
+    // Used so render interpolation across a wrap recovers true forward motion.
+    function wrapRadiusFor(o) {
+        if (o instanceof Asteroid) return o.boundRadius;
+        if (o instanceof Bullet) return CONFIG.BULLET_RADIUS;
+        return CONFIG.SHIP_SIZE; // Ship (and ship-like renderables)
+    }
+
+    // Run `drawFn` with every local renderable temporarily posed at its
+    // interpolated transform, restoring true sim state afterward. No-op (draws
+    // current state directly) in legacy mode or when alpha has reached 1.
+    function withLocalRenderInterpolation(alpha, drawFn) {
+        if (!isDeterministicMode() || alpha >= 1) { drawFn(); return; }
+        const objs = [];
+        if (game.ship) objs.push(game.ship);
+        for (const a of game.astervoids) objs.push(a);
+        for (const b of game.bullets) objs.push(b);
+        if (game.state === 'start' && !isSessionMode()) {
+            for (const c of game.cosmeticAstervoids) objs.push(c);
+        }
+        const saved = [];
+        for (const o of objs) {
+            if (typeof o._prevX !== 'number' || typeof o._prevY !== 'number') continue;
+            // Skip dead-reckoned remote objects: they are already positioned
+            // smoothly to "now" by DeadReckon.getReckoned every frame. Blending
+            // them between fixed-step snapshots double-smooths (adds lag) and,
+            // at a wrap seam, pulls them backward — visible as a remote bullet
+            // that fails to travel its full path. Render interpolation is only
+            // for objects THIS client simulates in discrete fixed steps.
+            if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) continue;
+            saved.push([o, o.x, o.y, o.angle]);
+            const r = wrapRadiusFor(o);
+            o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
+            o.y = interpNormalized(o._prevY, o.y, alpha, 1 + 2 * wrapMarginY(r));
+            if (typeof o.angle === 'number' && typeof o._prevAngle === 'number') {
+                o.angle = interpAngle(o._prevAngle, o.angle, alpha);
+            }
+        }
+        try {
+            drawFn();
+        } finally {
+            for (const [o, x, y, a] of saved) { o.x = x; o.y = y; o.angle = a; }
+        }
+    }
+
+    // Reposition every dead-reckoned remote object (ships, asteroids, bullets)
+    // from its DeadReckon state at the current instant. Dead reckoning is
+    // continuous (extrapolates to performance.now()), so calling this once per
+    // RENDER frame gives remotes smooth motion at the display refresh rate,
+    // independent of the fixed 60 Hz sim cadence. Without it, remotes would
+    // only move on frames where a sim step runs (visible stutter on >60 Hz
+    // displays). Locals are smoothed separately by render interpolation.
+    function repositionDeadReckonedRemotes() {
+        if (!isDeterministicMode() || !isSessionMode()) return;
+        // Game over: motion stops and every member must come to rest at the same
+        // authoritative pose. Use the un-extrapolated base snapshot instead of
+        // dead-reckoning forward (which would drift each member ahead by a
+        // latency-dependent amount up to the clamp, so they'd disagree).
+        const frozen = isGameOver();
+        const poseOf = (id) => frozen ? DeadReckon.getResting(id) : DeadReckon.getReckoned(id);
+        // Safety net: an object we OWN must never be dead-reckoned — we simulate
+        // it locally, and overwriting its pose from the (clamp-frozen) reckon
+        // state would freeze it. The migration handler clears dead-reckon state
+        // on the normal handoff, but ownership can also change via a
+        // reconciliation snapshot (object-sync sets ownerMemberId without
+        // touching DeadReckon) if a client missed the OnMemberLeft broadcast.
+        // Clearing here makes "owned ⇒ not dead-reckoned" hold for every path.
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const ownedByUs = (syncId) => {
+            if (!syncId || !myMemberId) return false;
+            const o = ObjectSync.getObject(syncId);
+            return !!o && o.ownerMemberId === myMemberId;
+        };
+        // Game over re-ingestion (mirrors repositionLegacyRemotesAtRest): the
+        // gameplay sync pass that feeds DeadReckon is gated by lives > 0, so it
+        // stops at game over. But the object's owner keeps simulating and
+        // broadcasting until ITS OWN lives hit 0 — and when the GameState owner is
+        // a different member, that happens a round-trip later, so the owner emits
+        // more packets after the fatal collision. Each member stops ingesting at
+        // the moment its own lives reach 0 (a per-member time), so without this
+        // every member would freeze DeadReckon at a DIFFERENT snapshot and the
+        // resting poses would disagree. ObjectSync keeps receiving the owner's
+        // packets regardless of local game state, so pull the latest version in
+        // here: once the owner finally stops, every member's getResting converges
+        // to the same authoritative final snapshot.
+        const reingestAtRest = (syncId) => {
+            const o = ObjectSync.getObject(syncId);
+            if (o && o.ownerMemberId !== myMemberId
+                && o.version !== DeadReckon.lastVersions.get(syncId)) {
+                DeadReckon.updateState(syncId, o.data);
+                DeadReckon.lastVersions.set(syncId, o.version);
+            }
+        };
+        for (const b of game.bullets) {
+            if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
+                if (ownedByUs(b.syncObjectId)) { DeadReckon.remove(b.syncObjectId); continue; }
+                if (frozen) reingestAtRest(b.syncObjectId);
+                const r = poseOf(b.syncObjectId);
+                if (r) b.fromSyncData(r);
+            }
+        }
+        for (const a of game.astervoids) {
+            if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
+                if (ownedByUs(a.syncObjectId)) { DeadReckon.remove(a.syncObjectId); continue; }
+                if (frozen) reingestAtRest(a.syncObjectId);
+                const r = poseOf(a.syncObjectId);
+                if (r) a.fromSyncData(r);
+            }
+        }
+        for (const [id, ship] of game.multiplayer.remoteShips) {
+            if (DeadReckon.states.has(id)) {
+                if (ownedByUs(id)) { DeadReckon.remove(id); continue; }
+                if (frozen) reingestAtRest(id);
+                const r = poseOf(id);
+                if (r) ship.fromSyncData(r);
+            }
+        }
+    }
+
+    // Legacy mode: settle remote objects onto the shared authoritative snapshot
+    // during game over, smoothly and without a pop.
+    //
+    // During play, legacy remotes are positioned by the gameplay sync pass
+    // (updateAstervoidsFromSync / updateRemoteShips / updateBulletsFromSync),
+    // which only runs while game.lives > 0. At game over that pass stops and the
+    // owner stops sending updates. Without intervention each member is left at a
+    // DIFFERENT pose: it had been rendering the object interpolation-delayed in
+    // the past (or extrapolated ahead under loss), and that per-member offset is
+    // frozen in — so the members disagree on the resting state.
+    //
+    // The shared reference is RemoteObjects.getSettling (the latest authoritative
+    // snapshot, with NO extrapolation past it). Pinning to it directly converges
+    // every member, but pops: game over is detected ~one network round-trip after
+    // the owner's final snapshot, so by then the replica has already drifted off
+    // that snapshot (interpolation lag or extrapolation), and the pin is a
+    // visible jump. Instead we EASE the visible transform (x, y, angle) toward
+    // the snapshot with a frame-rate-independent exponential decay
+    // (LEGACY_GAMEOVER_SETTLE_MS): the first game-over frame doesn't move
+    // (k = 0), then each member glides onto the identical shared pose and holds.
+    // Owned objects have no RemoteObjects snapshot (getSettling → null) and stay
+    // at their local frozen pose, which equals the last broadcast snapshot, so
+    // they converge too. Deterministic mode handles the same requirement in
+    // repositionDeadReckonedRemotes.
+    //
+    // CRUCIAL for the "GameState owner != object owner" case: the settle loop
+    // ALSO keeps ingesting the owner's latest broadcast into RemoteObjects (see
+    // the note inside `settle`). Otherwise each member would freeze at whatever
+    // snapshot it last ingested before its own lives hit 0 — a per-member moment
+    // that differs by a round-trip from the owner's actual final snapshot — and
+    // the resting poses would diverge even with the ease applied.
+    const legacyGameOverSettle = { active: false, lastTime: 0 };
+
+    function easeRemoteTowardRest(obj, target, k) {
+        // Capture the current displayed transform, apply the full authoritative
+        // rest data (velocity/vertices/etc.), then ease only the visible x/y/angle
+        // from the captured pose toward the target so the stop is smooth. k = 1
+        // ⇒ snap; k = 0 ⇒ hold (first game-over frame).
+        const startX = obj.x, startY = obj.y, startAngle = obj.angle;
+        obj.fromSyncData(target);
+        if (k >= 1) return;
+        if (typeof target.x === 'number' && typeof startX === 'number') {
+            const r = RemoteObjects.getBoundingRadius(target);
+            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
+            const rangeX = 1 + 2 * marginX, rangeY = 1 + 2 * marginY;
+            let dx = target.x - startX;
+            if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
+            obj.x = wrapNormalized(startX + dx * k, marginX);
+            if (typeof target.y === 'number' && typeof startY === 'number') {
+                let dy = target.y - startY;
+                if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
+                obj.y = wrapNormalized(startY + dy * k, marginY);
+            }
+        }
+        if (typeof target.angle === 'number' && typeof startAngle === 'number') {
+            obj.angle = startAngle + shortestAngleDelta(target.angle, startAngle) * k;
+        }
+    }
+
+    function repositionLegacyRemotesAtRest() {
+        if (isDeterministicMode() || !isSessionMode() || !isGameOver()) {
+            legacyGameOverSettle.active = false;
+            return;
+        }
+        const now = performance.now();
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        // Frame-rate-independent exponential blend factor. The first game-over
+        // frame has dt = 0 ⇒ k = 0 (no jump); thereafter k eases toward 1.
+        let dtMs = legacyGameOverSettle.active ? (now - legacyGameOverSettle.lastTime) : 0;
+        legacyGameOverSettle.active = true;
+        legacyGameOverSettle.lastTime = now;
+        dtMs = Math.max(0, Math.min(dtMs, 250)); // ignore long stalls (tab hidden)
+        const tau = CONFIG.LEGACY_GAMEOVER_SETTLE_MS;
+        const k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+        const settle = (obj, syncId) => {
+            // Keep ingesting the owner's latest broadcast into RemoteObjects.
+            //
+            // Game over stops the gameplay sync pass (updateAstervoidsFromSync /
+            // updateRemoteShips / updateBulletsFromSync, all gated by lives > 0),
+            // which is the ONLY thing that feeds RemoteObjects.states. But the
+            // object's owner keeps simulating and broadcasting until ITS OWN lives
+            // hit 0 — and when the GameState owner is a different member, the owner
+            // learns of game over a round-trip later, so it emits more snapshots
+            // after the fatal collision. Each member stops ingesting at the moment
+            // ITS own lives reach 0 (a per-member time), so without re-ingesting
+            // here every member would freeze RemoteObjects at a DIFFERENT snapshot
+            // and the resting poses would disagree. ObjectSync keeps receiving the
+            // owner's updates regardless of local game state, so pull the latest
+            // version in: once the owner finally stops, every member converges to
+            // the same authoritative final snapshot.
+            const syncObj = ObjectSync.getObject(syncId);
+            if (syncObj && syncObj.ownerMemberId !== myMemberId
+                && syncObj.version !== RemoteObjects.lastVersions.get(syncId)) {
+                RemoteObjects.updateState(syncId, syncObj.data, syncObj.ownerMemberId,
+                    syncObj.validAt, syncObj.arrivalServerTime);
+                RemoteObjects.lastVersions.set(syncId, syncObj.version);
+            }
+            const target = RemoteObjects.getSettling(syncId, now);
+            if (target) easeRemoteTowardRest(obj, target, k);
+        };
+        for (const b of game.bullets) {
+            if (b.syncObjectId) settle(b, b.syncObjectId);
+        }
+        for (const a of game.astervoids) {
+            if (a.syncObjectId) settle(a, a.syncObjectId);
+        }
+        for (const [id, ship] of game.multiplayer.remoteShips) {
+            settle(ship, id);
+        }
+    }
+
     function gameLoop(timestamp) {
         // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
         if (!game.lastFrameTime) game.lastFrameTime = timestamp;
@@ -6579,13 +7260,62 @@
         // still runs so the player sees the frozen game under the overlay.
         const frozenForReconnect = isSessionMode() && game.connectionLost;
 
-        // Tick ObjectSync frame counter for frame-count-based network sends
+        // Tick ObjectSync frame counter for frame-count-based network sends.
+        // This is wall-clock cadence (network flush), not a sim step, so it
+        // runs once per rendered frame in both modes.
         if (isSessionMode() && !frozenForReconnect) {
             ObjectSync.tick(elapsed / 1000);
         }
-        
+
         // --- UPDATE PHASE ---
-        
+        if (isDeterministicMode()) {
+            // Fixed-timestep accumulator: advance the sim in whole 1/TARGET_FPS
+            // steps (dt = 1.0 each) so physics is frame-rate independent and
+            // reproducible. Leftover fraction becomes the render interpolation
+            // alpha. The legacy variable-dt path is preserved in the else branch.
+            fixedStep.accumulatorMs = Math.min(
+                fixedStep.accumulatorMs + elapsed,
+                MAX_ACCUMULATED_MS
+            );
+            let steps = 0;
+            while (fixedStep.accumulatorMs >= targetFrameTime && steps < MAX_SIM_STEPS_PER_FRAME) {
+                runSimulationStep(1.0, frozenForReconnect);
+                fixedStep.accumulatorMs -= targetFrameTime;
+                steps++;
+            }
+            if (steps === MAX_SIM_STEPS_PER_FRAME) {
+                // Dropped the remaining backlog to avoid a spiral of death.
+                fixedStep.accumulatorMs = 0;
+            }
+            fixedStep.alpha = targetFrameTime > 0
+                ? Math.min(fixedStep.accumulatorMs / targetFrameTime, 1)
+                : 1;
+        } else {
+            // Legacy: single variable-dt update per rendered frame.
+            runSimulationStep(dt, frozenForReconnect);
+            fixedStep.alpha = 1;
+        }
+
+        // --- RENDER PHASE ---
+        renderScene(fixedStep.alpha);
+
+        // Request next frame
+        requestAnimationFrame(gameLoop);
+    }
+
+    /**
+     * Advance the simulation by one logic step.
+     * @param {number} dt - Delta-time multiplier (1.0 = one 60fps frame). In
+     *   deterministic mode this is always 1.0; in legacy mode it varies.
+     * @param {boolean} frozenForReconnect - When true, gameplay is frozen.
+     */
+    function runSimulationStep(dt, frozenForReconnect) {
+        // Deterministic mode: capture pre-step poses so the renderer can blend
+        // toward the post-step poses for smooth motion between fixed ticks.
+        if (isDeterministicMode()) {
+            snapshotRenderState();
+        }
+
         // Handle player input
         if (!frozenForReconnect) {
             handleInput(dt);
@@ -6733,9 +7463,24 @@
             updateGameStateFromSync();
             updateHUD();
         }
-        
-        // --- RENDER PHASE ---
-        
+    }
+
+    /**
+     * Render the current scene.
+     * @param {number} alpha - Render interpolation factor in [0,1]; in
+     *   deterministic mode renderables blend prev→curr transforms by this, in
+     *   legacy mode it is always 1 (draw current state directly).
+     */
+    function renderScene(alpha) {
+        // Refresh dead-reckoned remotes to the current instant every render
+        // frame so they move smoothly at the display rate (the fixed-step sim
+        // only refreshes them at 60 Hz). No-op in legacy / solo.
+        repositionDeadReckonedRemotes();
+        // Legacy mode: smoothly settle remotes onto the shared authoritative
+        // snapshot during game over (the gameplay sync pass has stopped). No-op
+        // otherwise.
+        repositionLegacyRemotesAtRest();
+
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -6754,27 +7499,32 @@
             ctx.translate(game.viewport.x, game.viewport.y);
         }
         
-        // Draw cosmetic astervoids only on start screen when not in session
-        if (game.state === 'start' && !isSessionMode()) {
-            drawAsteroidsBatched(ctx, game.cosmeticAstervoids);
-        }
-        
-        // Draw game entities (now in gameplay coordinates)
-        drawAsteroidsBatched(ctx, game.astervoids);
-        game.bullets.forEach(bullet => bullet.draw(ctx));
-        
-        // Draw ships
-        if (game.state !== 'start') {
-            // Draw remote ships in multiplayer (including during lobby live preview)
-            if (isSessionMode()) {
-                drawRemoteShips(ctx);
+        // Draw local renderables with deterministic-mode render interpolation
+        // (no-op pass-through in legacy mode). Remote ships read from their own
+        // replication state and are drawn untouched inside the callback.
+        withLocalRenderInterpolation(alpha, () => {
+            // Draw cosmetic astervoids only on start screen when not in session
+            if (game.state === 'start' && !isSessionMode()) {
+                drawAsteroidsBatched(ctx, game.cosmeticAstervoids);
             }
-            
-            // Draw local ship (only when present — spectators have no ship)
-            if (game.ship) {
-                game.ship.draw(ctx);
+
+            // Draw game entities (now in gameplay coordinates)
+            drawAsteroidsBatched(ctx, game.astervoids);
+            game.bullets.forEach(bullet => bullet.draw(ctx));
+
+            // Draw ships
+            if (game.state !== 'start') {
+                // Draw remote ships in multiplayer (including during lobby live preview)
+                if (isSessionMode()) {
+                    drawRemoteShips(ctx);
+                }
+
+                // Draw local ship (only when present — spectators have no ship)
+                if (game.ship) {
+                    game.ship.draw(ctx);
+                }
             }
-        }
+        });
         
         // Show/hide gameplay text overlays (HTML for crisp rendering at all DPIs)
         if (game.state === 'waveDelay') {
@@ -6806,9 +7556,6 @@
         // coords so it sits on top of gameplay and isn't clipped by the
         // aspect-locked viewport. No-op on desktop / when no anchor is held.
         drawStickAnchors(ctx);
-        
-        // Request next frame
-        requestAnimationFrame(gameLoop);
     }
 
     // ============================================
@@ -8127,6 +8874,10 @@
 
             const result = await SessionClient.joinSession(sessionId);
             if (result) {
+                // Record pre-existing object ids so we don't spawn-project
+                // adopted orphans (e.g. entering an emptied session).
+                game.multiplayer.joinSnapshotObjectIds = new Set(
+                    (result.session.objects || []).map(o => o.id));
                 // Enter lobby state (not playing yet)
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -8190,8 +8941,12 @@
                 aspectRatio: currentAspectRatio,
                 config: buildSessionConfigMetadata(),
                 schemas: WIREOPT_SCHEMAS,
+                seed: generateSessionSeed(),
             });
             if (result) {
+                // Newly created session: no pre-existing objects to guard.
+                game.multiplayer.joinSnapshotObjectIds = new Set(
+                    (result.session.objects || []).map(o => o.id));
                 // Enter lobby state as server
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -8565,6 +9320,10 @@
                     setPickerStatus(`Reconnecting... (joining session)`, 'error');
                     const result = await SessionClient.joinSession(sessionId, oldMemberId);
                     if (result) {
+                        // Record pre-existing object ids so re-adopted orphans
+                        // aren't spawn-projected on rejoin.
+                        game.multiplayer.joinSnapshotObjectIds = new Set(
+                            (result.session.objects || []).map(o => o.id));
                         _log('[Rejoin] Success! Session:', result.session.name,
                             'Role:', result.member.role, 'Objects:', result.session.objects?.length);
                         setPickerStatus('Reconnected!', 'connected');
@@ -8772,6 +9531,22 @@
             // observers (their bracket slope deviates only slightly when
             // the seed is omitted, which is well below the visual threshold
             // for the velocities and delays this game uses).
+            //
+            // Deterministic mode: when WE become the new owner we must drop
+            // the object's dead-reckon state. repositionDeadReckonedRemotes()
+            // re-pins any object still in DeadReckon.states to its (clamped,
+            // and thus eventually frozen) extrapolated pose every render
+            // frame — which would overwrite the position our own
+            // asteroid.update(dt) just simulated, leaving the asteroid
+            // stationary until it is destroyed. Clearing the replication
+            // state hands the object cleanly to local simulation.
+            const myMemberId = SessionClient.getCurrentMember()?.id;
+            for (const migration of info.migratedObjects) {
+                if (migration.newOwnerId === myMemberId) {
+                    DeadReckon.remove(migration.objectId);
+                    RemoteObjects.remove(migration.objectId);
+                }
+            }
         }
     });
 
