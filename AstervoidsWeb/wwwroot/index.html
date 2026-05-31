@@ -7084,9 +7084,30 @@
             const o = ObjectSync.getObject(syncId);
             return !!o && o.ownerMemberId === myMemberId;
         };
+        // Game over re-ingestion (mirrors repositionLegacyRemotesAtRest): the
+        // gameplay sync pass that feeds DeadReckon is gated by lives > 0, so it
+        // stops at game over. But the object's owner keeps simulating and
+        // broadcasting until ITS OWN lives hit 0 — and when the GameState owner is
+        // a different member, that happens a round-trip later, so the owner emits
+        // more packets after the fatal collision. Each member stops ingesting at
+        // the moment its own lives reach 0 (a per-member time), so without this
+        // every member would freeze DeadReckon at a DIFFERENT snapshot and the
+        // resting poses would disagree. ObjectSync keeps receiving the owner's
+        // packets regardless of local game state, so pull the latest version in
+        // here: once the owner finally stops, every member's getResting converges
+        // to the same authoritative final snapshot.
+        const reingestAtRest = (syncId) => {
+            const o = ObjectSync.getObject(syncId);
+            if (o && o.ownerMemberId !== myMemberId
+                && o.version !== DeadReckon.lastVersions.get(syncId)) {
+                DeadReckon.updateState(syncId, o.data);
+                DeadReckon.lastVersions.set(syncId, o.version);
+            }
+        };
         for (const b of game.bullets) {
             if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
                 if (ownedByUs(b.syncObjectId)) { DeadReckon.remove(b.syncObjectId); continue; }
+                if (frozen) reingestAtRest(b.syncObjectId);
                 const r = poseOf(b.syncObjectId);
                 if (r) b.fromSyncData(r);
             }
@@ -7094,6 +7115,7 @@
         for (const a of game.astervoids) {
             if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
                 if (ownedByUs(a.syncObjectId)) { DeadReckon.remove(a.syncObjectId); continue; }
+                if (frozen) reingestAtRest(a.syncObjectId);
                 const r = poseOf(a.syncObjectId);
                 if (r) a.fromSyncData(r);
             }
@@ -7101,6 +7123,7 @@
         for (const [id, ship] of game.multiplayer.remoteShips) {
             if (DeadReckon.states.has(id)) {
                 if (ownedByUs(id)) { DeadReckon.remove(id); continue; }
+                if (frozen) reingestAtRest(id);
                 const r = poseOf(id);
                 if (r) ship.fromSyncData(r);
             }
