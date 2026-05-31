@@ -694,3 +694,68 @@ test('legacy game over settle: motion is monotonic toward the target (no oversho
         prev = cur;
     }
 });
+
+// ── Legacy game over: keep ingesting the owner's late snapshots ──────────────
+//
+// When the GameState owner is a DIFFERENT member from the object's owner, the
+// owner keeps simulating and broadcasting after the fatal collision until it
+// itself learns of game over (a round-trip later). The gameplay sync pass that
+// feeds RemoteObjects is gated by lives > 0, so each member stops ingesting at
+// the moment ITS own lives hit 0 — a per-member time. If members froze at the
+// last snapshot they happened to ingest, their resting poses would disagree.
+// repositionLegacyRemotesAtRest fixes this by re-ingesting the owner's latest
+// broadcast (held in ObjectSync regardless of local game state) every frame, so
+// every member converges to the owner's TRUE final snapshot.
+
+// Models ObjectSync: always holds the owner's most recently *received* snapshot
+// (network receive is independent of the local member's game state).
+function makeObjectSyncStub() {
+    let version = 0, data = null;
+    return {
+        broadcast(v, d) { version = v; data = d; },           // owner emits
+        get: () => (data == null ? null : { version, data }), // latest received
+    };
+}
+
+// Models a member's RemoteObjects buffer + the rest re-ingestion. Each member
+// stops its GAMEPLAY ingestion at a different version (when its own lives hit 0)
+// but the rest pass keeps pulling the latest from ObjectSync.
+function makeMember(syncStub) {
+    let ingestedVersion = -1, restingData = null;
+    return {
+        gameplayIngestUpTo(v) { // pre-game-over: ingest through version v
+            const cur = syncStub.get();
+            if (cur && cur.version <= v && cur.version !== ingestedVersion) {
+                ingestedVersion = cur.version; restingData = cur.data;
+            }
+        },
+        restIngest() { // game-over frame: pull whatever ObjectSync now holds
+            const cur = syncStub.get();
+            if (cur && cur.version !== ingestedVersion) {
+                ingestedVersion = cur.version; restingData = cur.data;
+            }
+        },
+        resting: () => restingData,
+    };
+}
+
+test('legacy game over: late owner snapshots are re-ingested so members converge', () => {
+    const sync = makeObjectSyncStub();
+    const a = makeMember(sync); // stops its gameplay ingest early (lives hit 0 first)
+    const b = makeMember(sync); // stops its gameplay ingest later
+
+    // Owner broadcasts v1..v3 after the collision while it still simulates.
+    sync.broadcast(1, { x: 0.10 }); a.gameplayIngestUpTo(1); b.gameplayIngestUpTo(1);
+    sync.broadcast(2, { x: 0.20 }); /* a already stopped */    b.gameplayIngestUpTo(2);
+    sync.broadcast(3, { x: 0.30 }); /* both stopped: owner's TRUE final snapshot */
+
+    // Precondition: their gameplay-frozen poses disagree (the bug).
+    assert.notDeepEqual(a.resting(), b.resting());
+
+    // Game-over rest pass keeps ingesting ObjectSync's latest each frame.
+    for (let f = 0; f < 3; f++) { a.restIngest(); b.restIngest(); }
+
+    assert.deepEqual(a.resting(), { x: 0.30 }, 'member A reaches the owner\'s final snapshot');
+    assert.deepEqual(b.resting(), { x: 0.30 }, 'member B reaches the owner\'s final snapshot');
+    assert.deepEqual(a.resting(), b.resting(), 'both members converge to the identical snapshot');
+});
