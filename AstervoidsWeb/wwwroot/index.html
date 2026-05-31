@@ -1174,6 +1174,14 @@
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).
         DEADRECKON_SNAP_DIST: 0.2,
+        // Legacy mode only: time constant (ms) for easing remote objects onto
+        // their authoritative resting pose when the game enters the game-over
+        // state. Game over is detected ~one network round-trip after the owner's
+        // final snapshot, by which point the replica has interpolation-lagged or
+        // extrapolated away from that snapshot — so pinning directly would pop.
+        // Instead the visible transform decays toward the shared snapshot over
+        // ~this window, giving a smooth, convergent stop. 0 = hard snap.
+        LEGACY_GAMEOVER_SETTLE_MS: 140,
         
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -7105,39 +7113,78 @@
     // During play, legacy remotes are positioned by the gameplay sync pass
     // (updateAstervoidsFromSync / updateRemoteShips / updateBulletsFromSync),
     // which only runs while game.lives > 0. At game over that pass stops and the
-    // owner stops sending updates, so without intervention each member keeps
-    // extrapolating its last snapshot forward by a per-member (latency-dependent)
-    // amount → members disagree.
+    // owner stops sending updates. Without intervention each member is left at a
+    // DIFFERENT pose: it had been rendering the object interpolation-delayed in
+    // the past (or extrapolated ahead under loss), and that per-member offset is
+    // frozen in — so the members disagree on the resting state.
     //
-    // Game over is itself a synchronized signal (GameState lives/state), so it
-    // arrives right around the owner's final snapshot. At that instant each
-    // member is still rendering in the past (renderTime - delay < latest.time),
-    // so RemoteObjects.getSettling returns essentially the current displayed pose
-    // (no jump); then — as renderTime advances with no new snapshots — it glides
-    // up to the latest snapshot and holds (no extrapolation). Every member
-    // converges to that one shared pose with no discontinuous pop. Owned objects
-    // have no RemoteObjects snapshot (getSettling → null) and stay at their local
-    // frozen pose, which equals the last broadcast snapshot, so they converge
-    // too. Deterministic mode handles the same requirement in
+    // The shared reference is RemoteObjects.getSettling (the latest authoritative
+    // snapshot, with NO extrapolation past it). Pinning to it directly converges
+    // every member, but pops: game over is detected ~one network round-trip after
+    // the owner's final snapshot, so by then the replica has already drifted off
+    // that snapshot (interpolation lag or extrapolation), and the pin is a
+    // visible jump. Instead we EASE the visible transform (x, y, angle) toward
+    // the snapshot with a frame-rate-independent exponential decay
+    // (LEGACY_GAMEOVER_SETTLE_MS): the first game-over frame doesn't move
+    // (k = 0), then each member glides onto the identical shared pose and holds.
+    // Owned objects have no RemoteObjects snapshot (getSettling → null) and stay
+    // at their local frozen pose, which equals the last broadcast snapshot, so
+    // they converge too. Deterministic mode handles the same requirement in
     // repositionDeadReckonedRemotes.
-    function repositionLegacyRemotesAtRest() {
-        if (isDeterministicMode() || !isSessionMode() || !isGameOver()) return;
-        const renderTime = performance.now();
-        for (const b of game.bullets) {
-            if (b.syncObjectId) {
-                const r = RemoteObjects.getSettling(b.syncObjectId, renderTime);
-                if (r) b.fromSyncData(r);
+    const legacyGameOverSettle = { active: false, lastTime: 0 };
+
+    function easeRemoteTowardRest(obj, target, k) {
+        // Capture the current displayed transform, apply the full authoritative
+        // rest data (velocity/vertices/etc.), then ease only the visible x/y/angle
+        // from the captured pose toward the target so the stop is smooth. k = 1
+        // ⇒ snap; k = 0 ⇒ hold (first game-over frame).
+        const startX = obj.x, startY = obj.y, startAngle = obj.angle;
+        obj.fromSyncData(target);
+        if (k >= 1) return;
+        if (typeof target.x === 'number' && typeof startX === 'number') {
+            const r = RemoteObjects.getBoundingRadius(target);
+            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
+            const rangeX = 1 + 2 * marginX, rangeY = 1 + 2 * marginY;
+            let dx = target.x - startX;
+            if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
+            obj.x = wrapNormalized(startX + dx * k, marginX);
+            if (typeof target.y === 'number' && typeof startY === 'number') {
+                let dy = target.y - startY;
+                if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
+                obj.y = wrapNormalized(startY + dy * k, marginY);
             }
+        }
+        if (typeof target.angle === 'number' && typeof startAngle === 'number') {
+            obj.angle = startAngle + shortestAngleDelta(target.angle, startAngle) * k;
+        }
+    }
+
+    function repositionLegacyRemotesAtRest() {
+        if (isDeterministicMode() || !isSessionMode() || !isGameOver()) {
+            legacyGameOverSettle.active = false;
+            return;
+        }
+        const now = performance.now();
+        // Frame-rate-independent exponential blend factor. The first game-over
+        // frame has dt = 0 ⇒ k = 0 (no jump); thereafter k eases toward 1.
+        let dtMs = legacyGameOverSettle.active ? (now - legacyGameOverSettle.lastTime) : 0;
+        legacyGameOverSettle.active = true;
+        legacyGameOverSettle.lastTime = now;
+        dtMs = Math.max(0, Math.min(dtMs, 250)); // ignore long stalls (tab hidden)
+        const tau = CONFIG.LEGACY_GAMEOVER_SETTLE_MS;
+        const k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+        const settle = (obj, syncId) => {
+            const target = RemoteObjects.getSettling(syncId, now);
+            if (target) easeRemoteTowardRest(obj, target, k);
+        };
+        for (const b of game.bullets) {
+            if (b.syncObjectId) settle(b, b.syncObjectId);
         }
         for (const a of game.astervoids) {
-            if (a.syncObjectId) {
-                const r = RemoteObjects.getSettling(a.syncObjectId, renderTime);
-                if (r) a.fromSyncData(r);
-            }
+            if (a.syncObjectId) settle(a, a.syncObjectId);
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
-            const r = RemoteObjects.getSettling(id, renderTime);
-            if (r) ship.fromSyncData(r);
+            settle(ship, id);
         }
     }
 
