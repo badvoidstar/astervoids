@@ -5621,6 +5621,62 @@
         }
     }
 
+    // Set once we have force-flushed our owned objects at game over, so the
+    // flush fires exactly once per game-over transition. Reset whenever we are
+    // no longer in game over (restart / new wave / rejoin).
+    let gameOverFlushed = false;
+
+    /**
+     * Force a final authoritative broadcast of every object WE own at the
+     * instant our local game enters game over.
+     *
+     * Why this is needed (deterministic + send-on-change): owners suppress
+     * redundant per-frame re-anchors for ballistic asteroids/bullets
+     * (SendGate), so the last pose actually SENT can be up to one heartbeat
+     * stale versus the object's true freeze pose. At game over the gameplay
+     * sync pass (gated by lives > 0) stops, so no further sends happen. The
+     * owner renders its owned objects at their true frozen pose (owned objects
+     * are never dead-reckoned), but remotes converge via reingestAtRest +
+     * DeadReckon.getResting onto the owner's LAST-SENT (stale) snapshot — so
+     * owner and remotes disagree on the resting pose (visible on asteroids;
+     * ships are throttled too). Broadcasting the true current pose here makes
+     * the owner's final snapshot equal the freeze pose, so every member's
+     * getResting converges to it.
+     *
+     * Each member owns different objects and reaches game over at its own local
+     * time (shared lives arrive a round-trip apart), so flushing OUR owned
+     * objects when OUR lives hit 0 captures exactly the right final pose for
+     * the "GameState owner != object owner" timing the convergence depends on.
+     *
+     * Calls updateObject directly (immediate), bypassing SendGate (which is
+     * only consulted inside syncLocalAstervoids/syncLocalBullets), so the
+     * suppressed final pose is guaranteed to go out. Deterministic mode only;
+     * legacy always sends per-frame, so its final pose is never stale.
+     */
+    function flushOwnedObjectsAtGameOver() {
+        if (!isSessionMode() || !isDeterministicMode()) return;
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        if (!myMemberId) return;
+        const ownedByUs = (syncId) => {
+            if (!syncId) return false;
+            const o = ObjectSync.getObject(syncId);
+            return !!o && o.ownerMemberId === myMemberId;
+        };
+        for (const asteroid of game.astervoids) {
+            if (ownedByUs(asteroid.syncObjectId)) {
+                ObjectSync.updateObject(asteroid.syncObjectId, asteroid.toUpdateData(), true);
+            }
+        }
+        for (const bullet of game.bullets) {
+            if (ownedByUs(bullet.syncObjectId)) {
+                ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
+            }
+        }
+        if (game.ship && ownedByUs(game.multiplayer.myShipObjectId)) {
+            ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toUpdateData(), true);
+        }
+    }
+
     /**
      * Delete a synced bullet
      * @param {Bullet} bullet - The bullet to delete
@@ -7761,6 +7817,20 @@
             }
             if (isSessionMode() && !isGameStateOwner()) {
                 updateGameStateFromSync();
+            }
+            
+            // Game over: broadcast a final authoritative pose for every object we
+            // own, exactly once, so send-on-change-suppressed asteroids/bullets
+            // don't leave remotes resting on a stale snapshot. Detect the
+            // transition off isGameOver() (per-member local time) so it composes
+            // with the "GameState owner != object owner" convergence path.
+            if (isGameOver()) {
+                if (!gameOverFlushed) {
+                    flushOwnedObjectsAtGameOver();
+                    gameOverFlushed = true;
+                }
+            } else {
+                gameOverFlushed = false;
             }
             
             updateHUD();
