@@ -1174,6 +1174,18 @@
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).
         DEADRECKON_SNAP_DIST: 0.2,
+        // Deterministic mode only, SHIPS ONLY (P2): maximum number of 60fps
+        // frames a remote ship's ANGLE may be forward-extrapolated past its last
+        // authoritative packet (positional extrapolation still uses
+        // DEADRECKON_MAX_FRAMES). rotationSpeed is a step function, so between a
+        // turn STOP and the packet that announces it the receiver would keep
+        // spinning, over-rotating by rotationSpeed x (gap + latency) before
+        // snapping back. P1 sends the stop edge immediately; this caps the
+        // residual over-rotation when that edge is delayed/lost. Trade-off: a
+        // sustained turn at a very low send rate (high RTT) lags slightly once
+        // projection is capped, then eases forward via DEADRECKON_SMOOTH_MS.
+        // Asteroid/bullet spin is NOT clamped (constant rotation is exact).
+        DEADRECKON_ANGULAR_MAX_FRAMES: 10,
         // Legacy mode only: time constant (ms) for easing remote objects onto
         // their authoritative resting pose when the game enters the game-over
         // state. Game over is detected ~one network round-trip after the owner's
@@ -1212,6 +1224,29 @@
         // change velocity mid-life, so this is a safety net for generality.
         SEND_ON_CHANGE_VEL_EPS: 1e-4,
         SEND_ON_CHANGE_ROT_EPS: 1e-4,
+        // Deterministic mode only (P1): when the local ship crosses an
+        // overshoot-critical control EDGE (rotation start/stop or sign reversal,
+        // thrust on/off, brake on/off) flush its authoritative state IMMEDIATELY,
+        // bypassing the adaptive 2-20 Hz send throttle. Without this a turn STOP
+        // can sit unsent for up to a full send interval (~500ms at high RTT),
+        // and the remote over-rotates across the unannounced stop. Edge detection
+        // keys off the ship's DERIVED control state, so it is identical across
+        // keyboard, on-screen buttons, and analog touch schemes. Steady-state
+        // ship position keeps the throttled per-frame path; only edges jump the
+        // queue. Set false to restore pure-throttled ship sends.
+        SHIP_EDGE_SEND_ENABLED: true,
+        // Deterministic mode only (P3): remotes reproduce remote-ship motion by
+        // REPLAYING the real Ship.update() physics (exponential friction,
+        // rotating-heading thrust, speed clamp, brake) forward from each
+        // authoritative packet, instead of first-order linear dead reckoning.
+        // This is exact (modulo cross-engine float drift, bounded by the
+        // heartbeat re-anchor) and wraps natively. It requires the owner to also
+        // send thrustInput / brakeInput, so replay-enabled sessions put ships on
+        // ship-update schema id 4 (= id 1 + the 2 analog input fields). When
+        // disabled, ships stay on schema id 1 and the linear reckoner, so the
+        // wire and all existing size locks are byte-for-byte unchanged. DEFAULT
+        // OFF pending live two-client verification.
+        SHIP_INPUT_REPLAY_ENABLED: false,
 
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1794,6 +1829,19 @@
                 velocityX: data.velocityX || 0,
                 velocityY: data.velocityY || 0,
                 rotationSpeed: data.rotationSpeed || 0,
+                // P2: ships get a tighter ANGULAR extrapolation clamp than the
+                // positional one (rotationSpeed is a step → over-rotates across an
+                // unannounced stop). Ballistic spinners (asteroids/bullets) keep
+                // full-frame angular projection since their rotation is constant
+                // and therefore exact. Derived from the stored object type, which
+                // is present on the merged object data even though the ship's
+                // per-frame toUpdateData() omits it.
+                clampAngular: data.type === OBJECT_TYPES.SHIP,
+                // P3 input-replay seeds: analog control magnitudes the physics
+                // replay needs (turnInput is recovered from rotationSpeed). Only
+                // present on schema-id-4 ship updates; default 0 otherwise.
+                thrustInput: data.thrustInput || 0,
+                brakeInput: data.brakeInput || 0,
                 recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
                     ? baselinePerf
                     : now,
@@ -1842,9 +1890,59 @@
                 out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
             }
             if (s.angle !== null) {
-                out.angle = s.angle + s.rotationSpeed * frames;
+                // P2: clamp ANGULAR projection for ships to bound over-rotation
+                // across an unannounced turn stop; positional projection keeps
+                // the full DEADRECKON_MAX_FRAMES window above.
+                let angFrames = frames;
+                const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
+                if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
+                    angFrames = angCap;
+                }
+                out.angle = s.angle + s.rotationSpeed * angFrames;
+            }
+            // P3: for ships, replace the first-order linear projection above with
+            // an EXACT replay of Ship.update() forward from the baseline (same
+            // friction, rotating-heading thrust, clamp, brake the owner ran).
+            // turnInput is recovered from rotationSpeed; thrust/brake come off the
+            // schema-id-4 packet. Overwrites x/y/angle/velocity computed above.
+            if (s.clampAngular && CONFIG.SHIP_INPUT_REPLAY_ENABLED && isDeterministicMode()) {
+                this._replayShip(s, frames, out);
             }
             return out;
+        },
+
+        // Advance a scratch Ship through `frames` 60fps-equivalent steps from the
+        // baseline kinematic state `s`, writing the resulting pose into `out`.
+        // Steps in whole frames (matching the owner's fixed timestep) plus a
+        // fractional remainder. Pure kinematics: invulnerable/shootCooldown are
+        // zeroed so Ship.update's timer decrements are inert, and nothing else in
+        // Ship.update touches globals.
+        _replayShip(s, frames, out) {
+            const sh = this._scratch || (this._scratch = new Ship(0, 0, 0));
+            sh.x = s.x;
+            sh.y = s.y;
+            sh.angle = (s.angle !== null ? s.angle : 0);
+            sh.velocityX = s.velocityX;
+            sh.velocityY = s.velocityY;
+            const turnSpeed = CONFIG.SHIP_TURN_SPEED;
+            const turnInput = turnSpeed !== 0 ? s.rotationSpeed / turnSpeed : 0;
+            sh.turnInput = turnInput;
+            sh.turnTarget = turnInput;
+            sh.thrustInput = s.thrustInput || 0;
+            sh.brakeInput = s.brakeInput || 0;
+            sh.invulnerable = 0;
+            sh.shootCooldown = 0;
+            let remaining = frames > 0 ? frames : 0;
+            while (remaining > 1e-6) {
+                const dt = remaining > 1 ? 1 : remaining;
+                sh.update(dt);
+                remaining -= dt;
+            }
+            out.x = sh.x;
+            out.y = sh.y;
+            out.velocityX = sh.velocityX;
+            out.velocityY = sh.velocityY;
+            if (s.angle !== null) out.angle = sh.angle;
         },
 
         // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
@@ -1972,6 +2070,61 @@
         clear() { this.baselines.clear(); },
     };
 
+    // Owner-side immediate-flush gate for the LOCAL ship's control edges (P1,
+    // deterministic mode only). Ships are excluded from SendGate (friction makes
+    // their motion non-linearly-predictable, so they keep per-frame sends), but
+    // those per-frame sends ride the adaptive 2-20 Hz throttle. A turn STOP that
+    // lands on the throttled path can sit unsent for up to a full send interval,
+    // and the remote over-rotates across it (the visible turning overshoot at
+    // high latency). This gate watches the ship's DERIVED control state and, when
+    // it crosses an overshoot-critical edge, tells syncLocalShip to flush
+    // IMMEDIATELY (bypassing the throttle) so the edge reaches the remote after
+    // only the one-way latency.
+    //
+    // Keying off DERIVED state (rotationSpeed / thrustInput / brakeInput /
+    // thrusting), NOT individual input handlers, makes it scheme-agnostic:
+    // keyboard, classic on-screen buttons, and the analog touch schemes all
+    // funnel into these fields via handleInput. Only DISCONTINUITIES are edges —
+    // rotation start/stop & sign reversal, thrust on/off, brake on/off. Analog
+    // schemes vary magnitude continuously, but those mid-gesture changes are
+    // intentionally NOT edges: they ride the throttled per-frame path plus the
+    // heartbeat and are dead-reckoned in between. Promoting every analog frame to
+    // an immediate flush would defeat the adaptive throttle.
+    const ShipControlGate = {
+        last: null,
+        // Epsilon for treating an analog magnitude as "active" (non-zero).
+        EPS: 1e-4,
+
+        // Sample the ship's control state and return true iff it crossed an
+        // overshoot-critical edge since the previous sample. Must be called once
+        // per frame (it advances the baseline) regardless of mode so the baseline
+        // never goes stale; the caller gates the immediate flush on mode.
+        isEdge(ship) {
+            const rotEps = CONFIG.SEND_ON_CHANGE_ROT_EPS;
+            const eps = this.EPS;
+            const rs = ship.rotationSpeed || 0;
+            const th = ship.thrustInput || 0;
+            const br = ship.brakeInput || 0;
+            const thrusting = !!ship.thrusting;
+            const p = this.last;
+            this.last = { rs, th, br, thrusting };
+            if (!p) return false; // first sample seeds the baseline only
+            // Rotation start/stop: zero <-> non-zero crossing.
+            if ((Math.abs(rs) > rotEps) !== (Math.abs(p.rs) > rotEps)) return true;
+            // Rotation sign reversal (turn flipped direction without resting at 0).
+            if (rs * p.rs < 0) return true;
+            // Thrust flame flip (drives both visual and the thrust integration).
+            if (thrusting !== p.thrusting) return true;
+            // Analog thrust / brake on<->off (covers schemes where `thrusting`
+            // may not capture the magnitude edge).
+            if ((th > eps) !== (p.th > eps)) return true;
+            if ((br > eps) !== (p.br > eps)) return true;
+            return false;
+        },
+
+        reset() { this.last = null; },
+    };
+
     // ============================================
     // SECTION 1B: MULTIPLAYER CONSTANTS
     // Object types and ship colors for multiplayer sync
@@ -2071,6 +2224,19 @@
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
             ['rotationSpeed', 'q16s'],
         ]},
+        // Ship update schema for INPUT-REPLAY mode (P3, schema id 4). Identical
+        // to id 1 plus the two analog control magnitudes the remote needs to
+        // replay Ship.update() exactly: thrustInput and brakeInput (turnInput is
+        // recovered from rotationSpeed). Only used when
+        // CONFIG.SHIP_INPUT_REPLAY_ENABLED is true, so id 1 (and its wire-size
+        // locks) is untouched when replay is off.
+        { id: 4, fields: [
+            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+            ['rotationSpeed', 'q16s'],
+            ['thrusting', 'bool'], ['invulnerable', 'u16'],
+            ['thrustInput', 'q16s'], ['brakeInput', 'q16s'],
+        ]},
     ];
     const SCHEMA_ID_UPDATE = {
         [OBJECT_TYPES.SHIP]: 1,
@@ -2085,6 +2251,11 @@
         if (kind === 'update') {
             const obj = ctx && ctx.object;
             const type = obj && obj.data && obj.data.type;
+            // P3: replay-enabled sessions carry the analog input fields on the
+            // ship update (schema id 4); otherwise the lean id 1.
+            if (type === OBJECT_TYPES.SHIP && CONFIG.SHIP_INPUT_REPLAY_ENABLED) {
+                return 4;
+            }
             return SCHEMA_ID_UPDATE[type] || 0;
         }
         if (kind === 'create' || kind === 'replace') {
@@ -4116,7 +4287,12 @@
                 velocityY: this.velocityY,
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
-                invulnerable: this.invulnerable
+                invulnerable: this.invulnerable,
+                // P3 input-replay: analog control magnitudes. Only encoded when
+                // the session uses ship-update schema id 4 (SHIP_INPUT_REPLAY_
+                // ENABLED); harmless extra dict keys under schema id 1.
+                thrustInput: this.thrustInput,
+                brakeInput: this.brakeInput
             };
         }
 
@@ -4133,6 +4309,8 @@
             if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
             if (data.thrusting !== undefined) this.thrusting = data.thrusting;
             if (data.invulnerable !== undefined) this.invulnerable = data.invulnerable;
+            if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
+            if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
             if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
             if (data.memberId !== undefined) this.memberId = data.memberId;
             // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
@@ -5075,7 +5253,13 @@
      */
     function syncLocalShip() {
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
-        ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toUpdateData());
+        // P1: sample control edges every frame (keeps the baseline fresh) and
+        // flush immediately on an overshoot-critical edge in deterministic mode,
+        // bypassing the adaptive send throttle. Steady-state position still rides
+        // the throttled per-frame path.
+        const edge = ShipControlGate.isEdge(game.ship);
+        const immediate = edge && CONFIG.SHIP_EDGE_SEND_ENABLED && isDeterministicMode();
+        ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toUpdateData(), immediate);
     }
 
     /**
@@ -5231,6 +5415,7 @@
         RemoteObjects.clear();
         DeadReckon.clear();
         SendGate.clear();
+        ShipControlGate.reset();
         ObjectSync.clear();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
