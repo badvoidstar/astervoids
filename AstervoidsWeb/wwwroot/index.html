@@ -6006,8 +6006,20 @@
                     game.waveDelayTimer = existingGsObj.data.waveDelayTimer;
                 }
                 game.multiplayer.gameStateObjectId = existingGsObj?.id;
-                game.astervoids = [];
-                game.bullets = [];
+                // We reach here as a spectator who INHERITED ownership (every
+                // other member left). While spectating we already populated
+                // game.astervoids/bullets and — once they migrated to us — began
+                // simulating them locally at their live dead-reckoned pose. Do
+                // NOT wipe and rebuild from raw sync data: the owner's last
+                // broadcast is send-on-change-sparse (up to one heartbeat stale),
+                // so recreating from obj.data snaps every owned object BACKWARD to
+                // that older snapshot. Keep the live objects (continuous) and drop
+                // only entries the server no longer knows about; the *FromSync
+                // passes reconcile ownership and adopt any we don't yet hold.
+                game.astervoids = game.astervoids.filter(
+                    a => a.syncObjectId && ObjectSync.getObject(a.syncObjectId));
+                game.bullets = game.bullets.filter(
+                    b => b.syncObjectId && ObjectSync.getObject(b.syncObjectId));
                 updateAstervoidsFromSync();
                 updateBulletsFromSync();
             } else {
