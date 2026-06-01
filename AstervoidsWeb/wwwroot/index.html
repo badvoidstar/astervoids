@@ -1182,7 +1182,37 @@
         // Instead the visible transform decays toward the shared snapshot over
         // ~this window, giving a smooth, convergent stop. 0 = hard snap.
         LEGACY_GAMEOVER_SETTLE_MS: 140,
-        
+
+        // Deterministic mode only: owner-side "send-on-change" suppression.
+        // For purely ballistic objects (asteroids, bullets) the receiver
+        // dead-reckons constant velocity/rotation EXACTLY, so per-frame
+        // positional updates are redundant re-anchors. The owner therefore
+        // stops broadcasting them and sends only when the receiver's prediction
+        // would actually diverge — i.e. on a velocity/rotation change, on a
+        // toroidal wrap (the receiver extrapolates UNWRAPPED), or at a periodic
+        // heartbeat. Set false to restore per-frame sends. Has NO effect in
+        // legacy mode (always sends) — gated by isDeterministicMode().
+        SEND_ON_CHANGE_ENABLED: true,
+        // Heartbeat ceiling (ms): force a re-anchor at least this often even
+        // when nothing changed. Bounds three things: (a) the receiver's
+        // dead-reckon clamp — must stay safely below
+        // DEADRECKON_MAX_FRAMES * (1000/TARGET_FPS) (=500ms) so a straight-
+        // flying object never hits the clamp and freezes; (b) packet-loss
+        // recovery; (c) late-joiner / reconciliation staleness (server keeps
+        // only the last SENT state). 250ms leaves ~250ms of transit headroom
+        // before the 500ms clamp.
+        SEND_ON_CHANGE_HEARTBEAT_MS: 250,
+        // A single-frame normalized position delta larger than this can only be
+        // a wrap-seam crossing (no per-step velocity moves this far), so it
+        // forces an immediate re-anchor. The receiver then snaps via
+        // DEADRECKON_SNAP_DIST instead of sweeping across the field.
+        SEND_ON_CHANGE_WRAP_JUMP: 0.5,
+        // Velocity / rotation-rate change beyond these epsilons re-anchors
+        // immediately (thrust, collision, fracture). Ballistic objects never
+        // change velocity mid-life, so this is a safety net for generality.
+        SEND_ON_CHANGE_VEL_EPS: 1e-4,
+        SEND_ON_CHANGE_ROT_EPS: 1e-4,
+
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
         SHIP_THRUST: 0.009,         // Acceleration per frame (normalized, ~0.15/600*60)
@@ -1865,6 +1895,81 @@
 
         remove(id) { this.states.delete(id); this.lastVersions.delete(id); this.smooth.delete(id); },
         clear() { this.states.clear(); this.lastVersions.clear(); this.smooth.clear(); },
+    };
+
+    // Owner-side "send-on-change" suppression gate (deterministic mode only).
+    //
+    // Counterpart to DeadReckon: where DeadReckon is the RECEIVER's exact
+    // constant-velocity/rotation extrapolator, SendGate is the OWNER deciding
+    // when a fresh authoritative packet would actually improve that receiver's
+    // prediction. For ballistic objects (asteroids, bullets) it almost never
+    // does — the receiver re-anchors to the last SENT pose and integrates the
+    // same constant velocity, so it already shows the right place. The owner
+    // therefore suppresses the per-frame update and re-anchors only on a real
+    // discontinuity the receiver cannot predict:
+    //
+    //   1. No baseline yet  → CREATION / ownership adoption: first send seeds
+    //      the receiver. (Reconciliation discontinuity #1.)
+    //   2. Velocity / rotationSpeed change beyond epsilon → the linear
+    //      prediction is now wrong (thrust, fracture). Ballistic objects don't
+    //      hit this mid-life; it's a generality safety net.
+    //   3. Wrap jump → a single-frame position delta far larger than any
+    //      per-step velocity move means the object crossed the toroidal seam.
+    //      DeadReckon._reckonRaw does NOT wrap, so the receiver would fly off
+    //      unwrapped; forcing a send re-anchors it (snapped via SNAP_DIST).
+    //      (Discontinuity the dead-reckoner can't model.)
+    //   4. Heartbeat → bounds the receiver's dead-reckon clamp, packet-loss
+    //      recovery, and late-joiner staleness (the server only stores the last
+    //      SENT state). (Reconciliation discontinuity #2 — bounded to
+    //      SEND_ON_CHANGE_HEARTBEAT_MS of motion, self-corrected next heartbeat.)
+    //
+    // Time-based (performance.now) rather than frame-counted so it is robust to
+    // variable-dt fallback paths (hidden-tab background loop). Tracked per owned
+    // syncObjectId; cleared on delete (deleteSyncedObject) and session reset.
+    const SendGate = {
+        baselines: new Map(),
+
+        // Returns true if the owner should broadcast this object this frame and
+        // records the new baseline; false to suppress. `angle`/`rs` may be null
+        // for objects without rotation (bullets). Always returns true outside
+        // deterministic mode or when disabled, so legacy is byte-for-byte
+        // unchanged.
+        shouldSend(id, x, y, angle, vx, vy, rs) {
+            if (!CONFIG.SEND_ON_CHANGE_ENABLED || !isDeterministicMode()) return true;
+            vx = vx || 0; vy = vy || 0; rs = rs || 0;
+            const now = performance.now();
+            const b = this.baselines.get(id);
+            if (!b) { this._set(id, x, y, angle, vx, vy, rs, now); return true; }
+            let send = false;
+            if (Math.abs(vx - b.vx) > CONFIG.SEND_ON_CHANGE_VEL_EPS ||
+                Math.abs(vy - b.vy) > CONFIG.SEND_ON_CHANGE_VEL_EPS ||
+                Math.abs(rs - b.rs) > CONFIG.SEND_ON_CHANGE_ROT_EPS) {
+                send = true;
+            } else if (Math.abs(x - b.prevX) > CONFIG.SEND_ON_CHANGE_WRAP_JUMP ||
+                       Math.abs(y - b.prevY) > CONFIG.SEND_ON_CHANGE_WRAP_JUMP) {
+                send = true;
+            } else if ((now - b.lastSentMs) >= CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS) {
+                send = true;
+            }
+            if (send) {
+                this._set(id, x, y, angle, vx, vy, rs, now);
+            } else {
+                // Track every frame's pose (even while suppressing) so wrap
+                // detection compares against the immediately previous frame.
+                b.prevX = x; b.prevY = y; b.prevAngle = angle;
+            }
+            return send;
+        },
+
+        _set(id, x, y, angle, vx, vy, rs, now) {
+            this.baselines.set(id, {
+                x, y, angle, vx, vy, rs,
+                lastSentMs: now, prevX: x, prevY: y, prevAngle: angle,
+            });
+        },
+
+        remove(id) { this.baselines.delete(id); },
+        clear() { this.baselines.clear(); },
     };
 
     // ============================================
@@ -4926,6 +5031,7 @@
      */
     async function deleteSyncedObject(syncObjectId, label) {
         if (!syncObjectId) return false;
+        SendGate.remove(syncObjectId);
         try {
             await ObjectSync.deleteObject(syncObjectId);
         } catch (err) {
@@ -5124,6 +5230,7 @@
         game.bullets = [];
         RemoteObjects.clear();
         DeadReckon.clear();
+        SendGate.clear();
         ObjectSync.clear();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
@@ -5162,7 +5269,15 @@
             if (asteroid.syncObjectId) {
                 const syncObj = ObjectSync.getObject(asteroid.syncObjectId);
                 if (syncObj && syncObj.ownerMemberId === myMemberId) {
-                    ObjectSync.updateObject(asteroid.syncObjectId, asteroid.toUpdateData());
+                    // Send-on-change: a ballistic asteroid is dead-reckoned
+                    // exactly by remotes, so suppress redundant per-frame
+                    // re-anchors (deterministic mode only; no-op in legacy).
+                    if (SendGate.shouldSend(
+                            asteroid.syncObjectId, asteroid.x, asteroid.y,
+                            asteroid.angle, asteroid.velocityX, asteroid.velocityY,
+                            asteroid.rotationSpeed)) {
+                        ObjectSync.updateObject(asteroid.syncObjectId, asteroid.toUpdateData());
+                    }
                 }
             }
         }
@@ -5305,7 +5420,18 @@
         for (const bullet of game.bullets) {
             // Only sync our own bullets
             if (bullet.ownerMemberId === myMemberId && bullet.syncObjectId) {
-                ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData());
+                // Send-on-change: bullets fly ballistically (frictionless,
+                // constant velocity), so remotes dead-reckon them exactly and
+                // per-frame re-anchors are redundant. ALWAYS send when a hit is
+                // pending, though — pendingHit + the hit* fields are the hit
+                // reconciliation event the asteroid owner must receive, and
+                // they are not predictable from kinematics. (No-op in legacy.)
+                const gateSend = SendGate.shouldSend(
+                    bullet.syncObjectId, bullet.x, bullet.y, null,
+                    bullet.velocityX, bullet.velocityY, 0);
+                if (gateSend || bullet.pendingHit) {
+                    ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData());
+                }
             }
         }
     }
@@ -9545,6 +9671,9 @@
                 if (migration.newOwnerId === myMemberId) {
                     DeadReckon.remove(migration.objectId);
                     RemoteObjects.remove(migration.objectId);
+                    // Drop any stale send-on-change baseline so our first sync
+                    // as the new owner re-anchors remotes immediately.
+                    SendGate.remove(migration.objectId);
                 }
             }
         }
