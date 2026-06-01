@@ -5569,6 +5569,12 @@
                 AudioSystem.playExplosion(size);
                 RemoteObjects.remove(a.syncObjectId);
                 DeadReckon.remove(a.syncObjectId);
+                // Owner-side send-on-change baseline must be released too. An
+                // asteroid we owned and then SPLIT is replaced (replaceObject)
+                // rather than deleteSyncedObject'd, so its SendGate baseline is
+                // never cleared on that path — without this, every fracture
+                // leaks one baseline entry for the life of the session.
+                SendGate.remove(a.syncObjectId);
                 return false;
             }
             return true;
