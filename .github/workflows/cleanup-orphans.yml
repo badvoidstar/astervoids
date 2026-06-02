@@ -191,6 +191,16 @@ jobs:
           for APP in $ACTIVE_APPS; do
             SUFFIX="${APP#${{ env.CONTAINER_APP_PREFIX }}-}"
             ACTIVE_SUFFIXES="$ACTIVE_SUFFIXES $SUFFIX"
+            # Multi-region production apps are named ca-web-production-<region>
+            # (suffix "production-<region>"), but their per-region DNS records are
+            # named <subdomain>-<region> — i.e. the bare region with NO
+            # "production-" prefix (see infra/main.bicep dnsRecordsPerRegion). Add
+            # the bare region as a protected suffix too, otherwise the DNS/cert
+            # scan below treats production regional CNAME/TXT/cert records as
+            # orphans and deletes them, breaking production custom-domain routing.
+            case "$SUFFIX" in
+              production-*) ACTIVE_SUFFIXES="$ACTIVE_SUFFIXES ${SUFFIX#production-}" ;;
+            esac
           done
           echo "Active branch suffixes: $ACTIVE_SUFFIXES"
           
