@@ -808,252 +808,191 @@ test('deterministic game over: re-ingested base snapshot converges members', () 
         'both members rest at the owner\'s final authoritative snapshot');
 });
 
-// ── Deterministic game over: ease onto the resting pose (no snap-back) ───────
+// ── Deterministic game over: shared ballistic freeze ────────────────────────
 //
-// In play, a dead-reckoned remote is rendered at DeadReckon.getReckoned (the
-// authoritative base PLUS a forward prediction). At game over the replica must
-// converge to DeadReckon.getResting (the RAW base, no prediction), which is
-// BEHIND the displayed pose. The old code switched getReckoned → getResting in
-// a single frame, snapping backward by the prediction — the reported 1-2 frame
-// jump. easeDeadReckonedTowardRest instead eases the visible pose toward the
-// (advancing) resting target with a frame-rate-independent exponential blend;
-// first frozen frame k = 0 (hold, no pop). Mirror of that helper (1-D + wrap).
-const SETTLE_EPS = 0.0005;
-function wrapN(v) { let r = v % 1; if (r < 0) r += 1; return r; }
-// Mirror of easeDeadReckonedTowardRest's positional ease over a toroidal range
-// of 1: shortest-path delta, epsilon-pin, and snap (intentional warp) override.
-function easeRest(start, target, k, snap) {
-    if (snap || k >= 1) return target;
-    let dx = target - start;
-    if (dx > 0.5) dx -= 1; else if (dx < -0.5) dx += 1;
-    if (Math.abs(dx) >= SETTLE_EPS) return wrapN(start + dx * k);
-    return target; // below epsilon: pin exactly so members converge
+// At game over every synced object (owned AND remote) stops being simulated /
+// dead-reckoned and is instead projected forward at its last constant velocity
+// from where it is CURRENTLY displayed to a single shared stop instant
+// T_freeze = gameOverAt + DEADRECKON_GAMEOVER_FREEZE_DELAY_MS, then held. This
+// gives a seamless (no-jump, no-blend) forward coast that halts on every member
+// at the same shared server-time. The mirrors below reproduce that projection
+// (1-D normalized field of width 1; angle handled identically).
+const FREEZE_DELAY = 400, GO_STEP_MS = 1000 / 60;
+function wrapMod1(v) { const r = v % 1; return r < 0 ? r + 1 : r; }
+// Mirror of repositionDeadReckonedRemotes' game-over branch for one 1-D object.
+// `anchor` = { pose, vPerFrame, anchorMs }; project to the evaluation instant.
+function freezeProject(anchor, tEvalMs) {
+    let frames = (tEvalMs - anchor.anchorMs) / GO_STEP_MS;
+    if (!(frames > 0)) frames = 0;
+    return wrapMod1(anchor.pose + anchor.vPerFrame * frames);
 }
-function makeRestSettler(startPose, tau) {
-    let pose = startPose;
-    let active = false;
-    return {
-        step(dtMs, target, snap = false) {
-            const k = active && tau > 0 && dtMs > 0
-                ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
-            active = true;
-            pose = easeRest(pose, target, k, snap);
-            return pose;
-        },
-        get: () => pose,
-    };
+// Resolve the shared stop instant and clamp the evaluation time, mirroring the
+// latch in the reposition function (tEval = min(now, gameOverAt + delay)).
+function tEvalFor(nowMs, gameOverAtMs) {
+    return Math.min(nowMs, gameOverAtMs + FREEZE_DELAY);
 }
 
-test('deterministic game over: first frozen frame holds, then eases onto base (no pop)', () => {
-    const tau = 90, stepMs = 1000 / 60;
-    const base = 0.50;               // getResting (authoritative, no prediction)
-    const displayedAtGameOver = 0.53; // getReckoned was ahead by the prediction
-    const s = makeRestSettler(displayedAtGameOver, tau);
-    // First frozen frame: dt = 0 ⇒ k = 0 ⇒ no movement. The OLD code snapped
-    // straight to `base` here (the visible backward jump).
-    assert.equal(s.step(0, base), displayedAtGameOver);
-    // Then it glides onto the authoritative base and converges exactly (epsilon
-    // pin), rather than asymptotically hovering short of it.
-    let prev = s.get();
-    for (let f = 0; f < 200; f++) {
-        const cur = s.step(stepMs, base);
-        assert.ok(cur <= prev + 1e-12 && cur >= base - 1e-12,
-            'monotonic toward the base, no overshoot');
+test('game-over freeze: first frozen frame holds at the displayed pose (no jump)', () => {
+    // The anchor is captured from the current on-screen pose at the moment game
+    // over is detected, with anchorMs = the local server-time of capture. The very
+    // first projected frame (tEval == anchorMs) must reproduce that pose exactly.
+    const anchor = { pose: 0.5312, vPerFrame: 0.004, anchorMs: 10_000 };
+    const gameOverAt = 9_900; // a little earlier; T_freeze = 10_300
+    const tEval = tEvalFor(10_000, gameOverAt); // == 10_000 (anchor instant)
+    assert.equal(freezeProject(anchor, tEval), 0.5312);
+});
+
+test('game-over freeze: coasts strictly forward then halts exactly at T_freeze', () => {
+    const anchor = { pose: 0.20, vPerFrame: 0.003, anchorMs: 10_000 };
+    const gameOverAt = 9_800;                 // T_freeze = 10_200
+    const tFreeze = gameOverAt + FREEZE_DELAY; // 10_200
+    let prev = freezeProject(anchor, tEvalFor(10_000, gameOverAt));
+    // Coast: each render frame advances forward by the constant per-frame step.
+    for (let now = 10_000; now <= 10_200; now += GO_STEP_MS) {
+        const cur = freezeProject(anchor, tEvalFor(now, gameOverAt));
+        let d = cur - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
+        assert.ok(d >= -1e-12, 'forward only, never reverses');
         prev = cur;
     }
-    assert.equal(s.get(), base, 'epsilon completion pins exactly onto the resting base');
-});
-
-test('deterministic game over: eases forward through advancing late snapshots', () => {
-    const tau = 90, stepMs = 1000 / 60;
-    // The owner kept moving for ~a round-trip after the fatal collision, so the
-    // resting target advances FORWARD across re-ingested late snapshots. The
-    // replica should flow forward to the final pose, not roll back then step.
-    const targets = [0.50, 0.52, 0.54, 0.56, 0.56, 0.56];
-    const s = makeRestSettler(0.505, tau); // slightly ahead of the first base
-    assert.equal(s.step(0, targets[0]), 0.505); // first frame holds
-    let prev = s.get();
-    let frame = 1;
-    for (let i = 1; i < targets.length; i++) {
-        for (let f = 0; f < 30; f++) {
-            const cur = s.step(stepMs, targets[Math.min(i, targets.length - 1)]);
-            assert.ok(cur >= prev - 1e-9, 'motion is forward (never snaps backward)');
-            prev = cur; frame++;
-        }
+    // The resting pose is exactly the projection evaluated at T_freeze...
+    const rest = freezeProject(anchor, tFreeze);
+    // ...and it does not change once now passes T_freeze (tEval is clamped).
+    for (let now = 10_200; now <= 11_500; now += GO_STEP_MS) {
+        assert.equal(freezeProject(anchor, tEvalFor(now, gameOverAt)), rest,
+            'held constant after the shared stop instant');
     }
-    assert.ok(Math.abs(s.get() - 0.56) < 1e-9, 'arrives at the owner\'s final pose');
+    // Expected analytic rest: 0.20 + 0.003 * ((10_200 - 10_000) / GO_STEP_MS).
+    const frames = (10_200 - 10_000) / GO_STEP_MS;
+    assert.ok(Math.abs(rest - wrapMod1(0.20 + 0.003 * frames)) < 1e-12);
 });
 
-test('deterministic game over: intentional warp (ship respawn) snaps, not eased', () => {
-    // snap = true (invulnerable jumped up ⇒ Ship.reset teleport) jumps to the
-    // target regardless of k — even on the held first frame.
-    assert.equal(easeRest(0.10, 0.90, 0.0, true), 0.90);
-    assert.equal(easeRest(0.10, 0.90, 0.5, true), 0.90);
+test('game-over freeze: identical inputs converge to the identical rest pose', () => {
+    // The core convergence property: any two members that capture the SAME object
+    // with the SAME velocity and anchor, evaluated at the SAME shared T_freeze,
+    // land on the SAME pose — independent of their own frame timing/refresh rate.
+    const gameOverAt = 50_000;
+    const tFreeze = gameOverAt + FREEZE_DELAY;
+    const a = { pose: 0.61, vPerFrame: 0.0025, anchorMs: 50_050 };
+    const b = { pose: 0.61, vPerFrame: 0.0025, anchorMs: 50_050 };
+    // Evaluate on very different per-member render cadences up to past T_freeze.
+    let pa, pb;
+    for (let now = 50_050; now <= tFreeze + 500; now += GO_STEP_MS) pa = freezeProject(a, tEvalFor(now, gameOverAt));
+    for (let now = 50_050; now <= tFreeze + 500; now += 7.3) pb = freezeProject(b, tEvalFor(now, gameOverAt));
+    assert.equal(pa, pb, 'shared stop instant ⇒ identical rest pose regardless of cadence');
 });
 
-test('deterministic game over: wraparound eases the SHORT way across the seam', () => {
-    // Displayed at 0.98, resting at 0.02: the short toroidal path is +0.04
-    // across the seam, NOT −0.96 across the whole field. Halfway (k = 0.5) lands
-    // at the seam (~0.00), and the move magnitude is tiny — a continuous glide,
-    // not a field-spanning sweep.
-    const out = easeRest(0.98, 0.02, 0.5, false);
-    assert.ok(Math.abs(out - 0.0) < 1e-9 || Math.abs(out - 1.0) < 1e-9,
-        'midpoint sits on the seam, taking the short path');
-    // The eased step never traverses anywhere near the middle of the field.
-    for (let k = 0; k <= 1.0001; k += 0.1) {
-        const p = easeRest(0.98, 0.02, k, false);
-        const nearSeam = Math.min(p, 1 - p) <= 0.04 + 1e-9;
-        assert.ok(nearSeam, 'stays within the short wrap arc, never sweeps the field');
+test('game-over freeze: all objects cease simultaneously at the shared instant', () => {
+    // Objects of different velocities (and whose owners died at different times,
+    // i.e. different anchorMs) all stop at the SAME shared server-time T_freeze —
+    // they coast different distances but halt together.
+    const gameOverAt = 0;
+    const tFreeze = gameOverAt + FREEZE_DELAY;
+    const slow = { pose: 0.10, vPerFrame: 0.001, anchorMs: 50 };
+    const fast = { pose: 0.10, vPerFrame: 0.006, anchorMs: 180 };
+    const restSlow = freezeProject(slow, tFreeze);
+    const restFast = freezeProject(fast, tFreeze);
+    // A frame BEFORE T_freeze both are still moving; AT/after T_freeze both held.
+    assert.notEqual(freezeProject(slow, tFreeze - GO_STEP_MS), restSlow);
+    assert.notEqual(freezeProject(fast, tFreeze - GO_STEP_MS), restFast);
+    for (const dt of [0, GO_STEP_MS, 200, 1000]) {
+        assert.equal(freezeProject(slow, tEvalFor(tFreeze + dt, gameOverAt)), restSlow);
+        assert.equal(freezeProject(fast, tEvalFor(tFreeze + dt, gameOverAt)), restFast);
     }
 });
 
-test('deterministic game over: epsilon-close pose pins exactly onto the target', () => {
-    // A residual below the settle epsilon snaps to the target so every member
-    // ends at identical state (an exponential ease only approaches it).
-    assert.equal(easeRest(0.5 - SETTLE_EPS / 2, 0.5, 0.5, false), 0.5);
-    // A residual above epsilon still eases (does not pin prematurely).
-    assert.notEqual(easeRest(0.5 - 0.01, 0.5, 0.5, false), 0.5);
+test('game-over freeze: toroidal wrap is continuous across the seam (modulo)', () => {
+    // A coast that crosses the wrap boundary continues smoothly via modulo — it is
+    // NOT treated as a backward discontinuity. Start near the seam moving forward.
+    const gameOverAt = 0;
+    const anchor = { pose: 0.97, vPerFrame: 0.004, anchorMs: 0 };
+    let prev = freezeProject(anchor, 0);
+    let crossed = false;
+    for (let now = GO_STEP_MS; now <= FREEZE_DELAY; now += GO_STEP_MS) {
+        const cur = freezeProject(anchor, tEvalFor(now, gameOverAt));
+        let d = cur - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
+        assert.ok(Math.abs(d) < 0.01, 'per-frame step stays small across the seam');
+        assert.ok(d >= -1e-12, 'still forward across the wrap');
+        if (cur < prev) crossed = true; // value wrapped 0.99.. → 0.00..
+        prev = cur;
+    }
+    assert.ok(crossed, 'the projection actually wrapped across the seam');
 });
 
-// ── Deterministic game over: FRESH (getReckoned) vs STALE (ease) switching ───
-//
-// The "ease toward the static getResting every frame" settle still throbs while
-// the owner is STILL streaming: getResting only advances at the ~4 Hz heartbeat,
-// so the replica reverses toward a stale base then jerks forward on each packet.
-// repositionDeadReckonedRemotes therefore keeps each remote in a FRESH phase
-// (rendered at getReckoned — continuous forward dead reckoning, no ease) while
-// the owner's snapshots keep arriving (age <= DEADRECKON_SETTLE_FRESH_MS), and
-// only switches to the STALE ease toward getResting once the stream stops. A
-// per-object latch keeps it stale for the rest of the episode so a late straggler
-// heartbeat cannot flip it back and pop it forward. The mirror below reproduces
-// that decision (1-D, arrival-anchored clamp, latch + per-object ease clock).
-const FRESH_MS = 400, GO_TAU = 90, CLAMP_FRAMES = 30, FRAME_MS = 1000 / 60;
-function kFromDt(dtMs, tau) {
-    const dt = Math.max(0, Math.min(dtMs, 250));
-    return (tau > 0 && dt > 0) ? Math.min(1, 1 - Math.exp(-dt / tau)) : (tau <= 0 ? 1 : 0);
-}
-// Mirror of applyPose's game-over branch for a single 1-D object.
-function makeFreshStaleReplica(velPerFrame, startPose) {
-    let base = startPose;        // getResting: raw snapshot position
-    let recvPerf = 0;            // arrival time of the last ingested snapshot
-    let lastEase = null;         // null ⇒ not latched stale; else last ease time
-    let pose = startPose;        // on-screen position
-    const reckoned = (now) => {
-        const frames = Math.min(Math.max(0, (now - recvPerf) / FRAME_MS), CLAMP_FRAMES);
-        return wrapN(base + velPerFrame * frames);
+test('game-over freeze: projection over a long coast exceeding one field wraps cleanly', () => {
+    // wrapNormalizedMod must tolerate an excursion of more than one field width
+    // (a very fast object over the whole coast window). The single-step
+    // wrapNormalized would fail here; the modulo form keeps it in range.
+    const anchor = { pose: 0.0, vPerFrame: 0.05, anchorMs: 0 }; // ~1.2 fields over 400ms
+    const tFreeze = FREEZE_DELAY;
+    const rest = freezeProject(anchor, tFreeze);
+    assert.ok(rest >= 0 && rest < 1, 'stays within the normalized field after a >1-field coast');
+    const frames = tFreeze / GO_STEP_MS;
+    assert.ok(Math.abs(rest - wrapMod1(0.05 * frames)) < 1e-12);
+});
+
+test('game-over freeze: a member detecting game over after T_freeze halts immediately', () => {
+    // Extreme-latency edge: this member only reaches game over after the shared
+    // stop instant has already passed. tEval clamps to T_freeze ≤ anchorMs, so
+    // frames ≤ 0 ⇒ it freezes immediately at its captured pose (no backward jump,
+    // no runaway forward coast).
+    const gameOverAt = 0;
+    const anchor = { pose: 0.42, vPerFrame: 0.01, anchorMs: FREEZE_DELAY + 300 };
+    const rest = freezeProject(anchor, tEvalFor(anchor.anchorMs, gameOverAt));
+    assert.equal(rest, 0.42, 'late member holds at its captured pose, no reversal');
+});
+
+test('game-over freeze: owner (true pose) rests ahead of a latency-lagged remote, never behind', () => {
+    // The owner captures the object at its TRUE pose; a remote captures it at a
+    // latency-lagged displayed pose (arrival-anchored dead reckoning lags by the
+    // inter-packet gap). Projected to the same T_freeze, the remote rests slightly
+    // BEHIND the owner (by that lag) — the residual divergence — but is NEVER
+    // forced backward and NEVER overshoots ahead of the owner.
+    const gameOverAt = 0;
+    const tFreeze = FREEZE_DELAY;
+    const v = 0.004;
+    const lagFrames = 5; // remote displayed pose is 5 frames behind truth
+    const owner = { pose: 0.500, vPerFrame: v, anchorMs: 20 };
+    const remote = { pose: wrapMod1(0.500 - v * lagFrames), vPerFrame: v, anchorMs: 20 };
+    const restOwner = freezeProject(owner, tFreeze);
+    const restRemote = freezeProject(remote, tFreeze);
+    let gap = restOwner - restRemote; if (gap > 0.5) gap -= 1; else if (gap < -0.5) gap += 1;
+    assert.ok(gap > 0, 'remote rests behind the owner (positive lag), not ahead');
+    assert.ok(Math.abs(gap - v * lagFrames) < 1e-12, 'residual equals exactly the latency lag');
+});
+
+test('game-over freeze: ship resting HEADING converges across members (angle unclamped)', () => {
+    // Ships rotate during the coast. Two members detect game over a few frames
+    // apart, so each captures the same ship at a DIFFERENT anchorMs with a
+    // correspondingly different captured heading. Projecting the angle LINEARLY
+    // (no DEADRECKON_ANGULAR_MAX_FRAMES clamp) makes those two offsets cancel so
+    // both members rest at the identical heading — the clamp would saturate the
+    // sweep and leave the pre-anchor rotation uncancelled, diverging the heading.
+    const rot = 0.05;                 // radians per frame
+    const gameOverAt = 0;
+    const tFreeze = gameOverAt + FREEZE_DELAY; // shared stop instant
+    // angleProject mirrors the linear angle branch of applyFreeze.
+    const angleProject = (baseAngle, anchorMs) => {
+        let frames = (tFreeze - anchorMs) / GO_STEP_MS;
+        if (!(frames > 0)) frames = 0;
+        return baseAngle + rot * frames;
     };
-    return {
-        // Advance one render frame at perf time `now`. `snapshot` (optional) is a
-        // newly ingested authoritative pose; `teleport` marks an intentional warp.
-        frame(now, snapshot, teleport = false) {
-            if (snapshot !== undefined) { base = snapshot; recvPerf = now; }
-            if (teleport) lastEase = null; // respawn: owner authoritative again
-            const staleMs = now - recvPerf;
-            const latched = lastEase !== null;
-            if (!latched && (teleport || staleMs <= FRESH_MS)) {
-                pose = reckoned(now); // FRESH: smooth continuous, no ease
-                return pose;
-            }
-            let k;
-            if (lastEase === null) k = 0; // first stale frame holds (no pop)
-            else k = kFromDt(now - lastEase, GO_TAU);
-            lastEase = now;
-            pose = easeRest(pose, base, k, false);
-            return pose;
-        },
-        pose: () => pose,
-        base: () => base,
-        isStale: () => lastEase !== null,
+    const skewFrames = 6; // member B detects game over 6 frames later than A
+    // True heading at A's capture instant; B captures skewFrames later, so its
+    // captured base heading has advanced by rot * skewFrames.
+    const angleA = 1.0, anchorA = 100;
+    const angleB = angleA + rot * skewFrames, anchorB = anchorA + skewFrames * GO_STEP_MS;
+    const restA = angleProject(angleA, anchorA);
+    const restB = angleProject(angleB, anchorB);
+    assert.ok(Math.abs(restA - restB) < 1e-12, 'linear angle projection converges the heading');
+    // Sanity: the clamped variant (saturating at 10 frames over a ~24-frame coast)
+    // would NOT converge — confirm the asymmetry the unclamped form avoids.
+    const ANG_CAP = 10;
+    const angleProjectClamped = (baseAngle, anchorMs) => {
+        let frames = (tFreeze - anchorMs) / GO_STEP_MS;
+        if (!(frames > 0)) frames = 0;
+        if (frames > ANG_CAP) frames = ANG_CAP;
+        return baseAngle + rot * frames;
     };
-}
-
-test('deterministic game over: FRESH phase moves smoothly forward (no reversal/throb)', () => {
-    // Owner keeps heartbeating (every 250 ms) for a while after the local member
-    // hits game over. Through that window the replica should track getReckoned —
-    // strictly forward, never reversing toward a stale base (the old throb).
-    const vel = 0.002; // per frame ≈ 0.12/s
-    const r = makeFreshStaleReplica(vel, 0.50);
-    r.frame(0, 0.50);  // last in-play snapshot at game over
-    let prev = r.pose();
-    let nextHeartbeat = 250, base = 0.50;
-    for (let now = FRAME_MS; now <= 700; now += FRAME_MS) {
-        let snap;
-        if (now >= nextHeartbeat) { base = wrapN(base + vel * (250 / FRAME_MS)); snap = base; nextHeartbeat += 250; }
-        const p = r.frame(now, snap);
-        assert.ok(!r.isStale(), 'stays FRESH while heartbeats keep arriving');
-        // Forward only on a toroidal field: the per-frame step is small & positive.
-        let d = p - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
-        assert.ok(d >= -1e-9, 'moves forward, never reverses toward a stale base');
-        prev = p;
-    }
-});
-
-test('deterministic game over: switches to STALE ~freshMs after the owner stops, then settles', () => {
-    const vel = 0.002;
-    const r = makeFreshStaleReplica(vel, 0.50);
-    const lastSnapAt = 0;
-    r.frame(lastSnapAt, 0.50); // final snapshot; owner sends nothing more
-    // Still fresh just before the window closes...
-    r.frame(FRESH_MS - FRAME_MS);
-    assert.ok(!r.isStale(), 'fresh until the snapshot age exceeds freshMs');
-    // ...and stale shortly after.
-    r.frame(FRESH_MS + FRAME_MS);
-    assert.ok(r.isStale(), 'goes stale once the owner stream stops');
-    // First stale frame holds (no pop): pose unchanged from the prior fresh pose.
-    // Then it eases onto the raw base and pins exactly (convergence).
-    for (let now = FRESH_MS + 2 * FRAME_MS; now <= FRESH_MS + 2000; now += FRAME_MS) r.frame(now);
-    assert.equal(r.pose(), 0.50, 'eases onto and pins exactly at the resting base');
-});
-
-test('deterministic game over: latch prevents a straggler heartbeat from popping forward', () => {
-    // Once stale, a late snapshot must NOT flip the object back to the fresh
-    // (extrapolating) phase — that would jump it forward by the prediction again.
-    const vel = 0.01; // fast: a flip back to getReckoned would be a big visible pop
-    const r = makeFreshStaleReplica(vel, 0.50);
-    r.frame(0, 0.50);
-    // Let it go stale and partly settle.
-    r.frame(FRESH_MS + FRAME_MS);          // first stale frame (holds)
-    r.frame(FRESH_MS + 2 * FRAME_MS);      // eases a little toward base
-    const settling = r.pose();
-    assert.ok(r.isStale());
-    // A straggler heartbeat arrives (new base slightly ahead). It is re-ingested
-    // (base advances) but the object STAYS stale and keeps easing — it must not
-    // snap to base + a fresh forward prediction.
-    const newBase = wrapN(0.50 + vel * 5);
-    const after = r.frame(FRESH_MS + 3 * FRAME_MS, newBase);
-    assert.ok(r.isStale(), 'remains latched stale through a late snapshot');
-    let step = after - settling; if (step > 0.5) step -= 1; else if (step < -0.5) step += 1;
-    assert.ok(Math.abs(step) < vel * CLAMP_FRAMES * 0.5,
-        'moves only a small eased amount, not a full prediction-sized jump');
-});
-
-test('deterministic game over: members that stop at different times still converge', () => {
-    // Two members go stale at different moments (different latency to the owner's
-    // last packet) but both ease onto the identical final base.
-    const vel = 0.003;
-    const a = makeFreshStaleReplica(vel, 0.50);
-    const b = makeFreshStaleReplica(vel, 0.50);
-    const finalBase = wrapN(0.50 + vel * 8);
-    a.frame(0, 0.50); b.frame(0, 0.50);
-    // A ingests the owner's final snapshot promptly; B ingests it later.
-    a.frame(40, finalBase);
-    b.frame(120, finalBase);
-    for (let now = 160; now <= 3000; now += FRAME_MS) { a.frame(now); b.frame(now); }
-    assert.equal(a.pose(), finalBase);
-    assert.equal(b.pose(), finalBase);
-    assert.equal(a.pose(), b.pose(), 'both converge to the owner\'s final base');
-});
-
-test('deterministic game over: intentional respawn teleport unlatches and snaps', () => {
-    // If a remote ship respawns mid-settle the owner is alive/authoritative again:
-    // the teleport drops the stale latch and snaps the replica to the spawn pose.
-    const r = makeFreshStaleReplica(0.0, 0.20);
-    r.frame(0, 0.20);
-    r.frame(FRESH_MS + FRAME_MS);     // stale
-    r.frame(FRESH_MS + 2 * FRAME_MS); // easing
-    assert.ok(r.isStale());
-    const spawn = 0.80;
-    const p = r.frame(FRESH_MS + 3 * FRAME_MS, spawn, true);
-    assert.ok(!r.isStale(), 'teleport clears the stale latch');
-    assert.equal(p, spawn, 'snaps directly to the spawn pose, not eased');
+    assert.ok(Math.abs(angleProjectClamped(angleA, anchorA) - angleProjectClamped(angleB, anchorB)) > 1e-6,
+        'the clamped projection diverges (regression guard for why we drop the clamp here)');
 });
