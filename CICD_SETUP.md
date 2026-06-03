@@ -135,21 +135,64 @@ Branch deployments get subdomains following this pattern:
 Branch names are sanitized for DNS compatibility:
 - Converted to lowercase
 - `/` replaced with `-` (e.g., `feature/login` → `feature-login`)
-- Special characters removed
-- Truncated to 20 characters
+- Special characters removed; trailing dashes trimmed
+- **Short names are used as-is, with no hash.** If the sanitized name fits
+  within 25 characters (e.g., `feature/login` → `feature-login`), it is emitted
+  verbatim. This keeps the derived Container App name (`ca-web-{sanitized}`)
+  within Azure's 32-character limit.
+- **Only over-long names get a hash.** When the sanitized name exceeds 25
+  characters, it is truncated to 20 characters and a 4-character hash of the
+  full branch name is appended as `{name}-{hash}` (e.g. a long branch →
+  `feature-super-long-b-71b3`). The hash guarantees that two long branches
+  sharing the same truncated 20-char prefix never collide.
 
 ### Resource Naming
 
 | Resource | Production single-region | Production multi-region | Branch (feature/login) |
 |---|---|---|---|
-| Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login` |
+| Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login` (long branches: `ca-web-<name>-<hash>`) |
 | Container Apps Environment | `cae-production` | `cae-production-<primary-region>` and peers | shared production CAE (`cae-production` or `cae-production-<primary-region>`) |
-| Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login.domain.com` |
+| Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login.domain.com` (long branches: `app-<name>-<hash>.domain.com`) |
 
 ### Prerequisites for Branch Deployments
 
 1. **Production must be deployed first** - Branch deployments use the shared Container Apps Environment created by the production deployment
 2. **Custom domain secrets configured** - `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must be set
+
+### Finding a branch's custom URL (privately)
+
+This repository is public, and **GitHub does not mask secrets in job summaries**
+(only in logs). The deploy job therefore never prints a branch's full custom
+hostname — it embeds the secret `CUSTOM_SUBDOMAIN`/`CUSTOM_DOMAIN_NAME`. The
+branch name and its derived `{name}-{hash}` segment are public; only the
+subdomain and domain stay secret.
+
+To resolve the full URL yourself, use either method below.
+
+**Option A — local helper (offline, needs the secrets):**
+Provide the secret parts via environment variables, or an untracked
+`.deploy.local` file at the repo root (git-ignored):
+
+```
+CUSTOM_SUBDOMAIN=app
+CUSTOM_DOMAIN_NAME=example.com
+```
+
+Then run:
+
+```bash
+./.github/scripts/branch-url.sh                # current branch
+./.github/scripts/branch-url.sh feature/login  # a specific branch
+# => https://app-feature-login.example.com
+```
+
+**Option B — ask Azure (no local secrets):**
+
+```bash
+az containerapp show -g rg-production \
+  -n "ca-web-$(./.github/scripts/branch-url.sh --sanitized feature/login)" \
+  --query "properties.configuration.ingress.customDomains[].name" -o tsv
+```
 
 ### Greenfield expectations
 
