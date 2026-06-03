@@ -807,3 +807,110 @@ test('deterministic game over: re-ingested base snapshot converges members', () 
     assert.deepEqual(a.getResting(), b.getResting(),
         'both members rest at the owner\'s final authoritative snapshot');
 });
+
+// ── Deterministic game over: ease onto the resting pose (no snap-back) ───────
+//
+// In play, a dead-reckoned remote is rendered at DeadReckon.getReckoned (the
+// authoritative base PLUS a forward prediction). At game over the replica must
+// converge to DeadReckon.getResting (the RAW base, no prediction), which is
+// BEHIND the displayed pose. The old code switched getReckoned → getResting in
+// a single frame, snapping backward by the prediction — the reported 1-2 frame
+// jump. easeDeadReckonedTowardRest instead eases the visible pose toward the
+// (advancing) resting target with a frame-rate-independent exponential blend;
+// first frozen frame k = 0 (hold, no pop). Mirror of that helper (1-D + wrap).
+const SETTLE_EPS = 0.0005;
+function wrapN(v) { let r = v % 1; if (r < 0) r += 1; return r; }
+// Mirror of easeDeadReckonedTowardRest's positional ease over a toroidal range
+// of 1: shortest-path delta, epsilon-pin, and snap (intentional warp) override.
+function easeRest(start, target, k, snap) {
+    if (snap || k >= 1) return target;
+    let dx = target - start;
+    if (dx > 0.5) dx -= 1; else if (dx < -0.5) dx += 1;
+    if (Math.abs(dx) >= SETTLE_EPS) return wrapN(start + dx * k);
+    return target; // below epsilon: pin exactly so members converge
+}
+function makeRestSettler(startPose, tau) {
+    let pose = startPose;
+    let active = false;
+    return {
+        step(dtMs, target, snap = false) {
+            const k = active && tau > 0 && dtMs > 0
+                ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+            active = true;
+            pose = easeRest(pose, target, k, snap);
+            return pose;
+        },
+        get: () => pose,
+    };
+}
+
+test('deterministic game over: first frozen frame holds, then eases onto base (no pop)', () => {
+    const tau = 90, stepMs = 1000 / 60;
+    const base = 0.50;               // getResting (authoritative, no prediction)
+    const displayedAtGameOver = 0.53; // getReckoned was ahead by the prediction
+    const s = makeRestSettler(displayedAtGameOver, tau);
+    // First frozen frame: dt = 0 ⇒ k = 0 ⇒ no movement. The OLD code snapped
+    // straight to `base` here (the visible backward jump).
+    assert.equal(s.step(0, base), displayedAtGameOver);
+    // Then it glides onto the authoritative base and converges exactly (epsilon
+    // pin), rather than asymptotically hovering short of it.
+    let prev = s.get();
+    for (let f = 0; f < 200; f++) {
+        const cur = s.step(stepMs, base);
+        assert.ok(cur <= prev + 1e-12 && cur >= base - 1e-12,
+            'monotonic toward the base, no overshoot');
+        prev = cur;
+    }
+    assert.equal(s.get(), base, 'epsilon completion pins exactly onto the resting base');
+});
+
+test('deterministic game over: eases forward through advancing late snapshots', () => {
+    const tau = 90, stepMs = 1000 / 60;
+    // The owner kept moving for ~a round-trip after the fatal collision, so the
+    // resting target advances FORWARD across re-ingested late snapshots. The
+    // replica should flow forward to the final pose, not roll back then step.
+    const targets = [0.50, 0.52, 0.54, 0.56, 0.56, 0.56];
+    const s = makeRestSettler(0.505, tau); // slightly ahead of the first base
+    assert.equal(s.step(0, targets[0]), 0.505); // first frame holds
+    let prev = s.get();
+    let frame = 1;
+    for (let i = 1; i < targets.length; i++) {
+        for (let f = 0; f < 30; f++) {
+            const cur = s.step(stepMs, targets[Math.min(i, targets.length - 1)]);
+            assert.ok(cur >= prev - 1e-9, 'motion is forward (never snaps backward)');
+            prev = cur; frame++;
+        }
+    }
+    assert.ok(Math.abs(s.get() - 0.56) < 1e-9, 'arrives at the owner\'s final pose');
+});
+
+test('deterministic game over: intentional warp (ship respawn) snaps, not eased', () => {
+    // snap = true (invulnerable jumped up ⇒ Ship.reset teleport) jumps to the
+    // target regardless of k — even on the held first frame.
+    assert.equal(easeRest(0.10, 0.90, 0.0, true), 0.90);
+    assert.equal(easeRest(0.10, 0.90, 0.5, true), 0.90);
+});
+
+test('deterministic game over: wraparound eases the SHORT way across the seam', () => {
+    // Displayed at 0.98, resting at 0.02: the short toroidal path is +0.04
+    // across the seam, NOT −0.96 across the whole field. Halfway (k = 0.5) lands
+    // at the seam (~0.00), and the move magnitude is tiny — a continuous glide,
+    // not a field-spanning sweep.
+    const out = easeRest(0.98, 0.02, 0.5, false);
+    assert.ok(Math.abs(out - 0.0) < 1e-9 || Math.abs(out - 1.0) < 1e-9,
+        'midpoint sits on the seam, taking the short path');
+    // The eased step never traverses anywhere near the middle of the field.
+    for (let k = 0; k <= 1.0001; k += 0.1) {
+        const p = easeRest(0.98, 0.02, k, false);
+        const nearSeam = Math.min(p, 1 - p) <= 0.04 + 1e-9;
+        assert.ok(nearSeam, 'stays within the short wrap arc, never sweeps the field');
+    }
+});
+
+test('deterministic game over: epsilon-close pose pins exactly onto the target', () => {
+    // A residual below the settle epsilon snaps to the target so every member
+    // ends at identical state (an exponential ease only approaches it).
+    assert.equal(easeRest(0.5 - SETTLE_EPS / 2, 0.5, 0.5, false), 0.5);
+    // A residual above epsilon still eases (does not pin prematurely).
+    assert.notEqual(easeRest(0.5 - 0.01, 0.5, 0.5, false), 0.5);
+});
