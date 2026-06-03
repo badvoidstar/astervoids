@@ -807,3 +807,192 @@ test('deterministic game over: re-ingested base snapshot converges members', () 
     assert.deepEqual(a.getResting(), b.getResting(),
         'both members rest at the owner\'s final authoritative snapshot');
 });
+
+// ── Deterministic game over: shared ballistic freeze ────────────────────────
+//
+// At game over every synced object (owned AND remote) stops being simulated /
+// dead-reckoned and is instead projected forward at its last constant velocity
+// from where it is CURRENTLY displayed to a single shared stop instant
+// T_freeze = gameOverAt + DEADRECKON_GAMEOVER_FREEZE_DELAY_MS, then held. This
+// gives a seamless (no-jump, no-blend) forward coast that halts on every member
+// at the same shared server-time. The mirrors below reproduce that projection
+// (1-D normalized field of width 1; angle handled identically).
+const FREEZE_DELAY = 400, GO_STEP_MS = 1000 / 60;
+function wrapMod1(v) { const r = v % 1; return r < 0 ? r + 1 : r; }
+// Mirror of repositionDeadReckonedRemotes' game-over branch for one 1-D object.
+// `anchor` = { pose, vPerFrame, anchorMs }; project to the evaluation instant.
+function freezeProject(anchor, tEvalMs) {
+    let frames = (tEvalMs - anchor.anchorMs) / GO_STEP_MS;
+    if (!(frames > 0)) frames = 0;
+    return wrapMod1(anchor.pose + anchor.vPerFrame * frames);
+}
+// Resolve the shared stop instant and clamp the evaluation time, mirroring the
+// latch in the reposition function (tEval = min(now, gameOverAt + delay)).
+function tEvalFor(nowMs, gameOverAtMs) {
+    return Math.min(nowMs, gameOverAtMs + FREEZE_DELAY);
+}
+
+test('game-over freeze: first frozen frame holds at the displayed pose (no jump)', () => {
+    // The anchor is captured from the current on-screen pose at the moment game
+    // over is detected, with anchorMs = the local server-time of capture. The very
+    // first projected frame (tEval == anchorMs) must reproduce that pose exactly.
+    const anchor = { pose: 0.5312, vPerFrame: 0.004, anchorMs: 10_000 };
+    const gameOverAt = 9_900; // a little earlier; T_freeze = 10_300
+    const tEval = tEvalFor(10_000, gameOverAt); // == 10_000 (anchor instant)
+    assert.equal(freezeProject(anchor, tEval), 0.5312);
+});
+
+test('game-over freeze: coasts strictly forward then halts exactly at T_freeze', () => {
+    const anchor = { pose: 0.20, vPerFrame: 0.003, anchorMs: 10_000 };
+    const gameOverAt = 9_800;                 // T_freeze = 10_200
+    const tFreeze = gameOverAt + FREEZE_DELAY; // 10_200
+    let prev = freezeProject(anchor, tEvalFor(10_000, gameOverAt));
+    // Coast: each render frame advances forward by the constant per-frame step.
+    for (let now = 10_000; now <= 10_200; now += GO_STEP_MS) {
+        const cur = freezeProject(anchor, tEvalFor(now, gameOverAt));
+        let d = cur - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
+        assert.ok(d >= -1e-12, 'forward only, never reverses');
+        prev = cur;
+    }
+    // The resting pose is exactly the projection evaluated at T_freeze...
+    const rest = freezeProject(anchor, tFreeze);
+    // ...and it does not change once now passes T_freeze (tEval is clamped).
+    for (let now = 10_200; now <= 11_500; now += GO_STEP_MS) {
+        assert.equal(freezeProject(anchor, tEvalFor(now, gameOverAt)), rest,
+            'held constant after the shared stop instant');
+    }
+    // Expected analytic rest: 0.20 + 0.003 * ((10_200 - 10_000) / GO_STEP_MS).
+    const frames = (10_200 - 10_000) / GO_STEP_MS;
+    assert.ok(Math.abs(rest - wrapMod1(0.20 + 0.003 * frames)) < 1e-12);
+});
+
+test('game-over freeze: identical inputs converge to the identical rest pose', () => {
+    // The core convergence property: any two members that capture the SAME object
+    // with the SAME velocity and anchor, evaluated at the SAME shared T_freeze,
+    // land on the SAME pose — independent of their own frame timing/refresh rate.
+    const gameOverAt = 50_000;
+    const tFreeze = gameOverAt + FREEZE_DELAY;
+    const a = { pose: 0.61, vPerFrame: 0.0025, anchorMs: 50_050 };
+    const b = { pose: 0.61, vPerFrame: 0.0025, anchorMs: 50_050 };
+    // Evaluate on very different per-member render cadences up to past T_freeze.
+    let pa, pb;
+    for (let now = 50_050; now <= tFreeze + 500; now += GO_STEP_MS) pa = freezeProject(a, tEvalFor(now, gameOverAt));
+    for (let now = 50_050; now <= tFreeze + 500; now += 7.3) pb = freezeProject(b, tEvalFor(now, gameOverAt));
+    assert.equal(pa, pb, 'shared stop instant ⇒ identical rest pose regardless of cadence');
+});
+
+test('game-over freeze: all objects cease simultaneously at the shared instant', () => {
+    // Objects of different velocities (and whose owners died at different times,
+    // i.e. different anchorMs) all stop at the SAME shared server-time T_freeze —
+    // they coast different distances but halt together.
+    const gameOverAt = 0;
+    const tFreeze = gameOverAt + FREEZE_DELAY;
+    const slow = { pose: 0.10, vPerFrame: 0.001, anchorMs: 50 };
+    const fast = { pose: 0.10, vPerFrame: 0.006, anchorMs: 180 };
+    const restSlow = freezeProject(slow, tFreeze);
+    const restFast = freezeProject(fast, tFreeze);
+    // A frame BEFORE T_freeze both are still moving; AT/after T_freeze both held.
+    assert.notEqual(freezeProject(slow, tFreeze - GO_STEP_MS), restSlow);
+    assert.notEqual(freezeProject(fast, tFreeze - GO_STEP_MS), restFast);
+    for (const dt of [0, GO_STEP_MS, 200, 1000]) {
+        assert.equal(freezeProject(slow, tEvalFor(tFreeze + dt, gameOverAt)), restSlow);
+        assert.equal(freezeProject(fast, tEvalFor(tFreeze + dt, gameOverAt)), restFast);
+    }
+});
+
+test('game-over freeze: toroidal wrap is continuous across the seam (modulo)', () => {
+    // A coast that crosses the wrap boundary continues smoothly via modulo — it is
+    // NOT treated as a backward discontinuity. Start near the seam moving forward.
+    const gameOverAt = 0;
+    const anchor = { pose: 0.97, vPerFrame: 0.004, anchorMs: 0 };
+    let prev = freezeProject(anchor, 0);
+    let crossed = false;
+    for (let now = GO_STEP_MS; now <= FREEZE_DELAY; now += GO_STEP_MS) {
+        const cur = freezeProject(anchor, tEvalFor(now, gameOverAt));
+        let d = cur - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
+        assert.ok(Math.abs(d) < 0.01, 'per-frame step stays small across the seam');
+        assert.ok(d >= -1e-12, 'still forward across the wrap');
+        if (cur < prev) crossed = true; // value wrapped 0.99.. → 0.00..
+        prev = cur;
+    }
+    assert.ok(crossed, 'the projection actually wrapped across the seam');
+});
+
+test('game-over freeze: projection over a long coast exceeding one field wraps cleanly', () => {
+    // wrapNormalizedMod must tolerate an excursion of more than one field width
+    // (a very fast object over the whole coast window). The single-step
+    // wrapNormalized would fail here; the modulo form keeps it in range.
+    const anchor = { pose: 0.0, vPerFrame: 0.05, anchorMs: 0 }; // ~1.2 fields over 400ms
+    const tFreeze = FREEZE_DELAY;
+    const rest = freezeProject(anchor, tFreeze);
+    assert.ok(rest >= 0 && rest < 1, 'stays within the normalized field after a >1-field coast');
+    const frames = tFreeze / GO_STEP_MS;
+    assert.ok(Math.abs(rest - wrapMod1(0.05 * frames)) < 1e-12);
+});
+
+test('game-over freeze: a member detecting game over after T_freeze halts immediately', () => {
+    // Extreme-latency edge: this member only reaches game over after the shared
+    // stop instant has already passed. tEval clamps to T_freeze ≤ anchorMs, so
+    // frames ≤ 0 ⇒ it freezes immediately at its captured pose (no backward jump,
+    // no runaway forward coast).
+    const gameOverAt = 0;
+    const anchor = { pose: 0.42, vPerFrame: 0.01, anchorMs: FREEZE_DELAY + 300 };
+    const rest = freezeProject(anchor, tEvalFor(anchor.anchorMs, gameOverAt));
+    assert.equal(rest, 0.42, 'late member holds at its captured pose, no reversal');
+});
+
+test('game-over freeze: owner (true pose) rests ahead of a latency-lagged remote, never behind', () => {
+    // The owner captures the object at its TRUE pose; a remote captures it at a
+    // latency-lagged displayed pose (arrival-anchored dead reckoning lags by the
+    // inter-packet gap). Projected to the same T_freeze, the remote rests slightly
+    // BEHIND the owner (by that lag) — the residual divergence — but is NEVER
+    // forced backward and NEVER overshoots ahead of the owner.
+    const gameOverAt = 0;
+    const tFreeze = FREEZE_DELAY;
+    const v = 0.004;
+    const lagFrames = 5; // remote displayed pose is 5 frames behind truth
+    const owner = { pose: 0.500, vPerFrame: v, anchorMs: 20 };
+    const remote = { pose: wrapMod1(0.500 - v * lagFrames), vPerFrame: v, anchorMs: 20 };
+    const restOwner = freezeProject(owner, tFreeze);
+    const restRemote = freezeProject(remote, tFreeze);
+    let gap = restOwner - restRemote; if (gap > 0.5) gap -= 1; else if (gap < -0.5) gap += 1;
+    assert.ok(gap > 0, 'remote rests behind the owner (positive lag), not ahead');
+    assert.ok(Math.abs(gap - v * lagFrames) < 1e-12, 'residual equals exactly the latency lag');
+});
+
+test('game-over freeze: ship resting HEADING converges across members (angle unclamped)', () => {
+    // Ships rotate during the coast. Two members detect game over a few frames
+    // apart, so each captures the same ship at a DIFFERENT anchorMs with a
+    // correspondingly different captured heading. Projecting the angle LINEARLY
+    // (no DEADRECKON_ANGULAR_MAX_FRAMES clamp) makes those two offsets cancel so
+    // both members rest at the identical heading — the clamp would saturate the
+    // sweep and leave the pre-anchor rotation uncancelled, diverging the heading.
+    const rot = 0.05;                 // radians per frame
+    const gameOverAt = 0;
+    const tFreeze = gameOverAt + FREEZE_DELAY; // shared stop instant
+    // angleProject mirrors the linear angle branch of applyFreeze.
+    const angleProject = (baseAngle, anchorMs) => {
+        let frames = (tFreeze - anchorMs) / GO_STEP_MS;
+        if (!(frames > 0)) frames = 0;
+        return baseAngle + rot * frames;
+    };
+    const skewFrames = 6; // member B detects game over 6 frames later than A
+    // True heading at A's capture instant; B captures skewFrames later, so its
+    // captured base heading has advanced by rot * skewFrames.
+    const angleA = 1.0, anchorA = 100;
+    const angleB = angleA + rot * skewFrames, anchorB = anchorA + skewFrames * GO_STEP_MS;
+    const restA = angleProject(angleA, anchorA);
+    const restB = angleProject(angleB, anchorB);
+    assert.ok(Math.abs(restA - restB) < 1e-12, 'linear angle projection converges the heading');
+    // Sanity: the clamped variant (saturating at 10 frames over a ~24-frame coast)
+    // would NOT converge — confirm the asymmetry the unclamped form avoids.
+    const ANG_CAP = 10;
+    const angleProjectClamped = (baseAngle, anchorMs) => {
+        let frames = (tFreeze - anchorMs) / GO_STEP_MS;
+        if (!(frames > 0)) frames = 0;
+        if (frames > ANG_CAP) frames = ANG_CAP;
+        return baseAngle + rot * frames;
+    };
+    assert.ok(Math.abs(angleProjectClamped(angleA, anchorA) - angleProjectClamped(angleB, anchorB)) > 1e-6,
+        'the clamped projection diverges (regression guard for why we drop the clamp here)');
+});
