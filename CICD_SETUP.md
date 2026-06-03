@@ -130,25 +130,29 @@ When you push to any branch, the workflow automatically:
 
 Branch deployments get subdomains following this pattern:
 - **Production (main):** `{subdomain}.{domain}` (e.g., `app.yourdomain.com`)
-- **Feature branches:** `{subdomain}-{branch}.{domain}` (e.g., `app-feature-login-df7c.yourdomain.com`)
+- **Feature branches:** `{subdomain}-{branch}.{domain}` (e.g., `app-feature-login.yourdomain.com`)
 
 Branch names are sanitized for DNS compatibility:
 - Converted to lowercase
 - `/` replaced with `-` (e.g., `feature/login` → `feature-login`)
-- Special characters removed
-- Readable name truncated to 20 characters, then a 4-character hash of the
-  full branch name is appended as `{name}-{hash}` (e.g., `feature-login-df7c`).
-  The hash guarantees that two long branches sharing the same truncated
-  20-char prefix never collide, while keeping the derived Container App name
-  (`ca-web-{sanitized}`) within Azure's 32-character limit.
+- Special characters removed; trailing dashes trimmed
+- **Short names are used as-is, with no hash.** If the sanitized name fits
+  within 25 characters (e.g., `feature/login` → `feature-login`), it is emitted
+  verbatim. This keeps the derived Container App name (`ca-web-{sanitized}`)
+  within Azure's 32-character limit.
+- **Only over-long names get a hash.** When the sanitized name exceeds 25
+  characters, it is truncated to 20 characters and a 4-character hash of the
+  full branch name is appended as `{name}-{hash}` (e.g. a long branch →
+  `feature-super-long-b-71b3`). The hash guarantees that two long branches
+  sharing the same truncated 20-char prefix never collide.
 
 ### Resource Naming
 
 | Resource | Production single-region | Production multi-region | Branch (feature/login) |
 |---|---|---|---|
-| Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login-<hash>` |
+| Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login` (long branches: `ca-web-<name>-<hash>`) |
 | Container Apps Environment | `cae-production` | `cae-production-<primary-region>` and peers | shared production CAE (`cae-production` or `cae-production-<primary-region>`) |
-| Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login-<hash>.domain.com` |
+| Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login.domain.com` (long branches: `app-<name>-<hash>.domain.com`) |
 
 ### Prerequisites for Branch Deployments
 
@@ -179,7 +183,7 @@ Then run:
 ```bash
 ./.github/scripts/branch-url.sh                # current branch
 ./.github/scripts/branch-url.sh feature/login  # a specific branch
-# => https://app-feature-login-df7c.example.com
+# => https://app-feature-login.example.com
 ```
 
 **Option B — ask Azure (no local secrets):**
