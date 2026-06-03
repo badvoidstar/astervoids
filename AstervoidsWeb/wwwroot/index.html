@@ -1213,6 +1213,19 @@
         // exponential ease only approaches its target asymptotically).
         DEADRECKON_SETTLE_EPSILON: 0.0005,
         DEADRECKON_SETTLE_EPSILON_ANGLE: 0.002,
+        // Deterministic game-over settle freshness window. At game over the local
+        // member stops its gameplay sim, but each object's OWNER keeps simulating
+        // and broadcasting until ITS OWN lives hit 0 — up to a round-trip later.
+        // While those packets keep arriving (snapshot age <= this) the remote is
+        // still rendered with smooth continuous dead reckoning (getReckoned),
+        // exactly as in play, so it never throbs or reverses. Only once the stream
+        // goes STALE (owner truly stopped) does it ease the small remaining
+        // prediction back onto the shared resting base. Must stay BELOW the
+        // DEADRECKON_MAX_FRAMES extrapolation clamp (30 frames = 500 ms) so the
+        // object is still moving when the ease begins (no mid-air clamp freeze),
+        // and ABOVE the heartbeat (SEND_ON_CHANGE_HEARTBEAT_MS = 250 ms) plus
+        // jitter so a single delayed heartbeat is not mistaken for a stop.
+        DEADRECKON_SETTLE_FRESH_MS: 400,
 
         // Deterministic mode only: owner-side "send-on-change" suppression.
         // For purely ballistic objects (asteroids, bullets) the receiver
@@ -7460,11 +7473,16 @@
         }
     }
 
-    // Deterministic game-over settle clock (mirrors legacyGameOverSettle): drives
-    // the frame-rate-independent ease in repositionDeadReckonedRemotes. `active`
-    // is reset whenever we are NOT frozen so the FIRST frozen frame measures
-    // dt = 0 ⇒ k = 0 (the object holds at its last in-play pose, no pop).
-    const deterministicGameOverSettle = { active: false, lastTime: 0 };
+    // Deterministic game-over settle state. `staleAt` maps a syncObjectId to the
+    // perf time of the last ease frame; PRESENCE in the map also latches the
+    // object into the STALE (easing) phase. The ease clock is therefore PER
+    // OBJECT and starts at that object's own fresh→stale transition, so its first
+    // stale frame measures dt = 0 ⇒ k = 0 (holds at the last smooth fresh pose,
+    // no pop) regardless of how long it stayed fresh. The map is cleared whenever
+    // we are not frozen. The latch (once stale, stay stale for the episode)
+    // prevents a late straggler heartbeat from flipping the object back to the
+    // extrapolating fresh phase and popping it forward.
+    const deterministicGameOverSettle = { staleAt: new Map() };
 
     // Ease a dead-reckoned remote's VISIBLE transform from its current pose
     // toward the authoritative resting `target` (DeadReckon.getResting) by blend
@@ -7520,36 +7538,39 @@
     // only move on frames where a sim step runs (visible stutter on >60 Hz
     // displays). Locals are smoothed separately by render interpolation.
     function repositionDeadReckonedRemotes() {
+        const staleAt = deterministicGameOverSettle.staleAt;
         if (!isDeterministicMode() || !isSessionMode()) {
-            deterministicGameOverSettle.active = false;
+            staleAt.clear();
             return;
         }
         // Game over: motion stops and every member must come to rest at the same
         // authoritative pose, DeadReckon.getResting (the un-extrapolated base
         // snapshot — dead-reckoning forward would drift each member ahead by a
-        // latency-dependent amount up to the clamp, so they'd disagree). But
-        // switching straight from getReckoned (extrapolated + smoothed) to
-        // getResting in one frame snaps backward by the forward-prediction it had
-        // been showing — a visible 1-2 frame jump. So instead of pinning, we EASE
-        // the visible pose toward getResting with a frame-rate-independent
-        // exponential blend: the first frozen frame holds (k = 0, no pop), then
-        // the object glides on. The target keeps advancing as the owner's last
-        // in-flight snapshots are re-ingested (below), so the replica flows
-        // forward through them to the final pose over the natural delivery window
-        // rather than rolling back and stepping forward discretely.
+        // latency-dependent amount up to the clamp, so they'd disagree).
+        //
+        // The naive "switch getReckoned → getResting" at game over snaps backward
+        // by the forward-prediction the replica was showing. Easing that whole
+        // prediction away each frame is little better: while the owner is STILL
+        // streaming (it keeps simulating until its own lives reach 0, up to a
+        // round-trip later), getResting only advances at the ~4 Hz heartbeat, so
+        // the replica reverses toward a stale base then jerks forward on each
+        // packet — the "jump then blend" throb.
+        //
+        // Instead we keep two phases per object (see DEADRECKON_SETTLE_FRESH_MS):
+        //   FRESH (owner still sending): render at getReckoned — the SAME smooth,
+        //     continuous, forward dead reckoning used in play. No reversal, no
+        //     throb; motion simply carries on at the real velocity.
+        //   STALE (owner stopped, snapshot age > fresh window): ease the now-small
+        //     residual prediction from the current on-screen pose onto getResting
+        //     so every member converges to the identical shared base.
+        // The fresh→stale transition is seamless because the ease starts from the
+        // current pose with a per-object k = 0 first frame (no pop), and once the
+        // object is stale on every member they all ease to the same final base.
         const frozen = isGameOver();
-        let k = 1;
-        if (frozen) {
-            const now = performance.now();
-            let dtMs = deterministicGameOverSettle.active ? (now - deterministicGameOverSettle.lastTime) : 0;
-            deterministicGameOverSettle.active = true;
-            deterministicGameOverSettle.lastTime = now;
-            dtMs = Math.max(0, Math.min(dtMs, 250)); // ignore long stalls (tab hidden)
-            const tau = CONFIG.DEADRECKON_GAMEOVER_SETTLE_MS;
-            k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
-        } else {
-            deterministicGameOverSettle.active = false;
-        }
+        const now = performance.now();
+        const tau = CONFIG.DEADRECKON_GAMEOVER_SETTLE_MS;
+        const freshMs = CONFIG.DEADRECKON_SETTLE_FRESH_MS;
+        if (!frozen) staleAt.clear();
         // Safety net: an object we OWN must never be dead-reckoned — we simulate
         // it locally, and overwriting its pose from the (clamp-frozen) reckon
         // state would freeze it. The migration handler clears dead-reckon state
@@ -7565,7 +7586,9 @@
         };
         // Apply the per-frame pose for one dead-reckoned remote. During play
         // (not frozen) just position it at getReckoned. At game over, re-ingest
-        // the owner's latest in-flight snapshot, then ease toward getResting.
+        // the owner's latest in-flight snapshot, then render FRESH (getReckoned)
+        // while the owner is still sending or STALE (ease toward getResting) once
+        // it has stopped — see the phase note above.
         //
         // Game over re-ingestion (mirrors repositionLegacyRemotesAtRest): the
         // gameplay sync pass that feeds DeadReckon is gated by lives > 0, so it
@@ -7578,9 +7601,11 @@
         // resting poses would disagree. ObjectSync keeps receiving the owner's
         // packets regardless of local game state, so pull the latest version in
         // here: once the owner finally stops, every member's getResting converges
-        // to the same authoritative final snapshot.
+        // to the same authoritative final snapshot. Each re-ingest also resets the
+        // snapshot's recvPerf to now, which is what keeps the object FRESH until
+        // the packets stop.
         const applyPose = (obj, syncId, isShip) => {
-            if (ownedByUs(syncId)) { DeadReckon.remove(syncId); return; }
+            if (ownedByUs(syncId)) { DeadReckon.remove(syncId); staleAt.delete(syncId); return; }
             if (!frozen) {
                 const r = DeadReckon.getReckoned(syncId);
                 if (r) obj.fromSyncData(r);
@@ -7605,8 +7630,37 @@
                 DeadReckon.lastVersions.set(syncId, o.version);
                 if (isShip && o.data.invulnerable !== undefined) obj.invulnerable = o.data.invulnerable;
             }
+            // A respawn means the owner is alive and authoritative again: drop any
+            // stale latch so the object resumes smooth fresh rendering (and the
+            // snap below lands it on the spawn pose).
+            if (teleport) staleAt.delete(syncId);
+            const st = DeadReckon.states.get(syncId);
+            const staleMs = st ? (now - st.recvPerf) : Infinity;
+            const latched = staleAt.has(syncId);
+            if (!latched && (teleport || staleMs <= freshMs)) {
+                // FRESH: owner is still streaming (or just teleported). Render the
+                // continuous dead-reckoned pose exactly as in play — no ease, so no
+                // reversal or heartbeat throb. A teleport snaps here because
+                // updateState(snap) cleared the correction offset.
+                const r = DeadReckon.getReckoned(syncId);
+                if (r) obj.fromSyncData(r);
+                return;
+            }
+            // STALE: owner has stopped. Ease the remaining prediction from the
+            // current on-screen pose onto the shared resting base. The per-object
+            // clock starts now, so this object's first stale frame holds (k = 0,
+            // continuous with its last fresh frame) before gliding on.
+            const prev = staleAt.get(syncId);
+            let k;
+            if (prev === undefined) {
+                k = 0;
+            } else {
+                const dtMs = Math.max(0, Math.min(now - prev, 250)); // ignore long stalls (tab hidden)
+                k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+            }
+            staleAt.set(syncId, now);
             const r = DeadReckon.getResting(syncId);
-            if (r) easeDeadReckonedTowardRest(obj, r, k, teleport);
+            if (r) easeDeadReckonedTowardRest(obj, r, k, false);
         };
         for (const b of game.bullets) {
             if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) applyPose(b, b.syncObjectId, false);

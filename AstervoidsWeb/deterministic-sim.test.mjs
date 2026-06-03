@@ -914,3 +914,146 @@ test('deterministic game over: epsilon-close pose pins exactly onto the target',
     // A residual above epsilon still eases (does not pin prematurely).
     assert.notEqual(easeRest(0.5 - 0.01, 0.5, 0.5, false), 0.5);
 });
+
+// ── Deterministic game over: FRESH (getReckoned) vs STALE (ease) switching ───
+//
+// The "ease toward the static getResting every frame" settle still throbs while
+// the owner is STILL streaming: getResting only advances at the ~4 Hz heartbeat,
+// so the replica reverses toward a stale base then jerks forward on each packet.
+// repositionDeadReckonedRemotes therefore keeps each remote in a FRESH phase
+// (rendered at getReckoned — continuous forward dead reckoning, no ease) while
+// the owner's snapshots keep arriving (age <= DEADRECKON_SETTLE_FRESH_MS), and
+// only switches to the STALE ease toward getResting once the stream stops. A
+// per-object latch keeps it stale for the rest of the episode so a late straggler
+// heartbeat cannot flip it back and pop it forward. The mirror below reproduces
+// that decision (1-D, arrival-anchored clamp, latch + per-object ease clock).
+const FRESH_MS = 400, GO_TAU = 90, CLAMP_FRAMES = 30, FRAME_MS = 1000 / 60;
+function kFromDt(dtMs, tau) {
+    const dt = Math.max(0, Math.min(dtMs, 250));
+    return (tau > 0 && dt > 0) ? Math.min(1, 1 - Math.exp(-dt / tau)) : (tau <= 0 ? 1 : 0);
+}
+// Mirror of applyPose's game-over branch for a single 1-D object.
+function makeFreshStaleReplica(velPerFrame, startPose) {
+    let base = startPose;        // getResting: raw snapshot position
+    let recvPerf = 0;            // arrival time of the last ingested snapshot
+    let lastEase = null;         // null ⇒ not latched stale; else last ease time
+    let pose = startPose;        // on-screen position
+    const reckoned = (now) => {
+        const frames = Math.min(Math.max(0, (now - recvPerf) / FRAME_MS), CLAMP_FRAMES);
+        return wrapN(base + velPerFrame * frames);
+    };
+    return {
+        // Advance one render frame at perf time `now`. `snapshot` (optional) is a
+        // newly ingested authoritative pose; `teleport` marks an intentional warp.
+        frame(now, snapshot, teleport = false) {
+            if (snapshot !== undefined) { base = snapshot; recvPerf = now; }
+            if (teleport) lastEase = null; // respawn: owner authoritative again
+            const staleMs = now - recvPerf;
+            const latched = lastEase !== null;
+            if (!latched && (teleport || staleMs <= FRESH_MS)) {
+                pose = reckoned(now); // FRESH: smooth continuous, no ease
+                return pose;
+            }
+            let k;
+            if (lastEase === null) k = 0; // first stale frame holds (no pop)
+            else k = kFromDt(now - lastEase, GO_TAU);
+            lastEase = now;
+            pose = easeRest(pose, base, k, false);
+            return pose;
+        },
+        pose: () => pose,
+        base: () => base,
+        isStale: () => lastEase !== null,
+    };
+}
+
+test('deterministic game over: FRESH phase moves smoothly forward (no reversal/throb)', () => {
+    // Owner keeps heartbeating (every 250 ms) for a while after the local member
+    // hits game over. Through that window the replica should track getReckoned —
+    // strictly forward, never reversing toward a stale base (the old throb).
+    const vel = 0.002; // per frame ≈ 0.12/s
+    const r = makeFreshStaleReplica(vel, 0.50);
+    r.frame(0, 0.50);  // last in-play snapshot at game over
+    let prev = r.pose();
+    let nextHeartbeat = 250, base = 0.50;
+    for (let now = FRAME_MS; now <= 700; now += FRAME_MS) {
+        let snap;
+        if (now >= nextHeartbeat) { base = wrapN(base + vel * (250 / FRAME_MS)); snap = base; nextHeartbeat += 250; }
+        const p = r.frame(now, snap);
+        assert.ok(!r.isStale(), 'stays FRESH while heartbeats keep arriving');
+        // Forward only on a toroidal field: the per-frame step is small & positive.
+        let d = p - prev; if (d < -0.5) d += 1; else if (d > 0.5) d -= 1;
+        assert.ok(d >= -1e-9, 'moves forward, never reverses toward a stale base');
+        prev = p;
+    }
+});
+
+test('deterministic game over: switches to STALE ~freshMs after the owner stops, then settles', () => {
+    const vel = 0.002;
+    const r = makeFreshStaleReplica(vel, 0.50);
+    const lastSnapAt = 0;
+    r.frame(lastSnapAt, 0.50); // final snapshot; owner sends nothing more
+    // Still fresh just before the window closes...
+    r.frame(FRESH_MS - FRAME_MS);
+    assert.ok(!r.isStale(), 'fresh until the snapshot age exceeds freshMs');
+    // ...and stale shortly after.
+    r.frame(FRESH_MS + FRAME_MS);
+    assert.ok(r.isStale(), 'goes stale once the owner stream stops');
+    // First stale frame holds (no pop): pose unchanged from the prior fresh pose.
+    // Then it eases onto the raw base and pins exactly (convergence).
+    for (let now = FRESH_MS + 2 * FRAME_MS; now <= FRESH_MS + 2000; now += FRAME_MS) r.frame(now);
+    assert.equal(r.pose(), 0.50, 'eases onto and pins exactly at the resting base');
+});
+
+test('deterministic game over: latch prevents a straggler heartbeat from popping forward', () => {
+    // Once stale, a late snapshot must NOT flip the object back to the fresh
+    // (extrapolating) phase — that would jump it forward by the prediction again.
+    const vel = 0.01; // fast: a flip back to getReckoned would be a big visible pop
+    const r = makeFreshStaleReplica(vel, 0.50);
+    r.frame(0, 0.50);
+    // Let it go stale and partly settle.
+    r.frame(FRESH_MS + FRAME_MS);          // first stale frame (holds)
+    r.frame(FRESH_MS + 2 * FRAME_MS);      // eases a little toward base
+    const settling = r.pose();
+    assert.ok(r.isStale());
+    // A straggler heartbeat arrives (new base slightly ahead). It is re-ingested
+    // (base advances) but the object STAYS stale and keeps easing — it must not
+    // snap to base + a fresh forward prediction.
+    const newBase = wrapN(0.50 + vel * 5);
+    const after = r.frame(FRESH_MS + 3 * FRAME_MS, newBase);
+    assert.ok(r.isStale(), 'remains latched stale through a late snapshot');
+    let step = after - settling; if (step > 0.5) step -= 1; else if (step < -0.5) step += 1;
+    assert.ok(Math.abs(step) < vel * CLAMP_FRAMES * 0.5,
+        'moves only a small eased amount, not a full prediction-sized jump');
+});
+
+test('deterministic game over: members that stop at different times still converge', () => {
+    // Two members go stale at different moments (different latency to the owner's
+    // last packet) but both ease onto the identical final base.
+    const vel = 0.003;
+    const a = makeFreshStaleReplica(vel, 0.50);
+    const b = makeFreshStaleReplica(vel, 0.50);
+    const finalBase = wrapN(0.50 + vel * 8);
+    a.frame(0, 0.50); b.frame(0, 0.50);
+    // A ingests the owner's final snapshot promptly; B ingests it later.
+    a.frame(40, finalBase);
+    b.frame(120, finalBase);
+    for (let now = 160; now <= 3000; now += FRAME_MS) { a.frame(now); b.frame(now); }
+    assert.equal(a.pose(), finalBase);
+    assert.equal(b.pose(), finalBase);
+    assert.equal(a.pose(), b.pose(), 'both converge to the owner\'s final base');
+});
+
+test('deterministic game over: intentional respawn teleport unlatches and snaps', () => {
+    // If a remote ship respawns mid-settle the owner is alive/authoritative again:
+    // the teleport drops the stale latch and snaps the replica to the spawn pose.
+    const r = makeFreshStaleReplica(0.0, 0.20);
+    r.frame(0, 0.20);
+    r.frame(FRESH_MS + FRAME_MS);     // stale
+    r.frame(FRESH_MS + 2 * FRAME_MS); // easing
+    assert.ok(r.isStale());
+    const spawn = 0.80;
+    const p = r.frame(FRESH_MS + 3 * FRAME_MS, spawn, true);
+    assert.ok(!r.isStale(), 'teleport clears the stale latch');
+    assert.equal(p, spawn, 'snaps directly to the spawn pose, not eased');
+});
