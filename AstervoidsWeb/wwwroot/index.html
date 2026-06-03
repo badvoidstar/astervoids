@@ -1194,38 +1194,23 @@
         // Instead the visible transform decays toward the shared snapshot over
         // ~this window, giving a smooth, convergent stop. 0 = hard snap.
         LEGACY_GAMEOVER_SETTLE_MS: 140,
-        // Deterministic mode only: time constant (ms) for easing a dead-reckoned
-        // remote onto its authoritative resting pose at game over. During play
-        // the replica is rendered at DeadReckon.getReckoned (extrapolated +
-        // smoothed); at game over it must converge to DeadReckon.getResting (the
-        // raw, un-extrapolated authoritative snapshot) so every member agrees.
-        // Switching in a single frame snaps (a visible 1-2 frame jump). Instead
-        // the visible transform eases toward the resting pose — which keeps
-        // advancing as the owner's last in-flight snapshots are re-ingested — so
-        // the object glides to its final pose over the natural snapshot-delivery
-        // window plus this short smoothing tail (kept equal to DEADRECKON_SMOOTH_MS
-        // so the stop looks identical to in-play render smoothing). 0 = hard snap.
-        DEADRECKON_GAMEOVER_SETTLE_MS: 90,
-        // Deterministic game-over settle: once the eased remaining distance to the
-        // authoritative resting pose falls below this (normalized position) and
-        // the residual angle below DEADRECKON_SETTLE_EPSILON_ANGLE, snap exactly
-        // onto the pose so every member converges to identical state (an
-        // exponential ease only approaches its target asymptotically).
-        DEADRECKON_SETTLE_EPSILON: 0.0005,
-        DEADRECKON_SETTLE_EPSILON_ANGLE: 0.002,
-        // Deterministic game-over settle freshness window. At game over the local
-        // member stops its gameplay sim, but each object's OWNER keeps simulating
-        // and broadcasting until ITS OWN lives hit 0 — up to a round-trip later.
-        // While those packets keep arriving (snapshot age <= this) the remote is
-        // still rendered with smooth continuous dead reckoning (getReckoned),
-        // exactly as in play, so it never throbs or reverses. Only once the stream
-        // goes STALE (owner truly stopped) does it ease the small remaining
-        // prediction back onto the shared resting base. Must stay BELOW the
-        // DEADRECKON_MAX_FRAMES extrapolation clamp (30 frames = 500 ms) so the
-        // object is still moving when the ease begins (no mid-air clamp freeze),
-        // and ABOVE the heartbeat (SEND_ON_CHANGE_HEARTBEAT_MS = 250 ms) plus
-        // jitter so a single delayed heartbeat is not mistaken for a stop.
-        DEADRECKON_SETTLE_FRESH_MS: 400,
+        // Deterministic mode only: game-over "shared ballistic freeze" coast
+        // window (ms). At game over every synced object (owned AND remote) stops
+        // being simulated / dead-reckoned and is instead projected forward at its
+        // last constant velocity from where it is currently displayed to a single
+        // shared stop instant T_freeze = gameOverAt + this delay, where gameOverAt
+        // is the authoritative server-time the shared lives hit 0 (broadcast on
+        // the GameState object, so identical on every member). Because every
+        // member coasts the SAME object along the SAME velocity to the SAME shared
+        // server-time and then holds, all objects on all members come to rest
+        // together (simultaneous cessation) with the least divergence achievable
+        // without any backward motion — the object simply carries on from its
+        // current pose and stops, so there is no jump and no blend. The delay must
+        // exceed the worst-case inter-member game-over skew (~one round-trip) so
+        // the stop instant is still in the future when each member detects game
+        // over and the coast is therefore always forward (objects whose owner died
+        // later coast for less time, but every object still halts at T_freeze).
+        DEADRECKON_GAMEOVER_FREEZE_DELAY_MS: 400,
 
         // Deterministic mode only: owner-side "send-on-change" suppression.
         // For purely ballistic objects (asteroids, bullets) the receiver
@@ -5814,7 +5799,13 @@
                 speedMultiplier: game.speedMultiplier,
                 waveDelayTimer: game.waveDelayTimer,
                 processedHits: {},
-                peakShipCount: shipObjects.length
+                peakShipCount: shipObjects.length,
+                // Authoritative server-time (ms) at which the shared lives reached
+                // 0. Null until game over; stamped once by the GameState owner in
+                // syncGameState. Every member reads this identical value to anchor
+                // the deterministic game-over ballistic freeze (see
+                // DEADRECKON_GAMEOVER_FREEZE_DELAY_MS).
+                gameOverAt: null
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -5889,6 +5880,17 @@
         
         // Write back to game.lives for local rendering/game-over checks
         game.lives = lives;
+
+        // Stamp the authoritative game-over instant exactly once, the first sync
+        // where the shared lives reach 0. Carried on the GameState object so every
+        // member converges on the SAME server-time anchor (gameOverAt) for the
+        // deterministic ballistic freeze, independent of when each member's local
+        // lives counter observes the transition. Preserve any value already set
+        // (gsObj.data) so later syncs don't move the anchor.
+        let gameOverAt = gsObj?.data?.gameOverAt ?? null;
+        if (lives <= 0 && gameOverAt == null) {
+            gameOverAt = Math.round(RemoteObjects.serverNowMs());
+        }
         
         // If game.state is 'lobby' (spectator who just inherited ownership),
         // adopt the actual game state from the GameState object so we don't
@@ -5910,7 +5912,8 @@
             waveDelayTimer: game.waveDelayTimer,
             processedHits: processedHits,
             processedScores: processedScores,
-            peakShipCount: peakShipCount
+            peakShipCount: peakShipCount,
+            gameOverAt: gameOverAt
         };
         
         // Note: this queues into pendingUpdates (same batch as ship/asteroid/bullet updates).
@@ -7458,6 +7461,11 @@
             // that fails to travel its full path. Render interpolation is only
             // for objects THIS client simulates in discrete fixed steps.
             if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) continue;
+            // Skip objects under the game-over ballistic freeze: repositionDead-
+            // ReckonedRemotes already places them at their shared projected pose
+            // each render frame. Interpolating prev→curr here would blend that
+            // projection against the now-stale last sim pose, reintroducing a pop.
+            if (o.syncObjectId && deterministicGameOverFreeze.bases.has(o.syncObjectId)) continue;
             saved.push([o, o.x, o.y, o.angle]);
             const r = wrapRadiusFor(o);
             o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
@@ -7473,61 +7481,37 @@
         }
     }
 
-    // Deterministic game-over settle state. `staleAt` maps a syncObjectId to the
-    // perf time of the last ease frame; PRESENCE in the map also latches the
-    // object into the STALE (easing) phase. The ease clock is therefore PER
-    // OBJECT and starts at that object's own fresh→stale transition, so its first
-    // stale frame measures dt = 0 ⇒ k = 0 (holds at the last smooth fresh pose,
-    // no pop) regardless of how long it stayed fresh. The map is cleared whenever
-    // we are not frozen. The latch (once stale, stay stale for the episode)
-    // prevents a late straggler heartbeat from flipping the object back to the
-    // extrapolating fresh phase and popping it forward.
-    const deterministicGameOverSettle = { staleAt: new Map() };
+    // Deterministic game-over "shared ballistic freeze" state.
+    //
+    //   bases  – syncObjectId → the captured kinematic anchor used to project the
+    //            object to the shared stop instant. Captured once, the first
+    //            game-over frame the object is seen, from where it is CURRENTLY
+    //            displayed (so the freeze starts seamlessly — no jump), together
+    //            with its last constant velocity and the local server-time of
+    //            capture. Cleared whenever we are not in the game-over freeze.
+    //   freezeAtMs – the latched shared stop instant (server-time). Resolved from
+    //            the authoritative gameOverAt (GameState) so every member stops at
+    //            the SAME instant; falls back to a local estimate only if the
+    //            anchor has not propagated yet.
+    const deterministicGameOverFreeze = { bases: new Map(), freezeAtMs: null };
 
-    // Ease a dead-reckoned remote's VISIBLE transform from its current pose
-    // toward the authoritative resting `target` (DeadReckon.getResting) by blend
-    // factor k. Full kinematic data (velocity etc.) is applied immediately via
-    // fromSyncData; only the rendered x/y/angle are eased so the stop is smooth.
-    //
-    //   k = 0   ⇒ hold at the current pose (first game-over frame, no pop).
-    //   k = 1   ⇒ snap exactly to target.
-    //   snap    ⇒ intentional warp (e.g. ship respawn): snap regardless of k.
-    //
-    // Positional easing uses the SHORTEST toroidal path (range = 1 + 2*margin),
-    // so a wraparound is glided the short way across the seam — a small,
-    // continuous move — rather than swept across the whole field. Once the
-    // residual falls below the settle epsilon the object is pinned exactly onto
-    // the target so every member converges to identical state (an exponential
-    // ease only approaches asymptotically). Angle uses the shortest arc.
-    function easeDeadReckonedTowardRest(obj, target, k, snap) {
-        const startX = obj.x, startY = obj.y, startAngle = obj.angle;
-        obj.fromSyncData(target);
-        if (snap || k >= 1) return;
-        const epsPos = CONFIG.DEADRECKON_SETTLE_EPSILON;
-        const epsAng = CONFIG.DEADRECKON_SETTLE_EPSILON_ANGLE;
-        if (typeof target.x === 'number' && typeof startX === 'number') {
-            const r = wrapRadiusFor(obj);
-            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
-            const rangeX = 1 + 2 * marginX, rangeY = 1 + 2 * marginY;
-            let dx = target.x - startX;
-            if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
-            let dy = 0;
-            if (typeof target.y === 'number' && typeof startY === 'number') {
-                dy = target.y - startY;
-                if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
-            }
-            // Below epsilon: leave x/y pinned at the target (already set above).
-            if (Math.abs(dx) >= epsPos || Math.abs(dy) >= epsPos) {
-                obj.x = wrapNormalized(startX + dx * k, marginX);
-                if (typeof target.y === 'number' && typeof startY === 'number') {
-                    obj.y = wrapNormalized(startY + dy * k, marginY);
-                }
-            }
-        }
-        if (typeof target.angle === 'number' && typeof startAngle === 'number') {
-            const da = shortestAngleDelta(target.angle, startAngle);
-            if (Math.abs(da) >= epsAng) obj.angle = startAngle + da * k;
-        }
+    // Toroidal wrap that tolerates an excursion of more than one field width
+    // (constant-velocity projection over the whole coast window can exceed a
+    // single wrapNormalized step for very fast objects). Mirrors wrapNormalized's
+    // [-margin, 1+margin) span via modulo.
+    function wrapNormalizedMod(value, margin) {
+        const lo = -margin;
+        const range = 1 + 2 * margin;
+        return lo + (((value - lo) % range) + range) % range;
+    }
+
+    // Resolve the authoritative shared game-over instant (server-time ms) the
+    // freeze projects toward, or null if it is not yet known. Read from the
+    // GameState object so it is identical on every member.
+    function resolveSharedGameOverAtMs() {
+        const gs = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        const v = gs?.data?.gameOverAt;
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
     }
 
     // Reposition every dead-reckoned remote object (ships, asteroids, bullets)
@@ -7537,139 +7521,142 @@
     // independent of the fixed 60 Hz sim cadence. Without it, remotes would
     // only move on frames where a sim step runs (visible stutter on >60 Hz
     // displays). Locals are smoothed separately by render interpolation.
+    //
+    // GAME OVER — "shared ballistic freeze": when the shared lives reach 0 the
+    // gameplay sim (owned objects) and the dead-reckoning ingest (remotes) both
+    // stop, and every member must bring all objects to rest at as close to a
+    // single shared pose as possible WITHOUT any jump or blend. We do this by
+    // projecting every synced object — owned AND remote — forward at its last
+    // constant velocity from where it is CURRENTLY displayed to a single shared
+    // stop instant T_freeze = gameOverAt + DEADRECKON_GAMEOVER_FREEZE_DELAY_MS,
+    // then holding. Properties:
+    //   • No jump / no blend: the anchor is the object's current on-screen pose,
+    //     so projection is C0-continuous with the last in-play frame; the object
+    //     simply carries on at its real velocity and stops.
+    //   • Simultaneous cessation: T_freeze is a shared server-time, so all objects
+    //     on all members halt together (objects whose owner died later coast for
+    //     less time, but every object stops at the same instant).
+    //   • Least divergence without reversal: every member coasts the SAME object
+    //     along the SAME velocity to the SAME shared instant; the only residual is
+    //     the latency lag baked into each member's captured displayed pose, which
+    //     is strictly smaller than the (forbidden) backward correction needed to
+    //     pin onto the un-extrapolated base.
+    // Intentional warps are a non-issue here: at game over there are no respawns
+    // (lives are 0) and a toroidal wrap during the coast is followed naturally by
+    // the modulo wrap, not treated as a discontinuity.
     function repositionDeadReckonedRemotes() {
-        const staleAt = deterministicGameOverSettle.staleAt;
+        const freeze = deterministicGameOverFreeze;
         if (!isDeterministicMode() || !isSessionMode()) {
-            staleAt.clear();
+            freeze.bases.clear();
+            freeze.freezeAtMs = null;
             return;
         }
-        // Game over: motion stops and every member must come to rest at the same
-        // authoritative pose, DeadReckon.getResting (the un-extrapolated base
-        // snapshot — dead-reckoning forward would drift each member ahead by a
-        // latency-dependent amount up to the clamp, so they'd disagree).
-        //
-        // The naive "switch getReckoned → getResting" at game over snaps backward
-        // by the forward-prediction the replica was showing. Easing that whole
-        // prediction away each frame is little better: while the owner is STILL
-        // streaming (it keeps simulating until its own lives reach 0, up to a
-        // round-trip later), getResting only advances at the ~4 Hz heartbeat, so
-        // the replica reverses toward a stale base then jerks forward on each
-        // packet — the "jump then blend" throb.
-        //
-        // Instead we keep two phases per object (see DEADRECKON_SETTLE_FRESH_MS):
-        //   FRESH (owner still sending): render at getReckoned — the SAME smooth,
-        //     continuous, forward dead reckoning used in play. No reversal, no
-        //     throb; motion simply carries on at the real velocity.
-        //   STALE (owner stopped, snapshot age > fresh window): ease the now-small
-        //     residual prediction from the current on-screen pose onto getResting
-        //     so every member converges to the identical shared base.
-        // The fresh→stale transition is seamless because the ease starts from the
-        // current pose with a per-object k = 0 first frame (no pop), and once the
-        // object is stale on every member they all ease to the same final base.
-        const frozen = isGameOver();
-        const now = performance.now();
-        const tau = CONFIG.DEADRECKON_GAMEOVER_SETTLE_MS;
-        const freshMs = CONFIG.DEADRECKON_SETTLE_FRESH_MS;
-        if (!frozen) staleAt.clear();
-        // Safety net: an object we OWN must never be dead-reckoned — we simulate
-        // it locally, and overwriting its pose from the (clamp-frozen) reckon
-        // state would freeze it. The migration handler clears dead-reckon state
-        // on the normal handoff, but ownership can also change via a
-        // reconciliation snapshot (object-sync sets ownerMemberId without
-        // touching DeadReckon) if a client missed the OnMemberLeft broadcast.
-        // Clearing here makes "owned ⇒ not dead-reckoned" hold for every path.
         const myMemberId = SessionClient.getCurrentMember()?.id;
         const ownedByUs = (syncId) => {
             if (!syncId || !myMemberId) return false;
             const o = ObjectSync.getObject(syncId);
             return !!o && o.ownerMemberId === myMemberId;
         };
-        // Apply the per-frame pose for one dead-reckoned remote. During play
-        // (not frozen) just position it at getReckoned. At game over, re-ingest
-        // the owner's latest in-flight snapshot, then render FRESH (getReckoned)
-        // while the owner is still sending or STALE (ease toward getResting) once
-        // it has stopped — see the phase note above.
-        //
-        // Game over re-ingestion (mirrors repositionLegacyRemotesAtRest): the
-        // gameplay sync pass that feeds DeadReckon is gated by lives > 0, so it
-        // stops at game over. But the object's owner keeps simulating and
-        // broadcasting until ITS OWN lives hit 0 — and when the GameState owner is
-        // a different member, that happens a round-trip later, so the owner emits
-        // more packets after the fatal collision. Each member stops ingesting at
-        // the moment its own lives reach 0 (a per-member time), so without this
-        // every member would freeze DeadReckon at a DIFFERENT snapshot and the
-        // resting poses would disagree. ObjectSync keeps receiving the owner's
-        // packets regardless of local game state, so pull the latest version in
-        // here: once the owner finally stops, every member's getResting converges
-        // to the same authoritative final snapshot. Each re-ingest also resets the
-        // snapshot's recvPerf to now, which is what keeps the object FRESH until
-        // the packets stop.
-        const applyPose = (obj, syncId, isShip) => {
-            if (ownedByUs(syncId)) { DeadReckon.remove(syncId); staleAt.delete(syncId); return; }
-            if (!frozen) {
+
+        if (!isGameOver()) {
+            // PLAY: position remotes at their continuous dead-reckoned pose. An
+            // object we OWN must never be dead-reckoned — we simulate it locally,
+            // and overwriting its pose from the (clamp-frozen) reckon state would
+            // freeze it. The migration handler clears dead-reckon state on the
+            // normal handoff, but ownership can also change via a reconciliation
+            // snapshot (object-sync sets ownerMemberId without touching
+            // DeadReckon) if a client missed the OnMemberLeft broadcast. Clearing
+            // here makes "owned ⇒ not dead-reckoned" hold for every path.
+            freeze.bases.clear();
+            freeze.freezeAtMs = null;
+            const place = (obj, syncId) => {
+                if (ownedByUs(syncId)) { DeadReckon.remove(syncId); return; }
                 const r = DeadReckon.getReckoned(syncId);
                 if (r) obj.fromSyncData(r);
-                return;
+            };
+            for (const b of game.bullets) {
+                if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) place(b, b.syncObjectId);
             }
-            let teleport = false;
-            const o = ObjectSync.getObject(syncId);
-            if (o && o.ownerMemberId !== myMemberId
-                && o.version !== DeadReckon.lastVersions.get(syncId)) {
-                if (isShip) {
-                    // Intentional respawn teleport detection mirrors
-                    // updateRemoteShips: the invulnerability counter only ever
-                    // decreases during play and jumps UP on Ship.reset(). Snap to
-                    // the spawn pose instead of gliding the replica across the
-                    // field. (Asteroids/bullets have no teleport; their only
-                    // discontinuity is a wrap, handled by the shortest-path ease.)
-                    const prevInvuln = obj.invulnerable;
-                    teleport = typeof prevInvuln === 'number'
-                        && (o.data.invulnerable || 0) > prevInvuln;
-                }
-                DeadReckon.updateState(syncId, o.data, undefined, teleport);
-                DeadReckon.lastVersions.set(syncId, o.version);
-                if (isShip && o.data.invulnerable !== undefined) obj.invulnerable = o.data.invulnerable;
+            for (const a of game.astervoids) {
+                if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) place(a, a.syncObjectId);
             }
-            // A respawn means the owner is alive and authoritative again: drop any
-            // stale latch so the object resumes smooth fresh rendering (and the
-            // snap below lands it on the spawn pose).
-            if (teleport) staleAt.delete(syncId);
-            const st = DeadReckon.states.get(syncId);
-            const staleMs = st ? (now - st.recvPerf) : Infinity;
-            const latched = staleAt.has(syncId);
-            if (!latched && (teleport || staleMs <= freshMs)) {
-                // FRESH: owner is still streaming (or just teleported). Render the
-                // continuous dead-reckoned pose exactly as in play — no ease, so no
-                // reversal or heartbeat throb. A teleport snaps here because
-                // updateState(snap) cleared the correction offset.
-                const r = DeadReckon.getReckoned(syncId);
-                if (r) obj.fromSyncData(r);
-                return;
+            for (const [id, ship] of game.multiplayer.remoteShips) {
+                if (DeadReckon.states.has(id)) place(ship, id);
             }
-            // STALE: owner has stopped. Ease the remaining prediction from the
-            // current on-screen pose onto the shared resting base. The per-object
-            // clock starts now, so this object's first stale frame holds (k = 0,
-            // continuous with its last fresh frame) before gliding on.
-            const prev = staleAt.get(syncId);
-            let k;
-            if (prev === undefined) {
-                k = 0;
-            } else {
-                const dtMs = Math.max(0, Math.min(now - prev, 250)); // ignore long stalls (tab hidden)
-                k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+            return;
+        }
+
+        // GAME OVER: shared ballistic freeze.
+        const nowServer = RemoteObjects.serverNowMs();
+        const delay = CONFIG.DEADRECKON_GAMEOVER_FREEZE_DELAY_MS;
+        // Latch the stop instant. Prefer the authoritative shared anchor; only
+        // estimate locally while it has not propagated, and upgrade to the
+        // authoritative value as soon as it arrives so all members agree.
+        const sharedAt = resolveSharedGameOverAtMs();
+        if (sharedAt != null) {
+            freeze.freezeAtMs = sharedAt + delay;
+        } else if (freeze.freezeAtMs == null) {
+            freeze.freezeAtMs = nowServer + delay;
+        }
+        const tEval = Math.min(nowServer, freeze.freezeAtMs);
+        const stepMs = 1000 / CONFIG.TARGET_FPS;
+
+        const seen = new Set();
+        const applyFreeze = (obj, syncId) => {
+            if (!syncId) return;
+            seen.add(syncId);
+            let base = freeze.bases.get(syncId);
+            if (!base) {
+                // Capture the anchor from the CURRENT displayed pose so the coast
+                // is seamless. Velocity is the object's last authoritative value
+                // (set from sync for remotes, from the sim for owned).
+                base = {
+                    x: obj.x,
+                    y: obj.y,
+                    angle: (typeof obj.angle === 'number') ? obj.angle : null,
+                    vNx: velocityToNormalizedDeltaX(obj.velocityX || 0),
+                    vNy: velocityToNormalizedDeltaY(obj.velocityY || 0),
+                    rot: obj.rotationSpeed || 0,
+                    anchorMs: nowServer,
+                };
+                freeze.bases.set(syncId, base);
             }
-            staleAt.set(syncId, now);
-            const r = DeadReckon.getResting(syncId);
-            if (r) easeDeadReckonedTowardRest(obj, r, k, false);
+            let frames = (tEval - base.anchorMs) / stepMs;
+            if (!(frames > 0)) frames = 0;
+            const r = wrapRadiusFor(obj);
+            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
+            obj.x = wrapNormalizedMod(base.x + base.vNx * frames, marginX);
+            obj.y = wrapNormalizedMod(base.y + base.vNy * frames, marginY);
+            if (base.angle !== null) {
+                // Project the angle linearly, exactly like position. The angular
+                // clamp used during play (to bound over-rotation across an
+                // unsignalled turn-stop) is deliberately NOT applied here: it
+                // saturates after DEADRECKON_ANGULAR_MAX_FRAMES, which would break
+                // the cross-member convergence that the unclamped linear
+                // projection guarantees (each member captures at a different
+                // anchorMs/base, and only a linear projection makes those
+                // differences cancel onto one shared resting heading).
+                obj.angle = base.angle + base.rot * frames;
+            }
         };
         for (const b of game.bullets) {
-            if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) applyPose(b, b.syncObjectId, false);
+            if (b.syncObjectId) applyFreeze(b, b.syncObjectId);
         }
         for (const a of game.astervoids) {
-            if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) applyPose(a, a.syncObjectId, false);
+            if (a.syncObjectId) applyFreeze(a, a.syncObjectId);
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
-            if (DeadReckon.states.has(id)) applyPose(ship, id, true);
+            applyFreeze(ship, id);
+        }
+        if (game.ship && game.multiplayer.myShipObjectId) {
+            applyFreeze(game.ship, game.multiplayer.myShipObjectId);
+        }
+        // Drop anchors for objects that no longer exist so a later episode starts
+        // clean (objects can be deleted by their owner during the freeze).
+        if (freeze.bases.size > seen.size) {
+            for (const id of freeze.bases.keys()) {
+                if (!seen.has(id)) freeze.bases.delete(id);
+            }
         }
     }
 
