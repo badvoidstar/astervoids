@@ -1194,6 +1194,25 @@
         // Instead the visible transform decays toward the shared snapshot over
         // ~this window, giving a smooth, convergent stop. 0 = hard snap.
         LEGACY_GAMEOVER_SETTLE_MS: 140,
+        // Deterministic mode only: time constant (ms) for easing a dead-reckoned
+        // remote onto its authoritative resting pose at game over. During play
+        // the replica is rendered at DeadReckon.getReckoned (extrapolated +
+        // smoothed); at game over it must converge to DeadReckon.getResting (the
+        // raw, un-extrapolated authoritative snapshot) so every member agrees.
+        // Switching in a single frame snaps (a visible 1-2 frame jump). Instead
+        // the visible transform eases toward the resting pose — which keeps
+        // advancing as the owner's last in-flight snapshots are re-ingested — so
+        // the object glides to its final pose over the natural snapshot-delivery
+        // window plus this short smoothing tail (kept equal to DEADRECKON_SMOOTH_MS
+        // so the stop looks identical to in-play render smoothing). 0 = hard snap.
+        DEADRECKON_GAMEOVER_SETTLE_MS: 90,
+        // Deterministic game-over settle: once the eased remaining distance to the
+        // authoritative resting pose falls below this (normalized position) and
+        // the residual angle below DEADRECKON_SETTLE_EPSILON_ANGLE, snap exactly
+        // onto the pose so every member converges to identical state (an
+        // exponential ease only approaches its target asymptotically).
+        DEADRECKON_SETTLE_EPSILON: 0.0005,
+        DEADRECKON_SETTLE_EPSILON_ANGLE: 0.002,
 
         // Deterministic mode only: owner-side "send-on-change" suppression.
         // For purely ballistic objects (asteroids, bullets) the receiver
@@ -7441,6 +7460,58 @@
         }
     }
 
+    // Deterministic game-over settle clock (mirrors legacyGameOverSettle): drives
+    // the frame-rate-independent ease in repositionDeadReckonedRemotes. `active`
+    // is reset whenever we are NOT frozen so the FIRST frozen frame measures
+    // dt = 0 ⇒ k = 0 (the object holds at its last in-play pose, no pop).
+    const deterministicGameOverSettle = { active: false, lastTime: 0 };
+
+    // Ease a dead-reckoned remote's VISIBLE transform from its current pose
+    // toward the authoritative resting `target` (DeadReckon.getResting) by blend
+    // factor k. Full kinematic data (velocity etc.) is applied immediately via
+    // fromSyncData; only the rendered x/y/angle are eased so the stop is smooth.
+    //
+    //   k = 0   ⇒ hold at the current pose (first game-over frame, no pop).
+    //   k = 1   ⇒ snap exactly to target.
+    //   snap    ⇒ intentional warp (e.g. ship respawn): snap regardless of k.
+    //
+    // Positional easing uses the SHORTEST toroidal path (range = 1 + 2*margin),
+    // so a wraparound is glided the short way across the seam — a small,
+    // continuous move — rather than swept across the whole field. Once the
+    // residual falls below the settle epsilon the object is pinned exactly onto
+    // the target so every member converges to identical state (an exponential
+    // ease only approaches asymptotically). Angle uses the shortest arc.
+    function easeDeadReckonedTowardRest(obj, target, k, snap) {
+        const startX = obj.x, startY = obj.y, startAngle = obj.angle;
+        obj.fromSyncData(target);
+        if (snap || k >= 1) return;
+        const epsPos = CONFIG.DEADRECKON_SETTLE_EPSILON;
+        const epsAng = CONFIG.DEADRECKON_SETTLE_EPSILON_ANGLE;
+        if (typeof target.x === 'number' && typeof startX === 'number') {
+            const r = wrapRadiusFor(obj);
+            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
+            const rangeX = 1 + 2 * marginX, rangeY = 1 + 2 * marginY;
+            let dx = target.x - startX;
+            if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
+            let dy = 0;
+            if (typeof target.y === 'number' && typeof startY === 'number') {
+                dy = target.y - startY;
+                if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
+            }
+            // Below epsilon: leave x/y pinned at the target (already set above).
+            if (Math.abs(dx) >= epsPos || Math.abs(dy) >= epsPos) {
+                obj.x = wrapNormalized(startX + dx * k, marginX);
+                if (typeof target.y === 'number' && typeof startY === 'number') {
+                    obj.y = wrapNormalized(startY + dy * k, marginY);
+                }
+            }
+        }
+        if (typeof target.angle === 'number' && typeof startAngle === 'number') {
+            const da = shortestAngleDelta(target.angle, startAngle);
+            if (Math.abs(da) >= epsAng) obj.angle = startAngle + da * k;
+        }
+    }
+
     // Reposition every dead-reckoned remote object (ships, asteroids, bullets)
     // from its DeadReckon state at the current instant. Dead reckoning is
     // continuous (extrapolates to performance.now()), so calling this once per
@@ -7449,13 +7520,36 @@
     // only move on frames where a sim step runs (visible stutter on >60 Hz
     // displays). Locals are smoothed separately by render interpolation.
     function repositionDeadReckonedRemotes() {
-        if (!isDeterministicMode() || !isSessionMode()) return;
+        if (!isDeterministicMode() || !isSessionMode()) {
+            deterministicGameOverSettle.active = false;
+            return;
+        }
         // Game over: motion stops and every member must come to rest at the same
-        // authoritative pose. Use the un-extrapolated base snapshot instead of
-        // dead-reckoning forward (which would drift each member ahead by a
-        // latency-dependent amount up to the clamp, so they'd disagree).
+        // authoritative pose, DeadReckon.getResting (the un-extrapolated base
+        // snapshot — dead-reckoning forward would drift each member ahead by a
+        // latency-dependent amount up to the clamp, so they'd disagree). But
+        // switching straight from getReckoned (extrapolated + smoothed) to
+        // getResting in one frame snaps backward by the forward-prediction it had
+        // been showing — a visible 1-2 frame jump. So instead of pinning, we EASE
+        // the visible pose toward getResting with a frame-rate-independent
+        // exponential blend: the first frozen frame holds (k = 0, no pop), then
+        // the object glides on. The target keeps advancing as the owner's last
+        // in-flight snapshots are re-ingested (below), so the replica flows
+        // forward through them to the final pose over the natural delivery window
+        // rather than rolling back and stepping forward discretely.
         const frozen = isGameOver();
-        const poseOf = (id) => frozen ? DeadReckon.getResting(id) : DeadReckon.getReckoned(id);
+        let k = 1;
+        if (frozen) {
+            const now = performance.now();
+            let dtMs = deterministicGameOverSettle.active ? (now - deterministicGameOverSettle.lastTime) : 0;
+            deterministicGameOverSettle.active = true;
+            deterministicGameOverSettle.lastTime = now;
+            dtMs = Math.max(0, Math.min(dtMs, 250)); // ignore long stalls (tab hidden)
+            const tau = CONFIG.DEADRECKON_GAMEOVER_SETTLE_MS;
+            k = (tau > 0 && dtMs > 0) ? Math.min(1, 1 - Math.exp(-dtMs / tau)) : (tau <= 0 ? 1 : 0);
+        } else {
+            deterministicGameOverSettle.active = false;
+        }
         // Safety net: an object we OWN must never be dead-reckoned — we simulate
         // it locally, and overwriting its pose from the (clamp-frozen) reckon
         // state would freeze it. The migration handler clears dead-reckon state
@@ -7469,6 +7563,10 @@
             const o = ObjectSync.getObject(syncId);
             return !!o && o.ownerMemberId === myMemberId;
         };
+        // Apply the per-frame pose for one dead-reckoned remote. During play
+        // (not frozen) just position it at getReckoned. At game over, re-ingest
+        // the owner's latest in-flight snapshot, then ease toward getResting.
+        //
         // Game over re-ingestion (mirrors repositionLegacyRemotesAtRest): the
         // gameplay sync pass that feeds DeadReckon is gated by lives > 0, so it
         // stops at game over. But the object's owner keeps simulating and
@@ -7481,37 +7579,43 @@
         // packets regardless of local game state, so pull the latest version in
         // here: once the owner finally stops, every member's getResting converges
         // to the same authoritative final snapshot.
-        const reingestAtRest = (syncId) => {
+        const applyPose = (obj, syncId, isShip) => {
+            if (ownedByUs(syncId)) { DeadReckon.remove(syncId); return; }
+            if (!frozen) {
+                const r = DeadReckon.getReckoned(syncId);
+                if (r) obj.fromSyncData(r);
+                return;
+            }
+            let teleport = false;
             const o = ObjectSync.getObject(syncId);
             if (o && o.ownerMemberId !== myMemberId
                 && o.version !== DeadReckon.lastVersions.get(syncId)) {
-                DeadReckon.updateState(syncId, o.data);
+                if (isShip) {
+                    // Intentional respawn teleport detection mirrors
+                    // updateRemoteShips: the invulnerability counter only ever
+                    // decreases during play and jumps UP on Ship.reset(). Snap to
+                    // the spawn pose instead of gliding the replica across the
+                    // field. (Asteroids/bullets have no teleport; their only
+                    // discontinuity is a wrap, handled by the shortest-path ease.)
+                    const prevInvuln = obj.invulnerable;
+                    teleport = typeof prevInvuln === 'number'
+                        && (o.data.invulnerable || 0) > prevInvuln;
+                }
+                DeadReckon.updateState(syncId, o.data, undefined, teleport);
                 DeadReckon.lastVersions.set(syncId, o.version);
+                if (isShip && o.data.invulnerable !== undefined) obj.invulnerable = o.data.invulnerable;
             }
+            const r = DeadReckon.getResting(syncId);
+            if (r) easeDeadReckonedTowardRest(obj, r, k, teleport);
         };
         for (const b of game.bullets) {
-            if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) {
-                if (ownedByUs(b.syncObjectId)) { DeadReckon.remove(b.syncObjectId); continue; }
-                if (frozen) reingestAtRest(b.syncObjectId);
-                const r = poseOf(b.syncObjectId);
-                if (r) b.fromSyncData(r);
-            }
+            if (b.syncObjectId && DeadReckon.states.has(b.syncObjectId)) applyPose(b, b.syncObjectId, false);
         }
         for (const a of game.astervoids) {
-            if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) {
-                if (ownedByUs(a.syncObjectId)) { DeadReckon.remove(a.syncObjectId); continue; }
-                if (frozen) reingestAtRest(a.syncObjectId);
-                const r = poseOf(a.syncObjectId);
-                if (r) a.fromSyncData(r);
-            }
+            if (a.syncObjectId && DeadReckon.states.has(a.syncObjectId)) applyPose(a, a.syncObjectId, false);
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
-            if (DeadReckon.states.has(id)) {
-                if (ownedByUs(id)) { DeadReckon.remove(id); continue; }
-                if (frozen) reingestAtRest(id);
-                const r = poseOf(id);
-                if (r) ship.fromSyncData(r);
-            }
+            if (DeadReckon.states.has(id)) applyPose(ship, id, true);
         }
     }
 
