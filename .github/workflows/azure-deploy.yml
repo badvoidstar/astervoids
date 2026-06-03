@@ -927,7 +927,16 @@ jobs:
           fi
           echo "**Application URL:** ${{ steps.deploy.outputs.url }}" >> $GITHUB_STEP_SUMMARY
           if [ -n "$CUSTOM_DOMAIN" ]; then
-            echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
+              # Production apex is intentionally public.
+              echo "**Custom Domain:** https://$CUSTOM_DOMAIN" >> $GITHUB_STEP_SUMMARY
+            else
+              # SECURITY: job summaries are NOT secret-masked (only logs are), and
+              # this repo is public. A branch's custom hostname embeds the secret
+              # CUSTOM_SUBDOMAIN/CUSTOM_DOMAIN_NAME, so never print it here. Resolve
+              # it privately instead with .github/scripts/branch-url.sh.
+              echo "**Custom domain:** configured (private — run \`.github/scripts/branch-url.sh\` locally to resolve)" >> $GITHUB_STEP_SUMMARY
+            fi
           fi
 
           # Multi-region: list per-region container apps + static apex host info

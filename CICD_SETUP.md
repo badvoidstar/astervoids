@@ -155,6 +155,41 @@ Branch names are sanitized for DNS compatibility:
 1. **Production must be deployed first** - Branch deployments use the shared Container Apps Environment created by the production deployment
 2. **Custom domain secrets configured** - `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must be set
 
+### Finding a branch's custom URL (privately)
+
+This repository is public, and **GitHub does not mask secrets in job summaries**
+(only in logs). The deploy job therefore never prints a branch's full custom
+hostname — it embeds the secret `CUSTOM_SUBDOMAIN`/`CUSTOM_DOMAIN_NAME`. The
+branch name and its derived `{name}-{hash}` segment are public; only the
+subdomain and domain stay secret.
+
+To resolve the full URL yourself, use either method below.
+
+**Option A — local helper (offline, needs the secrets):**
+Provide the secret parts via environment variables, or an untracked
+`.deploy.local` file at the repo root (git-ignored):
+
+```
+CUSTOM_SUBDOMAIN=app
+CUSTOM_DOMAIN_NAME=example.com
+```
+
+Then run:
+
+```bash
+./.github/scripts/branch-url.sh                # current branch
+./.github/scripts/branch-url.sh feature/login  # a specific branch
+# => https://app-feature-login-df7c.example.com
+```
+
+**Option B — ask Azure (no local secrets):**
+
+```bash
+az containerapp show -g rg-production \
+  -n "ca-web-$(./.github/scripts/branch-url.sh --sanitized feature/login)" \
+  --query "properties.configuration.ingress.customDomains[].name" -o tsv
+```
+
 ### Greenfield expectations
 
 - `main` deploys are expected to work from a clean app-stack state (no pre-existing app resource groups) when required inputs are supplied.

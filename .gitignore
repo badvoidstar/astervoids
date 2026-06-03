@@ -47,3 +47,6 @@ test_output.log
 # Bicep compiled output
 infra/*.json
 !infra/main.parameters.json
+
+# Local-only deployment secrets (consumed by .github/scripts/branch-url.sh)
+.deploy.local
