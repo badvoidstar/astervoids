@@ -194,6 +194,15 @@ az containerapp show -g rg-production \
   --query "properties.configuration.ingress.customDomains[].name" -o tsv
 ```
 
+> **Security invariant (don't reintroduce the leak):** because the repo is
+> public and GitHub does **not** mask secrets in `$GITHUB_STEP_SUMMARY`, PR
+> comments, the deployment `environment.url`, job/step names, or workflow
+> outputs, no workflow may write `CUSTOM_DOMAIN` — or any value derived from
+> `CUSTOM_DOMAIN_NAME`/`CUSTOM_SUBDOMAIN` (including the full custom hostname or
+> cert names built from it) — to any of those surfaces. Public surfaces may only
+> show the non-secret default `*.azurecontainerapps.io`/`*.azurestaticapps.net`
+> FQDNs. Logs are fine (the secret substrings are auto-masked there).
+
 ### Greenfield expectations
 
 - `main` deploys are expected to work from a clean app-stack state (no pre-existing app resource groups) when required inputs are supplied.
