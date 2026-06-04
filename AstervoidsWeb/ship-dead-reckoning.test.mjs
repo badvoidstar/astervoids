@@ -12,8 +12,11 @@ import assert from 'node:assert/strict';
 //   P2  DeadReckon angular-projection clamp — ships bound their forward angular
 //       extrapolation to DEADRECKON_ANGULAR_MAX_FRAMES; ballistic spinners do not.
 //   P3  Physics input-replay — a remote that seeds from an authoritative packet
-//       (pose + velocity + rotationSpeed + thrustInput + brakeInput) and replays
-//       Ship.update() lands exactly where the owner did.
+//       (pose + velocity + rotationSpeed + control intent) and replays
+//       Ship.update() lands where the owner did for rate controls.
+//   P3b Target-heading replay — polar touch remotes recompute the owner's
+//       heading-alignment turn each replay step instead of projecting a stale
+//       rotationSpeed across latency.
 
 // ----------------------------------------------------------------------------
 // P1: ShipControlGate.isEdge mirror
@@ -162,6 +165,32 @@ const SHIP = {
     DECEL_TIME: 0.0,
 };
 
+const TURN_CONTROL_MODE = {
+    RATE: 0,
+    TARGET: 1,
+};
+
+function shortestAngleDelta(targetAngle, currentAngle) {
+    const diff = targetAngle - currentAngle;
+    return Math.atan2(Math.sin(diff), Math.cos(diff));
+}
+
+function attainableTurnTarget(delta, maxMagnitude, ratePerFrame, dt) {
+    if (maxMagnitude <= 0) return 0;
+    if (delta === 0) return 0;
+    const denom = ratePerFrame * dt;
+    if (denom <= 0) return 0;
+    const cappedMag = Math.min(maxMagnitude, Math.abs(delta) / denom);
+    return Math.sign(delta) * cappedMag;
+}
+
+function mergeTurnInputs(a, b) {
+    const sum = (a || 0) + (b || 0);
+    if (sum >  1) return  1;
+    if (sum < -1) return -1;
+    return sum;
+}
+
 function rampInputToward(cur, target, accel, decel, dtSec) {
     if (accel <= 0 && decel <= 0) return target; // instantaneous (shipped config)
     const rate = (Math.abs(target) > Math.abs(cur)) ? accel : decel;
@@ -182,6 +211,10 @@ class MiniShip {
         this.rotationSpeed = 0;
         this.turnTarget = 0; this.turnInput = 0;
         this.thrustInput = 0; this.brakeInput = 0;
+        this.turnControlMode = TURN_CONTROL_MODE.RATE;
+        this.turnTargetAngle = 0;
+        this.turnMagnitude = 0;
+        this.turnBias = 0;
     }
     update(dt = 1) {
         const dtSec = dt / SHIP.TARGET_FPS;
@@ -218,15 +251,44 @@ class MiniShip {
 }
 
 // The replay used on the remote: seed a scratch ship from the authoritative
-// packet (turnInput recovered from rotationSpeed) and step it `frames` times.
+// packet and step it `frames` times. Rate controls replay turnTarget directly;
+// target-heading controls recompute turnTarget from targetAngle every substep.
 function replay(packet, frames) {
     const sh = new MiniShip();
     sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
     sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
+    sh.rotationSpeed = packet.rotationSpeed;
     const ti = SHIP.SHIP_TURN_SPEED !== 0 ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
-    sh.turnInput = ti; sh.turnTarget = ti;
+    sh.turnInput = ti;
     sh.thrustInput = packet.thrustInput || 0;
     sh.brakeInput = packet.brakeInput || 0;
+    let remaining = frames > 0 ? frames : 0;
+    while (remaining > 1e-6) {
+        const dt = remaining > 1 ? 1 : remaining;
+        if (packet.turnControlMode === TURN_CONTROL_MODE.TARGET) {
+            const delta = shortestAngleDelta(packet.turnTargetAngle || 0, sh.angle);
+            const targetTurn = attainableTurnTarget(
+                delta,
+                packet.turnMagnitude || 0,
+                SHIP.SHIP_TURN_SPEED,
+                dt);
+            sh.turnTarget = mergeTurnInputs(targetTurn, packet.turnBias || 0);
+        } else {
+            sh.turnTarget = Number.isFinite(packet.turnTarget) ? packet.turnTarget : ti;
+        }
+        sh.update(dt);
+        remaining -= dt;
+    }
+    return sh;
+}
+
+function staleRateReplay(packet, frames) {
+    const sh = new MiniShip();
+    sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
+    sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
+    const ti = SHIP.SHIP_TURN_SPEED !== 0 ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
+    sh.turnInput = ti;
+    sh.turnTarget = ti;
     let remaining = frames > 0 ? frames : 0;
     while (remaining > 1e-6) {
         const dt = remaining > 1 ? 1 : remaining;
@@ -242,6 +304,11 @@ function packetOf(ship) {
         velocityX: ship.velocityX, velocityY: ship.velocityY,
         rotationSpeed: ship.rotationSpeed,
         thrustInput: ship.thrustInput, brakeInput: ship.brakeInput,
+        turnControlMode: ship.turnControlMode,
+        turnTarget: ship.turnTarget,
+        turnTargetAngle: ship.turnTargetAngle,
+        turnMagnitude: ship.turnMagnitude,
+        turnBias: ship.turnBias,
     };
 }
 
@@ -251,6 +318,7 @@ function assertPose(a, b, msg) {
     assert.ok(Math.abs(a.angle - b.angle) < 1e-12, `${msg} angle`);
     assert.ok(Math.abs(a.velocityX - b.velocityX) < 1e-12, `${msg} vx`);
     assert.ok(Math.abs(a.velocityY - b.velocityY) < 1e-12, `${msg} vy`);
+    assert.ok(Math.abs(a.rotationSpeed - b.rotationSpeed) < 1e-12, `${msg} rotationSpeed`);
 }
 
 test('P3: replay reproduces a coasting (friction decay) ship exactly', () => {
@@ -307,6 +375,53 @@ test('P3: zero elapsed frames returns the baseline pose unchanged', () => {
     const owner = new MiniShip();
     owner.x = 0.42; owner.y = 0.17; owner.angle = 2.0;
     owner.velocityX = 0.1; owner.velocityY = -0.2;
+    owner.turnTarget = 0.5; owner.turnInput = 0.5;
+    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput;
     const packet = packetOf(owner);
     assertPose(replay(packet, 0), owner, 'zero-frames');
+});
+
+test('P3b: target-heading replay lands on target instead of projecting stale turn rate', () => {
+    const targetAngle = 0.18;
+    const packet = {
+        x: 0, y: 0, angle: 0,
+        velocityX: 0, velocityY: 0,
+        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        thrustInput: 0, brakeInput: 0,
+        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnTargetAngle: targetAngle,
+        turnMagnitude: 1,
+        turnBias: 0,
+    };
+
+    const stale = staleRateReplay(packet, 8);
+    assert.ok(stale.angle > targetAngle + 0.5,
+        `precondition: stale rate replay should overshoot badly, got ${stale.angle}`);
+
+    const replayed = replay(packet, 8);
+    assert.ok(Math.abs(shortestAngleDelta(targetAngle, replayed.angle)) < 1e-12,
+        `target replay should converge to target, got ${replayed.angle}`);
+    assert.ok(replayed.angle <= targetAngle + 1e-12,
+        'target replay must not cross past the target heading');
+    assert.ok(Math.abs(replayed.rotationSpeed) < 1e-12,
+        'rotationSpeed settles to zero at the target');
+});
+
+test('P3b: target-heading replay takes the short way across the angle seam', () => {
+    const targetAngle = 0.05;
+    const startAngle = Math.PI * 2 - 0.04;
+    const packet = {
+        x: 0, y: 0, angle: startAngle,
+        velocityX: 0, velocityY: 0,
+        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        thrustInput: 0, brakeInput: 0,
+        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnTargetAngle: targetAngle,
+        turnMagnitude: 1,
+        turnBias: 0,
+    };
+
+    const replayed = replay(packet, 4);
+    assert.ok(Math.abs(shortestAngleDelta(targetAngle, replayed.angle)) < 1e-12,
+        `target replay should converge across seam, got ${replayed.angle}`);
 });
