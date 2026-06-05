@@ -1267,6 +1267,15 @@
         // intended heading instead of projecting a stale rotationSpeed across
         // latency. DEFAULT OFF pending live two-client verification.
         SHIP_INPUT_REPLAY_ENABLED: false,
+        // Deterministic mode only, ships only: display remote ship rotation by
+        // targeting authoritative heading rather than forward-projecting stale
+        // angular velocity. With replay disabled, this renders the latest
+        // authoritative angle and lets DeadReckon's correction offset ease to it
+        // (no overshoot, small heading lag). With replay enabled and schema id 5
+        // target-heading metadata available, target-mode controls still replay
+        // forward toward the owner's intended heading; older schema-id-4 replay
+        // sessions gracefully fall back to authoritative-angle convergence.
+        SHIP_ROTATION_TARGET_ENABLED: true,
 
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1928,25 +1937,37 @@
                 out.x = s.x + velocityToNormalizedDeltaX(s.velocityX) * frames;
                 out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
             }
+            const targetMode = s.clampAngular
+                && CONFIG.SHIP_ROTATION_TARGET_ENABLED
+                && isDeterministicMode();
             if (s.angle !== null) {
-                // P2: clamp ANGULAR projection for ships to bound over-rotation
-                // across an unannounced turn stop; positional projection keeps
-                // the full DEADRECKON_MAX_FRAMES window above.
-                let angFrames = frames;
-                const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
-                if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
-                    angFrames = angCap;
+                if (targetMode) {
+                    // Ships target the owner's authoritative angle instead of
+                    // forward-projecting stale angular velocity. _reckonAt's
+                    // smoothing offset eases from the previously displayed angle
+                    // to this target, which can lag but cannot overshoot.
+                    out.angle = s.angle;
+                } else {
+                    // P2: clamp ANGULAR projection for ships to bound over-rotation
+                    // across an unannounced turn stop; positional projection keeps
+                    // the full DEADRECKON_MAX_FRAMES window above.
+                    let angFrames = frames;
+                    const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
+                    if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
+                        angFrames = angCap;
+                    }
+                    out.angle = s.angle + s.rotationSpeed * angFrames;
                 }
-                out.angle = s.angle + s.rotationSpeed * angFrames;
             }
             // P3: for ships, replace the first-order linear projection above with
             // a replay of Ship.update() forward from the baseline (same friction,
             // rotating-heading thrust, clamp, brake the owner ran). Rate controls
             // replay the transmitted turnTarget; polar controls replay target-
-            // heading intent, recomputing turnTarget each substep. Overwrites
-            // x/y/angle/velocity computed above.
+            // heading intent, recomputing turnTarget each substep. In rotation
+            // target mode, rate/legacy-schema controls keep the authoritative
+            // display angle above while still replaying position/velocity.
             if (s.clampAngular && CONFIG.SHIP_INPUT_REPLAY_ENABLED && isDeterministicMode()) {
-                this._replayShip(s, frames, out);
+                this._replayShip(s, frames, out, targetMode);
             }
             return out;
         },
@@ -1957,7 +1978,7 @@
         // fractional remainder. Pure kinematics: invulnerable/shootCooldown are
         // zeroed so Ship.update's timer decrements are inert, and nothing else in
         // Ship.update touches globals.
-        _replayShip(s, frames, out) {
+        _replayShip(s, frames, out, targetMode) {
             const sh = this._scratch || (this._scratch = new Ship(0, 0, 0));
             sh.x = s.x;
             sh.y = s.y;
@@ -1972,10 +1993,13 @@
             sh.brakeInput = s.brakeInput || 0;
             sh.invulnerable = 0;
             sh.shootCooldown = 0;
+            const targetDrive = targetMode
+                && s.turnControlMode === TURN_CONTROL_MODE.TARGET
+                && s.angle !== null;
             let remaining = frames > 0 ? frames : 0;
             while (remaining > 1e-6) {
                 const dt = remaining > 1 ? 1 : remaining;
-                if (s.turnControlMode === TURN_CONTROL_MODE.TARGET && s.angle !== null) {
+                if (targetDrive) {
                     const delta = shortestAngleDelta(s.turnTargetAngle, sh.angle);
                     const targetTurn = attainableTurnTarget(
                         delta,
@@ -1994,7 +2018,7 @@
             out.velocityX = sh.velocityX;
             out.velocityY = sh.velocityY;
             out.rotationSpeed = sh.rotationSpeed;
-            if (s.angle !== null) out.angle = sh.angle;
+            if (s.angle !== null && (!targetMode || targetDrive)) out.angle = sh.angle;
         },
 
         // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
