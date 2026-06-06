@@ -1265,8 +1265,9 @@
         // wire and all existing size locks are byte-for-byte unchanged. Schema
         // id 5 lets polar target-heading controls replay toward the owner's
         // intended heading instead of projecting a stale rotationSpeed across
-        // latency. DEFAULT OFF pending live two-client verification.
-        SHIP_INPUT_REPLAY_ENABLED: false,
+        // latency. On by default now that target-heading replay is paired with
+        // rotation-target convergence for non-replay and legacy replay paths.
+        SHIP_INPUT_REPLAY_ENABLED: true,
         // Deterministic mode only, ships only: display remote ship rotation by
         // targeting authoritative heading rather than forward-projecting stale
         // angular velocity. With replay disabled, this renders the latest
