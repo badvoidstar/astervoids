@@ -1258,12 +1258,25 @@
         // authoritative packet, instead of first-order linear dead reckoning.
         // This is exact (modulo cross-engine float drift, bounded by the
         // heartbeat re-anchor) and wraps natively. It requires the owner to also
-        // send thrustInput / brakeInput, so replay-enabled sessions put ships on
-        // ship-update schema id 4 (= id 1 + the 2 analog input fields). When
+        // send thrustInput / brakeInput and turn-control intent, so replay-
+        // enabled sessions put ships on ship-update schema id 5 when available
+        // (falling back to legacy replay schema id 4 for older sessions). When
         // disabled, ships stay on schema id 1 and the linear reckoner, so the
-        // wire and all existing size locks are byte-for-byte unchanged. DEFAULT
-        // OFF pending live two-client verification.
-        SHIP_INPUT_REPLAY_ENABLED: false,
+        // wire and all existing size locks are byte-for-byte unchanged. Schema
+        // id 5 lets polar target-heading controls replay toward the owner's
+        // intended heading instead of projecting a stale rotationSpeed across
+        // latency. On by default now that target-heading replay is paired with
+        // rotation-target convergence for non-replay and legacy replay paths.
+        SHIP_INPUT_REPLAY_ENABLED: true,
+        // Deterministic mode only, ships only: display remote ship rotation by
+        // targeting authoritative heading rather than forward-projecting stale
+        // angular velocity. With replay disabled, this renders the latest
+        // authoritative angle and lets DeadReckon's correction offset ease to it
+        // (no overshoot, small heading lag). With replay enabled and schema id 5
+        // target-heading metadata available, target-mode controls still replay
+        // forward toward the owner's intended heading; older schema-id-4 replay
+        // sessions gracefully fall back to authoritative-angle convergence.
+        SHIP_ROTATION_TARGET_ENABLED: true,
 
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1650,6 +1663,11 @@
     });
     const VALID_TOUCH_SCHEMES = new Set(Object.values(TOUCH_SCHEMES));
 
+    const TURN_CONTROL_MODE = Object.freeze({
+        RATE: 0,
+        TARGET: 1,
+    });
+
     // Resolve CONFIG.TOUCH_CONTROL_SCHEME with a fallback to the default
     // ('polar'). Tolerates unknown / mistyped values so a stray URL override
     // can't brick input on a live device.
@@ -1854,11 +1872,25 @@
                 // is present on the merged object data even though the ship's
                 // per-frame toUpdateData() omits it.
                 clampAngular: data.type === OBJECT_TYPES.SHIP,
-                // P3 input-replay seeds: analog control magnitudes the physics
-                // replay needs (turnInput is recovered from rotationSpeed). Only
-                // present on schema-id-4 ship updates; default 0 otherwise.
+                // P3 input-replay seeds: control magnitudes and optional target-
+                // heading intent. Rate-mode turns use turnTarget directly;
+                // polar target-mode turns recompute attainableTurnTarget every
+                // replay substep so latency does not project a stale turn rate.
                 thrustInput: data.thrustInput || 0,
                 brakeInput: data.brakeInput || 0,
+                turnControlMode: data.turnControlMode === TURN_CONTROL_MODE.TARGET
+                    ? TURN_CONTROL_MODE.TARGET
+                    : TURN_CONTROL_MODE.RATE,
+                turnTarget: Number.isFinite(data.turnTarget)
+                    ? data.turnTarget
+                    : (CONFIG.SHIP_TURN_SPEED !== 0
+                        ? (data.rotationSpeed || 0) / CONFIG.SHIP_TURN_SPEED
+                        : 0),
+                turnTargetAngle: Number.isFinite(data.turnTargetAngle) ? data.turnTargetAngle : 0,
+                turnMagnitude: Number.isFinite(data.turnMagnitude)
+                    ? Math.max(0, Math.min(1, data.turnMagnitude))
+                    : 0,
+                turnBias: Number.isFinite(data.turnBias) ? data.turnBias : 0,
                 recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
                     ? baselinePerf
                     : now,
@@ -1906,24 +1938,37 @@
                 out.x = s.x + velocityToNormalizedDeltaX(s.velocityX) * frames;
                 out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
             }
+            const targetMode = s.clampAngular
+                && CONFIG.SHIP_ROTATION_TARGET_ENABLED
+                && isDeterministicMode();
             if (s.angle !== null) {
-                // P2: clamp ANGULAR projection for ships to bound over-rotation
-                // across an unannounced turn stop; positional projection keeps
-                // the full DEADRECKON_MAX_FRAMES window above.
-                let angFrames = frames;
-                const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
-                if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
-                    angFrames = angCap;
+                if (targetMode) {
+                    // Ships target the owner's authoritative angle instead of
+                    // forward-projecting stale angular velocity. _reckonAt's
+                    // smoothing offset eases from the previously displayed angle
+                    // to this target, which can lag but cannot overshoot.
+                    out.angle = s.angle;
+                } else {
+                    // P2: clamp ANGULAR projection for ships to bound over-rotation
+                    // across an unannounced turn stop; positional projection keeps
+                    // the full DEADRECKON_MAX_FRAMES window above.
+                    let angFrames = frames;
+                    const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
+                    if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
+                        angFrames = angCap;
+                    }
+                    out.angle = s.angle + s.rotationSpeed * angFrames;
                 }
-                out.angle = s.angle + s.rotationSpeed * angFrames;
             }
             // P3: for ships, replace the first-order linear projection above with
-            // an EXACT replay of Ship.update() forward from the baseline (same
-            // friction, rotating-heading thrust, clamp, brake the owner ran).
-            // turnInput is recovered from rotationSpeed; thrust/brake come off the
-            // schema-id-4 packet. Overwrites x/y/angle/velocity computed above.
+            // a replay of Ship.update() forward from the baseline (same friction,
+            // rotating-heading thrust, clamp, brake the owner ran). Rate controls
+            // replay the transmitted turnTarget; polar controls replay target-
+            // heading intent, recomputing turnTarget each substep. In rotation
+            // target mode, rate/legacy-schema controls keep the authoritative
+            // display angle above while still replaying position/velocity.
             if (s.clampAngular && CONFIG.SHIP_INPUT_REPLAY_ENABLED && isDeterministicMode()) {
-                this._replayShip(s, frames, out);
+                this._replayShip(s, frames, out, targetMode);
             }
             return out;
         },
@@ -1934,24 +1979,38 @@
         // fractional remainder. Pure kinematics: invulnerable/shootCooldown are
         // zeroed so Ship.update's timer decrements are inert, and nothing else in
         // Ship.update touches globals.
-        _replayShip(s, frames, out) {
+        _replayShip(s, frames, out, targetMode) {
             const sh = this._scratch || (this._scratch = new Ship(0, 0, 0));
             sh.x = s.x;
             sh.y = s.y;
             sh.angle = (s.angle !== null ? s.angle : 0);
             sh.velocityX = s.velocityX;
             sh.velocityY = s.velocityY;
+            sh.rotationSpeed = s.rotationSpeed;
             const turnSpeed = CONFIG.SHIP_TURN_SPEED;
             const turnInput = turnSpeed !== 0 ? s.rotationSpeed / turnSpeed : 0;
             sh.turnInput = turnInput;
-            sh.turnTarget = turnInput;
             sh.thrustInput = s.thrustInput || 0;
             sh.brakeInput = s.brakeInput || 0;
             sh.invulnerable = 0;
             sh.shootCooldown = 0;
+            const targetDrive = targetMode
+                && s.turnControlMode === TURN_CONTROL_MODE.TARGET
+                && s.angle !== null;
             let remaining = frames > 0 ? frames : 0;
             while (remaining > 1e-6) {
                 const dt = remaining > 1 ? 1 : remaining;
+                if (targetDrive) {
+                    const delta = shortestAngleDelta(s.turnTargetAngle, sh.angle);
+                    const targetTurn = attainableTurnTarget(
+                        delta,
+                        s.turnMagnitude || 0,
+                        CONFIG.SHIP_TURN_SPEED,
+                        dt);
+                    sh.turnTarget = mergeTurnInputs(targetTurn, s.turnBias || 0);
+                } else {
+                    sh.turnTarget = Number.isFinite(s.turnTarget) ? s.turnTarget : turnInput;
+                }
                 sh.update(dt);
                 remaining -= dt;
             }
@@ -1959,7 +2018,8 @@
             out.y = sh.y;
             out.velocityX = sh.velocityX;
             out.velocityY = sh.velocityY;
-            if (s.angle !== null) out.angle = sh.angle;
+            out.rotationSpeed = sh.rotationSpeed;
+            if (s.angle !== null && (!targetMode || targetDrive)) out.angle = sh.angle;
         },
 
         // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
@@ -2241,18 +2301,31 @@
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
             ['rotationSpeed', 'q16s'],
         ]},
-        // Ship update schema for INPUT-REPLAY mode (P3, schema id 4). Identical
-        // to id 1 plus the two analog control magnitudes the remote needs to
-        // replay Ship.update() exactly: thrustInput and brakeInput (turnInput is
-        // recovered from rotationSpeed). Only used when
-        // CONFIG.SHIP_INPUT_REPLAY_ENABLED is true, so id 1 (and its wire-size
-        // locks) is untouched when replay is off.
+        // Ship update schema for INPUT-REPLAY mode (P3, schema id 4). Kept for
+        // compatibility with sessions created before target-heading replay fields
+        // existed; it replays thrust/brake but recovers turn input from
+        // rotationSpeed.
         { id: 4, fields: [
             ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
             ['rotationSpeed', 'q16s'],
             ['thrusting', 'bool'], ['invulnerable', 'u16'],
             ['thrustInput', 'q16s'], ['brakeInput', 'q16s'],
+        ]},
+        // Ship update schema for target-heading replay (P3b, schema id 5).
+        // Extends id 4 with turn-control intent: rate-mode uses turnTarget;
+        // polar target-mode recomputes turnTarget from turnTargetAngle and
+        // turnMagnitude each replay substep, plus turnBias for the optional
+        // right-anchor steering contribution.
+        { id: 5, fields: [
+            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+            ['rotationSpeed', 'q16s'],
+            ['thrusting', 'bool'], ['invulnerable', 'u16'],
+            ['thrustInput', 'q16s'], ['brakeInput', 'q16s'],
+            ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
+            ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q16s'],
+            ['turnBias', 'q16s'],
         ]},
     ];
     const SCHEMA_ID_UPDATE = {
@@ -2268,9 +2341,15 @@
         if (kind === 'update') {
             const obj = ctx && ctx.object;
             const type = obj && obj.data && obj.data.type;
-            // P3: replay-enabled sessions carry the analog input fields on the
-            // ship update (schema id 4); otherwise the lean id 1.
+            // P3/P3b: replay-enabled sessions carry control intent on ship
+            // updates. Prefer schema id 5 when the session registered it; fall
+            // back to id 4 for older session metadata.
             if (type === OBJECT_TYPES.SHIP && CONFIG.SHIP_INPUT_REPLAY_ENABLED) {
+                if (typeof window !== 'undefined' && window.SchemaCodec
+                    && typeof window.SchemaCodec.get === 'function'
+                    && window.SchemaCodec.get(5)) {
+                    return 5;
+                }
                 return 4;
             }
             return SCHEMA_ID_UPDATE[type] || 0;
@@ -4244,6 +4323,10 @@
             this.turnInput = 0;            // Current ramped turn input in [-1, 1]
             this.thrustInput = 0;          // Analog forward thrust magnitude (≥ 0)
             this.brakeInput = 0;           // Analog brake magnitude (≥ 0)
+            this.turnControlMode = TURN_CONTROL_MODE.RATE;
+            this.turnTargetAngle = 0;
+            this.turnMagnitude = 0;
+            this.turnBias = 0;
             this.invulnerable = 0;         // Invulnerability frames remaining
             this.shootCooldown = 0;        // Frames until can shoot again
             this.colorIndex = colorIndex;  // Player color index (0-3)
@@ -4305,11 +4388,16 @@
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
                 invulnerable: this.invulnerable,
-                // P3 input-replay: analog control magnitudes. Only encoded when
-                // the session uses ship-update schema id 4 (SHIP_INPUT_REPLAY_
+                // P3/P3b input-replay: control intent. Only encoded when the
+                // session uses ship-update schema id 4/5 (SHIP_INPUT_REPLAY_
                 // ENABLED); harmless extra dict keys under schema id 1.
                 thrustInput: this.thrustInput,
-                brakeInput: this.brakeInput
+                brakeInput: this.brakeInput,
+                turnControlMode: this.turnControlMode,
+                turnTarget: this.turnTarget,
+                turnTargetAngle: this.turnTargetAngle,
+                turnMagnitude: this.turnMagnitude,
+                turnBias: this.turnBias
             };
         }
 
@@ -4328,6 +4416,11 @@
             if (data.invulnerable !== undefined) this.invulnerable = data.invulnerable;
             if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
             if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
+            if (data.turnControlMode !== undefined) this.turnControlMode = data.turnControlMode;
+            if (data.turnTarget !== undefined) this.turnTarget = data.turnTarget;
+            if (data.turnTargetAngle !== undefined) this.turnTargetAngle = data.turnTargetAngle;
+            if (data.turnMagnitude !== undefined) this.turnMagnitude = data.turnMagnitude;
+            if (data.turnBias !== undefined) this.turnBias = data.turnBias;
             if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
             if (data.memberId !== undefined) this.memberId = data.memberId;
             // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
@@ -4348,6 +4441,10 @@
             this.thrusting = false;
             this.thrustInput = 0;
             this.brakeInput = 0;
+            this.turnControlMode = TURN_CONTROL_MODE.RATE;
+            this.turnTargetAngle = 0;
+            this.turnMagnitude = 0;
+            this.turnBias = 0;
         }
 
         /**
@@ -6744,6 +6841,10 @@
         let thrustOn = input.thrust();
         let thrustMag = thrustOn ? 1 : 0;
         let brakeMag = 0;
+        let turnControlMode = TURN_CONTROL_MODE.RATE;
+        let turnTargetAngle = 0;
+        let turnMagnitude = 0;
+        let turnBias = 0;
 
         if (isAnchorSchemeEnabled()) {
             const scheme = getTouchScheme();
@@ -6767,6 +6868,9 @@
                         stickInput.polarTurnMagnitude,
                         CONFIG.SHIP_TURN_SPEED,
                         dt);
+                    turnControlMode = TURN_CONTROL_MODE.TARGET;
+                    turnTargetAngle = stickInput.polarTargetAngle;
+                    turnMagnitude = stickInput.polarTurnMagnitude;
                     thrustMag = stickInput.polarThrust;
                     brakeMag  = stickInput.polarBrake;
                 } else if (scheme === TOUCH_SCHEMES.POLAR) {
@@ -6815,7 +6919,11 @@
                     brakeMag  = Math.max(brakeMag,  stickInput.fireBrakeInput);
                 }
                 if (scheme === TOUCH_SCHEMES.POLAR) {
-                    turnTarget = mergeTurnInputs(turnTarget, stickInput.fireTurnTarget);
+                    const fireTurn = stickInput.fireTurnTarget;
+                    turnTarget = mergeTurnInputs(turnTarget, fireTurn);
+                    if (turnControlMode === TURN_CONTROL_MODE.TARGET) {
+                        turnBias = fireTurn;
+                    }
                 }
             }
             thrustOn = thrustMag > 0;
@@ -6824,6 +6932,10 @@
         game.ship.turnTarget = turnTarget;
         game.ship.thrustInput = thrustMag;
         game.ship.brakeInput = brakeMag;
+        game.ship.turnControlMode = turnControlMode;
+        game.ship.turnTargetAngle = turnTargetAngle;
+        game.ship.turnMagnitude = turnMagnitude;
+        game.ship.turnBias = turnBias;
 
         // Thrust — boolean `thrusting` still drives the flame visual + multiplayer sync.
         const wasThrusting = game.ship.thrusting;
