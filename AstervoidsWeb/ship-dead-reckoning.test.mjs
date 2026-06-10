@@ -543,3 +543,129 @@ test('P4: disabling rotation target restores replayed rate angle', () => {
     const out = hybridReckon(packet, 4, { inputReplay: true, rotationTarget: false });
     assert.equal(out.angle, scratch.angle);
 });
+
+// ----------------------------------------------------------------------------
+// PERF: incremental whole-frame replay cache equivalence
+// ----------------------------------------------------------------------------
+//
+// _replayShip caches the scratch ship pose after an integer number of whole
+// dt=1 steps (keyed by the snapshot object via a WeakMap) and RESUMES from there
+// on the next, later-time call instead of replaying from the baseline. This
+// mirrors that cache and asserts it is bit-for-bit identical to a from-baseline
+// replay for a monotonically increasing sequence of frame counts (the access
+// pattern of a fixed snapshot reckoned every render frame), and that a fresh
+// snapshot object resets it. The whole-frame steps are exactly composable, so
+// the cache must be a pure performance optimization with no behavioural change.
+
+function makeCachedReplayer() {
+    const cache = new WeakMap();   // packet -> { whole, x, y, angle, vx, vy, rs, ti }
+    const sh = new MiniShip();     // shared scratch, mirroring DeadReckon._scratch
+    return function reckon(packet, frames, targetDrive) {
+        const f = frames > 0 ? frames : 0;
+        const whole = Math.floor(f);
+        const frac = f - whole;
+        const baseTurnInput = SHIP.SHIP_TURN_SPEED !== 0
+            ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
+        let rc = cache.get(packet);
+        let from;
+        if (rc && rc.whole <= whole) {
+            sh.x = rc.x; sh.y = rc.y; sh.angle = rc.angle;
+            sh.velocityX = rc.vx; sh.velocityY = rc.vy;
+            sh.rotationSpeed = rc.rs; sh.turnInput = rc.ti;
+            from = rc.whole;
+        } else {
+            sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
+            sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
+            sh.rotationSpeed = packet.rotationSpeed; sh.turnInput = baseTurnInput;
+            from = 0;
+        }
+        sh.thrustInput = packet.thrustInput || 0;
+        sh.brakeInput = packet.brakeInput || 0;
+        const driveTurn = (dt) => {
+            if (targetDrive && packet.turnControlMode === TURN_CONTROL_MODE.TARGET) {
+                const delta = shortestAngleDelta(packet.turnTargetAngle || 0, sh.angle);
+                const targetTurn = attainableTurnTarget(
+                    delta, packet.turnMagnitude || 0, SHIP.SHIP_TURN_SPEED, dt);
+                sh.turnTarget = mergeTurnInputs(targetTurn, packet.turnBias || 0);
+            } else {
+                sh.turnTarget = Number.isFinite(packet.turnTarget) ? packet.turnTarget : baseTurnInput;
+            }
+        };
+        for (let i = from; i < whole; i++) { driveTurn(1); sh.update(1); }
+        if (!rc) { rc = {}; cache.set(packet, rc); }
+        rc.whole = whole;
+        rc.x = sh.x; rc.y = sh.y; rc.angle = sh.angle;
+        rc.vx = sh.velocityX; rc.vy = sh.velocityY;
+        rc.rs = sh.rotationSpeed; rc.ti = sh.turnInput;
+        if (frac > 1e-6) { driveTurn(frac); sh.update(frac); }
+        return {
+            x: sh.x, y: sh.y, angle: sh.angle,
+            velocityX: sh.velocityX, velocityY: sh.velocityY,
+            rotationSpeed: sh.rotationSpeed,
+        };
+    };
+}
+
+test('PERF: incremental cache == from-scratch replay across a growing frame sequence (rate)', () => {
+    const owner = new MiniShip();
+    owner.velocityX = 0.4; owner.velocityY = -0.25; owner.angle = 0.7;
+    owner.thrustInput = 0.8;
+    owner.turnTarget = 0.6; owner.turnInput = 0.6;
+    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput;
+    const packet = packetOf(owner);            // RATE mode
+    const reckon = makeCachedReplayer();
+    // Monotonically non-decreasing, fractional, up to and past the 30-frame clamp.
+    const seq = [0, 0.3, 1, 1.5, 2, 2.7, 5, 5.5, 10.2, 17.9, 25, 29.4, 30, 30];
+    for (const frames of seq) {
+        assertPose(reckon(packet, frames, false), replay(packet, frames, false), `rate frames=${frames}`);
+    }
+});
+
+test('PERF: incremental cache == from-scratch replay across a growing frame sequence (target-drive)', () => {
+    const packet = {
+        x: 0.2, y: -0.1, angle: 0.0,
+        velocityX: 0.1, velocityY: 0.05,
+        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        thrustInput: 0.5, brakeInput: 0,
+        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnTargetAngle: 1.3, turnMagnitude: 1, turnBias: 0,
+    };
+    const reckon = makeCachedReplayer();
+    const seq = [0.5, 1, 2.2, 3, 4.8, 6, 9.1, 12, 18.6, 24, 30];
+    for (const frames of seq) {
+        assertPose(reckon(packet, frames, true), replay(packet, frames, true), `target frames=${frames}`);
+    }
+});
+
+test('PERF: a fresh snapshot object resets the cache; interleaved ships resume independently', () => {
+    const base = {
+        x: 0, y: 0, angle: 0,
+        velocityX: 0.3, velocityY: -0.2,
+        rotationSpeed: SHIP.SHIP_TURN_SPEED * 0.5,
+        thrustInput: 0.7, brakeInput: 0,
+        turnControlMode: TURN_CONTROL_MODE.RATE,
+        turnTarget: 0.5,
+    };
+    const a = { ...base, angle: 0.5 };
+    const b = { ...base, angle: -0.5, velocityX: 0.1 };
+    const reckon = makeCachedReplayer();   // ONE shared scratch, two snapshots
+    // Interleave A and B (mirrors many remote ships through DeadReckon._scratch).
+    assertPose(reckon(a, 3, false), replay(a, 3, false), 'A@3');
+    assertPose(reckon(b, 2, false), replay(b, 2, false), 'B@2');
+    assertPose(reckon(a, 7, false), replay(a, 7, false), 'A@7 resumes A (not B scratch)');
+    assertPose(reckon(b, 6.5, false), replay(b, 6.5, false), 'B@6.5 resumes B (not A scratch)');
+});
+
+test('PERF: repeated saturated calls stay identical (no drift) and match from-scratch', () => {
+    const owner = new MiniShip();
+    owner.velocityX = 0.5; owner.angle = 1.0; owner.thrustInput = 1;
+    owner.turnTarget = 1; owner.turnInput = 1;
+    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED;
+    const packet = packetOf(owner);
+    const reckon = makeCachedReplayer();
+    const ref = replay(packet, 30, false);     // clamped resting projection
+    reckon(packet, 12.3, false);               // partial window first
+    for (let i = 0; i < 5; i++) {
+        assertPose(reckon(packet, 30, false), ref, `saturated call ${i}`);
+    }
+});

@@ -1277,6 +1277,24 @@
         // forward toward the owner's intended heading; older schema-id-4 replay
         // sessions gracefully fall back to authoritative-angle convergence.
         SHIP_ROTATION_TARGET_ENABLED: true,
+        // Deterministic + input-replay mode only: suppress redundant per-frame
+        // ship sends the same way SendGate does for ballistic objects. Under
+        // SHIP_INPUT_REPLAY_ENABLED the receiver reproduces the ship's full
+        // physics (friction, thrust, turn ramp, wrap) by REPLAYING Ship.update()
+        // from the owner's last authoritative control intent, so between control
+        // changes the per-frame positional packets are redundant re-anchors. The
+        // owner therefore broadcasts only when the receiver's replay would
+        // diverge — i.e. on a control-intent change (thrust/brake/turn target or
+        // mode), an invulnerable change (respawn teleport + blink phase), a
+        // thrusting flip, or the heartbeat. Position/velocity changes are NOT
+        // triggers: the receiver derives them from the replayed inputs. Gated by
+        // isDeterministicMode() AND SHIP_INPUT_REPLAY_ENABLED — with replay off
+        // the receiver linearly dead-reckons and CANNOT reproduce friction, so
+        // ships must keep per-frame sends (this gate returns true, no change).
+        // The P1 immediate-edge flush (ShipControlGate / SHIP_EDGE_SEND_ENABLED)
+        // still fires and always forces a send. Set false to restore the prior
+        // per-frame ship sends.
+        SHIP_SEND_ON_CHANGE_ENABLED: true,
 
         // Ship settings (normalized: sizes relative to shorter dimension)
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
@@ -1814,6 +1832,13 @@
         // CONFIG.DEADRECKON_SMOOTH_MS so corrections ease in instead of snapping.
         // Shape: { dx, dy, da, t0 } (da = signed shortest angular error).
         smooth: new Map(),
+        // Incremental ship-replay cache (perf). Keyed by the snapshot STATE
+        // object so it is invalidated automatically when updateState installs a
+        // new snapshot (the old state object becomes unreachable → WeakMap entry
+        // is dropped). Holds the scratch ship pose after an integer number of
+        // whole dt=1 replay steps, so _replayShip can resume from there instead
+        // of re-simulating from the baseline every frame. See _replayShip.
+        replayCache: new WeakMap(),
 
         // `baselinePerf` is the performance.now()-domain instant this snapshot
         // becomes the integration baseline. Callers anchor at ARRIVAL (omit the
@@ -1979,27 +2004,59 @@
         // fractional remainder. Pure kinematics: invulnerable/shootCooldown are
         // zeroed so Ship.update's timer decrements are inert, and nothing else in
         // Ship.update touches globals.
+        //
+        // PERF (many ships): a naive replay re-simulates from the baseline every
+        // call, which is O(frames) and runs up to ~2x per render frame per remote
+        // ship (updateRemoteShips ingest + repositionDeadReckonedRemotes), with
+        // `frames` saturating at DEADRECKON_MAX_FRAMES (30) at low send-rate/high
+        // latency. Because `_reckonRaw` is called with monotonically
+        // non-decreasing time for a FIXED snapshot, floor(frames) only grows, and
+        // whole dt=1 steps are exactly composable (identical float ops, constant
+        // per-snapshot inputs; target-drive recomputes turnTarget from ship state
+        // each step deterministically). So we cache the scratch pose after an
+        // integer number of whole steps (keyed by the snapshot object via the
+        // replayCache WeakMap, dropped automatically on the next snapshot) and
+        // RESUME from there, stepping only the new whole frames. The result is
+        // bit-for-bit identical to a from-baseline replay; at saturation
+        // (frames==30, frac==0) the call collapses to field copies. The
+        // fractional remainder is applied AFTER caching so it never pollutes the
+        // integer-frame baseline the next call resumes from.
         _replayShip(s, frames, out, targetMode) {
             const sh = this._scratch || (this._scratch = new Ship(0, 0, 0));
-            sh.x = s.x;
-            sh.y = s.y;
-            sh.angle = (s.angle !== null ? s.angle : 0);
-            sh.velocityX = s.velocityX;
-            sh.velocityY = s.velocityY;
-            sh.rotationSpeed = s.rotationSpeed;
+            const f = frames > 0 ? frames : 0;
+            const whole = Math.floor(f);
+            const frac = f - whole;
             const turnSpeed = CONFIG.SHIP_TURN_SPEED;
-            const turnInput = turnSpeed !== 0 ? s.rotationSpeed / turnSpeed : 0;
-            sh.turnInput = turnInput;
+            const baseTurnInput = turnSpeed !== 0 ? s.rotationSpeed / turnSpeed : 0;
+            const targetDrive = targetMode
+                && s.turnControlMode === TURN_CONTROL_MODE.TARGET
+                && s.angle !== null;
+
+            // Resume from the cached integer-frame pose when it has not advanced
+            // past where we need to be; otherwise (re)seed from the baseline.
+            let rc = this.replayCache.get(s);
+            let from;
+            if (rc && rc.whole <= whole) {
+                sh.x = rc.x; sh.y = rc.y; sh.angle = rc.angle;
+                sh.velocityX = rc.velocityX; sh.velocityY = rc.velocityY;
+                sh.rotationSpeed = rc.rotationSpeed; sh.turnInput = rc.turnInput;
+                from = rc.whole;
+            } else {
+                sh.x = s.x;
+                sh.y = s.y;
+                sh.angle = (s.angle !== null ? s.angle : 0);
+                sh.velocityX = s.velocityX;
+                sh.velocityY = s.velocityY;
+                sh.rotationSpeed = s.rotationSpeed;
+                sh.turnInput = baseTurnInput;
+                from = 0;
+            }
             sh.thrustInput = s.thrustInput || 0;
             sh.brakeInput = s.brakeInput || 0;
             sh.invulnerable = 0;
             sh.shootCooldown = 0;
-            const targetDrive = targetMode
-                && s.turnControlMode === TURN_CONTROL_MODE.TARGET
-                && s.angle !== null;
-            let remaining = frames > 0 ? frames : 0;
-            while (remaining > 1e-6) {
-                const dt = remaining > 1 ? 1 : remaining;
+
+            const driveTurn = (dt) => {
                 if (targetDrive) {
                     const delta = shortestAngleDelta(s.turnTargetAngle, sh.angle);
                     const targetTurn = attainableTurnTarget(
@@ -2009,11 +2066,28 @@
                         dt);
                     sh.turnTarget = mergeTurnInputs(targetTurn, s.turnBias || 0);
                 } else {
-                    sh.turnTarget = Number.isFinite(s.turnTarget) ? s.turnTarget : turnInput;
+                    sh.turnTarget = Number.isFinite(s.turnTarget) ? s.turnTarget : baseTurnInput;
                 }
-                sh.update(dt);
-                remaining -= dt;
+            };
+
+            for (let i = from; i < whole; i++) {
+                driveTurn(1);
+                sh.update(1);
             }
+            // Persist the integer-frame pose for the next (later-time) call.
+            if (!rc) { rc = {}; this.replayCache.set(s, rc); }
+            rc.whole = whole;
+            rc.x = sh.x; rc.y = sh.y; rc.angle = sh.angle;
+            rc.velocityX = sh.velocityX; rc.velocityY = sh.velocityY;
+            rc.rotationSpeed = sh.rotationSpeed; rc.turnInput = sh.turnInput;
+
+            // Fractional remainder — applied on the scratch ship after the cache
+            // is saved, so it does not corrupt the integer-frame baseline.
+            if (frac > 1e-6) {
+                driveTurn(frac);
+                sh.update(frac);
+            }
+
             out.x = sh.x;
             out.y = sh.y;
             out.velocityX = sh.velocityX;
@@ -2202,6 +2276,88 @@
         reset() { this.last = null; },
     };
 
+    // Owner-side "send-on-change" suppression gate for the LOCAL ship, the
+    // ship-physics counterpart to SendGate (which covers ballistic asteroids /
+    // bullets). It only engages in deterministic mode WITH input-replay on:
+    // there the receiver reproduces the ship's full non-linear motion (friction,
+    // rotating-heading thrust, speed clamp, brake, turn ramp, toroidal wrap) by
+    // REPLAYING Ship.update() forward from the owner's last authoritative control
+    // intent (DeadReckon._replayShip). Between control changes the per-frame
+    // positional packets are therefore redundant — the receiver's replay already
+    // shows the right pose — so the owner re-anchors only on a discontinuity the
+    // replay can't predict from the last packet:
+    //
+    //   1. No baseline yet → CREATION / adoption: first send seeds the receiver.
+    //   2. Control-intent change → thrustInput / brakeInput / thrusting flip, or
+    //      any turn-control field (mode, target, target-angle, magnitude, bias).
+    //      These are the inputs the replay integrates; a change makes the prior
+    //      prediction wrong. (turnTarget is the upstream cause of rotationSpeed,
+    //      so gating on it rather than rotationSpeed avoids re-sending every
+    //      frame of a turn-rate RAMP the receiver reproduces natively.)
+    //   3. invulnerable change → fires every frame of the ~2 s post-respawn
+    //      countdown (keeps the remote blink phase fresh) AND catches the respawn
+    //      teleport edge (0 → max, which the receiver snaps on) and its → 0 end.
+    //   4. Heartbeat → bounds dead-reckon clamp, packet-loss recovery and
+    //      late-joiner staleness, identical to SendGate (250 ms < 500 ms clamp).
+    //
+    // Velocity and position are deliberately NOT triggers: the receiver derives
+    // them from the replayed inputs (friction decay, wrap) without a packet.
+    // The baseline holds the last SENT control state, so comparisons are against
+    // what the receiver last saw (a deadband), not the previous frame. Always
+    // returns true outside deterministic+replay mode or when disabled, so those
+    // paths keep their exact per-frame wire behaviour. The P1 immediate-edge
+    // flush passes force=true and always sends + re-baselines.
+    const ShipSendGate = {
+        baselines: new Map(),
+
+        shouldSend(id, ship, force) {
+            if (!CONFIG.SHIP_SEND_ON_CHANGE_ENABLED ||
+                !CONFIG.SHIP_INPUT_REPLAY_ENABLED ||
+                !isDeterministicMode()) {
+                return true;
+            }
+            const now = performance.now();
+            const b = this.baselines.get(id);
+            if (force || !b) { this._set(id, ship, now); return true; }
+            const eps = CONFIG.SEND_ON_CHANGE_VEL_EPS;
+            const rotEps = CONFIG.SEND_ON_CHANGE_ROT_EPS;
+            let send = false;
+            if (Math.abs((ship.thrustInput || 0) - b.thrustInput) > eps ||
+                Math.abs((ship.brakeInput || 0) - b.brakeInput) > eps ||
+                Math.abs((ship.turnTarget || 0) - b.turnTarget) > eps ||
+                Math.abs((ship.turnMagnitude || 0) - b.turnMagnitude) > eps ||
+                Math.abs((ship.turnBias || 0) - b.turnBias) > eps ||
+                Math.abs((ship.turnTargetAngle || 0) - b.turnTargetAngle) > rotEps ||
+                (ship.turnControlMode || 0) !== b.turnControlMode ||
+                !!ship.thrusting !== b.thrusting ||
+                (ship.invulnerable || 0) !== b.invulnerable) {
+                send = true;
+            } else if ((now - b.lastSentMs) >= CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS) {
+                send = true;
+            }
+            if (send) this._set(id, ship, now);
+            return send;
+        },
+
+        _set(id, ship, now) {
+            this.baselines.set(id, {
+                thrustInput: ship.thrustInput || 0,
+                brakeInput: ship.brakeInput || 0,
+                turnControlMode: ship.turnControlMode || 0,
+                turnTarget: ship.turnTarget || 0,
+                turnTargetAngle: ship.turnTargetAngle || 0,
+                turnMagnitude: ship.turnMagnitude || 0,
+                turnBias: ship.turnBias || 0,
+                thrusting: !!ship.thrusting,
+                invulnerable: ship.invulnerable || 0,
+                lastSentMs: now,
+            });
+        },
+
+        remove(id) { this.baselines.delete(id); },
+        clear() { this.baselines.clear(); },
+    };
+
     // ============================================
     // SECTION 1B: MULTIPLAYER CONSTANTS
     // Object types and ship colors for multiplayer sync
@@ -2316,15 +2472,20 @@
         // Extends id 4 with turn-control intent: rate-mode uses turnTarget;
         // polar target-mode recomputes turnTarget from turnTargetAngle and
         // turnMagnitude each replay substep, plus turnBias for the optional
-        // right-anchor steering contribution.
+        // right-anchor steering contribution. thrustInput / brakeInput /
+        // turnMagnitude are unsigned [0,1] (turnMagnitude is clamped in
+        // DeadReckon.updateState), so they ride q8 (1 B, 1/255 resolution) rather
+        // than q16s; turnTarget / turnBias stay q16s (signed [-1,1]). q8 is
+        // already supported by both codecs and the server registers schemas from
+        // session metadata, so this needs no server change.
         { id: 5, fields: [
             ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
             ['rotationSpeed', 'q16s'],
             ['thrusting', 'bool'], ['invulnerable', 'u16'],
-            ['thrustInput', 'q16s'], ['brakeInput', 'q16s'],
+            ['thrustInput', 'q8'], ['brakeInput', 'q8'],
             ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
-            ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q16s'],
+            ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
             ['turnBias', 'q16s'],
         ]},
     ];
@@ -5324,6 +5485,7 @@
     async function deleteSyncedObject(syncObjectId, label) {
         if (!syncObjectId) return false;
         SendGate.remove(syncObjectId);
+        ShipSendGate.remove(syncObjectId);
         try {
             await ObjectSync.deleteObject(syncObjectId);
         } catch (err) {
@@ -5373,6 +5535,10 @@
         // the throttled per-frame path.
         const edge = ShipControlGate.isEdge(game.ship);
         const immediate = edge && CONFIG.SHIP_EDGE_SEND_ENABLED && isDeterministicMode();
+        // P1b: under deterministic input-replay, suppress redundant per-frame
+        // ship sends between control changes (the receiver replays Ship.update
+        // from the last authoritative intent). An immediate edge forces the send.
+        if (!ShipSendGate.shouldSend(game.multiplayer.myShipObjectId, game.ship, immediate)) return;
         ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toUpdateData(), immediate);
     }
 
@@ -5530,6 +5696,7 @@
         DeadReckon.clear();
         SendGate.clear();
         ShipControlGate.reset();
+        ShipSendGate.clear();
         ObjectSync.clear();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
