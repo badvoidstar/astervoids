@@ -94,7 +94,11 @@ resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' =
   location: location
   tags: tags
   sku: {
-    name: 'Basic'
+    // Standard (not Basic): multi-region deploys cold-pull the image
+    // concurrently across regions; Basic's lower pull throughput throttles
+    // (HTTP 429) and leaves revisions stuck in ImagePullBackOff. Standard
+    // raises the throughput/storage ceiling enough to avoid that.
+    name: 'Standard'
   }
   properties: {
     adminUserEnabled: true
