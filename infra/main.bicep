@@ -320,14 +320,12 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
-    // Keep one warm replica per region. With minReplicas:0 the apps scale to
-    // zero and must cold-pull the image on every wake; concurrent cold pulls
-    // across all regions can saturate the Basic-SKU ACR (HTTP 429), leaving
-    // revisions stuck in ImagePullBackOff so no replica serves /api/ping and
-    // the region picker stalls in "warming" for ALL regions. A warm replica
-    // avoids the cold-pull storm and keeps serving the old revision while a
-    // new one pulls during deploys.
-    minReplicas: 1
+    // Scale-to-zero is safe now that the shared ACR is Standard SKU. Basic
+    // throttled concurrent cold-pulls across regions (HTTP 429), which left
+    // revisions stuck in ImagePullBackOff so no replica served /api/ping and
+    // the picker stalled in "warming"; Standard's higher pull throughput
+    // removes that ceiling, so the apps can scale to zero when idle again.
+    minReplicas: 0
     maxReplicas: 1
     // BYO cert binds per-region custom domain on every regional app:
     //   - additionalCustomDomain (= per-region subdomain, e.g.
