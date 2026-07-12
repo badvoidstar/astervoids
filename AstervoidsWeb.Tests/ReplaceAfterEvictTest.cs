@@ -16,7 +16,8 @@ public class ReplaceAfterEvictTest : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid", ["radius"] = 0.05 });
 
         // Act — reconnect (evict old member, join as new)
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.JoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMember = rejoinResult.Member!;
 
         // Verify asteroid was adopted

@@ -92,7 +92,7 @@ public class ObjectService : IObjectService
             var validAt = ValidateValidAt(clientValidAt, receive);
             var obj = NewSessionObject(sessionId, creatorMemberId, effectiveOwner, scope, data, validAt, schemaId);
             session.Objects.TryAdd(obj.Id, obj);
-            return obj;
+            return Snapshot(obj);
         }
     }
 
@@ -109,13 +109,16 @@ public class ObjectService : IObjectService
 
         lock (session.SyncRoot)
         {
+            if (session.LifecycleState != SessionLifecycleState.Active)
+                return null;
+
             if (!session.Objects.TryGetValue(objectId, out var obj))
                 return null;
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var validAt = ValidateValidAt(clientValidAt, receive, obj.ValidAt);
             ApplyUpdate(obj, data, validAt);
-            return obj;
+            return Snapshot(obj);
         }
     }
 
@@ -140,6 +143,8 @@ public class ObjectService : IObjectService
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return results;
+            if (!session.Members.ContainsKey(ownerMemberId))
+                return results;
 
             foreach (var update in updates)
             {
@@ -152,7 +157,7 @@ public class ObjectService : IObjectService
 
                 var validAt = ValidateValidAt(callLevelClientValidAt, receive, obj.ValidAt);
                 ApplyUpdate(obj, update.Data, validAt);
-                results.Add(obj);
+                results.Add(Snapshot(obj));
             }
         }
 
@@ -171,13 +176,20 @@ public class ObjectService : IObjectService
 
         lock (session.SyncRoot)
         {
+            if (session.LifecycleState != SessionLifecycleState.Active)
+                return null;
+            if (!session.Members.ContainsKey(ownerMemberId))
+                return null;
+
             if (!session.Objects.TryGetValue(objectId, out var obj))
                 return null;
 
             if (obj.OwnerMemberId != ownerMemberId)
                 return null;
 
-            return session.Objects.TryRemove(objectId, out _) ? obj : null;
+            return session.Objects.TryRemove(objectId, out var removed)
+                ? Snapshot(removed)
+                : null;
         }
     }
 
@@ -197,6 +209,8 @@ public class ObjectService : IObjectService
         lock (session.SyncRoot)
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
+                return null;
+            if (!session.Members.ContainsKey(ownerMemberId))
                 return null;
 
             // Verify ownership of the object being replaced — atomic with the delete below
@@ -229,7 +243,7 @@ public class ObjectService : IObjectService
             // Delete the original — we already verified ownership above
             session.Objects.TryRemove(deleteObjectId, out _);
 
-            return created;
+            return created.Select(Snapshot).ToList();
         }
     }
 
@@ -239,7 +253,13 @@ public class ObjectService : IObjectService
         if (session == null)
             return Enumerable.Empty<SessionObject>();
 
-        return session.Objects.Values.ToList();
+        lock (session.SyncRoot)
+        {
+            if (session.LifecycleState != SessionLifecycleState.Active)
+                return Enumerable.Empty<SessionObject>();
+
+            return session.Objects.Values.Select(Snapshot).ToList();
+        }
     }
 
     public SessionObject? GetObject(Guid sessionId, Guid objectId)
@@ -248,7 +268,15 @@ public class ObjectService : IObjectService
         if (session == null)
             return null;
 
-        return session.Objects.TryGetValue(objectId, out var obj) ? obj : null;
+        lock (session.SyncRoot)
+        {
+            if (session.LifecycleState != SessionLifecycleState.Active)
+                return null;
+
+            return session.Objects.TryGetValue(objectId, out var obj)
+                ? Snapshot(obj)
+                : null;
+        }
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────────
@@ -262,9 +290,9 @@ public class ObjectService : IObjectService
     {
         // Copy-on-write: create a new dictionary so readers outside the lock observe
         // a stable snapshot rather than a partially-written dictionary.
-        var newData = new Dictionary<string, object?>(obj.Data);
+        var newData = SyncDataCloner.CloneDictionary(obj.Data);
         foreach (var kvp in data)
-            newData[kvp.Key] = kvp.Value;
+            newData[kvp.Key] = SyncDataCloner.CloneValue(kvp.Value);
 
         obj.Data = newData;
         obj.Version++;
@@ -291,8 +319,26 @@ public class ObjectService : IObjectService
             CreatorMemberId = creatorMemberId,
             OwnerMemberId = ownerMemberId,
             Scope = scope,
-            Data = data != null ? new Dictionary<string, object?>(data) : new Dictionary<string, object?>(),
+            Data = data != null
+                ? SyncDataCloner.CloneDictionary(data)
+                : new Dictionary<string, object?>(),
             ValidAt = validAt,
             SchemaId = schemaId
+        };
+
+    private static SessionObject Snapshot(SessionObject obj)
+        => new()
+        {
+            Id = obj.Id,
+            SessionId = obj.SessionId,
+            CreatorMemberId = obj.CreatorMemberId,
+            OwnerMemberId = obj.OwnerMemberId,
+            Scope = obj.Scope,
+            Data = SyncDataCloner.CloneDictionary(obj.Data),
+            SchemaId = obj.SchemaId,
+            Version = obj.Version,
+            ValidAt = obj.ValidAt,
+            CreatedAt = obj.CreatedAt,
+            UpdatedAt = obj.UpdatedAt
         };
 }

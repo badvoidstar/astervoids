@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace AstervoidsWeb.Models;
 
 /// <summary>
@@ -29,6 +31,13 @@ public class Member
     /// The session this member belongs to.
     /// </summary>
     public Guid SessionId { get; init; }
+
+    /// <summary>
+    /// Unpredictable credential proving that a reconnecting client owns this member
+    /// identity. It is returned only to that member and is never broadcast.
+    /// </summary>
+    public string ReconnectToken { get; init; } =
+        Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 
     /// <summary>
     /// Per-member monotonic event sequence counter for broadcasts triggered by this member.

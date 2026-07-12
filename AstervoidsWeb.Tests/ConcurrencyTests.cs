@@ -338,38 +338,62 @@ public class ConcurrencyTests : TestBase
     }
 
     /// <summary>
-    /// Invariant: ObjectInfo Data must be a fresh copy, not the live dictionary.
-    /// Mutating the returned Data after the fact must not affect the stored object.
+    /// Invariant: object-service results are detached snapshots. Mutating a returned
+    /// object must not affect authoritative session state.
     /// </summary>
     [Fact]
-    public void ObjectInfo_DataIsCloned_MutatingReturnedDictDoesNotAffectStoredObject()
+    public void ObjectServiceResult_IsDetachedFromStoredObject()
     {
         // Arrange
         var (session, creator) = CreateTestSession();
         var obj = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Member,
             new Dictionary<string, object?> { ["x"] = 1.0 });
 
-        // Act — get the object and mutate the returned Data
+        // Act — get the object and mutate the detached result.
         var retrieved = ObjectService.GetObject(session.Id, obj!.Id);
         retrieved.Should().NotBeNull();
-        var originalX = (double)retrieved!.Data["x"]!;
-
-        // Simulate what a hub would do: retrieve, mutate the dict externally
         retrieved.Data["x"] = 999.0;
+        retrieved.OwnerMemberId = Guid.NewGuid();
+        retrieved.Version = 999;
 
-        // If Data is copy-on-write, the stored object should still have the original value
-        // (since we're mutating the live reference directly, the stored dict IS the same one —
-        // the important safety is that UpdateObject replaces it, not modifies in place)
-        // What we can assert is that a subsequent GetObject reflects the stored state
         var stored = ObjectService.GetObject(session.Id, obj.Id)!;
+        stored.Data["x"].Should().Be(1.0);
+        stored.OwnerMemberId.Should().Be(creator.Id);
+        stored.Version.Should().Be(1);
+    }
 
-        // After an update via UpdateObject, the stored Data must be a fresh dict
-        ObjectService.UpdateObject(session.Id, obj.Id,
-            new Dictionary<string, object?> { ["x"] = 2.0 });
+    [Fact]
+    public void ObjectServiceResult_DeepClonesNestedPayloads()
+    {
+        var (session, creator) = CreateTestSession();
+        var bytes = new byte[] { 1, 2, 3 };
+        var nested = new Dictionary<string, object?> { ["value"] = 1 };
+        var data = new Dictionary<string, object?>
+        {
+            ["nested"] = nested,
+            ["items"] = new List<object?> { nested },
+            ["bytes"] = bytes
+        };
 
-        var afterUpdate = ObjectService.GetObject(session.Id, obj.Id)!;
-        afterUpdate.Data["x"].Should().Be(2.0, "update must persist");
-        afterUpdate.Data.Should().ContainKey("x", "data must survive update");
+        var created = ObjectService.CreateObject(
+            session.Id, creator.Id, ObjectScope.Session, data)!;
+        nested["value"] = 99;
+        bytes[0] = 9;
+
+        var stored = ObjectService.GetObject(session.Id, created.Id)!;
+        ((Dictionary<string, object?>)stored.Data["nested"]!)["value"]
+            .Should().Be(1);
+        ((byte[])stored.Data["bytes"]!)[0].Should().Be(1);
+
+        ((Dictionary<string, object?>)stored.Data["nested"]!)["value"] = 77;
+        ((Dictionary<string, object?>)((List<object?>)stored.Data["items"]!)[0]!)
+            ["value"] = 88;
+
+        var reread = ObjectService.GetObject(session.Id, created.Id)!;
+        ((Dictionary<string, object?>)reread.Data["nested"]!)["value"]
+            .Should().Be(1);
+        ((Dictionary<string, object?>)((List<object?>)reread.Data["items"]!)[0]!)
+            ["value"].Should().Be(1);
     }
 
     // ── Cleanup / destruction ──────────────────────────────────────────────────
@@ -420,22 +444,57 @@ public class ConcurrencyTests : TestBase
         replaceResult.Should().BeNull("replace on destroyed session must return null");
     }
 
+    [Fact]
+    public void DepartedOwner_CannotMutateOrphanedSessionObject()
+    {
+        var (session, creator) = CreateTestSession("server-conn");
+        var obj = ObjectService.CreateObject(
+            session.Id,
+            creator.Id,
+            ObjectScope.Session,
+            new Dictionary<string, object?> { ["x"] = 1 })!;
+        SessionService.LeaveSession("server-conn");
+
+        var updates = ObjectService.UpdateObjects(
+            session.Id,
+            creator.Id,
+            [new ObjectUpdate(
+                obj.Id,
+                new Dictionary<string, object?> { ["x"] = 2 })]);
+        var deleted = ObjectService.DeleteObject(
+            session.Id, obj.Id, creator.Id);
+        var replaced = ObjectService.ReplaceObject(
+            session.Id,
+            obj.Id,
+            creator.Id,
+            [new ReplacementObjectSpec(
+                ObjectScope.Session,
+                new Dictionary<string, object?>())]);
+
+        updates.Should().BeEmpty();
+        deleted.Should().BeNull();
+        replaced.Should().BeNull();
+        ObjectService.GetObject(session.Id, obj.Id).Should().NotBeNull();
+    }
+
     /// <summary>
-    /// Invariant: ForceDestroySession with a predicate that returns false must not
+    /// Invariant: ForceDestroySession with an unmet declarative condition must not
     /// destroy the session (protects against join-vs-cleanup races).
     /// </summary>
     [Fact]
-    public void ForceDestroySession_PredicateReturnsFalse_DoesNotDestroySession()
+    public void ForceDestroySession_ConditionNotMet_DoesNotDestroySession()
     {
         // Arrange
         var (session, _) = CreateTestSession("server-conn");
 
-        // Act — destroy with a predicate that refuses to destroy (simulates a member joining)
-        var result = SessionService.ForceDestroySession(session.Id, _ => false);
+        // Act — cleanup requires an empty session, but a member is still present.
+        var result = SessionService.ForceDestroySession(
+            session.Id,
+            new SessionDestroyCondition(RequireEmpty: true));
 
         // Assert — session must still be alive
-        result.Should().BeNull("predicate false must prevent destruction");
-        SessionService.GetSession(session.Id).Should().NotBeNull("session must survive when predicate refuses");
+        result.Should().BeNull("an unmet condition must prevent destruction");
+        SessionService.GetSession(session.Id).Should().NotBeNull("session must survive when cleanup requirements are stale");
     }
 
     // ── Empty-session semantics ────────────────────────────────────────────────

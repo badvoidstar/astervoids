@@ -42,10 +42,12 @@ public class SessionHubTests
         response.Objects.Should().BeOfType<ObjectInfo[]>();
         response.Members.Should().HaveCount(2);
         response.Objects.Should().ContainSingle(o => o.Id == createdObject!.Id);
+        response.ReconnectToken.Should().Be(
+            _sessionService.GetMemberByConnectionId("connection-2")!.ReconnectToken);
     }
 
     [Fact]
-    public void GetSessionState_ShouldReturnMaterializedSnapshot()
+    public async Task GetSessionState_ShouldReturnMaterializedSnapshot()
     {
         // Arrange
         var createResult = _sessionService.CreateSession("connection-1");
@@ -62,7 +64,7 @@ public class SessionHubTests
         var hub = CreateHub("connection-1");
 
         // Act
-        var snapshot = hub.GetSessionState();
+        var snapshot = await hub.GetSessionState();
 
         // Assert
         snapshot.Should().NotBeNull();
@@ -154,6 +156,135 @@ public class SessionHubTests
         response!.Members.Should().HaveCount(2, "snapshot must include both the creator and the joiner");
         response.Members.Should().Contain(m => m.Role == MemberRole.Client,
             "the joining member should appear as Client in the snapshot");
+    }
+
+    [Fact]
+    public async Task LegacyJoin_DoesNotHonorUnauthenticatedEviction()
+    {
+        var createResult = _sessionService.CreateSession("connection-old");
+        var session = createResult.Session!;
+        var oldMember = createResult.Creator!;
+        var hub = CreateHub("connection-new");
+
+        var response = await hub.JoinSession(session.Id, oldMember.Id);
+
+        response.Should().NotBeNull();
+        session.Members.Should().ContainKey(oldMember.Id);
+        session.Members.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task CreateSession_GroupRegistrationFailure_RollsBackMembership()
+    {
+        var groups = new Mock<IGroupManager>();
+        groups
+            .Setup(g => g.AddToGroupAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("group unavailable"));
+        var hub = CreateHub("connection-new", groups);
+
+        var act = () => hub.CreateSession();
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        _sessionService.GetAllSessions().Should().BeEmpty();
+        _sessionService.GetMemberByConnectionId("connection-new").Should().BeNull();
+    }
+
+    [Fact]
+    public async Task CreateSession_RegistersSchemasBeforePublishingSession()
+    {
+        var registry = new SyncSchemaRegistry();
+        var sessionService = new Mock<ISessionService>();
+        var schemaWasPublished = false;
+        var publishedSessionId = Guid.Empty;
+        sessionService
+            .Setup(service => service.CreateSession(
+                "connection-new",
+                It.IsAny<Dictionary<string, object?>?>(),
+                It.IsAny<Guid?>()))
+            .Returns((
+                string _,
+                Dictionary<string, object?>? _,
+                Guid? sessionId) =>
+            {
+                publishedSessionId = sessionId!.Value;
+                schemaWasPublished =
+                    registry.GetSchema(publishedSessionId, 1) != null;
+                return new CreateSessionResult(
+                    false, null, null, "expected test failure");
+            });
+        var hub = new SessionHub(
+            sessionService.Object,
+            Mock.Of<IObjectService>(),
+            Mock.Of<ILogger<SessionHub>>(),
+            new ServerMetricsService(),
+            registry);
+        var context = new Mock<HubCallerContext>();
+        context.SetupGet(value => value.ConnectionId)
+            .Returns("connection-new");
+        hub.Context = context.Object;
+        var metadata = new Dictionary<string, object?>
+        {
+            ["schemas"] = new object?[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["id"] = 1,
+                    ["fields"] = new object?[]
+                    {
+                        new object?[] { "x", "f64" }
+                    }
+                }
+            }
+        };
+
+        var response = await hub.CreateSession(metadata);
+
+        response.Should().BeNull();
+        schemaWasPublished.Should().BeTrue();
+        registry.HasAnySchemas(publishedSessionId).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task JoinSession_GroupRegistrationFailure_RollsBackMembership()
+    {
+        var session = _sessionService.CreateSession("connection-old").Session!;
+        var groups = new Mock<IGroupManager>();
+        groups
+            .Setup(g => g.AddToGroupAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("group unavailable"));
+        var hub = CreateHub("connection-new", groups);
+
+        var act = () => hub.JoinSession(session.Id);
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        session.Members.Should().ContainSingle();
+        _sessionService.GetMemberByConnectionId("connection-new").Should().BeNull();
+    }
+
+    [Fact]
+    public async Task JoinSession_MemberBroadcastFailure_RollsBackMembership()
+    {
+        var session = _sessionService.CreateSession("connection-old").Session!;
+        var proxy = new Mock<IClientProxy>();
+        proxy
+            .Setup(p => p.SendCoreAsync(
+                It.IsAny<string>(),
+                It.IsAny<object?[]>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("broadcast unavailable"));
+        var hub = CreateHubWithProxy("connection-new", proxy);
+
+        var act = () => hub.JoinSession(session.Id);
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        session.Members.Should().ContainSingle();
+        _sessionService.GetMemberByConnectionId("connection-new").Should().BeNull();
     }
 
     [Fact]
@@ -269,7 +400,8 @@ public class SessionHubTests
         hub.Groups = groups.Object;
 
         // Act: join with eviction
-        var response = await hub.JoinSession(session.Id, staleMember.Id);
+        var response = await hub.RejoinSession(
+            session.Id, staleMember.Id, staleMember.ReconnectToken);
 
         // Assert
         response.Should().NotBeNull();
@@ -762,9 +894,71 @@ public class SessionHubTests
             "null clientValidAt must fall back to the hub-entry serverTimestamp");
     }
 
-    private SessionHub CreateHubWithProxy(string connectionId, Mock<IClientProxy> proxy)
+    [Fact]
+    public async Task ConcurrentHubOperations_CommitAndBroadcastInSessionOrder()
     {
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        _sessionService.JoinSession(session.Id, "connection-2");
+        var coordinator = new SessionOperationCoordinator();
+        var firstSendEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstSend = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var firstProxy = new Mock<IClientProxy>();
+        firstProxy
+            .Setup(p => p.SendCoreAsync(
+                "OnObjectCreated",
+                It.IsAny<object?[]>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => firstSendEntered.TrySetResult())
+            .Returns(releaseFirstSend.Task);
+        var secondProxy = new Mock<IClientProxy>();
+        secondProxy
+            .Setup(p => p.SendCoreAsync(
+                It.IsAny<string>(),
+                It.IsAny<object?[]>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var firstHub = CreateHubWithProxy(
+            "connection-1", firstProxy, coordinator);
+        var secondHub = CreateHubWithProxy(
+            "connection-2", secondProxy, coordinator);
+
+        var first = firstHub.CreateObject(
+            SyncPayloadCodec.EncodeDict(
+                new Dictionary<string, object?> { ["order"] = 1 }),
+            scope: "Session");
+        await firstSendEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var second = secondHub.CreateObject(
+            SyncPayloadCodec.EncodeDict(
+                new Dictionary<string, object?> { ["order"] = 2 }),
+            scope: "Session");
+        await Task.Delay(25);
+
+        _objectService.GetSessionObjects(session.Id).Should().ContainSingle(
+            "the second mutation must wait until the first broadcast completes");
+
+        releaseFirstSend.TrySetResult();
+        await Task.WhenAll(first, second);
+        _objectService.GetSessionObjects(session.Id).Should().HaveCount(2);
+    }
+
+    private SessionHub CreateHubWithProxy(
+        string connectionId,
+        Mock<IClientProxy> proxy,
+        ISessionOperationCoordinator? coordinator = null)
+    {
+        var hub = new SessionHub(
+            _sessionService,
+            _objectService,
+            Mock.Of<ILogger<SessionHub>>(),
+            new ServerMetricsService(),
+            new SyncSchemaRegistry(),
+            coordinator);
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns(connectionId);
         hub.Context = context.Object;

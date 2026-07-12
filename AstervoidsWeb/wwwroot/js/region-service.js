@@ -72,8 +72,11 @@ const RegionService = (function () {
     let localRegionId = null;  // id of the region we landed on
     const rtt = new Map();     // regionId -> {valueMs, confidence, sampleCount, lastSampleAt, state}
     const burstTimers = new Map();  // regionId -> timeout handle
+    const burstSequences = new Map();
     let currentBestRegion = null;   // memoised, recomputed only when bestRegion() advantage exceeds hysteresis
     let started = false;
+    let runGeneration = 0;
+    let loadGeneration = 0;
     let visibilityHandler = null;
 
     // ── Event bus (mirrors session-client.js shape) ───────────────────────────
@@ -239,10 +242,13 @@ const RegionService = (function () {
 
     // ── Per-region burst loop ─────────────────────────────────────────────────
 
-    function scheduleNextBurst(regionId, delayMs) {
+    function scheduleNextBurst(regionId, delayMs, generation) {
+        if (!started || generation !== runGeneration) return;
         if (typeof document !== 'undefined' && document.hidden) return;
         clearBurstTimer(regionId);
-        const handle = setTimeout(() => runBurst(regionId, false), delayMs);
+        const handle = setTimeout(
+            () => runBurst(regionId, false, generation),
+            delayMs);
         burstTimers.set(regionId, handle);
     }
 
@@ -256,8 +262,10 @@ const RegionService = (function () {
         for (const id of Array.from(burstTimers.keys())) clearBurstTimer(id);
     }
 
-    async function runBurst(regionId, isBootstrap) {
-        if (!started) return;
+    async function runBurst(regionId, isBootstrap, generation) {
+        if (!started || generation !== runGeneration) return;
+        const burstSequence = (burstSequences.get(regionId) ?? 0) + 1;
+        burstSequences.set(regionId, burstSequence);
         const region = regions.find(r => r.id === regionId);
         if (!region) return;
         const prev = rtt.get(regionId) ?? initialRttState();
@@ -266,12 +274,14 @@ const RegionService = (function () {
         const timeoutMs = isFirstSample ? CONFIG.COLD_PING_TIMEOUT_MS : CONFIG.WARM_PING_TIMEOUT_MS;
         const samples = isBootstrap ? CONFIG.BOOTSTRAP_SAMPLES : CONFIG.ROLLING_SAMPLES;
         const min = await measureBurst(region.hostname, samples, timeoutMs, /*discardFirst=*/isFirstSample);
-        if (!started) return;  // stop() may have run while we were awaiting
+        if (!started
+            || generation !== runGeneration
+            || burstSequences.get(regionId) !== burstSequence) return;
 
         if (min == null) {
             // All pings in the burst failed — surface as a measurement attempt without state change,
             // then reschedule.
-            scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS);
+            scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
             return;
         }
 
@@ -284,7 +294,7 @@ const RegionService = (function () {
         const newBest = pickBestRegion(rtt, currentBestRegion);
         if (newBest !== currentBestRegion) currentBestRegion = newBest;
 
-        scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS);
+        scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -307,6 +317,7 @@ const RegionService = (function () {
      *   - load({ bootstrap, originOverride })
      */
     async function load(options) {
+        const generation = ++loadGeneration;
         const opts = (typeof options === 'string')
             ? { originOverride: options }
             : (options || {});
@@ -322,6 +333,13 @@ const RegionService = (function () {
                 if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
                 return res.json();
             })());
+        if (generation !== loadGeneration) return;
+
+        if (started) {
+            clearAllBurstTimers();
+            runGeneration++;
+        }
+
         regions.length = 0;
         for (const r of body.regions ?? []) {
             regions.push({
@@ -352,6 +370,17 @@ const RegionService = (function () {
         for (const r of regions) rtt.set(r.id, initialRttState());
         currentBestRegion = null;
         emit('regionsLoaded', { regions: [...regions], localRegionId });
+
+        if (started) {
+            const generation = runGeneration;
+            for (const region of regions) {
+                const stagger = Math.floor(Math.random() * CONFIG.BURST_STAGGER_MAX_MS);
+                const handle = setTimeout(
+                    () => runBurst(region.id, true, generation),
+                    stagger);
+                burstTimers.set(region.id, handle);
+            }
+        }
     }
 
     /**
@@ -365,9 +394,12 @@ const RegionService = (function () {
             throw new Error('RegionService.start() called before load() (no regions configured)');
         }
         started = true;
+        const generation = ++runGeneration;
         for (const r of regions) {
             const stagger = Math.floor(Math.random() * CONFIG.BURST_STAGGER_MAX_MS);
-            const handle = setTimeout(() => runBurst(r.id, true), stagger);
+            const handle = setTimeout(
+                () => runBurst(r.id, true, generation),
+                stagger);
             burstTimers.set(r.id, handle);
         }
         // Visibility gating: closing burst timers on hide ensures backgrounded
@@ -382,7 +414,10 @@ const RegionService = (function () {
                     // time the user is looking, then resume the normal cadence.
                     for (const r of regions) {
                         if (!burstTimers.has(r.id)) {
-                            const handle = setTimeout(() => runBurst(r.id, false), 0);
+                            const generation = runGeneration;
+                            const handle = setTimeout(
+                                () => runBurst(r.id, false, generation),
+                                0);
                             burstTimers.set(r.id, handle);
                         }
                     }
@@ -398,6 +433,7 @@ const RegionService = (function () {
      */
     function stop() {
         started = false;
+        runGeneration++;
         clearAllBurstTimers();
         if (typeof document !== 'undefined' && visibilityHandler != null) {
             document.removeEventListener('visibilitychange', visibilityHandler);

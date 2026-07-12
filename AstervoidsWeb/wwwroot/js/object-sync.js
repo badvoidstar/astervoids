@@ -86,8 +86,9 @@
  *
  * When a gap is detected, triggerReconciliation() calls GetSessionState() which
  * returns a full object snapshot plus the current server-side memberSequences for
- * every member. The local memberSequences map is reset from this snapshot,
- * fast-forwarding past the gap to prevent re-triggering. Objects are synced:
+ * every member. The local memberSequences map is advanced monotonically from
+ * this snapshot, fast-forwarding past the gap without undoing newer events.
+ * Objects are synced:
  * missing objects added, stale objects updated, ghost objects removed. A
  * reconciling flag prevents concurrent reconciliations.
  */
@@ -168,8 +169,11 @@ const ObjectSync = (function() {
     
     // Per-member event sequence tracking for gap detection
     const memberSequences = new Map(); // memberId -> lastSeq
-    let reconciling = false;
+    let reconciling = null;
     let reconciliationCount = 0;
+    let stateEpoch = 0;
+    let stateRevision = 0;
+    const objectRevisions = new Map();
     // External callers (e.g. attemptAutoRejoin) can suspend reconciliation during
     // windows where currentMember/currentSession are mid-transition. While suspended,
     // triggerReconciliation() is a silent no-op. Counter (not bool) so nested
@@ -349,6 +353,7 @@ const ObjectSync = (function() {
         SessionClient.on('onObjectDeleted', handleRemoteObjectDeleted);
         SessionClient.on('onObjectReplaced', handleRemoteObjectReplaced);
         SessionClient.on('onObjectEvent', dispatchRemoteObjectEvent);
+        SessionClient.on('onSessionTransition', handleSessionTransition);
         SessionClient.on('onSessionJoined', handleSessionJoined);
         SessionClient.on('onSessionLeft', handleSessionLeft);
 
@@ -361,18 +366,41 @@ const ObjectSync = (function() {
      * Reset all sync state to initial values.
      */
     function resetState() {
+        stateEpoch++;
         objects.clear();
         typeIndex.clear();
         lastSentData.clear();
         pendingUpdates.clear();
+        objectRevisions.clear();
+        stateRevision = 0;
         frameCounter = 0;
         fullSyncCounter = 0;
         senderSequence = 0;
         memberSequences.clear();
         pendingDeletes.clear();
-        reconciling = false;
+        reconciling = null;
         reconciliationCount = 0;
-        flushInProgress = false;
+        flushInProgress = null;
+    }
+
+    function captureAsyncContext() {
+        return {
+            stateEpoch,
+            sessionEpoch: typeof SessionClient.getSessionEpoch === 'function'
+                ? SessionClient.getSessionEpoch()
+                : null
+        };
+    }
+
+    function isAsyncContextCurrent(context) {
+        if (stateEpoch !== context.stateEpoch) return false;
+        return context.sessionEpoch === null
+            || typeof SessionClient.getSessionEpoch !== 'function'
+            || SessionClient.getSessionEpoch() === context.sessionEpoch;
+    }
+
+    function markObjectMutation(objectId) {
+        objectRevisions.set(objectId, ++stateRevision);
     }
 
     /**
@@ -409,6 +437,7 @@ const ObjectSync = (function() {
         const obj = toLocalObject(objectInfo);
         objects.set(obj.id, obj);
         addToTypeIndex(obj);
+        markObjectMutation(obj.id);
         return obj;
     }
 
@@ -418,11 +447,13 @@ const ObjectSync = (function() {
      */
     function removeObjectLocal(objectId) {
         const obj = objects.get(objectId);
-        if (!obj) return null;
-        removeFromTypeIndex(obj);
-        objects.delete(objectId);
+        if (obj) {
+            removeFromTypeIndex(obj);
+            objects.delete(objectId);
+        }
         lastSentData.delete(objectId);
-        return obj;
+        markObjectMutation(objectId);
+        return obj || null;
     }
 
     /**
@@ -436,6 +467,15 @@ const ObjectSync = (function() {
         if (myId) {
             trackMemberSequence(myId, memberSequence);
         }
+    }
+
+    /**
+     * Reset immediately when SessionClient starts a new session lifecycle epoch.
+     * Live group events may arrive before JoinSession returns; resetting here lets
+     * those events become the monotonic baseline for the eventual snapshot.
+     */
+    function handleSessionTransition() {
+        resetState();
     }
 
     /**
@@ -453,8 +493,6 @@ const ObjectSync = (function() {
      * legitimately mixes objects of different ages.
      */
     function handleSessionJoined(session, member) {
-        resetState();
-
         // Phase 4 wireopt: register positional schemas published by the
         // session creator via metadata.schemas BEFORE processing any objects,
         // so SyncPayload.unwrap can dispatch positional payloads. Failures are
@@ -475,10 +513,62 @@ const ObjectSync = (function() {
                 obj.data = expandData(obj.data);
                 const existing = objects.get(obj.id);
                 if (existing && existing.version >= obj.version) {
-                    // A live broadcast already populated this object at >= this version
+                    // A live broadcast already populated this object at >= this
+                    // version. Backfill only metadata/static fields that the live
+                    // delta could not carry.
+                    let changed = false;
+                    if (existing.creatorMemberId == null && obj.creatorMemberId != null) {
+                        existing.creatorMemberId = obj.creatorMemberId;
+                        changed = true;
+                    }
+                    if (existing.ownerMemberId == null && obj.ownerMemberId != null) {
+                        existing.ownerMemberId = obj.ownerMemberId;
+                        changed = true;
+                    }
+                    if (existing.scope == null && obj.scope != null) {
+                        existing.scope = obj.scope;
+                        changed = true;
+                    }
+                    const oldType = existing.data?.type;
+                    for (const key in (obj.data || {})) {
+                        if (existing.data[key] === undefined) {
+                            existing.data[key] = obj.data[key];
+                            changed = true;
+                        }
+                    }
+                    if (oldType !== existing.data?.type) {
+                        updateTypeIndex(existing, oldType, existing.data?.type);
+                    }
+                    const va = validAts[obj.id];
+                    if (existing.validAt === undefined && va !== undefined && va !== null) {
+                        existing.validAt = va;
+                        changed = true;
+                    }
+                    if (changed) markObjectMutation(existing.id);
                     continue;
                 }
-                const registered = registerObject(obj, false);
+
+                if (existing) {
+                    const oldType = existing.data?.type;
+                    existing.creatorMemberId = obj.creatorMemberId;
+                    existing.ownerMemberId = obj.ownerMemberId;
+                    existing.scope = obj.scope;
+                    existing.data = obj.data || {};
+                    existing.version = obj.version;
+                    updateTypeIndex(existing, oldType, existing.data?.type);
+                    markObjectMutation(existing.id);
+                    const va = validAts[obj.id];
+                    if (va !== undefined && va !== null) {
+                        existing.validAt = va;
+                    }
+                    continue;
+                }
+
+                // A delete/migration event for an object that was absent locally
+                // arrived after group membership but before JoinSession returned.
+                if (objectRevisions.has(obj.id)) continue;
+
+                const registered = registerObject(obj);
                 const va = validAts[obj.id];
                 if (registered && va !== undefined && va !== null) {
                     registered.validAt = va;
@@ -537,12 +627,11 @@ const ObjectSync = (function() {
 
         const existing = objects.get(objectInfo.id);
         if (existing) {
-            // Backfill metadata from creation event (object was pre-created by update fallback)
-            existing.creatorMemberId = objectInfo.creatorMemberId;
-            existing.ownerMemberId = objectInfo.ownerMemberId;
-            existing.scope = objectInfo.scope;
             // Keep existing data/version if already ahead from updates
             if (objectInfo.version > existing.version) {
+                existing.creatorMemberId = objectInfo.creatorMemberId;
+                existing.ownerMemberId = objectInfo.ownerMemberId;
+                existing.scope = objectInfo.scope;
                 existing.data = objectInfo.data || {};
                 existing.version = objectInfo.version;
                 existing.arrivalTime = arrivalTime;
@@ -551,6 +640,15 @@ const ObjectSync = (function() {
                     existing.validAt = validAt;
                 }
             } else if (objectInfo.data) {
+                if (existing.creatorMemberId == null) {
+                    existing.creatorMemberId = objectInfo.creatorMemberId;
+                }
+                if (existing.ownerMemberId == null) {
+                    existing.ownerMemberId = objectInfo.ownerMemberId;
+                }
+                if (existing.scope == null) {
+                    existing.scope = objectInfo.scope;
+                }
                 // Even when the existing object's version is ahead (because an
                 // update arrived first via the fallback path), we still need to
                 // backfill any STATIC fields that updates don't carry — most
@@ -574,6 +672,7 @@ const ObjectSync = (function() {
             if (validAt !== undefined && validAt !== null && existing.validAt === undefined) {
                 existing.validAt = validAt;
             }
+            markObjectMutation(existing.id);
             return;
         }
 
@@ -655,6 +754,7 @@ const ObjectSync = (function() {
                         updateTypeIndex(existing, oldType, update.data.type);
                     }
 
+                    markObjectMutation(existing.id);
                     if (callbacks.onObjectUpdated) {
                         callbacks.onObjectUpdated(existing);
                     }
@@ -675,6 +775,7 @@ const ObjectSync = (function() {
                 };
                 objects.set(obj.id, obj);
                 addToTypeIndex(obj);
+                markObjectMutation(obj.id);
 
                 if (callbacks.onObjectCreated) {
                     callbacks.onObjectCreated(obj);
@@ -771,13 +872,17 @@ const ObjectSync = (function() {
      * Trigger state reconciliation via GetSessionState.
      */
     async function triggerReconciliation() {
-        if (reconciling) return;
+        if (reconciling !== null) return;
         if (reconciliationSuspendCount > 0) return;
-        reconciling = true;
+        const context = captureAsyncContext();
+        const revisionsAtStart = new Map(objectRevisions);
+        const operation = { context };
+        reconciling = operation;
         
         try {
             // console.log('[ObjectSync] Reconciling state...');
             const snapshot = await SessionClient.getSessionState();
+            if (!isAsyncContextCurrent(context)) return;
             if (!snapshot) {
                 // Server doesn't recognize this connection as a session member.
                 // This happens when auto-reconnect restores the transport but the
@@ -789,11 +894,14 @@ const ObjectSync = (function() {
                 return;
             }
             
-            // Restore per-member sequences from snapshot
-            memberSequences.clear();
+            // A live event may have advanced a member after the server captured
+            // this snapshot. Never move that baseline backward.
             if (snapshot.memberSequences) {
                 for (const [memberId, seq] of Object.entries(snapshot.memberSequences)) {
-                    memberSequences.set(memberId, seq);
+                    const current = memberSequences.get(memberId);
+                    if (current === undefined || seq > current) {
+                        memberSequences.set(memberId, seq);
+                    }
                 }
             }
             
@@ -807,16 +915,20 @@ const ObjectSync = (function() {
                 
                 const existing = objects.get(obj.id);
                 if (existing) {
-                    // Update ownership and version if server is newer
-                    existing.ownerMemberId = obj.ownerMemberId;
+                    // Ownership and state share the object version. Applying either
+                    // from an older snapshot could undo a live update/migration.
                     if (obj.version > existing.version) {
                         const oldType = existing.data?.type;
+                        existing.creatorMemberId = obj.creatorMemberId;
+                        existing.ownerMemberId = obj.ownerMemberId;
+                        existing.scope = obj.scope;
                         existing.data = obj.data || {};
                         existing.version = obj.version;
                         updateTypeIndex(existing, oldType, existing.data?.type);
                         if (snapValidAt !== undefined && snapValidAt !== null) {
                             existing.validAt = snapValidAt;
                         }
+                        markObjectMutation(existing.id);
                         // Reconciliation snapshots now carry the same validated
                         // server-time validAt as live broadcasts (monotonically
                         // capped, ±2 s clamped). The interpolator pushes them
@@ -825,10 +937,36 @@ const ObjectSync = (function() {
                         // either ARE the latest known state (correct to render
                         // from) or are dominated by newer live snapshots in
                         // the ring buffer (no visual effect).
+                    } else if (obj.version === existing.version) {
+                        // Update-first fallback objects can lack static metadata.
+                        // Filling nulls is monotonic and does not overwrite live data.
+                        let changed = false;
+                        if (existing.creatorMemberId == null && obj.creatorMemberId != null) {
+                            existing.creatorMemberId = obj.creatorMemberId;
+                            changed = true;
+                        }
+                        if (existing.ownerMemberId == null && obj.ownerMemberId != null) {
+                            existing.ownerMemberId = obj.ownerMemberId;
+                            changed = true;
+                        }
+                        if (existing.scope == null && obj.scope != null) {
+                            existing.scope = obj.scope;
+                            changed = true;
+                        }
+                        if (existing.validAt === undefined
+                            && snapValidAt !== undefined
+                            && snapValidAt !== null) {
+                            existing.validAt = snapValidAt;
+                            changed = true;
+                        }
+                        if (changed) markObjectMutation(existing.id);
                     }
                 } else if (pendingDeletes.has(obj.id)) {
                     // Locally deleted but server hasn't processed yet — do NOT
                     // resurrect. The server will broadcast OnObjectDeleted shortly.
+                    continue;
+                } else if (objectRevisions.get(obj.id) !== revisionsAtStart.get(obj.id)) {
+                    // A live delete/replacement arrived after this snapshot request.
                     continue;
                 } else {
                     // Add missing object
@@ -839,6 +977,7 @@ const ObjectSync = (function() {
                     if (callbacks.onObjectCreated) {
                         callbacks.onObjectCreated(localObj);
                     }
+                    if (!isAsyncContextCurrent(context)) return;
                 }
             }
             
@@ -846,11 +985,14 @@ const ObjectSync = (function() {
             // Skip pendingDeletes — they're already gone locally and are about
             // to be confirmed by the server.
             for (const [id, obj] of objects) {
-                if (!serverObjectIds.has(id) && !pendingDeletes.has(id)) {
+                if (!serverObjectIds.has(id)
+                    && !pendingDeletes.has(id)
+                    && objectRevisions.get(id) === revisionsAtStart.get(id)) {
                     removeObjectLocal(id);
                     if (callbacks.onObjectDeleted) {
                         callbacks.onObjectDeleted(obj);
                     }
+                    if (!isAsyncContextCurrent(context)) return;
                 }
             }
             
@@ -860,6 +1002,7 @@ const ObjectSync = (function() {
                 callbacks.onReconciliationComplete();
             }
         } catch (err) {
+            if (!isAsyncContextCurrent(context)) return;
             _error('[ObjectSync] Reconciliation failed:', err);
             // Treat invoke errors the same as a null snapshot: the connection
             // is broken (e.g. stale WebSocket after mobile background) and the
@@ -869,7 +1012,9 @@ const ObjectSync = (function() {
                 callbacks.onReconciliationFailed();
             }
         } finally {
-            reconciling = false;
+            if (reconciling === operation) {
+                reconciling = null;
+            }
         }
     }
 
@@ -896,6 +1041,7 @@ const ObjectSync = (function() {
         if (!SessionClient.isInSession()) {
             throw new Error('Not in a session');
         }
+        const context = captureAsyncContext();
 
         try {
             // Stamp owner's NTP-aligned server-time estimate of NOW. Server
@@ -914,6 +1060,7 @@ const ObjectSync = (function() {
             const createSchemaId = pickSchemaId(data, 'create');
             const wireData = (createSchemaId === 0) ? compressData(data) : data;
             const response = await SessionClient.createObject(wireData, scope, ownerMemberId, clientValidAt, createSchemaId);
+            if (!isAsyncContextCurrent(context)) return null;
             if (!response || !response.objectInfo) return null;
 
             const objectInfo = response.objectInfo;
@@ -921,6 +1068,7 @@ const ObjectSync = (function() {
 
             // Auto-cleanup: if caller's object was destroyed during async creation
             if (isStillNeeded && !isStillNeeded()) {
+                if (!isAsyncContextCurrent(context)) return null;
                 deleteObject(objectInfo.id); // fire-and-forget server cleanup
                 return null;
             }
@@ -941,11 +1089,13 @@ const ObjectSync = (function() {
                 }
             }
 
+            if (!isAsyncContextCurrent(context)) return null;
             // Track own member sequence from response (no broadcast echo to track it from)
             trackOwnMemberSequence(response.memberSequence);
 
             return objectInfo;
         } catch (err) {
+            if (!isAsyncContextCurrent(context)) return null;
             _error('[ObjectSync] Create object failed:', err);
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('create', err);
@@ -961,6 +1111,7 @@ const ObjectSync = (function() {
         if (!SessionClient.isInSession()) {
             throw new Error('Not in a session');
         }
+        const context = captureAsyncContext();
 
         try {
             // Positional schemas have no name bytes on the wire — compression
@@ -988,9 +1139,11 @@ const ObjectSync = (function() {
                 : null;
             const createdInfos = await SessionClient.replaceObject(
                 deleteObjectId, compressedReplacements, scope, ownerMemberId, clientValidAt, replacementSchemaIds);
+            if (!isAsyncContextCurrent(context)) return null;
             // Objects will be added/removed via the onObjectReplaced event
             return createdInfos;
         } catch (err) {
+            if (!isAsyncContextCurrent(context)) return null;
             _error('[ObjectSync] Replace object failed:', err);
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('replace', err);
@@ -1014,6 +1167,7 @@ const ObjectSync = (function() {
         
         // Update local data immediately
         Object.assign(obj.data, data);
+        markObjectMutation(objectId);
         
         // Update type index if type changed
         if (data.type !== undefined) {
@@ -1037,7 +1191,7 @@ const ObjectSync = (function() {
     }
 
     let fullSyncCounter = 0;
-    let flushInProgress = false;
+    let flushInProgress = null;
 
     /**
      * Called once per frame to drive frame-count-based sync.
@@ -1056,7 +1210,7 @@ const ObjectSync = (function() {
         if (frameCounter < sendThreshold) {
             frameCounter++;
         }
-        if (frameCounter >= sendThreshold && !flushInProgress) {
+        if (frameCounter >= sendThreshold && flushInProgress === null) {
             frameCounter = 0;
             flushUpdates();
         }
@@ -1125,7 +1279,8 @@ const ObjectSync = (function() {
     async function flushUpdates() {
         if (pendingUpdates.size === 0) return;
         if (!SessionClient.isInSession()) return;
-        if (flushInProgress) return;
+        if (flushInProgress !== null) return;
+        const context = captureAsyncContext();
 
         let updates;
         // Track deltas sent per object for deferred confirmation
@@ -1156,7 +1311,8 @@ const ObjectSync = (function() {
 
         if (updates.length === 0) return;
 
-        flushInProgress = true;
+        const operation = { context };
+        flushInProgress = operation;
         const currentSenderSequence = ++senderSequence;
         const clientTimestamp = Date.now();
         // Stamp owner's NTP-aligned server-time estimate of the simulation tick
@@ -1189,8 +1345,13 @@ const ObjectSync = (function() {
                 schemaId
             };
         });
+        if (!isAsyncContextCurrent(context)) {
+            if (flushInProgress === operation) flushInProgress = null;
+            return;
+        }
         try {
             const response = await SessionClient.updateObjects(wireUpdates, currentSenderSequence, Math.round(nominalFrameTime * 1000), clientValidAt);
+            if (!isAsyncContextCurrent(context)) return;
             // Capture response timestamp immediately — before processing
             // versions or sequences — so RTT reflects only the network
             // round-trip and not client-side processing overhead.
@@ -1202,6 +1363,7 @@ const ObjectSync = (function() {
                         const obj = objects.get(id);
                         if (obj && version > obj.version) {
                             obj.version = version;
+                            markObjectMutation(id);
                         }
                     }
                     // Confirm delta baselines only for objects the server accepted
@@ -1220,12 +1382,15 @@ const ObjectSync = (function() {
             // If response is null/undefined (server returned null), sentDeltas are
             // NOT confirmed — all fields will be re-sent on next flush.
         } catch (err) {
+            if (!isAsyncContextCurrent(context)) return;
             _error('[ObjectSync] Batch update failed:', err);
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('update', err);
             }
         } finally {
-            flushInProgress = false;
+            if (flushInProgress === operation) {
+                flushInProgress = null;
+            }
         }
     }
 
@@ -1248,6 +1413,7 @@ const ObjectSync = (function() {
         if (!SessionClient.isInSession()) {
             throw new Error('Not in a session');
         }
+        const context = captureAsyncContext();
 
         // Local-first: remove immediately so getObjectsByType() won't return it
         removeObjectLocal(objectId);
@@ -1260,6 +1426,7 @@ const ObjectSync = (function() {
 
         try {
             const response = await SessionClient.deleteObject(objectId);
+            if (!isAsyncContextCurrent(context)) return false;
 
             // Track own member sequence from response (no broadcast echo to track it from)
             if (response) {
@@ -1268,6 +1435,7 @@ const ObjectSync = (function() {
 
             return response?.success ?? false;
         } catch (err) {
+            if (!isAsyncContextCurrent(context)) return false;
             _warn('[ObjectSync] Server delete failed (local deletion already applied):', objectId, err.message);
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('delete', err);
@@ -1277,7 +1445,9 @@ const ObjectSync = (function() {
             // Whether the server accepted, rejected, or threw, the request has
             // resolved. Any subsequent snapshot reflects the post-resolution state,
             // so we no longer need to suppress this id from reconciliation.
-            pendingDeletes.delete(objectId);
+            if (isAsyncContextCurrent(context)) {
+                pendingDeletes.delete(objectId);
+            }
         }
     }
 
@@ -1456,10 +1626,16 @@ const ObjectSync = (function() {
     function handleOwnershipMigration(migratedObjects) {
         for (const migration of migratedObjects) {
             const obj = objects.get(migration.objectId);
-            if (obj) {
-                obj.ownerMemberId = migration.newOwnerId;
-                obj.version = migration.newVersion;
+            if (!obj) {
+                // We cannot materialize an object without its data, but recording
+                // the event prevents an older in-flight snapshot from doing so.
+                markObjectMutation(migration.objectId);
+                continue;
             }
+            if (migration.newVersion <= obj.version) continue;
+            obj.ownerMemberId = migration.newOwnerId;
+            obj.version = migration.newVersion;
+            markObjectMutation(obj.id);
         }
     }
 
@@ -1522,7 +1698,7 @@ const ObjectSync = (function() {
         handleOwnershipMigration,
         handleMemberDeparture,
         trackEventSequence,
-        isReconciling: () => reconciling,
+        isReconciling: () => reconciling !== null,
         on,
         registerEventKind,
         emitEvent,

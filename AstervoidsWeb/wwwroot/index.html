@@ -2605,6 +2605,8 @@
             outlierGateRttMul: 3,
             // Loop / lifecycle
             running: false,
+            generation: 0,
+            burstOperation: null,
             loopPromise: null,
             visibilityHandler: null,
             wakeResolve: null,
@@ -3043,17 +3045,21 @@
          * @param {number} burstSize - number of pings to fire (≥1)
          * @returns {Promise<object|null>} the accepted sample or null
          */
-        async runPingBurst(burstSize) {
+        async runPingBurst(burstSize, generation = this.clock.generation) {
+            if (!this.clock.running || generation !== this.clock.generation) return null;
             const samples = [];
             for (let i = 0; i < burstSize; i++) {
+                if (!this.clock.running || generation !== this.clock.generation) return null;
                 if (typeof document !== 'undefined' && document.hidden) break;
                 if (i > 0) {
                     await new Promise(r => setTimeout(r, this.clock.bootstrapIntervalMs));
+                    if (!this.clock.running || generation !== this.clock.generation) return null;
                 }
                 let sample;
                 try {
                     const t0Perf = performance.now();
                     const serverTime = await SessionClient.ping();
+                    if (!this.clock.running || generation !== this.clock.generation) return null;
                     const t3Perf = performance.now();
                     const t3Wall = Date.now();
                     if (typeof serverTime !== 'number' || !isFinite(serverTime)) continue;
@@ -3066,6 +3072,7 @@
                 samples.push(sample);
             }
             const winner = this.pickMinRttSample(samples);
+            if (!this.clock.running || generation !== this.clock.generation) return null;
             if (!winner) return null;
             const candidate = this.computeOffsetForSample(winner);
             const accepted = this.passesOutlierGate({
@@ -3097,34 +3104,56 @@
             return winner;
         },
 
+        queuePingBurst(burstSize, generation = this.clock.generation) {
+            const previous = this.clock.burstOperation;
+            const waitForPrevious = previous?.generation === generation
+                ? previous.promise.catch(() => {})
+                : Promise.resolve();
+            const operation = {
+                generation,
+                promise: null,
+            };
+            operation.promise = waitForPrevious.then(
+                () => this.runPingBurst(burstSize, generation));
+            this.clock.burstOperation = operation;
+            return operation.promise.finally(() => {
+                if (this.clock.burstOperation === operation) {
+                    this.clock.burstOperation = null;
+                }
+            });
+        },
+
         /**
          * Internal: long-running loop. Runs an initial bootstrap burst, then
          * one refresh ping every refreshIntervalMs. Skips work while hidden
          * and re-bootstraps on visibility return so the offset is fresh
          * before any spawn event is rendered.
          */
-        async clockSyncLoop() {
+        async clockSyncLoop(generation) {
             // Bootstrap: large burst gives several independent samples for
             // min-RTT selection, so the first usable offset lands fast.
-            await this.runPingBurst(this.clock.bootstrapBurstSize);
-            while (this.clock.running) {
+            await this.queuePingBurst(this.clock.bootstrapBurstSize, generation);
+            while (this.clock.running && generation === this.clock.generation) {
                 await new Promise(resolve => {
-                    this.clock.wakeResolve = resolve;
-                    setTimeout(() => {
-                        if (this.clock.wakeResolve === resolve) {
+                    let timer = null;
+                    const wake = () => {
+                        if (timer != null) clearTimeout(timer);
+                        if (this.clock.wakeResolve === wake) {
                             this.clock.wakeResolve = null;
-                            resolve();
                         }
-                    }, this.clock.refreshIntervalMs);
+                        resolve();
+                    };
+                    this.clock.wakeResolve = wake;
+                    timer = setTimeout(wake, this.clock.refreshIntervalMs);
                 });
-                if (!this.clock.running) break;
+                if (!this.clock.running || generation !== this.clock.generation) break;
                 if (typeof document !== 'undefined' && document.hidden) {
                     // Skip refreshes while hidden — frame throttling pollutes RTT.
                     // The visibilitychange handler will fire a fresh burst when
                     // we return to foreground.
                     continue;
                 }
-                await this.runPingBurst(1);
+                await this.queuePingBurst(1, generation);
             }
         },
 
@@ -3135,10 +3164,13 @@
         startClockSync() {
             if (this.clock.running) return;
             this.clock.running = true;
-            this.clock.loopPromise = this.clockSyncLoop().catch(() => {
+            const generation = ++this.clock.generation;
+            this.clock.loopPromise = this.clockSyncLoop(generation).catch(() => {
                 // Loop exited unexpectedly; clear running so a future
                 // startClockSync() call can restart it.
-                this.clock.running = false;
+                if (generation === this.clock.generation) {
+                    this.clock.running = false;
+                }
             });
             if (typeof document !== 'undefined' && !this.clock.visibilityHandler) {
                 this.clock.visibilityHandler = () => {
@@ -3147,10 +3179,11 @@
                         // and run a fresh bootstrap burst before any new gameplay
                         // event needs serverNowMs().
                         const wake = this.clock.wakeResolve;
-                        this.clock.wakeResolve = null;
-                        this.runPingBurst(this.clock.bootstrapBurstSize).then(() => {
-                            if (wake) wake();
-                        });
+                        const generation = this.clock.generation;
+                        this.queuePingBurst(this.clock.bootstrapBurstSize, generation)
+                            .then(
+                                () => { if (wake) wake(); },
+                                () => { if (wake) wake(); });
                     }
                 };
                 document.addEventListener('visibilitychange', this.clock.visibilityHandler);
@@ -3164,6 +3197,7 @@
          */
         stopClockSync() {
             this.clock.running = false;
+            this.clock.generation++;
             if (this.clock.wakeResolve) {
                 const r = this.clock.wakeResolve;
                 this.clock.wakeResolve = null;
@@ -6250,7 +6284,8 @@
      * Initialize or reset the game to starting state
      * Ship starts at center (normalized 0.5, 0.5)
      */
-    async function init() {
+    async function init(isCurrentStart = () => true) {
+        if (!isCurrentStart()) return false;
         // Track whether we're entering an in-progress game vs starting fresh.
         // Used to guard state resets and wave spawning below.
         let freshGameStart = true;
@@ -6272,6 +6307,7 @@
             
             // Create synced ship for multiplayer
             await createSyncedShip(colorIndex);
+            if (!isCurrentStart()) return false;
             
             // Fallback: if ship creation failed, create local ship
             if (!game.ship) {
@@ -6370,16 +6406,19 @@
         // When entering an in-progress game, the wave and GameState already exist.
         if (freshGameStart) {
             if (!isSessionMode() || isAuthority()) {
-                await spawnWave();
+                await spawnWave(isCurrentStart);
+                if (!isCurrentStart()) return false;
                 
                 // Create synced GameState (authority only)
                 if (isSessionMode()) {
                     await createSyncedGameState();
+                    if (!isCurrentStart()) return false;
                 }
             }
         }
         
         updateHUD();
+        return true;
     }
     
     /**
@@ -6395,7 +6434,8 @@
      * Spawn a new wave of astervoids
      * Astervoids spawn away from the ship
      */
-    async function spawnWave() {
+    async function spawnWave(isCurrent = null) {
+        if (isCurrent && !isCurrent()) return false;
         game.wave++;
         
         // Calculate number of astervoids for this wave
@@ -6410,10 +6450,12 @@
         
         // Spawn astervoids at random positions away from ship
         for (let i = 0; i < asteroidCount; i++) {
-            await spawnAsteroidAwayFromShip();
+            await spawnAsteroidAwayFromShip(isCurrent);
+            if (isCurrent && !isCurrent()) return false;
         }
         
         updateHUD();
+        return true;
     }
 
     /**
@@ -6421,7 +6463,8 @@
      * Uses normalized coordinates (0-1 range)
      * @returns {Asteroid} The spawned asteroid
      */
-    async function spawnAsteroidAwayFromShip() {
+    async function spawnAsteroidAwayFromShip(isCurrent = null) {
+        if (isCurrent && !isCurrent()) return null;
         let x, y;
         
         // Get reference position (local ship or center if no ship)
@@ -6462,6 +6505,7 @@
         // In solo mode, push directly to game state
         if (isSessionMode()) {
             await createSyncedAsteroid(asteroid);
+            if (isCurrent && !isCurrent()) return null;
         } else {
             game.astervoids.push(asteroid);
         }
@@ -9245,7 +9289,11 @@
 
         const perRegion = new Map();   // regionId -> { sessions, maxSessions, canCreate, state, lastFetchAt, lastError }
         const pendingRefetch = new Map(); // regionId -> setTimeout handle (debounce)
+        const inFlight = new Map();    // regionId -> AbortController
+        const requestSequences = new Map();
         let backgroundPollHandle = null;
+        let runGeneration = 0;
+        let running = false;
 
         function emptyResult() {
             return { sessions: [], maxSessions: 6, canCreateSession: true };
@@ -9256,9 +9304,8 @@
             return r ? r.state : 'cold';
         }
 
-        async function fetchOneRegion(region) {
+        async function fetchOneRegion(region, controller) {
             const url = `${region.hostname.replace(/\/$/, '')}/api/sessions`;
-            const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
             try {
                 const res = await fetch(url, {
@@ -9278,9 +9325,17 @@
         // Update one region's slice and trigger a picker render. Per-region
         // failure marks the region 'stale' and drops its sessions from the
         // merge until the next successful fetch.
-        async function refreshRegion(region) {
+        async function refreshRegion(region, generation = runGeneration) {
+            const requestSequence = (requestSequences.get(region.id) ?? 0) + 1;
+            requestSequences.set(region.id, requestSequence);
+            inFlight.get(region.id)?.abort();
+            const controller = new AbortController();
+            inFlight.set(region.id, controller);
             try {
-                const body = await fetchOneRegion(region);
+                const body = await fetchOneRegion(region, controller);
+                if (!running
+                    || generation !== runGeneration
+                    || requestSequences.get(region.id) !== requestSequence) return;
                 perRegion.set(region.id, {
                     sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
                     maxSessions: body.maxSessions ?? 6,
@@ -9290,6 +9345,9 @@
                     lastError: null,
                 });
             } catch (err) {
+                if (!running
+                    || generation !== runGeneration
+                    || requestSequences.get(region.id) !== requestSequence) return;
                 const prev = perRegion.get(region.id) ?? {};
                 perRegion.set(region.id, {
                     ...prev,
@@ -9297,7 +9355,14 @@
                     state: 'stale',
                     lastError: err && err.message,
                 });
+            } finally {
+                if (inFlight.get(region.id) === controller) {
+                    inFlight.delete(region.id);
+                }
             }
+            if (!running
+                || generation !== runGeneration
+                || requestSequences.get(region.id) !== requestSequence) return;
             // Render with the merged state — every region's fresh slice
             // contributes its sessions; stale regions contribute nothing.
             applyMerged();
@@ -9308,16 +9373,16 @@
         // cleanup + broadcast and the receiver would fetch 2-3 times.
         function requestRefresh(region, immediate = false) {
             if (immediate) {
-                refreshRegion(region);
-                return;
+                return refreshRegion(region, runGeneration);
             }
             const existing = pendingRefetch.get(region.id);
             if (existing) clearTimeout(existing);
             const handle = setTimeout(() => {
                 pendingRefetch.delete(region.id);
-                refreshRegion(region);
+                refreshRegion(region, runGeneration);
             }, COALESCE_MS);
             pendingRefetch.set(region.id, handle);
+            return Promise.resolve();
         }
 
         // Apply the merged view to the picker. Sessions are keyed by
@@ -9344,8 +9409,11 @@
         // Start the multi-region session-list machine. Idempotent.
         async function start(regions) {
             stop();
+            running = true;
+            const generation = ++runGeneration;
             // Bootstrap REST fetch in parallel across every region.
-            await Promise.all(regions.map(r => refreshRegion(r)));
+            await Promise.all(regions.map(r => refreshRegion(r, generation)));
+            if (!running || generation !== runGeneration) return;
             // Background belt-and-suspenders poll catches missed pushes.
             backgroundPollHandle = setInterval(() => {
                 if (typeof document !== 'undefined' && document.hidden) return;
@@ -9354,12 +9422,16 @@
         }
 
         function stop() {
+            running = false;
+            runGeneration++;
             if (backgroundPollHandle) {
                 clearInterval(backgroundPollHandle);
                 backgroundPollHandle = null;
             }
             for (const t of pendingRefetch.values()) clearTimeout(t);
             pendingRefetch.clear();
+            for (const controller of inFlight.values()) controller.abort();
+            inFlight.clear();
         }
 
         function reset() {
@@ -9384,14 +9456,18 @@
     // working with zero behavioral change.
     // Multi-region: delegates to MultiRegionSessions which does parallel
     // REST polls + spectator-push-driven refetches.
+    let sessionListRequestSequence = 0;
     async function refreshSessionList() {
         const usingMultiRegion = sessionPicker.regions.length > 1;
         if (!usingMultiRegion) {
             if (!SessionClient.isConnected()) return;
+            const requestSequence = ++sessionListRequestSequence;
             try {
                 const result = await SessionClient.getActiveSessions();
+                if (requestSequence !== sessionListRequestSequence) return;
                 updateSessionList(result);
             } catch (err) {
+                if (requestSequence !== sessionListRequestSequence) return;
                 _error('Failed to refresh sessions:', err);
                 setPickerStatus('Failed to load sessions', 'error');
             }
@@ -9823,7 +9899,7 @@
         game.mode = 'solo';
         game.sessionInfo = null;
         restoreLocalConfigBaseline();
-        startGameFromPicker();
+        await startGameFromPicker();
     }
 
     // Handle Leave/Create button
@@ -9912,18 +9988,62 @@
     }
 
     // Start game from picker (replaces old startGame for picker context)
+    let startGameOperation = null;
+
+    function captureGameStartContext() {
+        const sessionMode = isSessionMode();
+        return {
+            mode: sessionMode ? 'session' : 'solo',
+            sessionId: sessionMode ? sessionPicker.currentSessionId : null,
+            sessionEpoch: sessionMode ? SessionClient.getSessionEpoch() : null,
+        };
+    }
+
+    function isGameStartContextCurrent(context) {
+        if ((isSessionMode() ? 'session' : 'solo') !== context.mode) return false;
+        if (context.mode === 'solo') return true;
+        return sessionPicker.currentSessionId === context.sessionId
+            && SessionClient.getSessionEpoch() === context.sessionEpoch;
+    }
+
     async function startGameFromPicker() {
+        const context = captureGameStartContext();
+        if (startGameOperation
+            && startGameOperation.context.mode === context.mode
+            && startGameOperation.context.sessionId === context.sessionId
+            && startGameOperation.context.sessionEpoch === context.sessionEpoch) {
+            return startGameOperation.promise;
+        }
         // Allow entry from: start screen, lobby (game not started),
         // or session spectator entering an in-progress game (has actual state but no ship)
-        if (game.state === 'start' || game.state === 'lobby' || (isSessionMode() && !game.ship)) {
+        if (!(game.state === 'start' || game.state === 'lobby' || (isSessionMode() && !game.ship))) {
+            return;
+        }
+
+        sessionPicker.btnStartEnter.disabled = true;
+        const operation = { context, promise: null };
+        startGameOperation = operation;
+        const isCurrent = () =>
+            startGameOperation === operation
+            && isGameStartContextCurrent(context);
+        operation.promise = (async () => {
+            if (!isCurrent()) return;
             // Recalculate viewport with new session aspect ratio before initializing (force recalc)
             resizeCanvas(true);
             try {
-                await init();
+                await init(isCurrent);
             } catch (err) {
-                _error('[Game] Failed to start game:', err);
+                if (isCurrent()) {
+                    _error('[Game] Failed to start game:', err);
+                }
             }
-        }
+        })().finally(() => {
+            if (startGameOperation === operation) {
+                startGameOperation = null;
+                updatePickerButtons();
+            }
+        });
+        return operation.promise;
     }
 
     // Return to start screen
@@ -10097,6 +10217,10 @@
         if (oldMemberId == null) {
             oldMemberId = game.sessionInfo?.memberId ?? null;
         }
+        const reconnectHubHostname =
+            SessionClient.getReconnectHubHostname?.()
+            ?? SessionClient.getCurrentHubHostname?.()
+            ?? '';
         setPickerStatus('Reconnecting...', 'error');
 
         const maxAttempts = 5;
@@ -10116,7 +10240,7 @@
                     // WebSocket is dead. Forcing ensures ObjectSync.init() is called
                     // on the new connection and cancels any stale auto-reconnect.
                     setPickerStatus(`Reconnecting... (connecting)`, 'error');
-                    await connectToSessionHub(true);
+                    await connectToSessionHub(true, reconnectHubHostname);
                     if (!SessionClient.isConnected()) {
                         _warn('[Rejoin] Connect failed on attempt', attempt + 1);
                         setPickerStatus(`Reconnecting... (connect failed)`, 'error');

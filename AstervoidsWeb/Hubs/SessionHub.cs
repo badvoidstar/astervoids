@@ -20,6 +20,7 @@ public class SessionHub : Hub
     private readonly ILogger<SessionHub> _logger;
     private readonly ServerMetricsService _metrics;
     private readonly SyncSchemaRegistry _schemaRegistry;
+    private readonly ISessionOperationCoordinator _operationCoordinator;
 
     // Group name for all connected clients to receive session list updates
     internal const string AllClientsGroup = "AllClients";
@@ -29,13 +30,32 @@ public class SessionHub : Hub
         IObjectService objectService,
         ILogger<SessionHub> logger,
         ServerMetricsService metrics,
-        SyncSchemaRegistry schemaRegistry)
+        SyncSchemaRegistry schemaRegistry,
+        ISessionOperationCoordinator? operationCoordinator = null)
     {
         _sessionService = sessionService;
         _objectService = objectService;
         _logger = logger;
         _metrics = metrics;
         _schemaRegistry = schemaRegistry;
+        _operationCoordinator = operationCoordinator ?? new SessionOperationCoordinator();
+    }
+
+    private sealed class CallerSessionOperation : IDisposable
+    {
+        private readonly IDisposable _lease;
+
+        public CallerSessionOperation(IDisposable lease, Member member, Session session)
+        {
+            _lease = lease;
+            Member = member;
+            Session = session;
+        }
+
+        public Member Member { get; }
+        public Session Session { get; }
+
+        public void Dispose() => _lease.Dispose();
     }
 
     // ── Payload byte estimation ────────────────────────────────────────
@@ -93,6 +113,27 @@ public class SessionHub : Hub
         return ctx;
     }
 
+    private async Task<CallerSessionOperation?> EnterCallerSessionAsync(
+        [CallerMemberName] string caller = "")
+    {
+        var initial = GetCallerContext(caller);
+        if (initial == null)
+            return null;
+
+        var sessionId = initial.Value.Session.Id;
+        var lease = await _operationCoordinator.EnterAsync(
+            sessionId, Context.ConnectionAborted);
+        var current = GetCallerContext(caller);
+        if (current == null || current.Value.Session.Id != sessionId)
+        {
+            lease.Dispose();
+            return null;
+        }
+
+        return new CallerSessionOperation(
+            lease, current.Value.Member, current.Value.Session);
+    }
+
     /// <summary>
     /// Broadcasts <paramref name="method"/> with <paramref name="args"/> to every member
     /// of <paramref name="session"/> except the one identified by <paramref name="excludeMemberId"/>,
@@ -122,6 +163,71 @@ public class SessionHub : Hub
         _metrics.OnBroadcastToMembers(session.Members.Keys, bytes);
         // SendCoreAsync — see BroadcastToOthersAsync for the rationale.
         await Clients.Group(session.Id.ToString()).SendCoreAsync(method, args);
+    }
+
+    private async Task BroadcastSessionsChangedBestEffortAsync()
+    {
+        try
+        {
+            await BroadcastSessionsChanged();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to broadcast session-list change");
+        }
+    }
+
+    private async Task RollbackCommittedJoinAsync(
+        Session session,
+        Guid memberId,
+        long serverTimestamp)
+    {
+        var departure = _sessionService.LeaveSession(Context.ConnectionId);
+        _metrics.RemoveMember(memberId);
+
+        try
+        {
+            await Groups.RemoveFromGroupAsync(
+                Context.ConnectionId, session.Id.ToString());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to remove rolled-back member {MemberId} from session group {SessionId}",
+                memberId,
+                session.Id);
+        }
+
+        if (departure is { RemainingMemberIds.Count: > 0 })
+        {
+            var departureInfo = new MemberLeftInfo(
+                departure.MemberId,
+                departure.PromotedMember?.Id,
+                departure.PromotedMember?.Role,
+                departure.DeletedObjectIds,
+                departure.MigratedObjects);
+            try
+            {
+                await BroadcastToAllAsync(
+                    session,
+                    "OnMemberLeft",
+                    departureInfo,
+                    departure.MemberId,
+                    (long)0,
+                    serverTimestamp);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to broadcast rollback of member {MemberId} in session {SessionId}",
+                    memberId,
+                    session.Id);
+            }
+        }
+
+        await BroadcastSessionsChangedBestEffortAsync();
     }
 
     /// <summary>
@@ -173,16 +279,24 @@ public class SessionHub : Hub
     /// <see cref="ObjectInfo"/>; live broadcasts use a single batch-level
     /// <c>validAt</c> trailing argument and never need this map.
     /// </summary>
-    private (MemberInfo[] Members, ObjectInfo[] Objects, GuidLongPair[] ValidAts) ToSessionSnapshot(Session session)
+    private (
+        MemberInfo[] Members,
+        ObjectInfo[] Objects,
+        GuidLongPair[] ValidAts,
+        GuidLongPair[] MemberSequences) ToSessionSnapshot(Session session)
     {
         lock (session.SyncRoot)
         {
             var objs = session.Objects.Values.ToArray();
             var validAts = objs.Select(o => new GuidLongPair(o.Id, o.ValidAt)).ToArray();
+            var memberSequences = session.Members.Values
+                .Select(m => new GuidLongPair(m.Id, Interlocked.Read(ref m.EventSequence)))
+                .ToArray();
             return (
                 [.. session.Members.Values.Select(ToMemberInfo)],
                 [.. objs.Select(ToObjectInfo)],
-                validAts
+                validAts,
+                memberSequences
             );
         }
     }
@@ -209,10 +323,30 @@ public class SessionHub : Hub
     /// <param name="metadata">Optional key-value metadata for the session (e.g. aspect ratio, game mode).</param>
     public async Task<CreateSessionResponse?> CreateSession(Dictionary<string, object?>? metadata = null)
     {
-        var result = _sessionService.CreateSession(Context.ConnectionId, metadata);
+        IReadOnlyList<PositionalSchemaCodec.Schema> schemas;
+        try
+        {
+            schemas = SyncSchemaRegistry.ParseFromMetadata(metadata);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "CreateSession rejected invalid metadata.schemas");
+            return null;
+        }
+
+        var sessionId = Guid.NewGuid();
+        using var operation = await _operationCoordinator.EnterAsync(
+            sessionId, Context.ConnectionAborted);
+
+        // Register schemas before publishing the session through SessionService so a
+        // concurrent list/join cannot observe a session whose positional codec is absent.
+        _schemaRegistry.SetSessionSchemas(sessionId, schemas);
+        var result = _sessionService.CreateSession(
+            Context.ConnectionId, metadata, sessionId);
 
         if (!result.Success)
         {
+            _schemaRegistry.ClearSession(sessionId);
             _logger.LogWarning("CreateSession failed: {Error}", result.ErrorMessage);
             return null;
         }
@@ -222,42 +356,58 @@ public class SessionHub : Hub
 
         _metrics.OnHubInvocation(creator.Id, EstimatePayloadBytes(metadata));
 
-        // Phase 4 wireopt: register any schemas the game declared in
-        // metadata.schemas before any object events can flow. Schemas are
-        // session-create-time only; later joins inherit them via the
-        // metadata round-trip in JoinSessionResponse.
+        if (schemas.Count > 0)
+        {
+            _logger.LogInformation(
+                "Session {SessionId} registered {Count} positional schemas: {Ids}",
+                session.Id, schemas.Count, string.Join(",", schemas.Select(s => s.Id)));
+        }
+
         try
         {
-            var schemas = SyncSchemaRegistry.ParseFromMetadata(metadata);
-            _schemaRegistry.SetSessionSchemas(session.Id, schemas);
-            if (schemas.Count > 0)
-            {
-                _logger.LogInformation(
-                    "Session {SessionId} registered {Count} positional schemas: {Ids}",
-                    session.Id, schemas.Count, string.Join(",", schemas.Select(s => s.Id)));
-            }
+            await Groups.AddToGroupAsync(
+                Context.ConnectionId, session.Id.ToString());
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex,
-                "Session {SessionId} metadata.schemas parse failed; positional payloads will be rejected",
+            try
+            {
+                await Groups.RemoveFromGroupAsync(
+                    Context.ConnectionId, session.Id.ToString());
+            }
+            catch (Exception removeException)
+            {
+                _logger.LogWarning(
+                    removeException,
+                    "Failed to remove creator connection from rolled-back session group {SessionId}",
+                    session.Id);
+            }
+            _sessionService.LeaveSession(Context.ConnectionId);
+            _sessionService.ForceDestroySession(
+                session.Id,
+                new SessionDestroyCondition(RequireEmpty: true));
+            _schemaRegistry.ClearSession(session.Id);
+            _metrics.RemoveMember(creator.Id);
+            _logger.LogError(
+                ex,
+                "Rolled back session {SessionId} because group registration failed",
                 session.Id);
+            throw;
         }
-
-        await Groups.AddToGroupAsync(Context.ConnectionId, session.Id.ToString());
 
         _logger.LogInformation(
             "Session {SessionName} ({SessionId}) created by member {MemberId}",
             session.Name, session.Id, creator.Id);
 
         // Broadcast session list update to all connected clients
-        await BroadcastSessionsChanged();
+        await BroadcastSessionsChangedBestEffortAsync();
 
         return new CreateSessionResponse(
             session.Id,
             session.Name,
             creator.Id,
             creator.Role,
+            creator.ReconnectToken,
             session.Metadata
         );
     }
@@ -273,8 +423,34 @@ public class SessionHub : Hub
     /// Passing the old member ID lets the server clean it up atomically before
     /// adding the new member.
     /// </param>
-    public async Task<JoinSessionResponse?> JoinSession(Guid sessionId, Guid? evictMemberId = null)
+    public Task<JoinSessionResponse?> JoinSession(
+        Guid sessionId,
+        Guid? legacyEvictMemberId = null)
     {
+        if (legacyEvictMemberId.HasValue)
+        {
+            _logger.LogInformation(
+                "JoinSession ignored unauthenticated legacy eviction request for member {MemberId}",
+                legacyEvictMemberId.Value);
+        }
+
+        return JoinSessionCore(sessionId, null, null);
+    }
+
+    public Task<JoinSessionResponse?> RejoinSession(
+        Guid sessionId,
+        Guid evictMemberId,
+        string reconnectToken)
+        => JoinSessionCore(sessionId, evictMemberId, reconnectToken);
+
+    private async Task<JoinSessionResponse?> JoinSessionCore(
+        Guid sessionId,
+        Guid? evictMemberId,
+        string? reconnectToken)
+    {
+        using var operation = await _operationCoordinator.EnterAsync(
+            sessionId, Context.ConnectionAborted);
+
         // Capture serverTimestamp at hub-method entry so it represents the
         // moment the action was authoritatively realized, not the moment the
         // broadcast was assembled. Receivers use this for adaptive-delay
@@ -282,7 +458,8 @@ public class SessionHub : Hub
         // is null or fails the ±2s sanity clamp.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var result = _sessionService.JoinSession(sessionId, Context.ConnectionId, evictMemberId);
+        var result = _sessionService.JoinSession(
+            sessionId, Context.ConnectionId, evictMemberId, reconnectToken);
         if (!result.Success)
         {
             _logger.LogWarning("Failed to join session {SessionId}: {Error}", sessionId, result.ErrorMessage);
@@ -292,7 +469,8 @@ public class SessionHub : Hub
         var session = result.Session!;
         var member = result.Member!;
 
-        _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(sessionId, evictMemberId));
+        _metrics.OnHubInvocation(
+            member.Id, EstimatePayloadBytes(sessionId, evictMemberId, reconnectToken));
 
         if (evictMemberId.HasValue)
             _metrics.OnReconnect(member.Id);
@@ -309,7 +487,19 @@ public class SessionHub : Hub
             // is realized as part of this join call's atomic processing.
             // Remove the evicted member's dead connection from the group so
             // SignalR doesn't try to deliver to a stale transport.
-            await Groups.RemoveFromGroupAsync(eviction.EvictedConnectionId, session.Id.ToString());
+            try
+            {
+                await Groups.RemoveFromGroupAsync(
+                    eviction.EvictedConnectionId, session.Id.ToString());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to remove evicted connection {ConnectionId} from session group {SessionId}",
+                    eviction.EvictedConnectionId,
+                    session.Id);
+            }
 
             var evictionInfo = new MemberLeftInfo(
                 eviction.EvictedMemberId,
@@ -320,8 +510,19 @@ public class SessionHub : Hub
             );
             // The new joiner isn't in the SignalR group yet, so excluding member.Id
             // matches the actual delivery set and keeps RX accounting accurate.
-            await BroadcastToOthersAsync(session, member.Id, "OnMemberLeft",
-                evictionInfo, eviction.EvictedMemberId, (long)0, serverTimestamp);
+            try
+            {
+                await BroadcastToOthersAsync(session, member.Id, "OnMemberLeft",
+                    evictionInfo, eviction.EvictedMemberId, (long)0, serverTimestamp);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to broadcast eviction of member {MemberId} in session {SessionId}",
+                    eviction.EvictedMemberId,
+                    session.Id);
+            }
 
             _metrics.RemoveMember(eviction.EvictedMemberId);
 
@@ -345,28 +546,55 @@ public class SessionHub : Hub
         // that also appears in the snapshot. The client's handleSessionJoined and
         // handleRemoteObjectsUpdated both compare versions and apply whichever is
         // newer, so duplicates are dedup'd.
-        await Groups.AddToGroupAsync(Context.ConnectionId, session.Id.ToString());
+        MemberInfo[] members;
+        ObjectInfo[] objects;
+        GuidLongPair[] validAts;
+        try
+        {
+            await Groups.AddToGroupAsync(
+                Context.ConnectionId, session.Id.ToString());
+            (members, objects, validAts, _) = ToSessionSnapshot(session);
+        }
+        catch
+        {
+            await RollbackCommittedJoinAsync(
+                session, member.Id, serverTimestamp);
+            throw;
+        }
 
-        var (members, objects, validAts) = ToSessionSnapshot(session);
-
-        var memberSequence = NextMemberSequence(member);
+        var memberSequence = NextMemberSequence(session, member);
 
         var joinedMemberInfo = ToMemberInfo(member);
-        await BroadcastToOthersAsync(session, member.Id, "OnMemberJoined",
-            joinedMemberInfo, member.Id, memberSequence, serverTimestamp);
+        try
+        {
+            await BroadcastToOthersAsync(session, member.Id, "OnMemberJoined",
+                joinedMemberInfo, member.Id, memberSequence, serverTimestamp);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Rolling back member {MemberId} after join broadcast failed in session {SessionId}",
+                member.Id,
+                session.Id);
+            await RollbackCommittedJoinAsync(
+                session, member.Id, serverTimestamp);
+            throw;
+        }
 
         _logger.LogInformation(
             "Member {MemberId} joined session {SessionName} ({SessionId})",
             member.Id, session.Name, session.Id);
 
         // Broadcast session list update to all connected clients
-        await BroadcastSessionsChanged();
+        await BroadcastSessionsChangedBestEffortAsync();
 
         return new JoinSessionResponse(
             session.Id,
             session.Name,
             member.Id,
             member.Role,
+            member.ReconnectToken,
             members,
             objects,
             validAts,
@@ -385,6 +613,23 @@ public class SessionHub : Hub
     {
         // Hub-entry serverTimestamp — see JoinSession for rationale.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var initial = _sessionService.GetMemberAndSessionByConnectionId(
+            Context.ConnectionId);
+        if (initial == null)
+        {
+            _logger.LogDebug(
+                "LeaveSession: no session found for connection {ConnectionId} (already departed)",
+                Context.ConnectionId);
+            return;
+        }
+
+        var sessionId = initial.Value.Session.Id;
+        using var operation = await _operationCoordinator.EnterAsync(sessionId);
+        var current = _sessionService.GetMemberAndSessionByConnectionId(
+            Context.ConnectionId);
+        if (current == null || current.Value.Session.Id != sessionId)
+            return;
 
         var result = _sessionService.LeaveSession(Context.ConnectionId);
         if (result == null)
@@ -509,9 +754,10 @@ public class SessionHub : Hub
         // clamp + monotonic cap) and stamps the result on SessionObject.ValidAt.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var ctx = GetCallerContext();
-        if (ctx == null) return null;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(data, scope, ownerMemberId, clientValidAt));
 
@@ -536,7 +782,7 @@ public class SessionHub : Hub
 
         var objectInfo = ToObjectInfo(obj);
 
-        var memberSequence = NextMemberSequence(member);
+        var memberSequence = NextMemberSequence(session, member);
 
         // Broadcast to other members only — sender registers from invoke response (response-first).
         // Sender's own memberSequence is returned in the response, not via broadcast echo.
@@ -573,9 +819,10 @@ public class SessionHub : Hub
         // and stamped on each SessionObject.ValidAt.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var ctx = GetCallerContext();
-        if (ctx == null) return null;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(updates, senderSequence, senderSendIntervalMs, clientValidAt));
 
@@ -596,7 +843,7 @@ public class SessionHub : Hub
         long memberSequence = 0;
         if (updatedObjects.Count > 0)
         {
-            memberSequence = NextMemberSequence(member);
+            memberSequence = NextMemberSequence(session, member);
             // Build broadcast payload from the cached request payloads (verbatim
             // bytes from the sender) — no need to re-encode the dict the service
             // already merged into obj.Data.
@@ -636,9 +883,10 @@ public class SessionHub : Hub
         // Hub-entry serverTimestamp — see JoinSession for rationale.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var ctx = GetCallerContext();
-        if (ctx == null) return null;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(objectId));
 
@@ -651,7 +899,7 @@ public class SessionHub : Hub
             return null;
         }
 
-        var memberSequence = NextMemberSequence(member);
+        var memberSequence = NextMemberSequence(session, member);
 
         // Broadcast to other members only — sender deleted locally before invoking (local-first).
         // Sender's own memberSequence is returned in the response, not via broadcast echo.
@@ -692,9 +940,10 @@ public class SessionHub : Hub
         // SessionObject by the service, then read back for the broadcast.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var ctx = GetCallerContext();
-        if (ctx == null) return null;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(deleteObjectId, replacements, scope, ownerMemberId, clientValidAt));
 
@@ -726,7 +975,7 @@ public class SessionHub : Hub
 
         var createdInfos = createdObjects.Select(ToObjectInfo).ToList();
 
-        var memberSequence = NextMemberSequence(member);
+        var memberSequence = NextMemberSequence(session, member);
 
         // Single atomic broadcast to ALL members (including sender).
         // NOTE: Cannot use OthersInGroup here — sender relies on this broadcast to
@@ -749,19 +998,18 @@ public class SessionHub : Hub
     /// Returns the current session state for reconciliation.
     /// No side effects — does not broadcast or modify any state.
     /// </summary>
-    public SessionStateSnapshot? GetSessionState()
+    public async Task<SessionStateSnapshot?> GetSessionState()
     {
-        var ctx = GetCallerContext();
-        if (ctx == null) return null;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, 1); // GetSessionState has no payload arguments
         _metrics.OnReconciliation(member.Id);
 
-        var (members, objects, validAts) = ToSessionSnapshot(session);
-
-        var memberSequences = session.Members.Values.Select(
-            m => new GuidLongPair(m.Id, Interlocked.Read(ref m.EventSequence))).ToArray();
+        var (members, objects, validAts, memberSequences) =
+            ToSessionSnapshot(session);
 
         return new SessionStateSnapshot(members, objects, validAts, memberSequences);
     }
@@ -790,18 +1038,27 @@ public class SessionHub : Hub
     {
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var ctx = GetCallerContext();
-        if (ctx == null) return false;
-        var (member, session) = ctx.Value;
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return false;
+        var member = operation.Member;
+        var session = operation.Session;
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(objectId, eventKind, payload, clientValidAt));
 
-        // Ownership check — events are owner-attested observations about the
-        // object's state; non-owners cannot fabricate them.
-        var owned = GetOwnedObject(member, objectId);
-        if (owned == null) return false;
+        long memberSequence;
+        lock (session.SyncRoot)
+        {
+            if (session.LifecycleState != SessionLifecycleState.Active
+                || !session.Members.TryGetValue(member.Id, out var currentMember)
+                || currentMember.ConnectionId != Context.ConnectionId
+                || !session.Objects.TryGetValue(objectId, out var owned)
+                || owned.OwnerMemberId != member.Id)
+            {
+                return false;
+            }
 
-        var memberSequence = NextMemberSequence(member);
+            memberSequence = Interlocked.Increment(ref currentMember.EventSequence);
+        }
 
         // Inline ±2s clamp (events don't go through ObjectService.ValidateValidAt).
         long validAt = serverTimestamp;
@@ -811,7 +1068,10 @@ public class SessionHub : Hub
             if (diff >= -2000 && diff <= 2000) validAt = clientValidAt.Value;
         }
 
-        var eventInfo = new ObjectEventInfo(objectId, eventKind, payload);
+        var eventInfo = new ObjectEventInfo(
+            objectId,
+            eventKind,
+            payload == null ? null : new Dictionary<string, object?>(payload));
         await BroadcastToOthersAsync(session, member.Id, "OnObjectEvent",
             eventInfo, member.Id, memberSequence, serverTimestamp, validAt);
 
@@ -868,8 +1128,15 @@ public class SessionHub : Hub
     /// <summary>
     /// Atomically increments and returns the next event sequence number for a member.
     /// </summary>
-    private static long NextMemberSequence(Member member)
+    private static long NextMemberSequence(Session session, Member member)
     {
-        return Interlocked.Increment(ref member.EventSequence);
+        lock (session.SyncRoot)
+        {
+            return session.LifecycleState == SessionLifecycleState.Active
+                && session.Members.TryGetValue(member.Id, out var current)
+                && ReferenceEquals(current, member)
+                    ? Interlocked.Increment(ref member.EventSequence)
+                    : 0;
+        }
     }
 }

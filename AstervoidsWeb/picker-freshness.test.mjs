@@ -34,7 +34,9 @@ function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.no
     const POLL_INTERVAL_MS = 30000;
     const perRegion = new Map();
     const pendingRefetch = new Map();
+    const requestSequences = new Map();
     let backgroundPollHandle = null;
+    let runGeneration = 0;
 
     async function fetchOneRegion(region) {
         const url = `${region.hostname.replace(/\/$/, '')}/api/sessions`;
@@ -42,9 +44,13 @@ function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.no
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.json();
     }
-    async function refreshRegion(region) {
+    async function refreshRegion(region, generation = runGeneration) {
+        const requestSequence = (requestSequences.get(region.id) ?? 0) + 1;
+        requestSequences.set(region.id, requestSequence);
         try {
             const body = await fetchOneRegion(region);
+            if (generation !== runGeneration
+                || requestSequences.get(region.id) !== requestSequence) return;
             perRegion.set(region.id, {
                 sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
                 maxSessions: body.maxSessions ?? 6,
@@ -54,6 +60,8 @@ function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.no
                 lastError: null,
             });
         } catch (err) {
+            if (generation !== runGeneration
+                || requestSequences.get(region.id) !== requestSequence) return;
             const prev = perRegion.get(region.id) ?? {};
             perRegion.set(region.id, {
                 ...prev,
@@ -62,17 +70,21 @@ function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.no
                 lastError: err && err.message,
             });
         }
-        applyMerged();
+        if (generation === runGeneration
+            && requestSequences.get(region.id) === requestSequence) {
+            applyMerged();
+        }
     }
     function requestRefresh(region, immediate = false) {
-        if (immediate) { refreshRegion(region); return; }
+        if (immediate) return refreshRegion(region, runGeneration);
         const existing = pendingRefetch.get(region.id);
         if (existing) clearTimeout(existing);
         const handle = setTimeout(() => {
             pendingRefetch.delete(region.id);
-            refreshRegion(region);
+            refreshRegion(region, runGeneration);
         }, COALESCE_MS);
         pendingRefetch.set(region.id, handle);
+        return Promise.resolve();
     }
     function applyMerged() {
         const sessions = [];
@@ -88,12 +100,15 @@ function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.no
     }
     async function start(regions) {
         stop();
-        await Promise.all(regions.map(r => refreshRegion(r)));
+        const generation = ++runGeneration;
+        await Promise.all(regions.map(r => refreshRegion(r, generation)));
+        if (generation !== runGeneration) return;
         backgroundPollHandle = setInterval(() => {
             regions.forEach(r => requestRefresh(r));
         }, POLL_INTERVAL_MS);
     }
     function stop() {
+        runGeneration++;
         if (backgroundPollHandle) { clearInterval(backgroundPollHandle); backgroundPollHandle = null; }
         for (const t of pendingRefetch.values()) clearTimeout(t);
         pendingRefetch.clear();
@@ -185,6 +200,37 @@ describe('MultiRegionSessions push coalescing', () => {
         await new Promise(r => setTimeout(r, 10));
         assert.equal(fetchCount, 1,
             'immediate=true bypasses coalesce — used for explicit Refresh / Leave / Join paths that need synchronous freshness');
+        mrs.stop();
+    });
+
+    test('an older response cannot overwrite a newer refresh', async () => {
+        const responses = [];
+        const fetch = () => new Promise(resolve => responses.push(resolve));
+        const updates = [];
+        const mrs = makeMultiRegionSessions({
+            updateSessionList: result => updates.push(result),
+            fetch
+        });
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+
+        const older = mrs.requestRefresh(region, true);
+        const newer = mrs.requestRefresh(region, true);
+        responses[1](fakeOk({
+            sessions: [session('new', 'r1')],
+            maxSessions: 6,
+            canCreateSession: true
+        }));
+        await newer;
+        responses[0](fakeOk({
+            sessions: [session('old', 'r1')],
+            maxSessions: 6,
+            canCreateSession: true
+        }));
+        await older;
+
+        assert.deepEqual(
+            updates.at(-1).sessions.map(value => value.id),
+            ['new']);
         mrs.stop();
     });
 });

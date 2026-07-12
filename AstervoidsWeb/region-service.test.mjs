@@ -448,6 +448,113 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
         }
     });
 
+    test('an older concurrent load cannot overwrite a newer manifest', async () => {
+        const originalFetch = globalThis.fetch;
+        let resolveFirst;
+        let requestCount = 0;
+        globalThis.fetch = async () => {
+            requestCount++;
+            const body = requestCount === 1
+                ? await new Promise(resolve => { resolveFirst = resolve; })
+                : {
+                    regionId: 'new',
+                    regions: [{
+                        id: 'new',
+                        displayName: 'New',
+                        hostname: 'https://new.example.com'
+                    }]
+                };
+            return {
+                ok: true,
+                status: 200,
+                json: async () => body,
+            };
+        };
+
+        try {
+            const older = RegionService.load();
+            await Promise.resolve();
+            const newer = RegionService.load();
+            await newer;
+            resolveFirst({
+                regionId: 'old',
+                regions: [{
+                    id: 'old',
+                    displayName: 'Old',
+                    hostname: 'https://old.example.com'
+                }]
+            });
+            await older;
+
+            assert.deepEqual(
+                RegionService.getRegions().map(region => region.id),
+                ['new']);
+        } finally {
+            RegionService.stop();
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    test('manifest replacement invalidates an in-flight measurement burst', async () => {
+        let releaseOldPing;
+        const oldPing = new Promise(resolve => { releaseOldPing = resolve; });
+        let pingCount = 0;
+        const restore = installFetchStub([
+            ['/api/regions', async () => ({
+                body: {
+                    regionId: 'r1',
+                    regions: [{
+                        id: 'r1',
+                        displayName: 'R1',
+                        hostname: 'https://r1.example.com'
+                    }]
+                }
+            })],
+            ['/api/ping', async () => {
+                pingCount++;
+                if (pingCount === 1) await oldPing;
+                return { body: '', delayMs: 20 };
+            }]
+        ]);
+
+        try {
+            RegionService._configure({
+                BURST_STAGGER_MAX_MS: 0,
+                BURST_INTERVAL_MS: 60_000
+            });
+            await RegionService.load();
+            const updates = [];
+            RegionService.on('rttUpdated', id => updates.push(id));
+            RegionService.start();
+            while (pingCount === 0) {
+                await new Promise(resolve => setImmediate(resolve));
+            }
+
+            await RegionService.load({
+                bootstrap: {
+                    regionId: 'r1',
+                    regions: [{
+                        id: 'r1',
+                        displayName: 'R1 replacement',
+                        hostname: 'https://r1.example.com'
+                    }]
+                }
+            });
+            await new Promise(resolve => setTimeout(resolve, 50));
+            assert.equal(RegionService.getRtt('r1').sampleCount, 1);
+
+            releaseOldPing();
+            await new Promise(resolve => setTimeout(resolve, 50));
+            assert.equal(RegionService.getRtt('r1').sampleCount, 1,
+                'the old burst must not overwrite the replacement manifest measurement');
+            assert.deepEqual(updates, ['r1']);
+        } finally {
+            RegionService.stop();
+            releaseOldPing();
+            restore();
+        }
+    });
+
     test('empty regions manifest synthesizes a self-pointing entry from window.location.origin', async () => {
         // Single-region prod + branch deploys serve /api/regions with an
         // empty regions array (default RegionSettings.Regions=[]). Without
