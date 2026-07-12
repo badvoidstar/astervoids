@@ -159,21 +159,6 @@ public class SessionHubTests
     }
 
     [Fact]
-    public async Task LegacyJoin_DoesNotHonorUnauthenticatedEviction()
-    {
-        var createResult = _sessionService.CreateSession("connection-old");
-        var session = createResult.Session!;
-        var oldMember = createResult.Creator!;
-        var hub = CreateHub("connection-new");
-
-        var response = await hub.JoinSession(session.Id, oldMember.Id);
-
-        response.Should().NotBeNull();
-        session.Members.Should().ContainKey(oldMember.Id);
-        session.Members.Should().HaveCount(2);
-    }
-
-    [Fact]
     public async Task CreateSession_GroupRegistrationFailure_RollsBackMembership()
     {
         var groups = new Mock<IGroupManager>();

@@ -202,13 +202,10 @@ public class SessionCleanupServiceTests
 
         await cleanup.CleanupExpiredSessions();
 
-        notifications.Should().HaveCount(2);
-        notifications[0].Method.Should().Be("OnSessionExpiredV2");
+        notifications.Should().ContainSingle();
+        notifications[0].Method.Should().Be("OnSessionExpired");
         notifications[0].Args.Should().Equal(
             session.Id,
-            "Session exceeded maximum duration");
-        notifications[1].Method.Should().Be("OnSessionExpired");
-        notifications[1].Args.Should().Equal(
             "Session exceeded maximum duration");
     }
 }

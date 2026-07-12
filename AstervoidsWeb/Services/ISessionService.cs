@@ -23,18 +23,26 @@ public interface ISessionService
     /// </summary>
     /// <param name="sessionId">The session to join.</param>
     /// <param name="connectionId">SignalR connection ID of the joining member.</param>
-    /// <param name="evictMemberId">Optional stale member ID for reconnection.</param>
+    /// <returns>Result indicating success/failure with session and member if successful.</returns>
+    JoinSessionResult JoinSession(Guid sessionId, string connectionId);
+
+    /// <summary>
+    /// Rejoins an existing session by replacing a stale member identity.
+    /// </summary>
+    /// <param name="sessionId">The session to rejoin.</param>
+    /// <param name="connectionId">SignalR connection ID of the rejoining member.</param>
+    /// <param name="staleMemberId">Stale member identity to replace.</param>
     /// <param name="reconnectToken">
-    /// Secret credential issued with <paramref name="evictMemberId"/>. A live member is
+    /// Secret credential issued with <paramref name="staleMemberId"/>. A live member is
     /// evicted only when this token matches, preventing public member IDs from being used
     /// to disconnect another player.
     /// </param>
     /// <returns>Result indicating success/failure with session and member if successful.</returns>
-    JoinSessionResult JoinSession(
+    JoinSessionResult RejoinSession(
         Guid sessionId,
         string connectionId,
-        Guid? evictMemberId = null,
-        string? reconnectToken = null);
+        Guid staleMemberId,
+        string reconnectToken);
 
     /// <summary>
     /// Removes a member from their session, performs server promotion if needed, and

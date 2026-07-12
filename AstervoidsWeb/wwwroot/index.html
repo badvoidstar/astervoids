@@ -9657,10 +9657,6 @@
                 ObjectSync.on('onReconciliationFailed', () => {
                     _warn('[Session] Reconciliation failed — server no longer recognizes this connection. Triggering full rejoin.');
                     const lostSessionId = sessionPicker.currentSessionId || SessionClient.getLastSessionId();
-                    // Capture the old memberId BEFORE clearSessionState wipes it.
-                    // Required for the server-side eviction path during rejoin.
-                    const oldMemberId = SessionClient.getCurrentMember()?.id
-                        ?? game.sessionInfo?.memberId ?? null;
                     if (lostSessionId) {
                         // Re-freeze gameplay: onConnected may have unfrozen the game,
                         // but the session is broken. Keep the player frozen until rejoin.
@@ -9670,7 +9666,7 @@
                         }
                         // Clear stale session state so SessionClient knows we're not in a session
                         SessionClient.clearSessionState();
-                        attemptAutoRejoin(lostSessionId, oldMemberId);
+                        attemptAutoRejoin(lostSessionId);
                     } else {
                         returnToStartScreen('Session lost during reconnection');
                     }
@@ -10176,18 +10172,13 @@
     // (mobile background), network ops would fail. Save the info and let
     // visibilitychange trigger the rejoin when the tab becomes visible.
     let pendingRejoinSessionId = null;
-    let pendingRejoinMemberId = null;
 
     /**
      * Attempt to reconnect and rejoin a session after an unexpected disconnect.
      * Used when mobile browsers kill WebSocket connections during background suspension.
      * @param {string} sessionId - The session ID to rejoin
-     * @param {string|null} oldMemberId - Old member ID to evict server-side if the server
-     *   hasn't detected the dead connection yet. MUST be captured by the caller before
-     *   game.sessionInfo is cleared, otherwise the eviction path is silently skipped and
-     *   the session can appear "full" of our own ghost member.
      */
-    async function attemptAutoRejoin(sessionId, oldMemberId = null) {
+    async function attemptAutoRejoin(sessionId) {
         if (rejoinInProgress || leavingSession) {
             _log('[Rejoin] Skipped — rejoinInProgress:', rejoinInProgress, 'leavingSession:', leavingSession);
             return;
@@ -10198,12 +10189,11 @@
         // the tab. Defer until the tab becomes visible.
         if (document.hidden) {
             pendingRejoinSessionId = sessionId;
-            pendingRejoinMemberId = oldMemberId ?? game.sessionInfo?.memberId ?? null;
             _log('[Rejoin] Deferred — tab hidden. Session:', sessionId);
             return;
         }
 
-        _log('[Rejoin] Starting. Session:', sessionId, 'OldMember:', oldMemberId,
+        _log('[Rejoin] Starting. Session:', sessionId,
             'game.state:', game.state, 'game.mode:', game.mode);
         rejoinInProgress = true;
         // Suspend reconciliation during the rejoin window. Any visibilitychange or
@@ -10212,11 +10202,6 @@
         // freshly applied objects as ghosts.
         ObjectSync.suspendReconciliation();
         const wasPlaying = game.state === 'playing' || game.state === 'waveDelay';
-        // Fall back to game.sessionInfo only if caller didn't supply oldMemberId
-        // (preserves backwards compatibility but is unsafe — see onDisconnected).
-        if (oldMemberId == null) {
-            oldMemberId = game.sessionInfo?.memberId ?? null;
-        }
         const reconnectHubHostname =
             SessionClient.getReconnectHubHostname?.()
             ?? SessionClient.getCurrentHubHostname?.()
@@ -10263,9 +10248,9 @@
                     // visible objects (and the authority would re-spawn duplicates).
                     resetMultiplayerState();
 
-                    // Try to rejoin the same session, evicting the stale old member
+                    // SessionClient proves ownership using its stored reconnect identity.
                     setPickerStatus(`Reconnecting... (joining session)`, 'error');
-                    const result = await SessionClient.joinSession(sessionId, oldMemberId);
+                    const result = await SessionClient.joinSession(sessionId);
                     if (result) {
                         // Record pre-existing object ids so re-adopted orphans
                         // aren't spawn-projected on rejoin.
@@ -10378,13 +10363,7 @@
         // the session we're leaving, producing ghost membership.
         if (leavingSession) return;
 
-        // Capture both the lost session id AND the old member id BEFORE clearing
-        // any session refs. attemptAutoRejoin reads game.sessionInfo lazily inside
-        // an async function — by the time it runs, sessionInfo could be null
-        // (e.g. concurrent returnToStartScreen), causing the eviction path to be
-        // skipped and the rejoin to fail with "Session is full" on our own ghost.
         const lostSessionId = sessionPicker.currentSessionId;
-        const oldMemberId = game.sessionInfo?.memberId ?? null;
         sessionPicker.currentSessionId = null;
         sessionPicker.isServer = false;
         sessionPicker.gameStarted = false;
@@ -10400,7 +10379,7 @@
 
         if (lostSessionId) {
             // Lost connection while in a session — attempt auto-rejoin
-            attemptAutoRejoin(lostSessionId, oldMemberId);
+            attemptAutoRejoin(lostSessionId);
         } else if (game.state !== 'start') {
             returnToStartScreen('Disconnected from server');
         } else {
@@ -10637,12 +10616,10 @@
             if (!document.hidden && pendingRejoinSessionId && !rejoinInProgress) {
                 _log('[Visibility] Triggering deferred rejoin. Session:', pendingRejoinSessionId);
                 const sid = pendingRejoinSessionId;
-                const mid = pendingRejoinMemberId;
                 pendingRejoinSessionId = null;
-                pendingRejoinMemberId = null;
                 game.connectionLost = true;
                 reconnectingOverlay.classList.add('visible');
-                attemptAutoRejoin(sid, mid);
+                attemptAutoRejoin(sid);
             }
 
             if (!document.hidden && isSessionMode() && (game.state === 'playing' || game.state === 'waveDelay')) {
@@ -10650,15 +10627,13 @@
                 if (hiddenDurationMs > 5000 && !rejoinInProgress) {
                     _log('[Visibility] Long background (' + hiddenDurationMs + 'ms). Triggering direct rejoin.');
                     // Long background — connection is almost certainly dead.
-                    // Capture session info before anything clears it, then
-                    // force a fresh connection + rejoin immediately.
+                    // Capture the session id before anything clears it, then force
+                    // a fresh connection + authenticated rejoin immediately.
                     const savedSessionId = sessionPicker.currentSessionId || SessionClient.getLastSessionId();
-                    const oldMemberId = SessionClient.getCurrentMember()?.id
-                        ?? game.sessionInfo?.memberId ?? null;
                     if (savedSessionId) {
                         game.connectionLost = true;
                         reconnectingOverlay.classList.add('visible');
-                        attemptAutoRejoin(savedSessionId, oldMemberId);
+                        attemptAutoRejoin(savedSessionId);
                     }
                 } else if (SessionClient.isConnected() && !rejoinInProgress) {
                     ObjectSync.triggerReconciliation();

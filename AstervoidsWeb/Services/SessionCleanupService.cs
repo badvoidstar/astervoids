@@ -147,9 +147,7 @@ public class SessionCleanupService : BackgroundService
                         try
                         {
                             await _hubContext.Clients.Client(connectionId)
-                                .SendAsync("OnSessionExpiredV2", session.Id, reason);
-                            await _hubContext.Clients.Client(connectionId)
-                                .SendAsync("OnSessionExpired", reason);
+                                .SendAsync("OnSessionExpired", session.Id, reason);
                             await _hubContext.Groups.RemoveFromGroupAsync(
                                 connectionId, session.Id.ToString());
                         }

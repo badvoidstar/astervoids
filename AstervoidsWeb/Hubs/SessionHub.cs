@@ -416,32 +416,17 @@ public class SessionHub : Hub
     /// Joins an existing session as a client.
     /// </summary>
     /// <param name="sessionId">The session to join.</param>
-    /// <param name="evictMemberId">
-    /// Optional member ID to evict before joining. Used during auto-rejoin after a
-    /// network drop: the old member may still be in the session because the server
-    /// hasn't detected the dead connection yet (up to ClientTimeoutInterval).
-    /// Passing the old member ID lets the server clean it up atomically before
-    /// adding the new member.
-    /// </param>
-    public Task<JoinSessionResponse?> JoinSession(
-        Guid sessionId,
-        Guid? legacyEvictMemberId = null)
-    {
-        if (legacyEvictMemberId.HasValue)
-        {
-            _logger.LogInformation(
-                "JoinSession ignored unauthenticated legacy eviction request for member {MemberId}",
-                legacyEvictMemberId.Value);
-        }
+    public Task<JoinSessionResponse?> JoinSession(Guid sessionId)
+        => JoinSessionCore(sessionId, null, null);
 
-        return JoinSessionCore(sessionId, null, null);
-    }
-
+    /// <summary>
+    /// Rejoins a session by proving ownership of a stale member identity.
+    /// </summary>
     public Task<JoinSessionResponse?> RejoinSession(
         Guid sessionId,
-        Guid evictMemberId,
+        Guid staleMemberId,
         string reconnectToken)
-        => JoinSessionCore(sessionId, evictMemberId, reconnectToken);
+        => JoinSessionCore(sessionId, staleMemberId, reconnectToken);
 
     private async Task<JoinSessionResponse?> JoinSessionCore(
         Guid sessionId,
@@ -458,8 +443,12 @@ public class SessionHub : Hub
         // is null or fails the ±2s sanity clamp.
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var result = _sessionService.JoinSession(
-            sessionId, Context.ConnectionId, evictMemberId, reconnectToken);
+        var result = evictMemberId is Guid staleMemberId
+            && reconnectToken is string token
+                ? _sessionService.RejoinSession(
+                    sessionId, Context.ConnectionId, staleMemberId, token)
+                : _sessionService.JoinSession(
+                    sessionId, Context.ConnectionId);
         if (!result.Success)
         {
             _logger.LogWarning("Failed to join session {SessionId}: {Error}", sessionId, result.ErrorMessage);

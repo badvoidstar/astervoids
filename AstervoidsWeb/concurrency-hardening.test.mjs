@@ -362,6 +362,10 @@ test('SessionClient proves reconnect ownership with the server-issued token', as
     assert.equal(
         client.getReconnectHubHostname(),
         'https://regional.example.com');
+    const freshJoinCall = connection.invokeCalls
+        .filter(call => call.method === 'JoinSession')
+        .at(-1);
+    assert.deepEqual(freshJoinCall.args, ['session']);
     client.clearSessionState();
     await client.joinSession('session');
 
@@ -386,14 +390,12 @@ test('SessionClient ignores delayed expiration for a replaced session', async ()
 
     await client.joinSession('old');
     await client.joinSession('new');
-    connection.emit('OnSessionExpiredV2', 'old', 'old expired');
-    connection.emit('OnSessionExpired', 'old expired');
+    connection.emit('OnSessionExpired', 'old', 'old expired');
 
     assert.equal(client.getCurrentSession().id, 'new');
     assert.deepEqual(expirations, []);
 
-    connection.emit('OnSessionExpiredV2', 'new', 'new expired');
-    connection.emit('OnSessionExpired', 'new expired');
+    connection.emit('OnSessionExpired', 'new', 'new expired');
     assert.equal(client.getCurrentSession(), null);
     assert.deepEqual(expirations, [{
         reason: 'new expired',
@@ -424,6 +426,22 @@ test('failed leave keeps reconnect identity available for recovery', async () =>
     assert.deepEqual(
         recovery.args,
         ['session', 'member-session', 'token-session']);
+});
+
+test('SessionClient rejects session responses without reconnect credentials', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('JoinSession', sessionId => {
+        const response = joinResponse(sessionId);
+        delete response.reconnectToken;
+        return Promise.resolve(response);
+    });
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+
+    await assert.rejects(
+        client.joinSession('session'),
+        /missing reconnectToken/);
+    assert.equal(client.getCurrentSession(), null);
 });
 
 test('join snapshot preserves object events delivered before JoinSession returns', async () => {

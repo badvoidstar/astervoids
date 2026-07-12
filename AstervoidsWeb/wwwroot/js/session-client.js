@@ -20,9 +20,8 @@ const SessionClient = (function() {
     let sessionEpoch = 0;
     let pendingSessionTransition = null;
     let sessionTransitionTail = Promise.resolve();
-    let legacyExpirationToIgnore = null;
     // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
-    // Empty string = same-origin (legacy single-region behavior). Tracked so reconnect logic
+    // Empty string = same-origin single-region behavior. Tracked so reconnect logic
     // can rebuild the connection against the correct region after a transient drop.
     let currentHubHostname = '';
 
@@ -127,10 +126,22 @@ const SessionClient = (function() {
     }
 
     function acceptsExpirationForSession(expiredSessionId) {
-        if (expiredSessionId == null) return currentSession !== null;
         if (currentSession?.id === expiredSessionId) return true;
         return pendingSessionTransition?.kind === 'join'
             && pendingSessionTransition.targetSessionId === expiredSessionId;
+    }
+
+    function reconnectIdentityFromResponse(response, sessionId, memberId) {
+        if (typeof response?.reconnectToken !== 'string'
+            || response.reconnectToken.length === 0) {
+            throw new Error('Server response is missing reconnectToken');
+        }
+        return {
+            sessionId,
+            memberId,
+            token: response.reconnectToken,
+            hubHostname: currentHubHostname
+        };
     }
 
     /**
@@ -158,7 +169,6 @@ const SessionClient = (function() {
         const thisConnectionEpoch = ++connectionEpoch;
         const stale = connection;
         connection = null;
-        legacyExpirationToIgnore = null;
         sessionTransitionTail = Promise.resolve();
         invalidateSession('connect');
 
@@ -258,7 +268,6 @@ const SessionClient = (function() {
         const stale = connection;
         connection = null;
         currentHubHostname = '';
-        legacyExpirationToIgnore = null;
         sessionTransitionTail = Promise.resolve();
         invalidateSession('disconnect', true);
 
@@ -319,7 +328,6 @@ const SessionClient = (function() {
         thisConnection.onclose(guard(error => {
             // console.log('[SessionClient] Connection closed:', error);
             connection = null;
-            legacyExpirationToIgnore = null;
             sessionTransitionTail = Promise.resolve();
             const closedConnectionEpoch = ++connectionEpoch;
             invalidateSession('connectionClosed');
@@ -434,11 +442,7 @@ const SessionClient = (function() {
             }
         }));
 
-        // Correlated expiration is sent before the legacy notification. Remember
-        // the paired reason even when the expired session is stale so the following
-        // one-argument compatibility event cannot clear a replacement session.
-        thisConnection.on('OnSessionExpiredV2', guard((expiredSessionId, reason) => {
-            legacyExpirationToIgnore = reason;
+        thisConnection.on('OnSessionExpired', guard((expiredSessionId, reason) => {
             if (!acceptsExpirationForSession(expiredSessionId)) return;
 
             const expiredSessionEpoch = invalidateSession('sessionExpired', true);
@@ -446,20 +450,6 @@ const SessionClient = (function() {
                 callbacks.onSessionExpired(reason, expiredSessionId);
             }
         }, true));
-
-        thisConnection.on('OnSessionExpired', guard((reason) => {
-            if (legacyExpirationToIgnore === reason) {
-                legacyExpirationToIgnore = null;
-                return;
-            }
-            if (!currentSession) return;
-
-            const expiredSessionId = currentSession?.id ?? null;
-            const expiredSessionEpoch = invalidateSession('sessionExpired', true);
-            if (sessionEpoch === expiredSessionEpoch && callbacks.onSessionExpired) {
-                callbacks.onSessionExpired(reason, expiredSessionId);
-            }
-        }));
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -545,16 +535,11 @@ const SessionClient = (function() {
                 objects: [],
                 metadata: response.metadata || {}
             };
+            const nextReconnectIdentity = reconnectIdentityFromResponse(
+                response, createdSession.id, createdMember.id);
             currentMember = createdMember;
             currentSession = createdSession;
-            reconnectIdentity = response.reconnectToken
-                ? {
-                    sessionId: createdSession.id,
-                    memberId: createdMember.id,
-                    token: response.reconnectToken,
-                    hubHostname: currentHubHostname
-                }
-                : null;
+            reconnectIdentity = nextReconnectIdentity;
 
             // console.log('[SessionClient] Session created:', currentSession.name);
             lastSessionId = currentSession.id;
@@ -584,22 +569,16 @@ const SessionClient = (function() {
     /**
      * Join an existing session.
      */
-    async function joinSessionCore(sessionId, evictMemberId = null) {
+    async function joinSessionCore(sessionId) {
         ensureConnected();
-        if (currentSession?.id === sessionId && evictMemberId == null) {
+        if (currentSession?.id === sessionId) {
             return { session: currentSession, member: currentMember };
         }
         if (currentSession && !await leaveSessionCore()) {
             throw new Error('Could not leave the current session before joining another.');
         }
         const reconnecting = reconnectIdentity?.sessionId === sessionId
-            && (evictMemberId == null || reconnectIdentity.memberId === evictMemberId)
             ? reconnectIdentity
-            : null;
-        const effectiveEvictMemberId = evictMemberId ?? reconnecting?.memberId ?? null;
-        const reconnectToken = reconnecting
-            && reconnecting.memberId === effectiveEvictMemberId
-            ? reconnecting.token
             : null;
         const thisSessionEpoch = beginSessionTransition('join', false, sessionId);
         const context = captureSessionContext();
@@ -608,12 +587,15 @@ const SessionClient = (function() {
         }
 
         try {
-            _log('[SessionClient] JoinSession invoking:', sessionId, 'evict:', effectiveEvictMemberId);
-            const rawResponse = reconnectToken
+            _log('[SessionClient] JoinSession invoking:', sessionId, 'rejoin:', !!reconnecting);
+            const rawResponse = reconnecting
                 ? await context.connection.invoke(
-                    'RejoinSession', sessionId, effectiveEvictMemberId, reconnectToken)
+                    'RejoinSession',
+                    sessionId,
+                    reconnecting.memberId,
+                    reconnecting.token)
                 : await context.connection.invoke(
-                    'JoinSession', sessionId, effectiveEvictMemberId);
+                    'JoinSession', sessionId);
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
@@ -648,16 +630,11 @@ const SessionClient = (function() {
                 id: response.memberId,
                 role: WireEnum.roleFromWire(response.role)
             };
+            const nextReconnectIdentity = reconnectIdentityFromResponse(
+                response, joinedSession.id, joinedMember.id);
             currentSession = joinedSession;
             currentMember = joinedMember;
-            reconnectIdentity = response.reconnectToken
-                ? {
-                    sessionId: joinedSession.id,
-                    memberId: joinedMember.id,
-                    token: response.reconnectToken,
-                    hubHostname: currentHubHostname
-                }
-                : null;
+            reconnectIdentity = nextReconnectIdentity;
 
             _log('[SessionClient] Joined session:', currentSession.name, 'as', currentMember.role);
             lastSessionId = currentSession.id;
@@ -734,9 +711,8 @@ const SessionClient = (function() {
         return serializeSessionTransition(() => createSessionCore(metadata));
     }
 
-    function joinSession(sessionId, evictMemberId = null) {
-        return serializeSessionTransition(
-            () => joinSessionCore(sessionId, evictMemberId));
+    function joinSession(sessionId) {
+        return serializeSessionTransition(() => joinSessionCore(sessionId));
     }
 
     function leaveSession() {

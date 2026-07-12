@@ -132,11 +132,22 @@ public class SessionService : ISessionService
         }
     }
 
-    public JoinSessionResult JoinSession(
+    public JoinSessionResult JoinSession(Guid sessionId, string connectionId)
+        => JoinSessionCore(sessionId, connectionId, null, null);
+
+    public JoinSessionResult RejoinSession(
         Guid sessionId,
         string connectionId,
-        Guid? evictMemberId = null,
-        string? reconnectToken = null)
+        Guid staleMemberId,
+        string reconnectToken)
+        => JoinSessionCore(
+            sessionId, connectionId, staleMemberId, reconnectToken);
+
+    private JoinSessionResult JoinSessionCore(
+        Guid sessionId,
+        string connectionId,
+        Guid? evictMemberId,
+        string? reconnectToken)
     {
         lock (_sessionLock)
         {
