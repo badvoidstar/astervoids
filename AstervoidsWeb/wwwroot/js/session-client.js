@@ -12,11 +12,16 @@ const SessionClient = (function() {
     let currentSession = null;
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
+    let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
+    let connectionEpoch = 0;
+    let sessionEpoch = 0;
+    let pendingSessionTransition = null;
+    let sessionTransitionTail = Promise.resolve();
     // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
-    // Empty string = same-origin (legacy single-region behavior). Tracked so reconnect logic
+    // Empty string = same-origin single-region behavior. Tracked so reconnect logic
     // can rebuild the connection against the correct region after a transient drop.
     let currentHubHostname = '';
 
@@ -28,6 +33,7 @@ const SessionClient = (function() {
         onSessionCreated: null,
         onSessionJoined: null,
         onSessionLeft: null,
+        onSessionTransition: null,
         onMemberJoined: null,
         onMemberLeft: null,
         onRoleChanged: null,
@@ -40,6 +46,103 @@ const SessionClient = (function() {
         onSessionExpired: null,
         onError: null
     };
+
+    function notifySessionTransition(kind, epoch) {
+        if (callbacks.onSessionTransition) {
+            callbacks.onSessionTransition(kind, epoch);
+        }
+    }
+
+    function serializeSessionTransition(operation) {
+        const current = sessionTransitionTail
+            .catch(() => {})
+            .then(operation);
+        sessionTransitionTail = current.catch(() => {});
+        return current;
+    }
+
+    function beginSessionTransition(kind, clearLastSession = false, targetSessionId = null) {
+        const epoch = ++sessionEpoch;
+        pendingSessionTransition = { kind, epoch, targetSessionId };
+        currentSession = null;
+        currentMember = null;
+        if (clearLastSession) {
+            lastSessionId = null;
+            reconnectIdentity = null;
+        }
+        notifySessionTransition(kind, epoch);
+        return epoch;
+    }
+
+    function finishSessionTransition(epoch) {
+        if (pendingSessionTransition?.epoch === epoch) {
+            pendingSessionTransition = null;
+        }
+    }
+
+    function invalidateSession(kind, clearLastSession = false) {
+        const epoch = ++sessionEpoch;
+        pendingSessionTransition = null;
+        currentSession = null;
+        currentMember = null;
+        if (clearLastSession) {
+            lastSessionId = null;
+            reconnectIdentity = null;
+        }
+        notifySessionTransition(kind, epoch);
+        return epoch;
+    }
+
+    function captureConnectionContext() {
+        return { connection, connectionEpoch };
+    }
+
+    function isConnectionContextCurrent(context) {
+        return connection === context.connection
+            && connectionEpoch === context.connectionEpoch;
+    }
+
+    function captureSessionContext() {
+        return { connection, connectionEpoch, sessionEpoch };
+    }
+
+    function isSessionContextCurrent(context) {
+        return isConnectionContextCurrent(context)
+            && sessionEpoch === context.sessionEpoch;
+    }
+
+    function staleOperationError() {
+        const error = new Error('Operation superseded by a newer connection or session transition');
+        error.name = 'StaleOperationError';
+        return error;
+    }
+
+    function acceptsSessionEvents() {
+        if (pendingSessionTransition) {
+            return pendingSessionTransition.kind === 'create'
+                || pendingSessionTransition.kind === 'join';
+        }
+        return currentSession !== null;
+    }
+
+    function acceptsExpirationForSession(expiredSessionId) {
+        if (currentSession?.id === expiredSessionId) return true;
+        return pendingSessionTransition?.kind === 'join'
+            && pendingSessionTransition.targetSessionId === expiredSessionId;
+    }
+
+    function reconnectIdentityFromResponse(response, sessionId, memberId) {
+        if (typeof response?.reconnectToken !== 'string'
+            || response.reconnectToken.length === 0) {
+            throw new Error('Server response is missing reconnectToken');
+        }
+        return {
+            sessionId,
+            memberId,
+            token: response.reconnectToken,
+            hubHostname: currentHubHostname
+        };
+    }
 
     /**
      * Initialize the SignalR connection.
@@ -63,6 +166,12 @@ const SessionClient = (function() {
             return true;
         }
 
+        const thisConnectionEpoch = ++connectionEpoch;
+        const stale = connection;
+        connection = null;
+        sessionTransitionTail = Promise.resolve();
+        invalidateSession('connect');
+
         // Stop any existing connection to prevent stale event handlers from
         // firing after we create a new connection. On mobile, the OS kills
         // WebSocket connections when backgrounded. Without this cleanup, the
@@ -71,37 +180,39 @@ const SessionClient = (function() {
         //
         // The connection = null before stale.stop() is intentional: it ensures
         // any synchronously-fired onclose from stop() sees connection !== thisConnection
-        // and skips. The null window between here and line where the new connection is
-        // assigned is safe because JavaScript is single-threaded — no other code can
-        // access `connection` until we yield at await connection.start() below, by
-        // which point `connection` is already set to the new connection.
+        // and skips. The connection epoch makes the async stop window safe: a newer
+        // connect/disconnect supersedes this transition before it can install or
+        // publish a replacement connection.
         //
         // IMPORTANT: await stop() to ensure the old WebSocket is fully closed before
         // starting a new one. On mobile browsers with limited resources, starting a
         // new WebSocket while the old one is still closing can fail.
-        if (connection) {
-            const stale = connection;
-            connection = null; // Clear reference so stale handlers are ignored
-            // Also clear stale session state — the old connection's onclose handler
-            // is guarded (won't fire), so currentSession/currentMember would remain
-            // stale. This prevents the onConnected callback from seeing isInSession()
-            // as true when we're actually between sessions during a force-reconnect.
-            currentSession = null;
-            currentMember = null;
+        if (stale) {
+            let timeoutHandle = null;
             try {
                 // Race against a 3s timeout to prevent hanging on dead connections
                 await Promise.race([
                     stale.stop(),
-                    new Promise(r => setTimeout(r, 3000))
+                    new Promise(r => {
+                        timeoutHandle = setTimeout(r, 3000);
+                    })
                 ]);
             } catch (e) { /* ignore */ }
+            finally {
+                if (timeoutHandle != null) clearTimeout(timeoutHandle);
+            }
         }
 
+        if (connectionEpoch !== thisConnectionEpoch || connection !== null) {
+            return false;
+        }
+
+        let nextConnection = null;
         try {
             const hubUrl = targetHostname
                 ? `${targetHostname.replace(/\/$/, '')}/sessionHub`
                 : '/sessionHub';
-            connection = new signalR.HubConnectionBuilder()
+            nextConnection = new signalR.HubConnectionBuilder()
                 .withUrl(hubUrl)
                 .withHubProtocol(new signalR.protocols.msgpack.MessagePackHubProtocol())
                 .withAutomaticReconnect({
@@ -114,16 +225,20 @@ const SessionClient = (function() {
                 })
                 .configureLogging(signalR.LogLevel.Information)
                 .build();
+            connection = nextConnection;
             currentHubHostname = targetHostname;
 
             // Register event handlers
-            setupEventHandlers();
+            setupEventHandlers(nextConnection, thisConnectionEpoch);
 
             // Match server-side timeouts: ClientTimeoutInterval=20s, KeepAliveInterval=10s.
-            connection.serverTimeoutInMilliseconds = 20000;
-            connection.keepAliveIntervalInMilliseconds = 10000;
+            nextConnection.serverTimeoutInMilliseconds = 20000;
+            nextConnection.keepAliveIntervalInMilliseconds = 10000;
 
-            await connection.start();
+            await nextConnection.start();
+            if (connectionEpoch !== thisConnectionEpoch || connection !== nextConnection) {
+                return false;
+            }
             _log('[SessionClient] Connected to session hub');
             reconnectAttempts = 0;
 
@@ -131,8 +246,12 @@ const SessionClient = (function() {
                 callbacks.onConnected();
             }
 
-            return true;
+            return connectionEpoch === thisConnectionEpoch && connection === nextConnection;
         } catch (err) {
+            if (connectionEpoch !== thisConnectionEpoch || connection !== nextConnection) {
+                return false;
+            }
+            connection = null;
             _error('[SessionClient] Connection failed:', err);
             if (callbacks.onError) {
                 callbacks.onError('Connection failed: ' + err.message);
@@ -145,17 +264,24 @@ const SessionClient = (function() {
      * Disconnect from the SignalR hub.
      */
     async function disconnect() {
-        if (connection) {
-            try {
-                await connection.stop();
+        const thisConnectionEpoch = ++connectionEpoch;
+        const stale = connection;
+        connection = null;
+        currentHubHostname = '';
+        sessionTransitionTail = Promise.resolve();
+        invalidateSession('disconnect', true);
+
+        if (!stale) return;
+
+        try {
+            await stale.stop();
+            if (connectionEpoch === thisConnectionEpoch) {
                 // console.log('[SessionClient] Disconnected');
-            } catch (err) {
+            }
+        } catch (err) {
+            if (connectionEpoch === thisConnectionEpoch) {
                 _error('[SessionClient] Disconnect error:', err);
             }
-            connection = null;
-            currentSession = null;
-            currentMember = null;
-            lastSessionId = null; // Intentional disconnect
         }
     }
 
@@ -166,13 +292,14 @@ const SessionClient = (function() {
      * old connection's handlers are silently ignored instead of trashing
      * the newly restored session state.
      */
-    function setupEventHandlers() {
-        const thisConnection = connection;
+    function setupEventHandlers(thisConnection, thisConnectionEpoch) {
 
         // Guard wrapper: skips handler if connection was replaced (stale handler from mobile background disconnect)
         // Also transforms binary GUIDs (16-byte Uint8Array) to strings in all arguments
-        const guard = (fn) => (...args) => {
-            if (connection === thisConnection) {
+        const guard = (fn, sessionScoped = false) => (...args) => {
+            if (connection === thisConnection
+                && connectionEpoch === thisConnectionEpoch
+                && (!sessionScoped || acceptsSessionEvents())) {
                 for (let i = 0; i < args.length; i++) {
                     args[i] = GuidUtils.transformBinaryGuids(args[i]);
                 }
@@ -180,14 +307,14 @@ const SessionClient = (function() {
             }
         };
 
-        connection.onreconnecting(guard(error => {
+        thisConnection.onreconnecting(guard(error => {
             // console.log('[SessionClient] Reconnecting...', error);
             if (callbacks.onReconnecting) {
                 callbacks.onReconnecting(error);
             }
         }));
 
-        connection.onreconnected(guard(connectionId => {
+        thisConnection.onreconnected(guard(connectionId => {
             // console.log('[SessionClient] Reconnected:', connectionId);
             reconnectAttempts = 0;
             // Reconcile state — invoke responses for Create/Delete/Update may have been
@@ -198,19 +325,23 @@ const SessionClient = (function() {
             }
         }));
 
-        connection.onclose(guard(error => {
+        thisConnection.onclose(guard(error => {
             // console.log('[SessionClient] Connection closed:', error);
-            currentSession = null;
-            currentMember = null;
+            connection = null;
+            sessionTransitionTail = Promise.resolve();
+            const closedConnectionEpoch = ++connectionEpoch;
+            invalidateSession('connectionClosed');
             // Note: lastSessionId is intentionally NOT cleared here.
             // It is preserved so the game can attempt auto-rejoin after reconnecting.
-            if (callbacks.onDisconnected) {
+            if (connectionEpoch === closedConnectionEpoch
+                && connection === null
+                && callbacks.onDisconnected) {
                 callbacks.onDisconnected(error);
             }
         }));
 
         // Session events
-        connection.on('OnMemberJoined', guard((memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
+        thisConnection.on('OnMemberJoined', guard((memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
             // console.log('[SessionClient] Member joined:', memberInfo);
             WireEnum.translateMember(memberInfo);
             // Add member to local session state
@@ -220,9 +351,9 @@ const SessionClient = (function() {
             if (callbacks.onMemberJoined) {
                 callbacks.onMemberJoined(memberInfo, senderMemberId, memberSequence);
             }
-        }));
+        }, true));
 
-        connection.on('OnMemberLeft', guard((info, senderMemberId, memberSequence, serverTimestamp) => {
+        thisConnection.on('OnMemberLeft', guard((info, senderMemberId, memberSequence, serverTimestamp) => {
             // console.log('[SessionClient] Member left:', info);
             if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
 
@@ -251,7 +382,7 @@ const SessionClient = (function() {
                     callbacks.onRoleChanged(info.promotedRole);
                 }
             }
-        }));
+        }, true));
 
         // Object events
         // ValidAt is now a single batch-level trailing argument on each broadcast
@@ -259,30 +390,30 @@ const SessionClient = (function() {
         // time after server validation). Snapshot DTOs (JoinSessionResponse,
         // SessionStateSnapshot) carry a parallel validAts dictionary keyed by
         // objectId so each pre-existing object keeps its own age.
-        connection.on('OnObjectCreated', guard((objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+        thisConnection.on('OnObjectCreated', guard((objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
             WireEnum.translateObject(objectInfo);
             SyncPayload.unwrapObjectData(objectInfo);
             if (callbacks.onObjectCreated) {
                 callbacks.onObjectCreated(objectInfo, senderMemberId, memberSequence, validAt);
             }
-        }));
+        }, true));
 
-        connection.on('OnObjectsUpdated', guard((objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
+        thisConnection.on('OnObjectsUpdated', guard((objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
             if (Array.isArray(objects)) {
                 for (const u of objects) SyncPayload.unwrapObjectData(u);
             }
             if (callbacks.onObjectsUpdated) {
                 callbacks.onObjectsUpdated(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs, validAt);
             }
-        }));
+        }, true));
 
-        connection.on('OnObjectDeleted', guard((objectId, senderMemberId, memberSequence, serverTimestamp) => {
+        thisConnection.on('OnObjectDeleted', guard((objectId, senderMemberId, memberSequence, serverTimestamp) => {
             if (callbacks.onObjectDeleted) {
                 callbacks.onObjectDeleted(objectId, senderMemberId, memberSequence);
             }
-        }));
+        }, true));
 
-        connection.on('OnObjectReplaced', guard((event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+        thisConnection.on('OnObjectReplaced', guard((event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
             if (event && Array.isArray(event.createdObjects)) {
                 for (const o of event.createdObjects) {
                     WireEnum.translateObject(o);
@@ -292,34 +423,33 @@ const SessionClient = (function() {
             if (callbacks.onObjectReplaced) {
                 callbacks.onObjectReplaced(event, senderMemberId, memberSequence, validAt);
             }
-        }));
+        }, true));
 
         // Generic per-object event channel (Phase 2.1).
         // Server is a relay — eventInfo.payload is opaque (game-defined dict).
         // ObjectSync dispatches to game-registered handlers by eventKind byte.
-        connection.on('OnObjectEvent', guard((eventInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+        thisConnection.on('OnObjectEvent', guard((eventInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
             if (callbacks.onObjectEvent) {
                 callbacks.onObjectEvent(eventInfo, senderMemberId, memberSequence, validAt);
             }
-        }));
+        }, true));
 
         // Session list changed (signal only - fetch data separately)
-        connection.on('OnSessionsChanged', guard(() => {
+        thisConnection.on('OnSessionsChanged', guard(() => {
             // console.log('[SessionClient] Sessions changed signal received');
             if (callbacks.onSessionsChanged) {
                 callbacks.onSessionsChanged();
             }
         }));
 
-        // Session expired (server-side timeout)
-        connection.on('OnSessionExpired', guard((reason) => {
-            currentSession = null;
-            currentMember = null;
-            lastSessionId = null; // Can't auto-rejoin an expired session
-            if (callbacks.onSessionExpired) {
-                callbacks.onSessionExpired(reason);
+        thisConnection.on('OnSessionExpired', guard((expiredSessionId, reason) => {
+            if (!acceptsExpirationForSession(expiredSessionId)) return;
+
+            const expiredSessionEpoch = invalidateSession('sessionExpired', true);
+            if (sessionEpoch === expiredSessionEpoch && callbacks.onSessionExpired) {
+                callbacks.onSessionExpired(reason, expiredSessionId);
             }
-        }));
+        }, true));
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -350,10 +480,17 @@ const SessionClient = (function() {
      */
     async function invokeHub(method, ...args) {
         ensureInSession();
+        const context = captureSessionContext();
         try {
-            const result = await connection.invoke(method, ...args);
+            const result = await context.connection.invoke(method, ...args);
+            if (!isSessionContextCurrent(context)) {
+                throw staleOperationError();
+            }
             return GuidUtils.transformBinaryGuids(result);
         } catch (err) {
+            if (!isSessionContextCurrent(context) || err?.name === 'StaleOperationError') {
+                throw staleOperationError();
+            }
             _error(`[SessionClient] ${method} failed:`, err);
             throw err;
         }
@@ -363,38 +500,64 @@ const SessionClient = (function() {
      * Create a new session.
      * @param {object} [metadata] - Optional key-value metadata for the session (e.g. { aspectRatio: 1.78 }).
      */
-    async function createSession(metadata) {
+    async function createSessionCore(metadata) {
         ensureConnected();
+        if (currentSession && !await leaveSessionCore()) {
+            throw new Error('Could not leave the current session before creating another.');
+        }
+        const thisSessionEpoch = beginSessionTransition('create');
+        const context = captureSessionContext();
+        if (context.sessionEpoch !== thisSessionEpoch || !isSessionContextCurrent(context)) {
+            return null;
+        }
 
         try {
-            const response = GuidUtils.transformBinaryGuids(await connection.invoke('CreateSession', metadata || null));
+            const rawResponse = await context.connection.invoke('CreateSession', metadata || null);
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            const response = GuidUtils.transformBinaryGuids(rawResponse);
             if (!response) {
                 // console.log('[SessionClient] CreateSession failed - server at capacity');
+                finishSessionTransition(thisSessionEpoch);
                 return null;
             }
 
-            currentMember = {
+            const createdMember = {
                 id: response.memberId,
                 role: WireEnum.roleFromWire(response.role),
                 joinedAt: new Date().toISOString()
             };
-            currentSession = {
+            const createdSession = {
                 id: response.sessionId,
                 name: response.sessionName,
-                members: [currentMember],
+                members: [createdMember],
                 objects: [],
                 metadata: response.metadata || {}
             };
+            const nextReconnectIdentity = reconnectIdentityFromResponse(
+                response, createdSession.id, createdMember.id);
+            currentMember = createdMember;
+            currentSession = createdSession;
+            reconnectIdentity = nextReconnectIdentity;
 
             // console.log('[SessionClient] Session created:', currentSession.name);
             lastSessionId = currentSession.id;
+            finishSessionTransition(thisSessionEpoch);
 
             if (callbacks.onSessionCreated) {
                 callbacks.onSessionCreated(currentSession, currentMember);
             }
 
-            return { session: currentSession, member: currentMember };
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            return { session: createdSession, member: createdMember };
         } catch (err) {
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            finishSessionTransition(thisSessionEpoch);
             _error('[SessionClient] Create session failed:', err);
             if (callbacks.onError) {
                 callbacks.onError('Failed to create session: ' + err.message);
@@ -406,14 +569,40 @@ const SessionClient = (function() {
     /**
      * Join an existing session.
      */
-    async function joinSession(sessionId, evictMemberId = null) {
+    async function joinSessionCore(sessionId) {
         ensureConnected();
+        if (currentSession?.id === sessionId) {
+            return { session: currentSession, member: currentMember };
+        }
+        if (currentSession && !await leaveSessionCore()) {
+            throw new Error('Could not leave the current session before joining another.');
+        }
+        const reconnecting = reconnectIdentity?.sessionId === sessionId
+            ? reconnectIdentity
+            : null;
+        const thisSessionEpoch = beginSessionTransition('join', false, sessionId);
+        const context = captureSessionContext();
+        if (context.sessionEpoch !== thisSessionEpoch || !isSessionContextCurrent(context)) {
+            return null;
+        }
 
         try {
-            _log('[SessionClient] JoinSession invoking:', sessionId, 'evict:', evictMemberId);
-            const response = GuidUtils.transformBinaryGuids(await connection.invoke('JoinSession', sessionId, evictMemberId));
+            _log('[SessionClient] JoinSession invoking:', sessionId, 'rejoin:', !!reconnecting);
+            const rawResponse = reconnecting
+                ? await context.connection.invoke(
+                    'RejoinSession',
+                    sessionId,
+                    reconnecting.memberId,
+                    reconnecting.token)
+                : await context.connection.invoke(
+                    'JoinSession', sessionId);
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            const response = GuidUtils.transformBinaryGuids(rawResponse);
             if (!response) {
                 _warn('[SessionClient] JoinSession returned null — session not found, full, or rejected');
+                finishSessionTransition(thisSessionEpoch);
                 return null;
             }
 
@@ -429,7 +618,7 @@ const SessionClient = (function() {
                 }
             }
 
-            currentSession = {
+            const joinedSession = {
                 id: response.sessionId,
                 name: response.sessionName,
                 members: response.members,
@@ -437,20 +626,33 @@ const SessionClient = (function() {
                 validAts: WireEnum.pairsToObject(response.validAts),
                 metadata: response.metadata || {}
             };
-            currentMember = {
+            const joinedMember = {
                 id: response.memberId,
                 role: WireEnum.roleFromWire(response.role)
             };
+            const nextReconnectIdentity = reconnectIdentityFromResponse(
+                response, joinedSession.id, joinedMember.id);
+            currentSession = joinedSession;
+            currentMember = joinedMember;
+            reconnectIdentity = nextReconnectIdentity;
 
             _log('[SessionClient] Joined session:', currentSession.name, 'as', currentMember.role);
             lastSessionId = currentSession.id;
+            finishSessionTransition(thisSessionEpoch);
 
             if (callbacks.onSessionJoined) {
                 callbacks.onSessionJoined(currentSession, currentMember);
             }
 
-            return { session: currentSession, member: currentMember };
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            return { session: joinedSession, member: joinedMember };
         } catch (err) {
+            if (!isSessionContextCurrent(context)) {
+                return null;
+            }
+            finishSessionTransition(thisSessionEpoch);
             _error('[SessionClient] Join session failed:', err);
             if (callbacks.onError) {
                 callbacks.onError('Failed to join session: ' + err.message);
@@ -462,26 +664,59 @@ const SessionClient = (function() {
     /**
      * Leave the current session.
      */
-    async function leaveSession() {
+    async function leaveSessionCore() {
         if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
-            return;
+            return false;
+        }
+
+        const leftSession = currentSession;
+        if (!leftSession) return true;
+
+        const thisSessionEpoch = ++sessionEpoch;
+        pendingSessionTransition = {
+            kind: 'leave',
+            epoch: thisSessionEpoch,
+            targetSessionId: leftSession.id
+        };
+        const context = captureSessionContext();
+        if (context.sessionEpoch !== thisSessionEpoch || !isSessionContextCurrent(context)) {
+            return false;
         }
 
         try {
-            await connection.invoke('LeaveSession');
-            const leftSession = currentSession;
-            currentSession = null;
-            currentMember = null;
-            lastSessionId = null; // Intentional leave
+            await context.connection.invoke('LeaveSession');
+            if (!isSessionContextCurrent(context)) {
+                return false;
+            }
+            invalidateSession('leave', true);
 
             // console.log('[SessionClient] Left session');
 
             if (callbacks.onSessionLeft) {
                 callbacks.onSessionLeft(leftSession);
             }
+            return true;
         } catch (err) {
+            if (!isSessionContextCurrent(context)) {
+                return false;
+            }
+            finishSessionTransition(thisSessionEpoch);
+            ObjectSync.triggerReconciliation();
             _error('[SessionClient] Leave session failed:', err);
+            return false;
         }
+    }
+
+    function createSession(metadata) {
+        return serializeSessionTransition(() => createSessionCore(metadata));
+    }
+
+    function joinSession(sessionId) {
+        return serializeSessionTransition(() => joinSessionCore(sessionId));
+    }
+
+    function leaveSession() {
+        return serializeSessionTransition(leaveSessionCore);
     }
 
     /**
@@ -489,15 +724,23 @@ const SessionClient = (function() {
      */
     async function getActiveSessions() {
         ensureConnected();
+        const context = captureConnectionContext();
 
         try {
-            const response = GuidUtils.transformBinaryGuids(await connection.invoke('GetActiveSessions'));
+            const rawResponse = await context.connection.invoke('GetActiveSessions');
+            if (!isConnectionContextCurrent(context)) {
+                throw staleOperationError();
+            }
+            const response = GuidUtils.transformBinaryGuids(rawResponse);
             return {
                 sessions: response.sessions || [],
                 maxSessions: response.maxSessions,
                 canCreateSession: response.canCreateSession
             };
         } catch (err) {
+            if (!isConnectionContextCurrent(context) || err?.name === 'StaleOperationError') {
+                throw staleOperationError();
+            }
             _error('[SessionClient] Get sessions failed:', err);
             throw err;
         }
@@ -525,7 +768,11 @@ const SessionClient = (function() {
      * @param {number} [schemaId=0] Phase 4: positional schema id (0 = legacy MessagePack dict).
      */
     async function createObject(data, scope = 'Member', ownerMemberId = null, clientValidAt = null, schemaId = 0) {
+        const context = captureSessionContext();
         const response = await invokeHub('CreateObject', SyncPayload.wrap(data, schemaId), scope, ownerMemberId, clientValidAt);
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
         // Phase 3 envelope: response.objectInfo.data arrives as a SyncPayload
         // [schemaId, Uint8Array]; unwrap so the owner-side path in object-sync.js
         // sees the same plain dict shape as remote receivers.
@@ -547,6 +794,7 @@ const SessionClient = (function() {
      *   the server's hub-entry timestamp.
      */
     async function updateObjects(updates, senderSequence = null, senderSendIntervalMs = null, clientValidAt = null) {
+        const context = captureSessionContext();
         // Phase 3 envelope: wrap each update.data into the SyncPayload wire shape
         // before invoking. Avoid mutating the caller's request objects so callers
         // can keep using their `update.data` references for local bookkeeping.
@@ -565,6 +813,9 @@ const SessionClient = (function() {
             }
         }
         const response = await invokeHub('UpdateObjects', wrapped, senderSequence, senderSendIntervalMs, clientValidAt);
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
         // Phase 1 wire-shape: response.versions is GuidLongPair[] on the wire (each
         // entry deserialized as [guidString, long]). Game code expects a string-keyed
         // object so it can do `versions[id]` and `Object.entries(versions)`.
@@ -587,6 +838,7 @@ const SessionClient = (function() {
      *   timestamp (less accurate).
      */
     async function replaceObject(deleteObjectId, replacements, scope = 'Session', ownerMemberId = null, clientValidAt = null, schemaIds = null) {
+        const context = captureSessionContext();
         // Phase 3 envelope: each replacement is a raw game data dict; wrap before invoke.
         // Phase 4: schemaIds may be a parallel array of schemaId per replacement;
         // omitted/null entries fall back to 0 (legacy MessagePack dict).
@@ -594,6 +846,9 @@ const SessionClient = (function() {
             ? replacements.map((r, i) => SyncPayload.wrap(r, (schemaIds && schemaIds[i]) || 0))
             : replacements;
         const created = await invokeHub('ReplaceObject', deleteObjectId, wrapped, scope, ownerMemberId, clientValidAt);
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
         // Server returns List<ObjectInfo> for the owner; unwrap each so any
         // downstream consumer sees the canonical dict shape.
         if (Array.isArray(created)) {
@@ -606,7 +861,12 @@ const SessionClient = (function() {
      * Delete an object from the session.
      */
     async function deleteObject(objectId) {
-        return invokeHub('DeleteObject', objectId);
+        const context = captureSessionContext();
+        const response = await invokeHub('DeleteObject', objectId);
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
+        return response;
     }
 
     /**
@@ -617,11 +877,20 @@ const SessionClient = (function() {
      * belong on the per-frame update path.
      */
     async function broadcastObjectEvent(objectId, eventKind, payload, clientValidAt = null) {
-        return invokeHub('BroadcastObjectEvent', objectId, eventKind, payload, clientValidAt);
+        const context = captureSessionContext();
+        const response = await invokeHub('BroadcastObjectEvent', objectId, eventKind, payload, clientValidAt);
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
+        return response;
     }
 
     async function getSessionState() {
+        const context = captureSessionContext();
         const snapshot = await invokeHub('GetSessionState');
+        if (!isSessionContextCurrent(context)) {
+            throw staleOperationError();
+        }
         if (snapshot) {
             // Phase 1 wire-shape: SessionStateSnapshot now carries members with byte
             // role, objects with byte scope, and validAts/memberSequences as
@@ -654,7 +923,12 @@ const SessionClient = (function() {
         if (!isConnected()) {
             throw new Error('Not connected');
         }
-        return await connection.invoke('Ping');
+        const context = captureConnectionContext();
+        const result = await context.connection.invoke('Ping');
+        if (!isConnectionContextCurrent(context)) {
+            throw staleOperationError();
+        }
+        return result;
     }
 
     /**
@@ -703,14 +977,17 @@ const SessionClient = (function() {
         return lastSessionId;
     }
 
+    function getReconnectHubHostname() {
+        return reconnectIdentity?.hubHostname ?? currentHubHostname;
+    }
+
     /**
      * Clear stale session/member state without disconnecting.
      * Used when reconciliation fails after auto-reconnect: the transport is alive
      * but the server no longer recognizes this connection as a session member.
      */
     function clearSessionState() {
-        currentSession = null;
-        currentMember = null;
+        invalidateSession('clearSessionState');
     }
 
     /**
@@ -721,6 +998,14 @@ const SessionClient = (function() {
      */
     function getCurrentHubHostname() {
         return currentHubHostname;
+    }
+
+    function getSessionEpoch() {
+        return sessionEpoch;
+    }
+
+    function getConnectionEpoch() {
+        return connectionEpoch;
     }
 
     // Public API
@@ -744,8 +1029,11 @@ const SessionClient = (function() {
         isConnected,
         isInSession,
         getLastSessionId,
+        getReconnectHubHostname,
         clearSessionState,
-        getCurrentHubHostname
+        getCurrentHubHostname,
+        getSessionEpoch,
+        getConnectionEpoch
     };
 })();
 

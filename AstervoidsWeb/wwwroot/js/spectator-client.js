@@ -40,6 +40,7 @@ const SpectatorClient = (function () {
     // Per-region connection state. Keyed by regionId.
     //   { connection, hostname, state: 'connecting'|'open'|'reconnecting'|'closed' }
     const connections = new Map();
+    const regionOperations = new Map();
 
     // Event bus
     const listeners = {
@@ -64,11 +65,24 @@ const SpectatorClient = (function () {
         return () => listeners[event].delete(fn);
     }
 
-    function setRegionState(regionId, nextState) {
+    function setRegionState(regionId, connection, nextState) {
         const entry = connections.get(regionId);
-        if (!entry || entry.state === nextState) return;
+        if (!entry || entry.connection !== connection || entry.state === nextState) return;
         entry.state = nextState;
         emit('connectionStateChanged', regionId, nextState);
+    }
+
+    function serializeRegion(regionId, operation) {
+        const previous = regionOperations.get(regionId) ?? Promise.resolve();
+        const current = previous
+            .catch(() => {})
+            .then(operation);
+        regionOperations.set(regionId, current);
+        return current.finally(() => {
+            if (regionOperations.get(regionId) === current) {
+                regionOperations.delete(regionId);
+            }
+        });
     }
 
     /**
@@ -76,7 +90,7 @@ const SpectatorClient = (function () {
      * is the public entry point. Returns the connection promise so callers
      * can await first-connect completion (used by `openAll`).
      */
-    async function openOne(regionId, hostname) {
+    async function openOneCore(regionId, hostname) {
         const existing = connections.get(regionId);
         if (existing
             && existing.connection
@@ -86,7 +100,7 @@ const SpectatorClient = (function () {
 
         // Close any prior connection state for this region before reopening
         // (e.g. visibility cycle dropped us into a reconnecting state).
-        await closeOne(regionId);
+        await closeOneCore(regionId);
 
         const hubUrl = `${hostname.replace(/\/$/, '')}/sessionHub`;
         const connection = new signalR.HubConnectionBuilder()
@@ -107,23 +121,27 @@ const SpectatorClient = (function () {
         // in the region. We don't read the message body (it's a hint, not a
         // payload — same semantic as today's same-origin push). Listeners do
         // the actual refetch.
-        connection.on('OnSessionsChanged', () => emit('sessionsChanged', regionId));
+        connection.on('OnSessionsChanged', () => {
+            if (connections.get(regionId)?.connection === connection) {
+                emit('sessionsChanged', regionId);
+            }
+        });
 
-        connection.onreconnecting(() => setRegionState(regionId, 'reconnecting'));
-        connection.onreconnected(() => setRegionState(regionId, 'open'));
-        connection.onclose(() => setRegionState(regionId, 'closed'));
+        connection.onreconnecting(() => setRegionState(regionId, connection, 'reconnecting'));
+        connection.onreconnected(() => setRegionState(regionId, connection, 'open'));
+        connection.onclose(() => setRegionState(regionId, connection, 'closed'));
 
         const entry = { connection, hostname, state: 'connecting' };
         connections.set(regionId, entry);
 
         try {
             await connection.start();
-            setRegionState(regionId, 'open');
+            setRegionState(regionId, connection, 'open');
             _log('[SpectatorClient] connected', regionId, hostname);
             return connection;
         } catch (err) {
             _warn('[SpectatorClient] connect failed for', regionId, err && err.message);
-            setRegionState(regionId, 'closed');
+            setRegionState(regionId, connection, 'closed');
             // Leave the entry in place with a 'closed' state — picker can show
             // a ⚠ badge for unreachable regions and the REST 30s repoll covers
             // any sessions that exist there.
@@ -131,19 +149,33 @@ const SpectatorClient = (function () {
         }
     }
 
-    async function closeOne(regionId) {
+    function openOne(regionId, hostname) {
+        return serializeRegion(regionId, () => openOneCore(regionId, hostname));
+    }
+
+    async function closeOneCore(regionId) {
         const entry = connections.get(regionId);
         if (!entry) return;
         const c = entry.connection;
         connections.delete(regionId);
         if (c) {
+            let timeoutHandle = null;
             try {
                 await Promise.race([
                     c.stop(),
-                    new Promise(r => setTimeout(r, 3000)),
+                    new Promise(r => {
+                        timeoutHandle = setTimeout(r, 3000);
+                    }),
                 ]);
             } catch (_) { /* ignore */ }
+            finally {
+                if (timeoutHandle != null) clearTimeout(timeoutHandle);
+            }
         }
+    }
+
+    function closeOne(regionId) {
+        return serializeRegion(regionId, () => closeOneCore(regionId));
     }
 
     /**
@@ -168,7 +200,10 @@ const SpectatorClient = (function () {
 
     /** Close every spectator connection. */
     async function closeAll() {
-        const ids = Array.from(connections.keys());
+        const ids = Array.from(new Set([
+            ...connections.keys(),
+            ...regionOperations.keys(),
+        ]));
         await Promise.all(ids.map(closeOne));
     }
 
@@ -179,7 +214,10 @@ const SpectatorClient = (function () {
      * SignalR connection; close the rest to honor scale-to-zero.
      */
     async function closeAllExcept(keepRegionId) {
-        const ids = Array.from(connections.keys()).filter(id => id !== keepRegionId);
+        const ids = Array.from(new Set([
+            ...connections.keys(),
+            ...regionOperations.keys(),
+        ])).filter(id => id !== keepRegionId);
         await Promise.all(ids.map(closeOne));
     }
 

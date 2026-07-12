@@ -5,10 +5,10 @@ using Xunit;
 
 namespace AstervoidsWeb.Tests;
 
-public class ReplaceAfterEvictTest : TestBase
+public class ReplaceAfterRejoinTest : TestBase
 {
     [Fact]
-    public void JoinWithEvict_ReplaceObjectWorksOnAdoptedAsteroid()
+    public void Rejoin_ReplaceObjectWorksOnAdoptedAsteroid()
     {
         // Arrange — solo player with an asteroid
         var (session, server) = CreateTestSession("server-conn");
@@ -16,7 +16,8 @@ public class ReplaceAfterEvictTest : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid", ["radius"] = 0.05 });
 
         // Act — reconnect (evict old member, join as new)
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMember = rejoinResult.Member!;
 
         // Verify asteroid was adopted

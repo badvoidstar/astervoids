@@ -89,6 +89,14 @@ jobs:
       - name: Run tests
         run: dotnet test astervoids.sln --configuration Release --no-build --verbosity normal
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Run JavaScript tests
+        run: node --test AstervoidsWeb/*.test.mjs
+
       # Bicep smoke check — fail fast on template syntax errors before any
       # Azure deploy is attempted. Runs in the build job so a malformed
       # bicep change blocks the deploy job from even running.

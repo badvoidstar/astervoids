@@ -26,7 +26,8 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class SessionCleanupServiceTests
 {
-    private static IHubContext<SessionHub> CreateHubContextMock()
+    private static IHubContext<SessionHub> CreateHubContextMock(
+        Action<string, object?[]>? onClientSend = null)
     {
         var clientProxy = new Mock<IClientProxy>();
         clientProxy
@@ -36,6 +37,8 @@ public class SessionCleanupServiceTests
         var singleClientProxy = new Mock<ISingleClientProxy>();
         singleClientProxy
             .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((method, args, _) =>
+                onClientSend?.Invoke(method, args))
             .Returns(Task.CompletedTask);
 
         var clients = new Mock<IHubClients>();
@@ -56,16 +59,18 @@ public class SessionCleanupServiceTests
     private static SessionCleanupService CreateCleanupService(
         ISessionService sessionService,
         SyncSchemaRegistry registry,
-        int emptyTimeoutSeconds = 0)
+        int emptyTimeoutSeconds = 0,
+        int absoluteTimeoutMinutes = 60_000,
+        Action<string, object?[]>? onClientSend = null)
     {
         var settings = Options.Create(new SessionSettings
         {
             EmptyTimeoutSeconds = emptyTimeoutSeconds,
-            AbsoluteTimeoutMinutes = 60_000,
+            AbsoluteTimeoutMinutes = absoluteTimeoutMinutes,
         });
         return new SessionCleanupService(
             sessionService,
-            CreateHubContextMock(),
+            CreateHubContextMock(onClientSend),
             registry,
             settings,
             Mock.Of<ILogger<SessionCleanupService>>());
@@ -180,5 +185,27 @@ public class SessionCleanupServiceTests
 
         // The rejoiner can decode positional payloads — schemas survived.
         registry.GetSchema(session.Id, 7).Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task AbsoluteExpiration_IdentifiesSessionInClientNotification()
+    {
+        var sessionService = new SessionService();
+        var registry = new SyncSchemaRegistry();
+        var session = sessionService.CreateSession("connection-1").Session!;
+        var notifications = new List<(string Method, object?[] Args)>();
+        var cleanup = CreateCleanupService(
+            sessionService,
+            registry,
+            absoluteTimeoutMinutes: 0,
+            onClientSend: (method, args) => notifications.Add((method, args)));
+
+        await cleanup.CleanupExpiredSessions();
+
+        notifications.Should().ContainSingle();
+        notifications[0].Method.Should().Be("OnSessionExpired");
+        notifications[0].Args.Should().Equal(
+            session.Id,
+            "Session exceeded maximum duration");
     }
 }

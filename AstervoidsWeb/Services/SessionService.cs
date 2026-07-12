@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Models;
 using Microsoft.Extensions.Logging;
@@ -88,7 +90,10 @@ public class SessionService : ISessionService
     private static JoinSessionResult JoinSessionFailure(string errorMessage)
         => new(false, null, null, errorMessage);
 
-    public CreateSessionResult CreateSession(string creatorConnectionId, Dictionary<string, object?>? metadata = null)
+    public CreateSessionResult CreateSession(
+        string creatorConnectionId,
+        Dictionary<string, object?>? metadata = null,
+        Guid? sessionId = null)
     {
         lock (_sessionLock)
         {
@@ -109,9 +114,12 @@ public class SessionService : ISessionService
 
             var session = new Session
             {
+                Id = sessionId ?? Guid.NewGuid(),
                 Name = _nameGenerator.GenerateUniqueName(
                     _sessions.Values.Select(s => s.Name).ToHashSet()),
-                Metadata = metadata ?? new Dictionary<string, object?>()
+                Metadata = metadata != null
+                    ? SyncDataCloner.CloneDictionary(metadata)
+                    : new Dictionary<string, object?>()
             };
 
             _sessions.TryAdd(session.Id, session);
@@ -124,7 +132,22 @@ public class SessionService : ISessionService
         }
     }
 
-    public JoinSessionResult JoinSession(Guid sessionId, string connectionId, Guid? evictMemberId = null)
+    public JoinSessionResult JoinSession(Guid sessionId, string connectionId)
+        => JoinSessionCore(sessionId, connectionId, null, null);
+
+    public JoinSessionResult RejoinSession(
+        Guid sessionId,
+        string connectionId,
+        Guid staleMemberId,
+        string reconnectToken)
+        => JoinSessionCore(
+            sessionId, connectionId, staleMemberId, reconnectToken);
+
+    private JoinSessionResult JoinSessionCore(
+        Guid sessionId,
+        string connectionId,
+        Guid? evictMemberId,
+        string? reconnectToken)
     {
         lock (_sessionLock)
         {
@@ -161,6 +184,14 @@ public class SessionService : ISessionService
                 EvictionInfo? eviction = null;
                 if (evictMemberId.HasValue && session.Members.TryGetValue(evictMemberId.Value, out var staleMember))
                 {
+                    if (!ReconnectTokensEqual(staleMember.ReconnectToken, reconnectToken))
+                    {
+                        _logger?.LogWarning(
+                            "JoinSession rejected invalid reconnect credentials for member {MemberId} in session {SessionId}",
+                            evictMemberId.Value, sessionId);
+                        return JoinSessionFailure("Reconnect credentials are invalid.");
+                    }
+
                     // Only evict if the stale member's connection differs from the joining one
                     // (safety: never evict the caller's own active connection)
                     if (staleMember.ConnectionId != connectionId)
@@ -223,7 +254,8 @@ public class SessionService : ISessionService
         lock (session.SyncRoot)
         {
             // Re-validate under the lock (idempotent: someone else may have already removed this connection)
-            if (!_connectionToMember.ContainsKey(connectionId))
+            if (!_connectionToMember.TryGetValue(connectionId, out var currentMemberId)
+                || currentMemberId != memberId)
             {
                 _logger?.LogDebug(
                     "LeaveSession: connection {ConnectionId} already removed (concurrent departure)",
@@ -336,7 +368,9 @@ public class SessionService : ISessionService
         => _sessions.Values.ToList();
 
     /// <inheritdoc/>
-    public ForceDestroySessionResult? ForceDestroySession(Guid sessionId, Func<Session, bool>? shouldDestroy = null)
+    public ForceDestroySessionResult? ForceDestroySession(
+        Guid sessionId,
+        SessionDestroyCondition? condition = null)
     {
         if (!_sessions.TryGetValue(sessionId, out var session))
             return null;
@@ -347,8 +381,14 @@ public class SessionService : ISessionService
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return null;
 
-            // Re-check the caller's condition while holding the lock (guards join-vs-cleanup races)
-            if (shouldDestroy != null && !shouldDestroy(session))
+            // Re-check declarative cleanup requirements while holding the lock.
+            if (condition?.CreatedBefore is { } createdBefore
+                && session.CreatedAt >= createdBefore)
+                return null;
+            if (condition?.RequireEmpty == true && !session.Members.IsEmpty)
+                return null;
+            if (condition?.LastMemberLeftBefore is { } leftBefore
+                && (session.LastMemberLeftAt is not { } leftAt || leftAt >= leftBefore))
                 return null;
 
             // Mark as destroying before making any changes visible to other operations
@@ -399,8 +439,20 @@ public class SessionService : ISessionService
     /// </summary>
     private void UnregisterMember(string connectionId, Guid memberId)
     {
-        _connectionToMember.TryRemove(connectionId, out _);
+        ((ICollection<KeyValuePair<string, Guid>>)_connectionToMember)
+            .Remove(new KeyValuePair<string, Guid>(connectionId, memberId));
         _memberToSession.TryRemove(memberId, out _);
+    }
+
+    private static bool ReconnectTokensEqual(string expected, string? supplied)
+    {
+        if (supplied == null)
+            return false;
+
+        var expectedBytes = Encoding.UTF8.GetBytes(expected);
+        var suppliedBytes = Encoding.UTF8.GetBytes(supplied);
+        return expectedBytes.Length == suppliedBytes.Length
+            && CryptographicOperations.FixedTimeEquals(expectedBytes, suppliedBytes);
     }
 
     /// <summary>
@@ -527,7 +579,7 @@ public class SessionService : ISessionService
                 obj.OwnerMemberId = newOwnerId;
                 // Replace Data with a new dictionary so snapshot reads outside the lock
                 // see a stable copy (copy-on-write pattern).
-                obj.Data = new Dictionary<string, object?>(obj.Data);
+                obj.Data = SyncDataCloner.CloneDictionary(obj.Data);
                 obj.Version++;
                 obj.UpdatedAt = DateTime.UtcNow;
                 // ValidAt is preserved (NOT bumped to "now") so the new owner inherits the
@@ -563,7 +615,7 @@ public class SessionService : ISessionService
             if (obj.Scope == ObjectScope.Session && !memberIds.Contains(obj.OwnerMemberId))
             {
                 obj.OwnerMemberId = newOwnerId;
-                obj.Data = new Dictionary<string, object?>(obj.Data); // copy-on-write
+                obj.Data = SyncDataCloner.CloneDictionary(obj.Data);
                 obj.Version++;
                 obj.UpdatedAt = DateTime.UtcNow;
                 adopted++;

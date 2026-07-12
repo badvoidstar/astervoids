@@ -442,7 +442,7 @@ public class ServerPromotionTests : TestBase
     // ── Stale member eviction during rejoin ─────────────────────────────────
 
     [Fact]
-    public void JoinWithEvict_StaleMemberEvicted_NewMemberBecomesServer()
+    public void Rejoin_StaleMemberEvicted_NewMemberBecomesServer()
     {
         // Arrange — solo player creates session
         var (session, server) = CreateTestSession("server-conn");
@@ -453,7 +453,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — reconnect with new connectionId, evicting old member
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", oldMemberId);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", oldMemberId, server.ReconnectToken);
 
         // Assert — new member becomes Server (session was effectively empty after eviction)
         rejoinResult.Success.Should().BeTrue();
@@ -463,7 +464,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_OrphanedObjectsAdopted()
+    public void Rejoin_OrphanedObjectsAdopted()
     {
         // Arrange — solo player with session-scoped objects
         var (session, server) = CreateTestSession("server-conn");
@@ -473,7 +474,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — rejoin with eviction
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMemberId = rejoinResult.Member!.Id;
 
         // Assert — session-scoped objects adopted by new member
@@ -484,7 +486,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_MemberScopedObjectsDeleted()
+    public void Rejoin_MemberScopedObjectsDeleted()
     {
         // Arrange — solo player with member-scoped objects (ship, bullets)
         var (session, server) = CreateTestSession("server-conn");
@@ -496,7 +498,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — rejoin with eviction
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
 
         // Assert — member-scoped objects deleted, session-scoped adopted
         ObjectService.GetObject(session.Id, ship!.Id).Should().BeNull();
@@ -507,14 +510,15 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_DoesNotEvictDifferentMember()
+    public void Rejoin_NonexistentIdentityDoesNotEvictDifferentMember()
     {
         // Arrange — two players in session
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
         var bogusId = Guid.NewGuid(); // Non-existent member ID
 
-        // Act — new player joins with a bogus evict ID
-        var joinResult = SessionService.JoinSession(session.Id, "new-conn", bogusId);
+        // Act — stale identity is already absent, so rejoin proceeds as a fresh join.
+        var joinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", bogusId, "unused-token");
 
         // Assert — both original members still present, new member added
         joinResult.Success.Should().BeTrue();
@@ -524,14 +528,34 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_DoesNotEvictSameConnection()
+    public void Rejoin_RejectsEmptyOrInvalidReconnectToken()
+    {
+        var (session, server, client) =
+            CreateTestSessionWithClient("server-conn", "client-conn");
+
+        var missing = SessionService.RejoinSession(
+            session.Id, "attacker-1", client.Id, string.Empty);
+        var invalid = SessionService.RejoinSession(
+            session.Id, "attacker-2", client.Id, "not-the-token");
+
+        missing.Success.Should().BeFalse();
+        invalid.Success.Should().BeFalse();
+        session.Members.Should().ContainKey(client.Id);
+        session.Members.Should().ContainKey(server.Id);
+        SessionService.GetMemberByConnectionId("client-conn")
+            .Should().BeSameAs(client);
+    }
+
+    [Fact]
+    public void Rejoin_DoesNotEvictSameConnection()
     {
         // Arrange — solo player
         var (session, server) = CreateTestSession("server-conn");
 
         // Act — try to join with same connectionId and evict self
         // (This should fail because the connection is already in a session)
-        var joinResult = SessionService.JoinSession(session.Id, "server-conn", server.Id);
+        var joinResult = SessionService.RejoinSession(
+            session.Id, "server-conn", server.Id, server.ReconnectToken);
 
         // Assert — join fails (already in a session), no eviction
         joinResult.Success.Should().BeFalse();
@@ -540,7 +564,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_MultiplayerSession_EvictsOnlyTargetMember()
+    public void Rejoin_MultiplayerSession_EvictsOnlyTargetMember()
     {
         // Arrange — server + client, server creates objects
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
@@ -550,7 +574,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — new connection joins, evicting server
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
 
         // Assert — server evicted, client stays, new member joins
         rejoinResult.Success.Should().BeTrue();
@@ -569,7 +594,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_NewMemberCanUpdateAdoptedObjects()
+    public void Rejoin_NewMemberCanUpdateAdoptedObjects()
     {
         // Arrange — solo player with GameState
         var (session, server) = CreateTestSession("server-conn");
@@ -577,7 +602,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "GameState", ["wave"] = 1 });
 
         // Act — rejoin with eviction, then update the adopted object
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMemberId = rejoinResult.Member!.Id;
         var updated = ObjectService.UpdateObjects(session.Id, newMemberId,
             [new ObjectUpdate(gs!.Id, new Dictionary<string, object?> { ["wave"] = 5 })]).ToList();
@@ -590,7 +616,7 @@ public class ServerPromotionTests : TestBase
     // ── Eviction info returned in JoinSessionResult ─────────────────────────
 
     [Fact]
-    public void JoinWithEvict_ReturnsEvictionInfo_WithDeletedAndMigratedObjects()
+    public void Rejoin_ReturnsEvictionInfo_WithDeletedAndMigratedObjects()
     {
         // Arrange — server + client; server owns ship (member-scoped) and asteroid (session-scoped)
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
@@ -600,7 +626,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — reconnect, evicting server
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
 
         // Assert — eviction info present with correct deleted/migrated objects
         rejoinResult.Eviction.Should().NotBeNull();
@@ -612,7 +639,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_MultiplayerSession_MemberScopedObjectsDeletedAndReported()
+    public void Rejoin_MultiplayerSession_MemberScopedObjectsDeletedAndReported()
     {
         // Arrange — server + client; client owns ship and bullet (member-scoped)
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
@@ -622,7 +649,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "bullet" });
 
         // Act — client reconnects with new connection, evicting old client
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-client-conn", client.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-client-conn", client.Id, client.ReconnectToken);
 
         // Assert — member-scoped objects deleted and reported in eviction info
         rejoinResult.Eviction.Should().NotBeNull();
@@ -633,7 +661,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_MultiplayerSession_SessionScopedObjectsMigratedToRemainingMember()
+    public void Rejoin_MultiplayerSession_SessionScopedObjectsMigratedToRemainingMember()
     {
         // Arrange — server + client; client owns asteroids (session-scoped)
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
@@ -643,7 +671,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — client reconnects with new connection, evicting old client
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-client-conn", client.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-client-conn", client.Id, client.ReconnectToken);
 
         // Assert — session-scoped objects migrated to the remaining server member
         rejoinResult.Eviction.Should().NotBeNull();
@@ -653,13 +682,14 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_EvictionPromotesServerWhenServerEvicted()
+    public void Rejoin_EvictionPromotesServerWhenServerEvicted()
     {
         // Arrange — server + client
         var (session, server, client) = CreateTestSessionWithClient("server-conn", "client-conn");
 
         // Act — server reconnects (evicted), client should be promoted
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-server-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-server-conn", server.Id, server.ReconnectToken);
 
         // Assert — client promoted to Server
         rejoinResult.Eviction.Should().NotBeNull();
@@ -670,7 +700,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_NoEvictionInfo_WhenNoEvictionNeeded()
+    public void Join_NoEvictionInfo_WhenNoEvictionNeeded()
     {
         // Arrange — solo player creates session
         var (session, server) = CreateTestSession("server-conn");
@@ -684,7 +714,7 @@ public class ServerPromotionTests : TestBase
     }
 
     [Fact]
-    public void JoinWithEvict_SoloSession_EvictionInfoReturned_ObjectsAdoptedAfter()
+    public void Rejoin_SoloSession_EvictionInfoReturned_ObjectsAdoptedAfter()
     {
         // Arrange — solo player with ship (member-scoped) and asteroid (session-scoped)
         var (session, server) = CreateTestSession("server-conn");
@@ -694,7 +724,8 @@ public class ServerPromotionTests : TestBase
             new Dictionary<string, object?> { ["type"] = "asteroid" });
 
         // Act — reconnect (evict old member, join as new — session becomes empty then filled)
-        var rejoinResult = SessionService.JoinSession(session.Id, "new-conn", server.Id);
+        var rejoinResult = SessionService.RejoinSession(
+            session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMember = rejoinResult.Member!;
 
         // Assert — eviction info present

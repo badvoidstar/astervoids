@@ -13,21 +13,36 @@ public interface ISessionService
     /// <param name="creatorConnectionId">SignalR connection ID of the creator.</param>
     /// <param name="metadata">Optional key-value metadata for the session (e.g. aspect ratio, game mode).</param>
     /// <returns>Result indicating success/failure with session and member if successful.</returns>
-    CreateSessionResult CreateSession(string creatorConnectionId, Dictionary<string, object?>? metadata = null);
+    CreateSessionResult CreateSession(
+        string creatorConnectionId,
+        Dictionary<string, object?>? metadata = null,
+        Guid? sessionId = null);
 
     /// <summary>
     /// Joins an existing session as a client.
     /// </summary>
     /// <param name="sessionId">The session to join.</param>
     /// <param name="connectionId">SignalR connection ID of the joining member.</param>
-    /// <param name="evictMemberId">
-    /// Optional member ID to evict before joining (for reconnection scenarios where the
-    /// server hasn't yet detected the old connection's death). If the member exists in the
-    /// session and its connection differs from <paramref name="connectionId"/>, it is
-    /// removed atomically before the new member is added.
+    /// <returns>Result indicating success/failure with session and member if successful.</returns>
+    JoinSessionResult JoinSession(Guid sessionId, string connectionId);
+
+    /// <summary>
+    /// Rejoins an existing session by replacing a stale member identity.
+    /// </summary>
+    /// <param name="sessionId">The session to rejoin.</param>
+    /// <param name="connectionId">SignalR connection ID of the rejoining member.</param>
+    /// <param name="staleMemberId">Stale member identity to replace.</param>
+    /// <param name="reconnectToken">
+    /// Secret credential issued with <paramref name="staleMemberId"/>. A live member is
+    /// evicted only when this token matches, preventing public member IDs from being used
+    /// to disconnect another player.
     /// </param>
     /// <returns>Result indicating success/failure with session and member if successful.</returns>
-    JoinSessionResult JoinSession(Guid sessionId, string connectionId, Guid? evictMemberId = null);
+    JoinSessionResult RejoinSession(
+        Guid sessionId,
+        string connectionId,
+        Guid staleMemberId,
+        string reconnectToken);
 
     /// <summary>
     /// Removes a member from their session, performs server promotion if needed, and
@@ -96,15 +111,25 @@ public interface ISessionService
     /// This method is idempotent: a second call for the same session returns null.
     /// </summary>
     /// <param name="sessionId">The session to destroy.</param>
-    /// <param name="shouldDestroy">
-    /// Optional predicate evaluated under the session lock to re-confirm the session
-    /// should still be destroyed (guards against join-vs-cleanup races).  When null the
-    /// session is always destroyed.
+    /// <param name="condition">
+    /// Optional non-reentrant condition evaluated under the session lock to guard
+    /// join-vs-cleanup races.
     /// </param>
     /// <returns>Result with connection IDs of removed members, or null if session not found
     /// or already destroyed / predicate returned false.</returns>
-    ForceDestroySessionResult? ForceDestroySession(Guid sessionId, Func<Session, bool>? shouldDestroy = null);
+    ForceDestroySessionResult? ForceDestroySession(
+        Guid sessionId,
+        SessionDestroyCondition? condition = null);
 }
+
+/// <summary>
+/// Declarative requirements for destroying a session. Using data instead of a callback
+/// prevents service re-entry and lock-order inversion while the session lock is held.
+/// </summary>
+public record SessionDestroyCondition(
+    DateTime? CreatedBefore = null,
+    DateTime? LastMemberLeftBefore = null,
+    bool RequireEmpty = false);
 
 /// <summary>
 /// Result of a member leaving a session.

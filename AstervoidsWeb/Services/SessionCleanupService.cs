@@ -17,6 +17,7 @@ public class SessionCleanupService : BackgroundService
     private readonly ISessionService _sessionService;
     private readonly IHubContext<SessionHub> _hubContext;
     private readonly SyncSchemaRegistry _schemaRegistry;
+    private readonly ISessionOperationCoordinator _operationCoordinator;
     private readonly ILogger<SessionCleanupService> _logger;
     private readonly TimeSpan _emptyTimeout;
     private readonly TimeSpan _absoluteTimeout;
@@ -30,11 +31,13 @@ public class SessionCleanupService : BackgroundService
         IHubContext<SessionHub> hubContext,
         SyncSchemaRegistry schemaRegistry,
         IOptions<SessionSettings> settings,
-        ILogger<SessionCleanupService> logger)
+        ILogger<SessionCleanupService> logger,
+        ISessionOperationCoordinator? operationCoordinator = null)
     {
         _sessionService = sessionService;
         _hubContext = hubContext;
         _schemaRegistry = schemaRegistry;
+        _operationCoordinator = operationCoordinator ?? new SessionOperationCoordinator();
         _logger = logger;
         _emptyTimeout = TimeSpan.FromSeconds(settings.Value.EmptyTimeoutSeconds);
         _absoluteTimeout = TimeSpan.FromMinutes(settings.Value.AbsoluteTimeoutMinutes);
@@ -77,46 +80,56 @@ public class SessionCleanupService : BackgroundService
         foreach (var session in sessions)
         {
             string? reason = null;
-            Func<Session, bool>? predicate = null;
+            SessionDestroyCondition? condition = null;
+            TimeSpan? emptyDuration = null;
 
-            // Check absolute timeout first (takes priority)
-            if (now - session.CreatedAt > _absoluteTimeout)
+            lock (session.SyncRoot)
             {
-                reason = "Session exceeded maximum duration";
-                // Re-check the absolute timeout inside the lock to guard against a clock
-                // edge where CleanupExpiredSessions runs just before the deadline
-                var capturedNow = now;
-                var absoluteTimeout = _absoluteTimeout;
-                predicate = s => capturedNow - s.CreatedAt > absoluteTimeout;
+                if (session.LifecycleState != SessionLifecycleState.Active)
+                    continue;
 
-                _logger.LogInformation(
-                    "Session {SessionName} ({SessionId}) exceeded absolute timeout ({AbsoluteTimeout}min). Created at {CreatedAt}.",
-                    session.Name, session.Id, _absoluteTimeout.TotalMinutes, session.CreatedAt);
-            }
-            // Check empty timeout
-            else if (session.Members.IsEmpty
-                     && session.LastMemberLeftAt.HasValue
-                     && now - session.LastMemberLeftAt.Value > _emptyTimeout)
-            {
-                reason = "Session was empty for too long";
-                // Re-check inside the lock so a concurrent join that cleared
-                // LastMemberLeftAt prevents this session from being destroyed.
-                var capturedNow = now;
-                var emptyTimeout = _emptyTimeout;
-                predicate = s => s.Members.IsEmpty
-                              && s.LastMemberLeftAt.HasValue
-                              && capturedNow - s.LastMemberLeftAt.Value > emptyTimeout;
-
-                _logger.LogInformation(
-                    "Session {SessionName} ({SessionId}) empty for {EmptyDuration}s (timeout: {EmptyTimeout}s). Destroying.",
-                    session.Name, session.Id,
-                    (now - session.LastMemberLeftAt.Value).TotalSeconds,
-                    _emptyTimeout.TotalSeconds);
+                // Absolute timeout takes priority. The declarative condition is
+                // re-evaluated by SessionService after this method enters the
+                // asynchronous per-session operation gate.
+                if (now - session.CreatedAt > _absoluteTimeout)
+                {
+                    reason = "Session exceeded maximum duration";
+                    condition = new SessionDestroyCondition(
+                        CreatedBefore: now - _absoluteTimeout);
+                }
+                else if (session.Members.IsEmpty
+                         && session.LastMemberLeftAt is { } lastMemberLeftAt
+                         && now - lastMemberLeftAt > _emptyTimeout)
+                {
+                    reason = "Session was empty for too long";
+                    emptyDuration = now - lastMemberLeftAt;
+                    condition = new SessionDestroyCondition(
+                        LastMemberLeftBefore: now - _emptyTimeout,
+                        RequireEmpty: true);
+                }
             }
 
             if (reason != null)
             {
-                var result = _sessionService.ForceDestroySession(session.Id, predicate);
+                if (emptyDuration.HasValue)
+                {
+                    _logger.LogInformation(
+                        "Session {SessionName} ({SessionId}) empty for {EmptyDuration}s (timeout: {EmptyTimeout}s). Destroying.",
+                        session.Name, session.Id,
+                        emptyDuration.Value.TotalSeconds,
+                        _emptyTimeout.TotalSeconds);
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Session {SessionName} ({SessionId}) exceeded absolute timeout ({AbsoluteTimeout}min). Created at {CreatedAt}.",
+                        session.Name, session.Id, _absoluteTimeout.TotalMinutes, session.CreatedAt);
+                }
+
+                using var operation =
+                    await _operationCoordinator.EnterAsync(session.Id);
+                var result = _sessionService.ForceDestroySession(
+                    session.Id, condition);
                 if (result != null)
                 {
                     sessionsDestroyed = true;
@@ -134,7 +147,7 @@ public class SessionCleanupService : BackgroundService
                         try
                         {
                             await _hubContext.Clients.Client(connectionId)
-                                .SendAsync("OnSessionExpired", reason);
+                                .SendAsync("OnSessionExpired", session.Id, reason);
                             await _hubContext.Groups.RemoveFromGroupAsync(
                                 connectionId, session.Id.ToString());
                         }

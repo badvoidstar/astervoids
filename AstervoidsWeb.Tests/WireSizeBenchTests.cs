@@ -307,6 +307,7 @@ public class WireSizeBenchTests
             SessionName: "Banana",
             MemberId: Guid.NewGuid(),
             Role: MemberRole.Client,
+            ReconnectToken: new string('a', 64),
             Members: members,
             Objects: objects,
             ValidAts: validAtsList.ToArray(),
@@ -317,7 +318,7 @@ public class WireSizeBenchTests
         // + bin8 length header). Roughly +24 B vs the post-Phase-1 baseline of
         // 2056 B (range had ~24 B headroom). Phase 4 typed schemas will then
         // shrink each ObjectInfo's data slot considerably.
-        size.Should().BeInRange(2030, 2090, "JoinSessionResponse with 4 asteroids + 2 ships (Phase 3 envelope)");
+        size.Should().BeInRange(2110, 2180, "JoinSessionResponse with reconnect credential, 4 asteroids + 2 ships");
     }
 
     [Fact]

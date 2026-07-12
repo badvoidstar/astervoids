@@ -133,6 +133,51 @@ describe('SpectatorClient.openAll', () => {
         assert.equal(stub.connections.length, 0,
             'trailing-slash variants of the same host must match — no duplicate spectator on the joined region');
     });
+
+    test('concurrent opens for one region share a single connection', async () => {
+        const region = {
+            id: 'r1',
+            displayName: 'R1',
+            hostname: 'https://r1.example.com'
+        };
+
+        const [first, second] = await Promise.all([
+            SpectatorClient.openOne(region.id, region.hostname),
+            SpectatorClient.openOne(region.id, region.hostname),
+        ]);
+
+        assert.equal(stub.connections.length, 1);
+        assert.strictEqual(first, second);
+    });
+
+    test('closeAll queued during an open leaves no leaked connection', async () => {
+        let releaseStart;
+        const originalBuilder = stub.signalR.HubConnectionBuilder;
+        stub.signalR.HubConnectionBuilder = class extends originalBuilder {
+            build() {
+                const connection = super.build();
+                connection.start = () => new Promise(resolve => {
+                    releaseStart = () => {
+                        connection.state = 1;
+                        resolve();
+                    };
+                });
+                return connection;
+            }
+        };
+        SpectatorClient = loadSpectatorClient(stub);
+
+        const opening = SpectatorClient.openOne('r1', 'https://r1.example.com');
+        while (!releaseStart) {
+            await new Promise(resolve => setImmediate(resolve));
+        }
+        const closing = SpectatorClient.closeAll();
+        releaseStart();
+
+        await Promise.all([opening, closing]);
+        assert.deepEqual(SpectatorClient.getOpenRegionIds(), []);
+        assert.equal(stub.connections[0].state, 4);
+    });
 });
 
 describe('SpectatorClient sessionsChanged dispatch', () => {
@@ -173,6 +218,18 @@ describe('SpectatorClient sessionsChanged dispatch', () => {
         const tail = events.slice(events.indexOf('r1:open') + 1);
         assert.deepEqual(tail, ['r1:reconnecting', 'r1:open'],
             'reconnect cycle surfaces the picker-visible state transitions used by the ↻ stale-region badge');
+    });
+
+    test('callbacks from a replaced connection cannot change replacement state', async () => {
+        await SpectatorClient.openOne('r1', 'https://r1.example.com');
+        const oldConnection = stub.connections[0];
+        await SpectatorClient.closeOne('r1');
+        await SpectatorClient.openOne('r1', 'https://r1.example.com');
+
+        oldConnection._triggerReconnecting();
+        oldConnection._triggerClose();
+
+        assert.equal(SpectatorClient.getState('r1'), 'open');
     });
 });
 
