@@ -9349,8 +9349,7 @@
             inFlight.set(region.id, controller);
             try {
                 const body = await fetchOneRegion(region, controller);
-                if (!running
-                    || generation !== runGeneration
+                if (generation !== runGeneration
                     || requestSequences.get(region.id) !== requestSequence) return;
                 perRegion.set(region.id, {
                     sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
@@ -9361,8 +9360,7 @@
                     lastError: null,
                 });
             } catch (err) {
-                if (!running
-                    || generation !== runGeneration
+                if (generation !== runGeneration
                     || requestSequences.get(region.id) !== requestSequence) return;
                 const prev = perRegion.get(region.id) ?? {};
                 perRegion.set(region.id, {
@@ -9376,8 +9374,7 @@
                     inFlight.delete(region.id);
                 }
             }
-            if (!running
-                || generation !== runGeneration
+            if (generation !== runGeneration
                 || requestSequences.get(region.id) !== requestSequence) return;
             // Render with the merged state — every region's fresh slice
             // contributes its sessions; stale regions contribute nothing.
@@ -9387,6 +9384,9 @@
         // Coalesce N pushes within COALESCE_MS into one refetch per region.
         // Without this, a single member leave triggers promotion +
         // cleanup + broadcast and the receiver would fetch 2-3 times.
+        // `running` controls background polling only. An immediate request made
+        // after stop() is an intentional one-shot refresh; runGeneration still
+        // prevents any request started before stop() from applying stale data.
         function requestRefresh(region, immediate = false) {
             if (immediate) {
                 return refreshRegion(region, runGeneration);
@@ -9811,15 +9811,15 @@
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
                 
-                await refreshSessionList();
+                await activateSessionPickerUpdates();
             } else {
+                await activateSessionPickerUpdates();
                 setPickerStatus('Could not join - session may be full', 'error');
-                await refreshSessionList();
             }
         } catch (err) {
             _error('Join session failed:', err);
+            await activateSessionPickerUpdates();
             setPickerStatus('Failed to join session', 'error');
-            await refreshSessionList();
         }
     }
 
@@ -9879,15 +9879,15 @@
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
                 
-                await refreshSessionList();
+                await activateSessionPickerUpdates();
             } else {
+                await activateSessionPickerUpdates();
                 setPickerStatus('Could not create - max sessions reached', 'error');
-                await refreshSessionList();
             }
         } catch (err) {
             _error('Create session failed:', err);
+            await activateSessionPickerUpdates();
             setPickerStatus('Failed to create session', 'error');
-            await refreshSessionList();
         }
     }
 
@@ -9978,11 +9978,6 @@
         
         updateHUD();
         
-            await refreshSessionList();
-            if (message) {
-                setPickerStatus(message, 'error');
-            }
-
             // Multi-region: re-open spectator hubs + restart background poll
             // so the picker is live again for the user. Reconnect SessionClient
             // back to same-origin so future Create/Join requests start clean.
@@ -9991,10 +9986,13 @@
                     if (SessionClient.getCurrentHubHostname && SessionClient.getCurrentHubHostname()) {
                         await SessionClient.connect(true, '');
                     }
-                    await startMultiRegionPicker();
                 } catch (err) {
-                    _warn('[Picker] Failed to restart multi-region after Leave:', err);
+                    _warn('[Picker] Failed to reconnect after Leave:', err);
                 }
+            }
+            await activateSessionPickerUpdates();
+            if (message) {
+                setPickerStatus(message, 'error');
             }
         } finally {
             leavingSession = false;
@@ -10042,9 +10040,13 @@
             && isGameStartContextCurrent(context);
         operation.promise = (async () => {
             if (!isCurrent()) return;
-            // Recalculate viewport with new session aspect ratio before initializing (force recalc)
-            resizeCanvas(true);
             try {
+                if (sessionPicker.regions.length > 1) {
+                    await teardownMultiRegionPicker();
+                    if (!isCurrent()) return;
+                }
+                // Recalculate viewport with new session aspect ratio before initializing (force recalc)
+                resizeCanvas(true);
                 await init(isCurrent);
             } catch (err) {
                 if (isCurrent()) {
@@ -10136,9 +10138,8 @@
         // Reconnect and refresh if needed
         if (!SessionClient.isConnected()) {
             connectToSessionHub();
-        } else {
-            refreshSessionList();
         }
+        await activateSessionPickerUpdates();
         } finally {
             leavingSession = false;
         }
@@ -10317,7 +10318,7 @@
                         game.lastFrameTime = 0; // Reset to prevent delta time jump
                         reconnectingOverlay.classList.remove('visible');
 
-                        await refreshSessionList();
+                        await activateSessionPickerUpdates();
                         return;
                     } else {
                         // Session no longer exists or is full
@@ -10729,9 +10730,8 @@
         }
     }
 
-    // Whether spectator/multi-region machinery is currently running. Toggled
-    // by initMultiRegionPicker / teardownMultiRegionPicker so visibility and
-    // session lifecycle events can flip without re-binding handlers.
+    // Whether spectator/multi-region machinery should be active while the
+    // picker is visible. Physical connections pause while the tab is hidden.
     let multiRegionActive = false;
     let multiRegionInitialized = false;
     let regionDownBannerTimer = null;
@@ -10791,15 +10791,13 @@
                 if (!multiRegionInitialized) return;
                 if (document.hidden) {
                     if (multiRegionActive) {
-                        await window.SpectatorClient.closeAll();
-                        MultiRegionSessions.stop();
+                        await pauseMultiRegionPicker();
                     }
                 } else {
-                    // Tab returned to foreground. If we're still on the picker
-                    // (not in a session), bring everything back online with an
-                    // immediate refresh so the UI is fresh by the time the
-                    // user looks at it.
-                    if (multiRegionActive && !sessionPicker.currentSessionId) {
+                    // A session lobby still uses the picker and must show every
+                    // region. Resume whenever that UI is visible, whether or not
+                    // the player is already a member of a session.
+                    if (multiRegionActive && !startScreen.classList.contains('hidden')) {
                         await startMultiRegionPicker();
                     }
                 }
@@ -10810,25 +10808,59 @@
     }
 
     async function startMultiRegionPicker() {
-        if (!window.SpectatorClient) return;
+        if (startScreen.classList.contains('hidden')) return;
+
+        // Record desired picker activity even while hidden. The visibility
+        // handler uses this intent to perform the physical restart on return.
         multiRegionActive = true;
+        if (document.hidden) return;
+
+        MultiRegionSessions.stop();
+
         // Open one spectator connection per region. Exclude the region that
         // SessionClient is already connected to (if any) to avoid duplicate
-        // sockets. Currently SessionClient is same-origin at boot, so this
-        // exclusion is a no-op until Create/Join routes it elsewhere.
+        // sockets. The active SessionClient supplies change notifications for
+        // its own region; spectator connections cover every other region.
         const sessionClientHostname = window.SessionClient && SessionClient.getCurrentHubHostname
             ? SessionClient.getCurrentHubHostname()
             : '';
-        await window.SpectatorClient.openAll(sessionPicker.regions, sessionClientHostname);
-        // Bootstrap REST fetch + start background poll.
-        await MultiRegionSessions.start(sessionPicker.regions);
+        const spectatorStart = window.SpectatorClient
+            ? window.SpectatorClient.openAll(sessionPicker.regions, sessionClientHostname)
+            : Promise.resolve();
+
+        // REST bootstrap runs in parallel with spectator startup so a slow or
+        // cold WebSocket cannot delay painting sessions from warm regions.
+        await Promise.all([
+            spectatorStart,
+            MultiRegionSessions.start(sessionPicker.regions),
+        ]);
+    }
+
+    async function pauseMultiRegionPicker() {
+        MultiRegionSessions.stop();
+        if (window.SpectatorClient) {
+            await window.SpectatorClient.closeAll();
+        }
     }
 
     async function teardownMultiRegionPicker() {
-        if (!multiRegionActive) return;
         multiRegionActive = false;
-        if (window.SpectatorClient) await window.SpectatorClient.closeAll();
-        MultiRegionSessions.stop();
+        await pauseMultiRegionPicker();
+    }
+
+    async function activateSessionPickerUpdates() {
+        if (sessionPicker.regions.length <= 1) {
+            await refreshSessionList();
+            return;
+        }
+        if (startScreen.classList.contains('hidden')) return;
+
+        try {
+            await startMultiRegionPicker();
+        } catch (err) {
+            _warn('[Picker] Failed to start live regional updates:', err);
+            await refreshSessionList();
+        }
     }
 
     function renderRegionDownBanner() {
