@@ -21,12 +21,36 @@
  *     region within 250 ms collapse to a single refetch.
  *   - Visibility off (`document.hidden`): stop() halts background polls
  *     so backgrounded tabs don't keep regions warm (scale-to-zero).
+ *   - Explicit refresh after stop(): remains available for Join/Create
+ *     transitions while stale pre-stop requests are still rejected.
  *
  * The reimplementation below mirrors the inline module byte-for-byte
  * (modulo `updateSessionList` callback wiring which is what we observe).
  */
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const indexHtml = readFileSync(join(here, 'wwwroot/index.html'), 'utf8');
+const productionModuleStart = indexHtml.indexOf('const MultiRegionSessions = (function () {');
+const productionModuleEnd = indexHtml.indexOf(
+    '\n    // Refresh session list from server',
+    productionModuleStart
+);
+assert.ok(productionModuleStart >= 0 && productionModuleEnd > productionModuleStart);
+const productionModuleSource = indexHtml.slice(productionModuleStart, productionModuleEnd);
+
+function loadProductionMultiRegionSessions(updateSessionList, fetch) {
+    const factory = new Function(
+        'updateSessionList',
+        'fetch',
+        `${productionModuleSource}; return MultiRegionSessions;`
+    );
+    return factory(updateSessionList, fetch);
+}
 
 function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.now() }) {
     const COALESCE_MS = 250;
@@ -258,6 +282,33 @@ describe('MultiRegionSessions stop()', () => {
         await mrs.start(regions);
         const merged = updates[updates.length - 1];
         assert.equal(merged.sessions.length, 1, 'start() after stop() re-bootstraps cleanly');
+        mrs.stop();
+    });
+
+    test('production module applies an explicit refresh started after stop()', async () => {
+        let sessions = [session('before-stop', 'r1')];
+        const updates = [];
+        const fetch = async () => fakeOk({
+            sessions,
+            maxSessions: 6,
+            canCreateSession: true
+        });
+        const mrs = loadProductionMultiRegionSessions(
+            result => updates.push(result),
+            fetch
+        );
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+
+        await mrs.start([region]);
+        mrs.stop();
+        sessions = [session('after-stop', 'r1')];
+        await mrs.requestRefresh(region, true);
+
+        assert.deepEqual(
+            updates.at(-1).sessions.map(value => value.id),
+            ['after-stop'],
+            'Join/Create one-shot refresh must not be discarded merely because background polling is stopped'
+        );
         mrs.stop();
     });
 });

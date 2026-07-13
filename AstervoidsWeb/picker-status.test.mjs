@@ -79,7 +79,7 @@ test('connected session status uses live membership with listed capacity', () =>
     assert.equal(status.message, 'In Swift Mango (host) - 2/4');
 });
 
-test('join and create restore membership status before a stopped list refresh', () => {
+test('join and create reactivate live picker updates after membership succeeds', () => {
     const joinStart = html.indexOf('async function handleSelectSession(sessionId)');
     const createStart = html.indexOf('async function handleCreateSession()');
     const soloStart = html.indexOf('async function handleSoloPlay()');
@@ -87,9 +87,49 @@ test('join and create restore membership status before a stopped list refresh', 
 
     const joinSource = html.slice(joinStart, createStart);
     const createSource = html.slice(createStart, soloStart);
-    const statusBeforeRefresh =
-        /updateCurrentSessionStatus\(\);[\s\S]*?await refreshSessionList\(\);/;
+    const statusBeforeActivation =
+        /updateCurrentSessionStatus\(\);[\s\S]*?await activateSessionPickerUpdates\(\);/;
 
-    assert.match(joinSource, statusBeforeRefresh);
-    assert.match(createSource, statusBeforeRefresh);
+    assert.match(joinSource, statusBeforeActivation);
+    assert.match(createSource, statusBeforeActivation);
+});
+
+test('entering gameplay tears down picker updates before initialization', () => {
+    const startGameStart = html.indexOf('async function startGameFromPicker()');
+    const returnStart = html.indexOf('async function returnToStartScreen', startGameStart);
+    assert.ok(startGameStart >= 0 && returnStart > startGameStart);
+
+    const startGameSource = html.slice(startGameStart, returnStart);
+    assert.match(
+        startGameSource,
+        /await teardownMultiRegionPicker\(\);[\s\S]*?await init\(isCurrent\);/
+    );
+});
+
+test('visibility resume includes the lobby of an active session', () => {
+    const visibilityStart = html.indexOf(
+        "document.addEventListener('visibilitychange'",
+        html.indexOf('async function initMultiRegionPicker')
+    );
+    const startFunction = html.indexOf(
+        'async function startMultiRegionPicker()',
+        visibilityStart
+    );
+    assert.ok(visibilityStart >= 0 && startFunction > visibilityStart);
+
+    const visibilitySource = html.slice(visibilityStart, startFunction);
+    assert.match(
+        visibilitySource,
+        /multiRegionActive && !startScreen\.classList\.contains\('hidden'\)/
+    );
+    assert.doesNotMatch(visibilitySource, /!sessionPicker\.currentSessionId/);
+
+    const startSource = html.slice(
+        startFunction,
+        html.indexOf('async function pauseMultiRegionPicker()', startFunction)
+    );
+    assert.match(
+        startSource,
+        /if \(startScreen\.classList\.contains\('hidden'\)\) return;[\s\S]*?multiRegionActive = true;[\s\S]*?if \(document\.hidden\) return;/
+    );
 });
