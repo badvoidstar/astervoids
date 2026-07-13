@@ -721,6 +721,8 @@ test('ownership migration is strictly version-monotonic', () => {
     ]);
     assert.equal(objectSync.getObject('owned').ownerMemberId, 'new-owner');
     assert.equal(objectSync.getObject('owned').version, 6);
+    assert.equal(objectSync.getObject('owned').ownershipMigrationVersion, 6);
+    assert.equal(objectSync.getObject('owned').ownershipMigrationPending, true);
 });
 
 test('inline async systems are generation-scoped in production source', () => {

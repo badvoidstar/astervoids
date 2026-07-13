@@ -1544,6 +1544,9 @@
         STROKE_COLOR: '#fff',       // Primary drawing color
         THRUST_COLOR: '#f80',       // Thrust flame color
         INVULN_BLINK_RATE: 10,      // Blink frequency when invulnerable
+        COLLISION_CUE_MIN_MS: 120,   // Minimum visible hold before a resolved cue fades
+        COLLISION_CUE_FADE_MS: 180,  // Fade time after authoritative resolution
+        COLLISION_CUE_MAX_MS: 1000,  // Safety cap for a pending cue with no resolution
         
         // Start screen
         START_SCREEN_ASTERVOIDS: 4,  // Astervoids shown on start screen
@@ -1830,7 +1833,7 @@
         // blending). Seeded whenever a new snapshot disagrees with the replica's
         // current on-screen extrapolation, and bled out over
         // CONFIG.DEADRECKON_SMOOTH_MS so corrections ease in instead of snapping.
-        // Shape: { dx, dy, da, t0 } (da = signed shortest angular error).
+        // Shape: { dx, dy, da, t0, tauMs } (da = signed shortest angular error).
         smooth: new Map(),
         // Incremental ship-replay cache (perf). Keyed by the snapshot STATE
         // object so it is invalidated automatically when updateState installs a
@@ -1875,7 +1878,10 @@
         // point). The kinematic SNAP_DIST guard below only catches LARGE jumps;
         // an intentional teleport can be small (dying near center), so the game
         // layer signals it explicitly via this flag.
-        updateState(id, data, baselinePerf, snap) {
+        // `preserveDirection` is used for the first post-migration update: if
+        // the observer is ahead of the new owner's retained puppet pose, extend
+        // only that correction's decay enough to avoid visible reverse motion.
+        updateState(id, data, baselinePerf, snap, preserveDirection = false) {
             const now = performance.now();
             // Where the replica is CURRENTLY displayed (old extrapolation plus
             // any in-flight correction), captured BEFORE installing the new
@@ -1920,7 +1926,7 @@
                     ? baselinePerf
                     : now,
             });
-            const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+            let tau = CONFIG.DEADRECKON_SMOOTH_MS;
             if (displayed && tau > 0) {
                 const fresh = this._reckonRaw(id, now);
                 if (fresh) {
@@ -1935,7 +1941,26 @@
                     const snapDist = CONFIG.DEADRECKON_SNAP_DIST;
                     if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) { dx = 0; dy = 0; }
                     if (dx !== 0 || dy !== 0 || da !== 0) {
-                        this.smooth.set(id, { dx, dy, da, t0: now });
+                        if (preserveDirection) {
+                            const state = this.states.get(id);
+                            const stepMs = 1000 / CONFIG.TARGET_FPS;
+                            const motionX = velocityToNormalizedDeltaX(state.velocityX || 0);
+                            const motionY = velocityToNormalizedDeltaY(state.velocityY || 0);
+                            const motion = Math.hypot(motionX, motionY);
+                            if (motion > 1e-12) {
+                                const correctionAlong = (dx * motionX + dy * motionY) / motion;
+                                if (correctionAlong > 0) {
+                                    tau = Math.max(tau, correctionAlong * stepMs / motion);
+                                }
+                            }
+                            const angularMotion = state.rotationSpeed || 0;
+                            if (Math.abs(angularMotion) > 1e-12
+                                && Math.sign(da) === Math.sign(angularMotion)) {
+                                tau = Math.max(tau, Math.abs(da) * stepMs / Math.abs(angularMotion));
+                            }
+                            tau *= 1.05;
+                        }
+                        this.smooth.set(id, { dx, dy, da, t0: now, tauMs: tau });
                         return;
                     }
                 }
@@ -2102,7 +2127,7 @@
             if (!out) return null;
             const e = this.smooth.get(id);
             if (e) {
-                const tau = CONFIG.DEADRECKON_SMOOTH_MS;
+                const tau = e.tauMs || CONFIG.DEADRECKON_SMOOTH_MS;
                 const k = tau > 0 ? Math.exp(-(nowPerf - e.t0) / tau) : 0;
                 if (k <= 1e-3) {
                     this.smooth.delete(id);
@@ -3163,6 +3188,10 @@
          */
         startClockSync() {
             if (this.clock.running) return;
+            // The UTC offset remains valid across a quick reconnect, but RTT is
+            // connection/region-specific. Gate age-aware join projection until
+            // this connection supplies a fresh minimum-RTT clock sample.
+            this.clock.lastSampleRtt = Infinity;
             this.clock.running = true;
             const generation = ++this.clock.generation;
             this.clock.loopPromise = this.clockSyncLoop(generation).catch(() => {
@@ -5161,6 +5190,7 @@
             if (data.lifetime !== undefined) this.lifetime = data.lifetime;
             if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
             if (data.pendingHit !== undefined) this.pendingHit = data.pendingHit;
+            if (data.hitTargetId !== undefined) this.hitTargetId = data.hitTargetId;
             if (data.hitImpactTorque !== undefined) this.hitImpactTorque = data.hitImpactTorque;
             if (data.hitBulletAngle !== undefined) this.hitBulletAngle = data.hitBulletAngle;
             if (data.hitOffsetN !== undefined) this.hitOffsetN = data.hitOffsetN;
@@ -5180,7 +5210,7 @@
                 data.colorIndex || 0,
                 data.ownerMemberId
             );
-            bullet.lifetime = data.lifetime || CONFIG.BULLET_LIFETIME;
+            bullet.fromSyncData(data);
             return bullet;
         }
 
@@ -5358,13 +5388,12 @@
             gameStateObjectId: null,  // ObjectSync ID for shared game state
             isAuthority: false,       // True if this client is the Server (authority)
             processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
-            // Object ids present in the session snapshot at the moment we joined.
-            // These are pre-existing/steady-state (or orphaned) objects that we may
-            // adopt — but they were authored before we joined and must NOT be
-            // spawn-projected forward (that projection is only valid for split
-            // children spawned during our own active membership). Without this,
-            // adopting an idle orphan (e.g. joining an emptied session we were
-            // spectating) jumps it forward by up to MAX_EXTRAPOLATION of velocity.
+            collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
+            seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
+            seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
+            // Object ids present in the session snapshot at join. Locally adopted
+            // orphans use this to suppress spawn projection; remote objects with
+            // a live owner may use it for bounded, latency-delayed initial seeding.
             joinSnapshotObjectIds: new Set()
         },
         // Cosmetic astervoids for start screen (separate from game astervoids)
@@ -5377,6 +5406,185 @@
     function isSessionMode() {
         return game.mode === 'session';
     }
+
+    let localImpactCueSequence = 0;
+    const CollisionEffects = {
+        startAsteroidHit(source, target = null, impact = null) {
+            if (!isSessionMode() || !source) return;
+            const bulletId = source.syncObjectId || null;
+            if (bulletId && game.multiplayer.seenPendingBulletIds.has(bulletId)) return;
+            let key;
+            if (bulletId) {
+                key = `asteroid:${bulletId}`;
+            } else {
+                key = source._impactCueKey;
+                if (!key) {
+                    key = `asteroid:local:${++localImpactCueSequence}`;
+                    source._impactCueKey = key;
+                }
+            }
+            if (game.multiplayer.collisionEffects.has(key)) return;
+            if (bulletId) game.multiplayer.seenPendingBulletIds.add(bulletId);
+
+            const targetId = source.hitTargetId || impact?.hitTargetId || target?.syncObjectId || null;
+            if (!target && targetId) {
+                target = game.astervoids.find(a => a.syncObjectId === targetId) || null;
+            }
+            const radius = target?.radius || CONFIG.MIN_ASTEROID_RADIUS;
+            const bulletAngle = Number.isFinite(impact?.bulletAngle)
+                ? impact.bulletAngle
+                : (Number.isFinite(source.hitBulletAngle)
+                    ? source.hitBulletAngle
+                    : Math.atan2(source.velocityY || 0, source.velocityX || 0));
+            const offsetN = Math.max(-1, Math.min(1,
+                Number.isFinite(impact?.offsetN) ? impact.offsetN : (source.hitOffsetN || 0)));
+            const offsetAcross = offsetN * radius;
+            const offsetAlong = -Math.sqrt(Math.max(0, radius * radius - offsetAcross * offsetAcross));
+            const dx = Math.cos(bulletAngle);
+            const dy = Math.sin(bulletAngle);
+            const nx = -dy;
+            const ny = dx;
+
+            game.multiplayer.collisionEffects.set(key, {
+                key,
+                kind: 'asteroid',
+                bulletId,
+                targetId,
+                offsetRefX: offsetAlong * dx + offsetAcross * nx,
+                offsetRefY: offsetAlong * dy + offsetAcross * ny,
+                lastX: Number.isFinite(source.x) ? source.x : (target?.x || 0),
+                lastY: Number.isFinite(source.y) ? source.y : (target?.y || 0),
+                colorIndex: source.colorIndex || 0,
+                startedAt: performance.now(),
+                resolvedAt: null
+            });
+        },
+
+        startShipHit(objectId, payload, colorIndex = 0) {
+            if (!isSessionMode() || !objectId || !payload) return;
+            const hitCount = Number(payload.hitCount);
+            if (!Number.isFinite(hitCount)
+                || !Number.isFinite(payload.hitX)
+                || !Number.isFinite(payload.hitY)) {
+                return;
+            }
+            const seen = game.multiplayer.seenShipHitCounts.get(objectId) || 0;
+            if (hitCount <= seen) return;
+            game.multiplayer.seenShipHitCounts.set(objectId, hitCount);
+            const key = `ship:${objectId}:${hitCount}`;
+            const now = performance.now();
+            game.multiplayer.collisionEffects.set(key, {
+                key,
+                kind: 'ship',
+                objectId,
+                lastX: payload.hitX,
+                lastY: payload.hitY,
+                angle: Number.isFinite(payload.hitAngle) ? payload.hitAngle : 0,
+                colorIndex,
+                startedAt: now,
+                resolvedAt: now
+            });
+        },
+
+        resolveTarget(targetId) {
+            if (!targetId) return;
+            const now = performance.now();
+            for (const effect of game.multiplayer.collisionEffects.values()) {
+                if (effect.targetId === targetId && effect.resolvedAt == null) {
+                    effect.resolvedAt = now;
+                }
+            }
+        },
+
+        resolveBullet(bulletId) {
+            if (!bulletId) return;
+            game.multiplayer.seenPendingBulletIds.delete(bulletId);
+            const now = performance.now();
+            for (const effect of game.multiplayer.collisionEffects.values()) {
+                if (effect.bulletId === bulletId && effect.resolvedAt == null) {
+                    effect.resolvedAt = now;
+                }
+            }
+        },
+
+        clear() {
+            game.multiplayer.collisionEffects.clear();
+            game.multiplayer.seenPendingBulletIds.clear();
+            game.multiplayer.seenShipHitCounts.clear();
+            localImpactCueSequence = 0;
+        },
+
+        draw(ctx, now = performance.now()) {
+            const minMs = CONFIG.COLLISION_CUE_MIN_MS;
+            const fadeMs = Math.max(1, CONFIG.COLLISION_CUE_FADE_MS);
+            const maxMs = Math.max(minMs + fadeMs, CONFIG.COLLISION_CUE_MAX_MS);
+            const refDim = getReferenceDimension();
+
+            for (const [key, effect] of game.multiplayer.collisionEffects) {
+                let target = null;
+                if (effect.kind === 'asteroid' && effect.targetId) {
+                    target = game.astervoids.find(a => a.syncObjectId === effect.targetId) || null;
+                    if (target) {
+                        effect.lastX = target.x + effect.offsetRefX * refDim / getGameWidth();
+                        effect.lastY = target.y + effect.offsetRefY * refDim / getGameHeight();
+                    } else if (effect.resolvedAt == null) {
+                        effect.resolvedAt = now;
+                    }
+                }
+
+                const fadeStart = effect.resolvedAt == null
+                    ? effect.startedAt + maxMs - fadeMs
+                    : Math.max(effect.resolvedAt, effect.startedAt + minMs);
+                if (now >= fadeStart + fadeMs) {
+                    game.multiplayer.collisionEffects.delete(key);
+                    continue;
+                }
+
+                const alpha = now <= fadeStart ? 1 : 1 - (now - fadeStart) / fadeMs;
+                const age = Math.max(0, now - effect.startedAt);
+                const progress = Math.min(1, age / Math.max(1, minMs + fadeMs));
+                const x = fromNormalizedX(effect.lastX);
+                const y = fromNormalizedY(effect.lastY);
+                const color = SHIP_COLORS[effect.colorIndex] || CONFIG.STROKE_COLOR;
+
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, alpha);
+                ctx.strokeStyle = effect.kind === 'ship' ? CONFIG.THRUST_COLOR : color;
+                ctx.lineWidth = 2;
+                if (effect.kind === 'ship') {
+                    const base = fromNormalizedSize(CONFIG.SHIP_SIZE);
+                    const radius = base * (0.5 + 1.8 * progress);
+                    ctx.beginPath();
+                    ctx.arc(x, y, radius, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    for (let i = 0; i < 8; i++) {
+                        const angle = effect.angle + i * Math.PI / 4;
+                        ctx.moveTo(
+                            x + Math.cos(angle) * base * 0.45,
+                            y + Math.sin(angle) * base * 0.45);
+                        ctx.lineTo(
+                            x + Math.cos(angle) * radius * 1.25,
+                            y + Math.sin(angle) * radius * 1.25);
+                    }
+                    ctx.stroke();
+                } else {
+                    const base = Math.max(4, fromNormalizedSize(CONFIG.BULLET_RADIUS) * 2);
+                    const radius = base * (1 + 1.5 * progress);
+                    ctx.beginPath();
+                    ctx.arc(x, y, radius, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.moveTo(x - radius * 0.65, y);
+                    ctx.lineTo(x + radius * 0.65, y);
+                    ctx.moveTo(x, y - radius * 0.65);
+                    ctx.lineTo(x, y + radius * 0.65);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            }
+        }
+    };
     
     // Helper to check if this client has authority (is Server)
     function isAuthority() {
@@ -5584,12 +5792,21 @@
      * on every peer (including locally for symmetry); the GameState owner
      * reads ship.data.hitCount via the standard object-sync path.
      */
-    function emitShipStateChanged() {
+    function emitShipStateChanged(hitPose = null) {
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
-        ObjectSync.emitEvent(game.multiplayer.myShipObjectId, EVENT_KIND.SHIP_STATE_CHANGED, {
+        const payload = {
             score: game.ship.score || 0,
             hitCount: game.ship.hitCount || 0
-        });
+        };
+        if (hitPose) {
+            payload.hitX = hitPose.x;
+            payload.hitY = hitPose.y;
+            payload.hitAngle = hitPose.angle;
+        }
+        ObjectSync.emitEvent(
+            game.multiplayer.myShipObjectId,
+            EVENT_KIND.SHIP_STATE_CHANGED,
+            payload);
     }
     
     /**
@@ -5603,6 +5820,61 @@
 
         game.multiplayer.myShipObjectId = null;
         game.ship = null;
+    }
+
+    /**
+     * Seed a pre-existing join-snapshot object onto the same latency-delayed
+     * presentation timeline used by later arrival-anchored packets. This
+     * removes heartbeat staleness without predicting through one-way transit.
+     * Regular live creates and ownerless idle orphans remain arrival-anchored.
+     */
+    function getDeterministicJoinBaselinePerf(obj) {
+        if (!isDeterministicMode()
+            || !obj
+            || !game.multiplayer.joinSnapshotObjectIds.has(obj.id)) {
+            return undefined;
+        }
+        // This marker identifies the first remote ingest only. Even when the
+        // clock is not ready enough to seed, later packets must return to the
+        // normal arrival-anchored path rather than being projected repeatedly.
+        game.multiplayer.joinSnapshotObjectIds.delete(obj.id);
+        if (!RemoteObjects.isClockOffsetInitialized() || !Number.isFinite(obj.validAt)) {
+            return undefined;
+        }
+        const session = SessionClient.getCurrentSession();
+        const ownerIsActive = !!obj.ownerMemberId
+            && !!session?.members?.some(member => member.id === obj.ownerMemberId);
+        const clockRtt = RemoteObjects.getClockSampleRtt();
+        if (!ownerIsActive || !Number.isFinite(clockRtt)) return undefined;
+
+        const presentationNow = RemoteObjects.serverNowMs() - Math.max(0, clockRtt) / 2;
+        const maxAgeMs = CONFIG.DEADRECKON_MAX_FRAMES * (1000 / CONFIG.TARGET_FPS);
+        const ageMs = Math.min(maxAgeMs, Math.max(0, presentationNow - obj.validAt));
+        return performance.now() - ageMs;
+    }
+
+    function beginReplicationVersion(obj) {
+        const deterministic = isDeterministicMode();
+        const versions = deterministic ? DeadReckon.lastVersions : RemoteObjects.lastVersions;
+        if (obj.version === versions.get(obj.id)) return null;
+        const ownershipVersion = obj.ownershipMigrationVersion === obj.version;
+        const hasReplicationState = deterministic
+            ? DeadReckon.states.has(obj.id)
+            : RemoteObjects.states.has(obj.id);
+        const ownershipOnly = ownershipVersion && hasReplicationState;
+        return {
+            deterministic,
+            versions,
+            ownershipOnly,
+            preserveDirection: !ownershipVersion && obj.ownershipMigrationPending === true
+        };
+    }
+
+    function finishReplicationVersion(obj, change) {
+        change.versions.set(obj.id, obj.version);
+        if (change.preserveDirection) {
+            obj.ownershipMigrationPending = false;
+        }
     }
 
     /**
@@ -5623,10 +5895,12 @@
             
             currentRemoteIds.add(obj.id);
             
-            // Only feed new sync data to replication when version changes.
-            // Deterministic mode uses dead reckoning; legacy uses interpolation.
-            if (isDeterministicMode()) {
-                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+            // Only feed kinematic versions to replication. Ownership migration
+            // increments the version without changing data, so re-anchoring on
+            // that version would replay a stale pose as a fresh snapshot.
+            const replicationChange = beginReplicationVersion(obj);
+            if (replicationChange) {
+                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
                     // Intentional respawn teleport: the invulnerability counter
                     // only ever decreases during play and jumps back up to its
                     // max on Ship.reset(). A jump UP means death/respawn, so we
@@ -5637,12 +5911,21 @@
                         && (obj.data.invulnerable || 0) > prevInvuln;
                     // Arrival-anchored: render authoritative truth, dead-reckon
                     // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(obj.id, obj.data, undefined, isTeleport);
-                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                    DeadReckon.updateState(
+                        obj.id,
+                        obj.data,
+                        getDeterministicJoinBaselinePerf(obj),
+                        isTeleport,
+                        replicationChange.preserveDirection);
+                } else if (!replicationChange.ownershipOnly) {
+                    RemoteObjects.updateState(
+                        obj.id,
+                        obj.data,
+                        obj.ownerMemberId,
+                        obj.validAt,
+                        obj.arrivalServerTime);
                 }
-            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
-                RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
-                RemoteObjects.lastVersions.set(obj.id, obj.version);
+                finishReplicationVersion(obj, replicationChange);
             }
             
             // Get or create remote ship instance
@@ -5671,6 +5954,7 @@
         for (const [objectId, ship] of game.multiplayer.remoteShips) {
             if (!currentRemoteIds.has(objectId)) {
                 game.multiplayer.remoteShips.delete(objectId);
+                game.multiplayer.seenShipHitCounts.delete(objectId);
                 RemoteObjects.remove(objectId);
                 DeadReckon.remove(objectId);
             }
@@ -5724,6 +6008,8 @@
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
         game.multiplayer.processedPendingBullets.clear();
+        game.multiplayer.joinSnapshotObjectIds.clear();
+        CollisionEffects.clear();
         game.astervoids = [];
         game.bullets = [];
         RemoteObjects.clear();
@@ -5830,6 +6116,7 @@
                         asteroid.angle = projected.angle;
                     }
                     obj.spawnHandled = true;
+                    game.multiplayer.joinSnapshotObjectIds.delete(obj.id);
                     game.astervoids.push(asteroid);
                 }
                 continue;
@@ -5837,18 +6124,26 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to replication when version changes.
-            // Deterministic mode uses dead reckoning; legacy uses interpolation.
-            if (isDeterministicMode()) {
-                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+            const replicationChange = beginReplicationVersion(obj);
+            if (replicationChange) {
+                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
                     // Arrival-anchored: render authoritative truth, dead-reckon
                     // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(obj.id, obj.data);
-                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                    DeadReckon.updateState(
+                        obj.id,
+                        obj.data,
+                        getDeterministicJoinBaselinePerf(obj),
+                        false,
+                        replicationChange.preserveDirection);
+                } else if (!replicationChange.ownershipOnly) {
+                    RemoteObjects.updateState(
+                        obj.id,
+                        obj.data,
+                        obj.ownerMemberId,
+                        obj.validAt,
+                        obj.arrivalServerTime);
                 }
-            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
-                RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
-                RemoteObjects.lastVersions.set(obj.id, obj.version);
+                finishReplicationVersion(obj, replicationChange);
             }
             
             // Find existing asteroid by sync ID
@@ -5878,6 +6173,7 @@
             const syncObj = ObjectSync.getObject(a.syncObjectId);
             if (syncObj && syncObj.ownerMemberId === myMemberId) return true; // Keep our own
             if (!currentSyncIds.has(a.syncObjectId)) {
+                CollisionEffects.resolveTarget(a.syncObjectId);
                 // Remote asteroid destroyed — play explosion sound based on size
                 const size = a.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
                              a.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
@@ -6003,6 +6299,7 @@
      * @param {Bullet} bullet - The bullet to delete
      */
     async function deleteSyncedBullet(bullet) {
+        CollisionEffects.resolveBullet(bullet.syncObjectId);
         await deleteSyncedObject(bullet.syncObjectId, 'bullet');
     }
 
@@ -6024,18 +6321,26 @@
             
             currentSyncIds.add(obj.id);
             
-            // Only feed new sync data to replication when version changes.
-            // Deterministic mode uses dead reckoning; legacy uses interpolation.
-            if (isDeterministicMode()) {
-                if (obj.version !== DeadReckon.lastVersions.get(obj.id)) {
+            const replicationChange = beginReplicationVersion(obj);
+            if (replicationChange) {
+                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
                     // Arrival-anchored: render authoritative truth, dead-reckon
                     // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(obj.id, obj.data);
-                    DeadReckon.lastVersions.set(obj.id, obj.version);
+                    DeadReckon.updateState(
+                        obj.id,
+                        obj.data,
+                        getDeterministicJoinBaselinePerf(obj),
+                        false,
+                        replicationChange.preserveDirection);
+                } else if (!replicationChange.ownershipOnly) {
+                    RemoteObjects.updateState(
+                        obj.id,
+                        obj.data,
+                        obj.ownerMemberId,
+                        obj.validAt,
+                        obj.arrivalServerTime);
                 }
-            } else if (obj.version !== RemoteObjects.lastVersions.get(obj.id)) {
-                RemoteObjects.updateState(obj.id, obj.data, obj.ownerMemberId, obj.validAt, obj.arrivalServerTime);
-                RemoteObjects.lastVersions.set(obj.id, obj.version);
+                finishReplicationVersion(obj, replicationChange);
             }
             
             // Find existing bullet by sync ID
@@ -6058,6 +6363,19 @@
             } else {
                 bullet.fromSyncData(obj.data);
             }
+            // DeadReckon contains only kinematics. Apply hit-handshake fields
+            // directly so a pending remote bullet is hidden and can cue impact.
+            bullet.pendingHit = !!obj.data.pendingHit;
+            bullet.hitTargetId = obj.data.hitTargetId || null;
+            bullet.hitImpactTorque = obj.data.hitImpactTorque || 0;
+            bullet.hitBulletAngle = obj.data.hitBulletAngle || 0;
+            bullet.hitOffsetN = obj.data.hitOffsetN || 0;
+            if (obj.data.pendingHit) {
+                CollisionEffects.startAsteroidHit({
+                    ...obj.data,
+                    syncObjectId: obj.id
+                });
+            }
         }
         
         // Remove remote bullets that no longer exist in sync
@@ -6067,6 +6385,7 @@
             
             // Remove remote bullets that are gone from sync
             if (b.syncObjectId && !currentSyncIds.has(b.syncObjectId)) {
+                CollisionEffects.resolveBullet(b.syncObjectId);
                 RemoteObjects.remove(b.syncObjectId);
                 DeadReckon.remove(b.syncObjectId);
                 return false;
@@ -7236,6 +7555,7 @@
                             const relVelX = bullet.velocityX - asteroid.velocityX;
                             const relVelY = bullet.velocityY - asteroid.velocityY;
                             const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
+                            CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
                             // Split sends to server — OnObjectReplaced handles asteroid state for all clients
                             splitAsteroid(asteroid, null, impact, game.ship);
                             // Self-award score on own ship
@@ -7256,6 +7576,7 @@
                             bullet.hitImpactTorque = impact.impactTorque;
                             bullet.hitBulletAngle = impact.bulletAngle;
                             bullet.hitOffsetN = impact.offsetN;
+                            CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
                             if (bullet.syncObjectId) {
                                 ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
                             }
@@ -7399,11 +7720,12 @@
         
         if (isSessionMode()) {
             // Increment monotonic hitCount on ship (GameState owner watches this)
+            const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
             ship.hitCount = (ship.hitCount || 0) + 1;
             // Phase 2.3: hitCount no longer rides on toUpdateData(); push it
             // through the per-object event channel so other peers see it
             // before the next per-frame batch.
-            emitShipStateChanged();
+            emitShipStateChanged(hitPose);
 
             // Reset ship locally
             ship.reset();
@@ -8391,6 +8713,8 @@
                     game.ship.draw(ctx);
                 }
             }
+
+            CollisionEffects.draw(ctx);
         });
         
         // Show/hide gameplay text overlays (HTML for crisp rendering at all DPIs)
@@ -9501,6 +9825,11 @@
         setPickerStatus('Connecting...', 'connecting');
 
         try {
+            // Forced reconnects can replace the HubConnection without firing
+            // the public onDisconnected callback for the stale connection.
+            // Restart explicitly so join seeding cannot reuse another
+            // connection's or region's RTT sample.
+            if (force) RemoteObjects.stopClockSync();
             const success = await SessionClient.connect(force, hubHostname);
             if (success) {
                 // Initialize ObjectSync after connection
@@ -9523,6 +9852,10 @@
                     if (obj && obj.data) {
                         if (payload.score !== undefined) obj.data.score = payload.score;
                         if (payload.hitCount !== undefined) obj.data.hitCount = payload.hitCount;
+                        CollisionEffects.startShipHit(
+                            objectId,
+                            payload,
+                            obj.data.colorIndex || 0);
                     }
                 });
                 ObjectSync.on('onBatchReceived', (serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp) => RemoteObjects.recordPacketArrival(serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp));
@@ -9567,6 +9900,7 @@
                 // physics (the adopt branch in updateAstervoidsFromSync), not
                 // by interpolation, so a bridge would be ignored.
                 ObjectSync.on('onObjectReplaced', (deletedObjectId, createdObjects, batchValidAt) => {
+                    CollisionEffects.resolveTarget(deletedObjectId);
                     if (!CONFIG.SPAWN_BRIDGE_ENABLED) return;
                     if (!RemoteObjects.isClockOffsetInitialized()) return;
                     if (batchValidAt == null) return;
@@ -10341,6 +10675,7 @@
 
     // Freeze gameplay when SignalR enters reconnecting state
     SessionClient.on('onReconnecting', (error) => {
+        RemoteObjects.stopClockSync();
         if (isSessionMode() && (game.state === 'playing' || game.state === 'waveDelay')) {
             game.connectionLost = true;
             reconnectingOverlay.classList.add('visible');
@@ -10454,9 +10789,13 @@
                 // Clean up remote ship
                 if (game.multiplayer.remoteShips.has(objectId)) {
                     game.multiplayer.remoteShips.delete(objectId);
+                    game.multiplayer.seenShipHitCounts.delete(objectId);
                     RemoteObjects.remove(objectId);
+                    DeadReckon.remove(objectId);
                 }
                 // Clean up bullets owned by departing member
+                CollisionEffects.resolveBullet(objectId);
+                CollisionEffects.resolveTarget(objectId);
                 game.bullets = game.bullets.filter(b => b.syncObjectId !== objectId);
             }
         }
@@ -10491,6 +10830,9 @@
             const myMemberId = SessionClient.getCurrentMember()?.id;
             for (const migration of info.migratedObjects) {
                 if (migration.newOwnerId === myMemberId) {
+                    const migratedObject = ObjectSync.getObject(migration.objectId);
+                    if (migratedObject) migratedObject.ownershipMigrationPending = false;
+                    game.multiplayer.joinSnapshotObjectIds.delete(migration.objectId);
                     DeadReckon.remove(migration.objectId);
                     RemoteObjects.remove(migration.objectId);
                     // Drop any stale send-on-change baseline so our first sync

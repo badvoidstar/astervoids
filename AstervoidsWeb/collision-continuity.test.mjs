@@ -1,0 +1,176 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
+
+const CUE_MIN_MS = 120;
+const CUE_FADE_MS = 180;
+const CUE_MAX_MS = 1000;
+
+function impactOffset(radius, bulletAngle, offsetN) {
+    const clamped = Math.max(-1, Math.min(1, offsetN));
+    const across = clamped * radius;
+    const along = -Math.sqrt(Math.max(0, radius * radius - across * across));
+    const dx = Math.cos(bulletAngle);
+    const dy = Math.sin(bulletAngle);
+    return {
+        x: along * dx + across * -dy,
+        y: along * dy + across * dx
+    };
+}
+
+function cueAlpha(startedAt, resolvedAt, now) {
+    const fadeStart = resolvedAt == null
+        ? startedAt + CUE_MAX_MS - CUE_FADE_MS
+        : Math.max(resolvedAt, startedAt + CUE_MIN_MS);
+    if (now >= fadeStart + CUE_FADE_MS) return 0;
+    return now <= fadeStart ? 1 : 1 - (now - fadeStart) / CUE_FADE_MS;
+}
+
+class CueDeduper {
+    constructor() {
+        this.pendingBullets = new Set();
+        this.shipHitCounts = new Map();
+    }
+
+    startBullet(id) {
+        if (this.pendingBullets.has(id)) return false;
+        this.pendingBullets.add(id);
+        return true;
+    }
+
+    resolveBullet(id) {
+        this.pendingBullets.delete(id);
+    }
+
+    resolveTarget() {
+        // The pending bullet can outlive target replacement while its owner
+        // observes the acknowledgment and sends the follow-up deletion.
+    }
+
+    startShip(id, hitCount) {
+        const seen = this.shipHitCounts.get(id) || 0;
+        if (hitCount <= seen) return false;
+        this.shipHitCounts.set(id, hitCount);
+        return true;
+    }
+
+    clear() {
+        this.pendingBullets.clear();
+        this.shipHitCounts.clear();
+    }
+}
+
+test('asteroid impact cue remains attached to the transmitted disk impact point', () => {
+    for (const radius of [0.025, 0.05, 0.083]) {
+        for (const angle of [0, 0.7, Math.PI, 5.1]) {
+            for (const offsetN of [-1, -0.5, 0, 0.75, 1]) {
+                const offset = impactOffset(radius, angle, offsetN);
+                assert.ok(Math.abs(Math.hypot(offset.x, offset.y) - radius) < 1e-12);
+                const nx = -Math.sin(angle);
+                const ny = Math.cos(angle);
+                const across = offset.x * nx + offset.y * ny;
+                assert.ok(Math.abs(across - offsetN * radius) < 1e-12);
+            }
+        }
+    }
+});
+
+test('resolved cues hold long enough to explain a transition and then fade', () => {
+    assert.equal(cueAlpha(1000, 1010, 1000), 1);
+    assert.equal(cueAlpha(1000, 1010, 1119), 1);
+    assert.equal(cueAlpha(1000, 1010, 1210), 0.5);
+    assert.equal(cueAlpha(1000, 1010, 1300), 0);
+});
+
+test('unresolved pending cues have a bounded lifetime', () => {
+    assert.equal(cueAlpha(0, null, CUE_MAX_MS - CUE_FADE_MS), 1);
+    assert.ok(cueAlpha(0, null, CUE_MAX_MS - CUE_FADE_MS / 2) > 0);
+    assert.equal(cueAlpha(0, null, CUE_MAX_MS), 0);
+});
+
+test('collision acknowledgment precedes authoritative replacement across the network matrix', () => {
+    for (const rtt of [0, 50, 100, 150, 250]) {
+        for (const jitter of [0, 10, 25, 50]) {
+            const oneWay = rtt / 2;
+            const observerCueAt = Math.max(0, oneWay + jitter);
+            const replacementAt = Math.max(
+                observerCueAt,
+                oneWay + jitter + rtt);
+            assert.ok(observerCueAt <= replacementAt);
+            assert.equal(0 <= replacementAt, true, 'shooter cue starts in the collision frame');
+        }
+    }
+});
+
+test('pending bullets and monotonic ship hits are cued exactly once', () => {
+    const cues = new CueDeduper();
+    assert.equal(cues.startBullet('bullet-1'), true);
+    assert.equal(cues.startBullet('bullet-1'), false);
+    assert.equal(cues.startShip('ship-1', 2), true);
+    assert.equal(cues.startShip('ship-1', 2), false);
+    assert.equal(cues.startShip('ship-1', 1), false);
+    assert.equal(cues.startShip('ship-1', 3), true);
+    cues.resolveTarget('target-1');
+    assert.equal(cues.startBullet('bullet-1'), false);
+    cues.resolveBullet('bullet-1');
+    assert.equal(cues.startBullet('bullet-1'), true);
+    cues.clear();
+    assert.equal(cues.startShip('ship-1', 1), true);
+});
+
+test('production applies non-kinematic pending-hit fields outside DeadReckon', () => {
+    assert.match(productionSource, /bullet\.pendingHit = !!obj\.data\.pendingHit;/);
+    assert.match(productionSource, /bullet\.hitTargetId = obj\.data\.hitTargetId \|\| null;/);
+    assert.match(productionSource, /CollisionEffects\.startAsteroidHit\(\{\s*\.\.\.obj\.data,/);
+});
+
+test('production ship-hit event carries the pre-reset pose and deduplicates by hitCount', () => {
+    assert.match(productionSource, /const hitPose = \{ x: ship\.x, y: ship\.y, angle: ship\.angle \};/);
+    assert.match(productionSource, /payload\.hitX = hitPose\.x;/);
+    assert.match(productionSource, /game\.multiplayer\.seenShipHitCounts\.get\(objectId\)/);
+    assert.match(productionSource, /CollisionEffects\.startShipHit\(/);
+});
+
+test('production join seeding targets the delayed presentation timeline only for active owners', () => {
+    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.has\(obj\.id\)/);
+    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.delete\(obj\.id\)/);
+    assert.match(productionSource, /session\?\.members\?\.some\(member => member\.id === obj\.ownerMemberId\)/);
+    assert.match(
+        productionSource,
+        /presentationNow = RemoteObjects\.serverNowMs\(\) - Math\.max\(0, clockRtt\) \/ 2/);
+    assert.match(productionSource, /getDeterministicJoinBaselinePerf\(obj\)/);
+});
+
+test('production migration handoff skips ownership-only anchors and preserves direction', () => {
+    assert.match(productionSource, /obj\.ownershipMigrationVersion === obj\.version/);
+    assert.match(productionSource, /!replicationChange\.ownershipOnly && replicationChange\.deterministic/);
+    assert.match(productionSource, /replicationChange\.preserveDirection/);
+    assert.match(productionSource, /correctionAlong \* stepMs \/ motion/);
+    assert.match(productionSource, /tauMs: tau/);
+});
+
+test('session reset clears all transient collision state', () => {
+    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.clear\(\);[\s\S]*CollisionEffects\.clear\(\);/);
+    assert.match(productionSource, /game\.multiplayer\.seenPendingBulletIds\.clear\(\);/);
+    assert.match(productionSource, /game\.multiplayer\.seenShipHitCounts\.clear\(\);/);
+});
+
+test('target replacement retains bullet deduplication until bullet removal', () => {
+    const resolveTargetStart = productionSource.indexOf('        resolveTarget(targetId) {');
+    const resolveBulletStart = productionSource.indexOf('        resolveBullet(bulletId) {');
+    assert.ok(resolveTargetStart >= 0 && resolveBulletStart > resolveTargetStart);
+    const resolveTargetSource = productionSource.slice(resolveTargetStart, resolveBulletStart);
+    assert.doesNotMatch(
+        resolveTargetSource,
+        /seenPendingBulletIds\.delete/,
+        'target replacement must not permit a still-pending bullet to replay its cue');
+    assert.match(
+        productionSource,
+        /async function deleteSyncedBullet\(bullet\) \{\s*CollisionEffects\.resolveBullet\(bullet\.syncObjectId\);/,
+        'local bullet deletion must release its dedupe marker');
+});

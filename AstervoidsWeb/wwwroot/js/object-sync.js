@@ -1635,6 +1635,12 @@ const ObjectSync = (function() {
             if (migration.newVersion <= obj.version) continue;
             obj.ownerMemberId = migration.newOwnerId;
             obj.version = migration.newVersion;
+            // Ownership migration advances the object version without changing
+            // its data. Presentation layers must not re-anchor stale kinematics
+            // as though this were a motion snapshot; the pending flag remains
+            // set until the new owner's first real state update is ingested.
+            obj.ownershipMigrationVersion = migration.newVersion;
+            obj.ownershipMigrationPending = true;
             markObjectMutation(obj.id);
         }
     }
