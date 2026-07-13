@@ -8944,6 +8944,27 @@
         sessionPicker.statusEl.className = 'picker-status' + (type ? ' ' + type : '');
     }
 
+    function updateCurrentSessionStatus() {
+        const sessionId = sessionPicker.currentSessionId;
+        if (!sessionId) return false;
+
+        const listedSession = sessionPicker.sessions.find(s => s.id === sessionId);
+        const clientSession = SessionClient.getCurrentSession();
+        const liveSession = clientSession?.id === sessionId ? clientSession : null;
+        const gameSession = game.sessionInfo?.id === sessionId ? game.sessionInfo : null;
+        const sessionName = listedSession?.name || liveSession?.name || gameSession?.name || 'session';
+        const roleText = sessionPicker.isServer ? 'host' : 'member';
+        const memberCount = Array.isArray(liveSession?.members)
+            ? liveSession.members.length
+            : listedSession?.memberCount;
+        const occupancy = Number.isFinite(memberCount) && Number.isFinite(listedSession?.maxMembers)
+            ? ` - ${memberCount}/${listedSession.maxMembers}`
+            : '';
+
+        setPickerStatus(`In ${sessionName} (${roleText})${occupancy}`);
+        return true;
+    }
+
     // ── Regional picker helpers ─────────────────────────────────────────────
     // RegionService is loaded as a separate module (region-service.js). Picker
     // code accesses it through `window.RegionService` so that environments
@@ -9243,6 +9264,7 @@
                 if (sessionPicker.regions.length > 1) {
                     renderSessionList();
                     updatePickerButtons();
+                    updateCurrentSessionStatus();
                     return;
                 }
                 // Single-region: only data source is /api/sessions; if the
@@ -9256,13 +9278,7 @@
         updatePickerButtons();
         
         // Update status based on current state
-        if (sessionPicker.currentSessionId) {
-            const currentSession = sessionPicker.sessions.find(s => s.id === sessionPicker.currentSessionId);
-            if (currentSession) {
-                const roleText = sessionPicker.isServer ? 'host' : 'member';
-                setPickerStatus(`In ${currentSession.name} (${roleText}) - ${currentSession.memberCount}/${currentSession.maxMembers}`);
-            }
-        } else {
+        if (!updateCurrentSessionStatus()) {
             setPickerStatus(`${sessionPicker.sessions.length}/${sessionPicker.maxSessions} sessions`);
         }
     }
@@ -9790,6 +9806,7 @@
                 sessionPicker.gameStarted = (result.session.objects || []).some(
                     obj => obj.data?.type === OBJECT_TYPES.GAME_STATE
                 );
+                updateCurrentSessionStatus();
                 
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
@@ -9857,6 +9874,7 @@
                 sessionPicker.isServer = true; // Creator is always server
                 sessionPicker.gameStarted = false; // New session, game not started
                 updatePickerButtons();
+                updateCurrentSessionStatus();
                 
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
@@ -10275,6 +10293,7 @@
                             obj => obj.data?.type === OBJECT_TYPES.GAME_STATE
                         );
                         sessionPicker.connected = true;
+                        updateCurrentSessionStatus();
                         resizeCanvas(true);
 
                         if (wasPlaying && sessionPicker.gameStarted) {
@@ -10412,11 +10431,13 @@
         
         // Role data already provided in event - just update UI, no need to refetch
         updatePickerButtons();
+        updateCurrentSessionStatus();
     });
 
     // Handle member joining - track event sequence
     SessionClient.on('onMemberJoined', (memberInfo, senderMemberId, memberSequence) => {
         ObjectSync.trackEventSequence(senderMemberId, memberSequence);
+        updateCurrentSessionStatus();
     });
 
     // Handle member leaving - clean up their objects
@@ -10477,6 +10498,7 @@
                 }
             }
         }
+        updateCurrentSessionStatus();
     });
 
     // Handle session list changes (signal from server - fetch fresh data with jitter)
