@@ -136,6 +136,44 @@ test('production ship-hit event carries the pre-reset pose and deduplicates by h
     assert.match(productionSource, /CollisionEffects\.startShipHit\(/);
 });
 
+test('same-owner asteroid impacts broadcast a target-relative cue before replacement', () => {
+    assert.match(
+        productionSource,
+        /ASTEROID_IMPACT_CUE: 'asteroid-impact-cue'/);
+    assert.match(
+        productionSource,
+        /ASTEROID_IMPACT_CUE: 2/);
+    assert.match(
+        productionSource,
+        /ObjectSync\.registerEventKind\(EVENT_KIND\.ASTEROID_IMPACT_CUE, EVENT_KIND_BYTE\.ASTEROID_IMPACT_CUE\)/);
+    assert.match(
+        productionSource,
+        /_impactCueKey: `asteroid:event:\$\{payload\.cueId\}`[\s\S]*hitTargetId: objectId/);
+
+    const helperStart = productionSource.indexOf(
+        '    function emitOwnedAsteroidImpactCue(asteroid, bullet, impact) {');
+    const helperEnd = productionSource.indexOf(
+        '    async function deleteSyncedShip() {',
+        helperStart);
+    assert.ok(helperStart >= 0 && helperEnd > helperStart);
+    const helperSource = productionSource.slice(helperStart, helperEnd);
+    assert.match(helperSource, /cueId,\s*bulletAngle: impact\.bulletAngle,\s*offsetN: impact\.offsetN,/);
+    assert.doesNotMatch(helperSource, /\bhit[XY]\b|\bimpact[XY]\b/);
+
+    const ownerBranchStart = productionSource.indexOf(
+        '                        if (asteroidOwner === myMemberId) {');
+    const ownerBranchEnd = productionSource.indexOf(
+        '                        } else {',
+        ownerBranchStart);
+    assert.ok(ownerBranchStart >= 0 && ownerBranchEnd > ownerBranchStart);
+    const ownerBranch = productionSource.slice(ownerBranchStart, ownerBranchEnd);
+    const cueAt = ownerBranch.indexOf('emitOwnedAsteroidImpactCue(asteroid, bullet, impact);');
+    const deleteAt = ownerBranch.indexOf('deleteSyncedBullet(removedBullet);');
+    const replaceAt = ownerBranch.indexOf('splitAsteroid(asteroid, null, impact, game.ship);');
+    assert.ok(cueAt >= 0 && cueAt < deleteAt && deleteAt < replaceAt);
+    assert.doesNotMatch(ownerBranch, /CollisionEffects\.startAsteroidHit/);
+});
+
 test('production join seeding targets the delayed presentation timeline only for active owners', () => {
     assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.has\(obj\.id\)/);
     assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.delete\(obj\.id\)/);

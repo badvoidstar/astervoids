@@ -2399,10 +2399,12 @@
     // Phase 2.1: per-object event channel kinds. Both peers must register
     // the same name ↔ byte mapping (done at ObjectSync.init time).
     const EVENT_KIND = {
-        SHIP_STATE_CHANGED: 'ship-state-changed'
+        SHIP_STATE_CHANGED: 'ship-state-changed',
+        ASTEROID_IMPACT_CUE: 'asteroid-impact-cue'
     };
     const EVENT_KIND_BYTE = {
-        SHIP_STATE_CHANGED: 1
+        SHIP_STATE_CHANGED: 1,
+        ASTEROID_IMPACT_CUE: 2
     };
 
     // ── Phase 4 wireopt: positional schemas ─────────────────────────────────
@@ -5808,6 +5810,23 @@
             EVENT_KIND.SHIP_STATE_CHANGED,
             payload);
     }
+
+    function emitOwnedAsteroidImpactCue(asteroid, bullet, impact) {
+        if (!isSessionMode() || !asteroid?.syncObjectId || !bullet || !impact) return;
+        const memberId = SessionClient.getCurrentMember()?.id || 'local';
+        const cueId = bullet.syncObjectId || `${memberId}:${++localImpactCueSequence}`;
+        ObjectSync.emitEvent(
+            asteroid.syncObjectId,
+            EVENT_KIND.ASTEROID_IMPACT_CUE,
+            {
+                cueId,
+                bulletAngle: impact.bulletAngle,
+                offsetN: impact.offsetN,
+                colorIndex: bullet.colorIndex || 0
+            }).catch(err => {
+                _error('[Multiplayer] Failed to broadcast asteroid impact cue:', err);
+            });
+    }
     
     /**
      * Delete the local player's ship from ObjectSync
@@ -7546,16 +7565,19 @@
                         if (asteroidOwner === myMemberId) {
                             // We own both bullet and asteroid — process locally
                             const points = asteroid.getPoints();
-                            const removedBullet = game.bullets.splice(i, 1)[0];
-                            if (removedBullet.syncObjectId) {
-                                deleteSyncedBullet(removedBullet);
-                            }
                             const offsetX = bullet.x - asteroid.x;
                             const offsetY = bullet.y - asteroid.y;
                             const relVelX = bullet.velocityX - asteroid.velocityX;
                             const relVelY = bullet.velocityY - asteroid.velocityY;
                             const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
-                            CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+                            // The asteroid-owned event runs its handler locally
+                            // immediately and reaches every other member before
+                            // the ordered replacement broadcast.
+                            emitOwnedAsteroidImpactCue(asteroid, bullet, impact);
+                            const removedBullet = game.bullets.splice(i, 1)[0];
+                            if (removedBullet.syncObjectId) {
+                                deleteSyncedBullet(removedBullet);
+                            }
                             // Split sends to server — OnObjectReplaced handles asteroid state for all clients
                             splitAsteroid(asteroid, null, impact, game.ship);
                             // Self-award score on own ship
@@ -9841,11 +9863,7 @@
                     window.SchemaCodec.replaceAll(WIREOPT_SCHEMAS);
                 }
                 ObjectSync.setSchemaIdSelector(selectWireoptSchemaId);
-                // Phase 2.3: per-object event channel registrations.
-                // Score and hitCount move off the per-frame update path onto a
-                // tiny "ship-state-changed" event that fires only when the
-                // values change. Snapshot reconciliation (Ship.toSyncData)
-                // still carries them so late joiners see correct values.
+                // Phase 2.3: game-defined, low-frequency per-object events.
                 ObjectSync.registerEventKind(EVENT_KIND.SHIP_STATE_CHANGED, EVENT_KIND_BYTE.SHIP_STATE_CHANGED);
                 ObjectSync.on(`objectEvent:${EVENT_KIND.SHIP_STATE_CHANGED}`, (objectId, payload) => {
                     const obj = ObjectSync.getObject(objectId);
@@ -9857,6 +9875,34 @@
                             payload,
                             obj.data.colorIndex || 0);
                     }
+                });
+                ObjectSync.registerEventKind(EVENT_KIND.ASTEROID_IMPACT_CUE, EVENT_KIND_BYTE.ASTEROID_IMPACT_CUE);
+                ObjectSync.on(`objectEvent:${EVENT_KIND.ASTEROID_IMPACT_CUE}`, (objectId, payload) => {
+                    const obj = ObjectSync.getObject(objectId);
+                    if (obj?.data?.type !== OBJECT_TYPES.ASTEROID
+                        || typeof payload?.cueId !== 'string'
+                        || !payload.cueId) {
+                        return;
+                    }
+                    const asteroid = game.astervoids.find(a => a.syncObjectId === objectId);
+                    const target = asteroid || {
+                        syncObjectId: objectId,
+                        x: obj.data.x,
+                        y: obj.data.y,
+                        radius: obj.data.radius
+                    };
+                    CollisionEffects.startAsteroidHit({
+                        _impactCueKey: `asteroid:event:${payload.cueId}`,
+                        hitTargetId: objectId,
+                        hitBulletAngle: payload.bulletAngle,
+                        hitOffsetN: payload.offsetN,
+                        colorIndex: payload.colorIndex || 0,
+                        x: target.x,
+                        y: target.y
+                    }, target, {
+                        bulletAngle: payload.bulletAngle,
+                        offsetN: payload.offsetN
+                    });
                 });
                 ObjectSync.on('onBatchReceived', (serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp) => RemoteObjects.recordPacketArrival(serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp));
                 // Detect GameState creation (replaces onGameStarted event)
