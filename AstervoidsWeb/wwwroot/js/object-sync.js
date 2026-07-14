@@ -184,26 +184,31 @@ const ObjectSync = (function() {
     // Reconciliation skips these IDs in the "add missing object" pass — the server's
     // snapshot may still contain them (delete in flight), and re-adding them would
     // resurrect a ghost the user already destroyed. Cleared when DeleteObject's
-    // invoke resolves (success or failure) since by then the snapshot will reflect
-    // the deletion.
+    // invoke resolves. On success the server snapshot omits it; on failure,
+    // removing this guard allows a later reconciliation to restore server truth.
     const pendingDeletes = new Set();
     
-    // Delta encoding: track last-sent data per object to only send changes
+    // Delta encoding: track last server-confirmed data per object so rejected
+    // or later re-queued states can be diffed from an accepted baseline.
     const lastSentData = new Map();
     let deltaEncodingEnabled = false;
-    // Optional clock source for owner-stamped spawn times. Provided via
+    // Optional clock source for owner-operation validAt times. Provided via
     // configure({ clockSource: { nowMs(), initialized() } }). When set,
-    // replaceObject stamps clientSpawnServerTime so the server's broadcast
-    // anchors at the owner's collision-detection moment instead of the
-    // hub-entry time (eliminates upload-time bias in spawn projection).
+    // create/replace/event calls stamp their invocation time, while update
+    // batches stamp flush time. A coalesced update's underlying simulation pose
+    // can therefore predate validAt by its queue wait. The server clamps client
+    // stamps and applies its per-object monotonic rules.
     let clockSource = null;
     
-    // Full-state sync interval (frames at nominal rate)
+    // Delta-enabled flush opportunities between periodic forced-full payloads
+    // for objects already pending in that batch. This counts flushes with
+    // producer data, not render/simulation frames or all live objects.
     const FULL_SYNC_INTERVAL = 6000;
     
-    // Frame-count-based sync settings
+    // Approximate wall-clock flush settings, driven by one tick per render frame.
     let nominalFrameTime = 1 / 30;  // target send interval in seconds
-    let baseNominalFrameTime = 1 / 30; // configured baseline (before adaptive adjustment)
+    // Retained configured value; adaptive updates currently do not auto-reset to it.
+    let baseNominalFrameTime = 1 / 30;
     let minFrameTime = 1 / 480;     // clamp to prevent extreme thresholds
     let frameCounter = 0;
     let sendThreshold = 2;          // recalculated each frame from actual frame time
@@ -254,7 +259,9 @@ const ObjectSync = (function() {
     
     /**
      * Adapt send rate based on measured RTT.
-     * Linearly scales send interval: low RTT → 20Hz, high RTT → 2Hz.
+     * Uses one RTT as the target interval, clamped to 50-1000ms (20-1Hz).
+     * This controls flush opportunities, not whether game-layer gates have
+     * queued data or whether an in-flight invoke permits a new batch.
      * @param {number} rttMs - Current round-trip time in milliseconds
      */
     function updateSendRate(rttMs) {
@@ -275,11 +282,10 @@ const ObjectSync = (function() {
      * Returns null when the NTP clock isn't bootstrapped — callers must
      * guard so adaptive-delay metrics aren't fed pre-init guesses.
      *
-     * Captured INSIDE network event handlers so the lag = arrival − validAt
-     * sample reflects only owner→receiver delivery delay, with zero
-     * contamination from game-loop processing latency (a frame's worth of
-     * raf jitter, 0–16ms, that would otherwise systematically inflate the
-     * computed jitter buffer).
+     * Captured INSIDE network event handlers so lag = arrival - validAt excludes
+     * later game-loop polling. For update batches validAt is sampled at flush,
+     * so lag covers post-flush transport/queueing and residual clock error, not
+     * the age of state while it waited in pendingUpdates.
      */
     function getArrivalServerTimeMs() {
         if (clockSource && clockSource.initialized && clockSource.initialized()) {
@@ -594,7 +600,7 @@ const ObjectSync = (function() {
      *   as the trailing argument).
      * @param {string} senderMemberId
      * @param {number} memberSequence
-     * @param {number} validAt - Server-validated owner-stamped server-time ms
+     * @param {number} validAt - Server-validated owner-operation server-time ms
      *   (NTP-aligned), clamped within ±2 s of hub-entry receive time and
      *   monotonically capped against the object's previous ValidAt. THE unified
      *   interpolation axis: snap[0] is keyed at validAt. Stored on `obj.validAt`;
@@ -604,20 +610,19 @@ const ObjectSync = (function() {
         trackMemberSequence(senderMemberId, memberSequence);
         objectInfo.data = expandData(objectInfo.data);
 
-        // Capture true wire-arrival time (performance.now() domain) so the
-        // first interpolation snapshot for this object is anchored to when
-        // the network delivered it, not to when the next game-loop frame
-        // happens to detect it (0–16ms later, jittery).
+        // Capture wire-arrival metadata in the performance.now() domain.
+        // Current game presentation keys legacy samples by validAt and normal
+        // deterministic ingest at game-loop observation time; arrivalTime is
+        // retained on the object for diagnostics/future explicit baselines.
         const arrivalTime = (typeof performance !== 'undefined' && performance.now)
             ? performance.now()
             : Date.now();
-        // Server-time twin of arrivalTime (NTP-aligned), used by RemoteObjects
-        // for lag-based adaptive delay. Captured here so the lag estimate
-        // ignores game-loop processing latency entirely.
+        // Server-time twin used by legacy lag-based delay sizing. Capturing at
+        // dispatch excludes later game-loop polling from that measurement.
         const arrivalServerTime = getArrivalServerTimeMs();
 
         // Strip any legacy spawnTimestamp field from the wire data. The
-        // current model uses validAt as the single owner-stamped timestamp;
+        // current model uses validAt as the single operation timestamp;
         // spawnTimestamp lingered on the field-compression map (`sp` → ...)
         // but is never set or consumed by current code paths. Defensive
         // delete in case an older client still sends it.
@@ -677,15 +682,13 @@ const ObjectSync = (function() {
         }
 
         const obj = registerObject(objectInfo);
-        // Stamp arrival time on the freshly-registered object so the next
-        // game-loop frame's RemoteObjects.updateState(... obj.arrivalTime)
-        // call anchors the snapshot correctly (Fix 2 + Fix 3).
+        // Retain wire-arrival metadata separately from the validAt timeline.
         obj.arrivalTime = arrivalTime;
         obj.arrivalServerTime = arrivalServerTime;
         // Stamp the unified server-time axis anchor. RemoteObjects.updateState
         // converts validAt → perf.now-domain via validAtToPerfNow so bracket
-        // search remains monotonic while the snapshot key encodes the global
-        // server-time agreement (eliminates network-jitter contamination).
+        // search remains monotonic while the snapshot key encodes the estimated
+        // common server-time axis instead of packet arrival jitter.
         if (validAt !== undefined && validAt !== null) {
             obj.validAt = validAt;
         }
@@ -696,33 +699,24 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Handle remote objects updated (from other members only — self-echo eliminated).
+     * Handle a remote update batch (self echo is eliminated).
+     * `validAt` is one server-validated owner FLUSH timestamp fanned out to all
+     * updated objects. It gives legacy interpolation a common monotonic axis,
+     * but does not recover when each coalesced pose was originally simulated.
      *
-     * @param {Array} updatedObjects - Each entry includes a server-validated
-     *   `validAt` top-level property (per-object: ±2 s clamp + monotonic cap).
-     *   Stamped on `existing.validAt` so RemoteObjects.updateState uses it
-     *   directly as the unified bracket-search axis anchor.
-     * @param {number} serverTimestamp - hub-entry ms (still used for batch metrics)
+     * @param {number} serverTimestamp - Hub-entry ms (used for batch metrics)
      * @param {string} senderMemberId
      * @param {number} senderSeq
      * @param {number} memberSequence
      * @param {number} senderSendIntervalMs
      */
-    /**
-     * Handle remote objects updated batch.
-     * `validAt` is a single batch-level value (server-validated, owner-stamped) —
-     * fanned out to each updated object so RemoteObjects.updateState uses it as
-     * the unified interpolation axis (same axis as live OnObjectCreated).
-     */
     function handleRemoteObjectsUpdated(updatedObjects, serverTimestamp, senderMemberId, senderSeq, memberSequence, senderSendIntervalMs, validAt) {
         trackMemberSequence(senderMemberId, memberSequence);
 
-        // Capture the actual network arrival time once per packet. Stamping each
-        // updated object with this value lets downstream interpolation anchor
-        // its snapshot timestamps to when the data really arrived, rather than
-        // to whenever the next game-loop frame happens to detect the version
-        // change (which can be 0–16ms later and is jittery, producing visible
-        // discontinuities at each snapshot handoff).
+        // Capture wire-arrival metadata once per packet. Legacy presentation
+        // uses validAt as its sample key; deterministic normal ingest currently
+        // anchors when the game loop observes the version. arrivalTime remains
+        // available as explicit metadata rather than being conflated with either.
         const arrivalTime = (typeof performance !== 'undefined' && performance.now)
             ? performance.now()
             : Date.now();
@@ -798,15 +792,15 @@ const ObjectSync = (function() {
     /**
      * Handle remote object replaced (atomic delete + create).
      *
-     * `validAt` is a single batch-level value (the collision instant on the
-     * owner) shared by every child in `event.createdObjects`. It is fanned out
+     * `validAt` is one batch-level replacement-operation time (normally the
+     * collision invocation) shared by every child. It is fanned out
      * via handleRemoteObjectCreated so each child's `obj.validAt` is set
      * consistently for the spawn-bridge / bracket-interpolation paths.
      *
      * @param {object} event - { deletedObjectId, createdObjects }
      * @param {string} senderMemberId
      * @param {number} memberSequence
-     * @param {number} validAt - Batch-level server-validated collision time.
+     * @param {number} validAt - Server-validated replacement-operation time.
      */
     function handleRemoteObjectReplaced(event, senderMemberId, memberSequence, validAt) {
         trackMemberSequence(senderMemberId, memberSequence);
@@ -814,7 +808,7 @@ const ObjectSync = (function() {
         handleRemoteObjectDeleted(event.deletedObjectId);
 
         // Create all replacement objects (no sequence tracking — already tracked above).
-        // All children share the same server-validated collision-time validAt.
+        // All children share the same server-validated replacement validAt.
         for (const objectInfo of event.createdObjects) {
             handleRemoteObjectCreated(objectInfo, undefined, undefined, validAt);
         }
@@ -1121,7 +1115,8 @@ const ObjectSync = (function() {
                 return (rid === 0) ? compressData(r) : r;
             });
             const replacementSchemaIds = replacements.map(r => pickSchemaId(r, 'replace'));
-            // Stamp owner's best estimate of server time NOW (collision moment).
+            // Stamp the owner's best server-time estimate at replacement invoke
+            // (normally the collision path, after replacement data is built).
             // Server clamps to ±2s of its own UtcNow before forwarding as the
             // unified-axis validAt. If the clock isn't initialized yet, send
             // null and the server falls back to its hub-entry timestamp (less
@@ -1174,7 +1169,8 @@ const ObjectSync = (function() {
             updateTypeIndex(obj, oldType, data.type);
         }
 
-        // Queue for batch sync: O(1) coalesce by objectId
+        // Queue for batch sync: O(1) coalesce by objectId. Repeated producer
+        // writes before a flush merge field-wise into one latest-state payload.
         const existingData = pendingUpdates.get(objectId);
         if (existingData) {
             Object.assign(existingData, data);
@@ -1183,6 +1179,8 @@ const ObjectSync = (function() {
         }
 
         if (immediate) {
+            // Best-effort immediate: flushUpdates will not overlap an in-flight
+            // invoke. The merged pending state remains queued for a later tick.
             flushUpdates();
         }
         // Otherwise, tick() will flush when frame counter reaches threshold
@@ -1194,14 +1192,16 @@ const ObjectSync = (function() {
     let flushInProgress = null;
 
     /**
-     * Called once per frame to drive frame-count-based sync.
-     * Recalculates the send threshold from the current frame time,
-     * increments the frame counter, and flushes when threshold is reached.
+     * Called once per rendered frame to approximate nominal wall-clock cadence.
+     * Recalculates a frame threshold from current frame time and attempts a
+     * flush at that interval. Pending data may represent many simulation frames,
+     * and an empty interval sends nothing.
      *
      * Backpressure: when flushInProgress the counter caps at sendThreshold
      * instead of resetting. This way the very next tick after the in-flight
      * invoke completes will trigger a flush, preventing the effective send
-     * rate from being halved when RTT ≈ nominalFrameTime.
+     * rate from gaining another full nominal wait when RTT is near or above the
+     * target interval. SignalR invokes remain serialized by this layer.
      * @param {number} frameTimeSec - Elapsed time for this frame in seconds
      */
     function tick(frameTimeSec) {
@@ -1273,8 +1273,10 @@ const ObjectSync = (function() {
      *
      * Delta encoding defers lastSentData updates until the server confirms the batch.
      * On partial success, only confirmed objects update their delta baseline.
-     * On complete failure (network error), no baselines are updated, so all
-     * changed fields are re-included in the next flush.
+     * On complete failure, no baselines are updated. Sent entries are not
+     * automatically reinserted into pendingUpdates here; when a producer queues
+     * the object again, its delta is recomputed from the older confirmed
+     * baseline and therefore includes the unconfirmed fields.
      */
     async function flushUpdates() {
         if (pendingUpdates.size === 0) return;
@@ -1315,9 +1317,11 @@ const ObjectSync = (function() {
         flushInProgress = operation;
         const currentSenderSequence = ++senderSequence;
         const clientTimestamp = Date.now();
-        // Stamp owner's NTP-aligned server-time estimate of the simulation tick
-        // that produced this batch. Server clamps to ±2s and uses as the
-        // unified-axis validAt anchor for every snapshot in the broadcast.
+        // Stamp the owner's NTP-aligned estimate at FLUSH time. Every object in
+        // this batch shares the resulting validAt. Because pending updates are
+        // coalesced without per-write timestamps, this is an ordering/presentation
+        // anchor rather than an exact timestamp for each simulation pose.
+        // Server clamps to ±2s and applies per-object monotonicity.
         // Math.round is required (see replaceObject for MessagePack int64 contract).
         const clientValidAt = (clockSource && clockSource.initialized && clockSource.initialized())
             ? Math.round(clockSource.nowMs())
@@ -1527,10 +1531,12 @@ const ObjectSync = (function() {
 
     // ── Per-object event channel (Phase 2.1) ─────────────────────────────
     // Game registers a byte ↔ name mapping for each event kind, plus a
-    // handler per kind name. Owner-side emitEvent() invokes the handler
-    // locally (synchronously) before sending so all peers run the same
-    // handler exactly once. Receiver side: SessionClient.onObjectEvent
-    // dispatches to the same handler by looking up name from byte.
+    // handler per kind name. Owner-side emitEvent() invokes the handler locally
+    // and synchronously before asking the server to broadcast. That gives
+    // immediate local feedback, but a rejected/failed send can remain local-only;
+    // callers needing durable gameplay state must use object mutations instead.
+    // Remote events are transient, connection-ordered dispatches and are not
+    // replayed to late joiners.
     const eventKindToName = new Map(); // byte -> kindName
     const eventNameToKind = new Map(); // kindName -> byte
     const eventHandlers = new Map();   // kindName -> handler(objectId, payload, ctx)
@@ -1562,9 +1568,9 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Broadcast a per-object event to other members, and run the local
-     * handler synchronously so the owner sees the same effect everyone
-     * else will see. Returns true on send success.
+     * Ask the server to broadcast a transient per-object event, after running
+     * the local handler synchronously. Returns true on send success. The server
+     * enforces object ownership; local dispatch happens before that validation.
      * @param {string} objectId
      * @param {string} kindName - Must have been registered via registerEventKind
      * @param {object} payload - Game-defined dict
@@ -1576,8 +1582,8 @@ const ObjectSync = (function() {
             return Promise.resolve(false);
         }
 
-        // Run local handler synchronously so owner-side state matches what
-        // remote peers will observe when the broadcast arrives.
+        // Run local handler synchronously for zero-wait owner feedback. Do not
+        // treat this as proof that server validation/broadcast will succeed.
         const handler = eventHandlers.get(kindName);
         if (handler) {
             try {
@@ -1621,6 +1627,8 @@ const ObjectSync = (function() {
     /**
      * Handle ownership migration for objects (called when a member leaves and objects are migrated).
      * Uses server-authoritative version to prevent drift from blind local increments.
+     * Migration changes metadata/version only; presentation layers retain their
+     * current motion state until a data-bearing update from the new owner.
      * @param {Array<{objectId: string, newOwnerId: string, newVersion: number}>} migratedObjects - Objects with their new owners and versions
      */
     function handleOwnershipMigration(migratedObjects) {

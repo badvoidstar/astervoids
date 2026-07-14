@@ -1150,16 +1150,23 @@
         // Timing settings
         TARGET_FPS: 60,             // Target frame rate for physics
 
-        // Simulation mode: 'legacy' (asymmetric per-object sim with network
-        // interpolation/extrapolation) or 'deterministic' (owner-authoritative
-        // fixed-timestep sim; remotes apply authoritative state + dead reckoning).
-        // Locked into session metadata at create time so every member of a
-        // session runs the same mode. URL/env override: ?cfg.SIM_MODE=legacy
+        // Simulation mode:
+        //   legacy        - variable-dt owner simulation with buffered,
+        //                   per-owner adaptive-delay rendering for remotes.
+        //   deterministic - fixed-step owner simulation with arrival-anchored
+        //                   dead reckoning and replayable ship controls.
+        // Both modes retain single-owner gameplay authority; receivers only
+        // reconstruct presentation. They also assume one ordered, versioned
+        // stream from the current backend instance, not distributed
+        // cross-instance conflict resolution. The mode is locked into session
+        // metadata. URL/env override: ?cfg.SIM_MODE=legacy
         SIM_MODE: 'deterministic',
         // Deterministic mode only: maximum number of 60fps-equivalent frames a
         // remote replica may dead-reckon (extrapolate by constant velocity)
-        // past its last authoritative packet before holding position. Bounds
-        // divergence on packet loss; the next authoritative packet snaps it.
+        // past its receipt-anchored authoritative baseline before holding.
+        // Bounds divergence during an ordered delivery stall. A later packet
+        // normally re-anchors through correction smoothing; only explicit
+        // teleports or large errors bypass that blend.
         DEADRECKON_MAX_FRAMES: 30,
         // Deterministic mode only: projective-velocity-blending time constant
         // (ms) for absorbing extrapolation error. When a new authoritative
@@ -1167,9 +1174,12 @@
         // owner STOPS rotating and the replica had projected past the true
         // angle — the difference is decayed to zero over ~this window instead of
         // snapping. Kills the rotation overshoot/rubberband at motion start/stop
-        // (exaggerated at high latency, where the larger send gap produces a
-        // larger pre-correction overshoot). ~0 in steady state, so it adds no
-        // lag to smooth motion. Set 0 to disable (hard snap).
+        // (exaggerated at low send rates, where a longer unannounced interval
+        // produces more overshoot). ~0 in steady state, so it adds no lag to
+        // smooth motion. The first real update after ownership migration can
+        // select a longer, error-derived decay to avoid reversing displayed
+        // motion; that intentionally trades temporary lag for direction
+        // continuity and has no separate hard cap. Set 0 to disable (hard snap).
         DEADRECKON_SMOOTH_MS: 90,
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).
@@ -1179,20 +1189,20 @@
         // authoritative packet (positional extrapolation still uses
         // DEADRECKON_MAX_FRAMES). rotationSpeed is a step function, so between a
         // turn STOP and the packet that announces it the receiver would keep
-        // spinning, over-rotating by rotationSpeed x (gap + latency) before
-        // snapping back. P1 sends the stop edge immediately; this caps the
+        // spinning, over-rotating across the unannounced stop before correcting
+        // back. P1 requests an immediate stop-edge send; this cap bounds the
         // residual over-rotation when that edge is delayed/lost. Trade-off: a
         // sustained turn at a very low send rate (high RTT) lags slightly once
         // projection is capped, then eases forward via DEADRECKON_SMOOTH_MS.
         // Asteroid/bullet spin is NOT clamped (constant rotation is exact).
         DEADRECKON_ANGULAR_MAX_FRAMES: 10,
-        // Legacy mode only: time constant (ms) for easing remote objects onto
-        // their authoritative resting pose when the game enters the game-over
-        // state. Game over is detected ~one network round-trip after the owner's
-        // final snapshot, by which point the replica has interpolation-lagged or
-        // extrapolated away from that snapshot — so pinning directly would pop.
-        // Instead the visible transform decays toward the shared snapshot over
-        // ~this window, giving a smooth, convergent stop. 0 = hard snap.
+        // Legacy mode only: time constant (ms) for easing each remote object
+        // onto its latest accepted authoritative snapshot at game over.
+        // Members observe game over at different times, and a replica may have
+        // interpolated or extrapolated away from that snapshot, so pinning
+        // directly would pop. The ease converges remote observers; the owning
+        // member can retain up to its final unsent/queued pose difference.
+        // 0 = hard snap.
         LEGACY_GAMEOVER_SETTLE_MS: 140,
         // Deterministic mode only: game-over "shared ballistic freeze" coast
         // window (ms). At game over every synced object (owned AND remote) stops
@@ -1200,36 +1210,37 @@
         // last constant velocity from where it is currently displayed to a single
         // shared stop instant T_freeze = gameOverAt + this delay, where gameOverAt
         // is the authoritative server-time the shared lives hit 0 (broadcast on
-        // the GameState object, so identical on every member). Because every
-        // member coasts the SAME object along the SAME velocity to the SAME shared
-        // server-time and then holds, all objects on all members come to rest
-        // together (simultaneous cessation) with the least divergence achievable
-        // without any backward motion — the object simply carries on from its
-        // current pose and stops, so there is no jump and no blend. The delay must
-        // exceed the worst-case inter-member game-over skew (~one round-trip) so
-        // the stop instant is still in the future when each member detects game
-        // over and the coast is therefore always forward (objects whose owner died
-        // later coast for less time, but every object still halts at T_freeze).
+        // the GameState object, so identical on every member). Each object coasts
+        // forward from its current displayed pose and then holds, avoiding a
+        // correction at the transition. The common stop time synchronizes
+        // cessation but does not erase arrival-delay error already present in
+        // different members' displayed anchors; doing so would require a visible
+        // correction. The delay is a tolerance window for GameState propagation,
+        // not a guarantee: a sufficiently long ordered stall can deliver the
+        // shared instant after it has passed, in which case that member stops
+        // from its current pose without a backward catch-up.
         DEADRECKON_GAMEOVER_FREEZE_DELAY_MS: 400,
 
         // Deterministic mode only: owner-side "send-on-change" suppression.
         // For purely ballistic objects (asteroids, bullets) the receiver
-        // dead-reckons constant velocity/rotation EXACTLY, so per-frame
-        // positional updates are redundant re-anchors. The owner therefore
+        // advances the transmitted constant velocity/rotation predictably
+        // (apart from wire quantization/float drift), so per-frame positional
+        // updates are redundant re-anchors. The owner therefore
         // stops broadcasting them and sends only when the receiver's prediction
         // would actually diverge — i.e. on a velocity/rotation change, on a
         // toroidal wrap (the receiver extrapolates UNWRAPPED), or at a periodic
         // heartbeat. Set false to restore per-frame sends. Has NO effect in
         // legacy mode (always sends) — gated by isDeterministicMode().
         SEND_ON_CHANGE_ENABLED: true,
-        // Heartbeat ceiling (ms): force a re-anchor at least this often even
-        // when nothing changed. Bounds three things: (a) the receiver's
-        // dead-reckon clamp — must stay safely below
-        // DEADRECKON_MAX_FRAMES * (1000/TARGET_FPS) (=500ms) so a straight-
-        // flying object never hits the clamp and freezes; (b) packet-loss
-        // recovery; (c) late-joiner / reconciliation staleness (server keeps
-        // only the last SENT state). 250ms leaves ~250ms of transit headroom
-        // before the 500ms clamp.
+        // Heartbeat gate (ms): make a re-anchor eligible this often even when
+        // nothing changed. The receiver's cap is measured from packet receipt,
+        // so a steady 250ms inter-arrival gap leaves about 250ms for jitter or
+        // an ordered delivery stall before the 500ms hold. This also bounds the
+        // age of server state used by joins, reconciliation, and migration.
+        //
+        // This is not a wire-cadence guarantee: ObjectSync's RTT-adaptive
+        // 1-20Hz flush and in-flight backpressure can coalesce or delay an
+        // eligible heartbeat.
         SEND_ON_CHANGE_HEARTBEAT_MS: 250,
         // A single-frame normalized position delta larger than this can only be
         // a wrap-seam crossing (no per-step velocity moves this far), so it
@@ -1243,14 +1254,17 @@
         SEND_ON_CHANGE_ROT_EPS: 1e-4,
         // Deterministic mode only (P1): when the local ship crosses an
         // overshoot-critical control EDGE (rotation start/stop or sign reversal,
-        // thrust on/off, brake on/off) flush its authoritative state IMMEDIATELY,
-        // bypassing the adaptive 2-20 Hz send throttle. Without this a turn STOP
-        // can sit unsent for up to a full send interval (~500ms at high RTT),
-        // and the remote over-rotates across the unannounced stop. Edge detection
+        // thrust on/off, brake on/off) request an immediate authoritative-state
+        // flush instead of waiting for the adaptive 1-20Hz cadence. It cannot
+        // overlap an in-flight flush; then the coalesced edge leaves on the first
+        // eligible tick after backpressure clears. Without this a turn STOP can
+        // sit unsent for up to a full send interval, and the remote over-rotates
+        // across the unannounced stop. Edge detection
         // keys off the ship's DERIVED control state, so it is identical across
         // keyboard, on-screen buttons, and analog touch schemes. Steady-state
         // ship position keeps the throttled per-frame path; only edges jump the
-        // queue. Set false to restore pure-throttled ship sends.
+        // queue when transport is available. Set false to restore cadence-only
+        // ship sends.
         SHIP_EDGE_SEND_ENABLED: true,
         // Deterministic mode only (P3): remotes reproduce remote-ship motion by
         // REPLAYING the real Ship.update() physics (exponential friction,
@@ -1294,6 +1308,8 @@
         // The P1 immediate-edge flush (ShipControlGate / SHIP_EDGE_SEND_ENABLED)
         // still fires and always forces a send. Set false to restore the prior
         // per-frame ship sends.
+        // This gate controls eligibility, not packet count: ObjectSync may batch
+        // several objects and coalesce multiple local frames into one invoke.
         SHIP_SEND_ON_CHANGE_ENABLED: true,
 
         // Ship settings (normalized: sizes relative to shorter dimension)
@@ -1554,28 +1570,30 @@
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 3,          // Shared lives pool for multiplayer sessions
-        SYNC_NOMINAL_FRAME_TIME: 1/10, // Target send interval (seconds)
+        SYNC_NOMINAL_FRAME_TIME: 1/10, // Initial send interval before RTT adaptation (seconds)
         SYNC_MIN_FRAME_TIME: 1/480,    // Min frame time clamp for threshold calc
-        ADAPTIVE_SEND_RATE: true,      // Dynamically adjust send rate based on RTT
+        ADAPTIVE_SEND_RATE: true,      // Shared transport cadence: RTT-clamped to 1-20Hz
         DELTA_ENCODING_ENABLED: true, // Send only changed fields to reduce bandwidth
-        INTERPOLATION_ENABLED: true,   // Enable/disable interpolation for remote objects
-        INTERPOLATION_DELAY: 1000/30,  // Render delay for smooth interpolation (ms)
-        ADAPTIVE_DELAY_ENABLED: true,   // Auto-tune interpolation delay based on jitter
-        ADAPTIVE_DELAY_MIN: 1000/60,   // Auto-tune interpolation min delay (hard floor)
-        ADAPTIVE_DELAY_JITTER_MULT: 2, // σ multiplier for jitter buffer (2 ≈ 95% coverage)
-        ADAPTIVE_DELAY_NET_FLOOR: 0.8, // Min network factor — keeps interpolation delay near a full send interval so the renderer stays in the safe interpolation buffer (was 0.25, which left the renderer in the extrapolation zone ~70% of each send cycle and made it sensitive to small jitter-induced changes in computedDelay).
-        ADAPTIVE_DELAY_NET_SCALE: 2,   // RTT-to-mean divisor for network factor: factor = floor + RTT / (scale × mean)
-        ADAPTIVE_DELAY_SMOOTHING: 0.1, // EMA alpha for delay transitions (lower = smoother, 0.1 ≈ 10-sample convergence)
-        ADAPTIVE_DELAY_SAMPLES: 30,    // Sliding window size for packet interval history
-        ADAPTIVE_DELAY_MIN_SAMPLES: 5, // Minimum samples before computing adaptive delay
-        SNAP_THRESHOLD: 0.25,          // Snap instead of interpolate when position error exceeds this (in reference-dimension units, isotropic)
-        MAX_EXTRAPOLATION: 2.0,        // Max extrapolation time in seconds to prevent overshoot
-        SNAPSHOT_BUFFER_SIZE: 6,       // Ring buffer size per object — 6 snapshots covers 2-3 send intervals
-        // Spawn-bridge: on OnObjectReplaced (e.g. asteroid split), synthesize an
-        // additional snapshot at "local render time" carrying the parent's last
-        // interpolated position with the child's identity. Bracket-search then
-        // interpolates from parent_pos → child authority_pos over one display
-        // delay, eliminating the position discontinuity at spawn.
+        // Legacy remote-presentation settings. Deterministic rendering does not
+        // use this snapshot buffer or adaptive interpolation delay, although the
+        // shared clock estimator also supports deterministic join seeding.
+        INTERPOLATION_ENABLED: true,   // Master switch for legacy interpolation
+        INTERPOLATION_DELAY: 1000/30,  // Initial/fallback per-owner delay (ms)
+        ADAPTIVE_DELAY_ENABLED: true,  // Adapt each legacy owner's render delay
+        ADAPTIVE_DELAY_MIN: 1000/60,   // Floor for lag-based and warm-up estimates
+        ADAPTIVE_DELAY_JITTER_MULT: 2, // Statistical cushion, not a hard coverage guarantee
+        ADAPTIVE_DELAY_NET_FLOOR: 0.8, // Warm-up fallback fraction of one send interval
+        ADAPTIVE_DELAY_NET_SCALE: 2,   // Warm-up RTT/send-interval divisor
+        ADAPTIVE_DELAY_SMOOTHING: 0.1, // EMA alpha; avoids abrupt target-time shifts
+        ADAPTIVE_DELAY_SAMPLES: 30,    // Lag and packet-interval samples retained per owner
+        ADAPTIVE_DELAY_MIN_SAMPLES: 5, // Samples required before each estimate is trusted
+        SNAP_THRESHOLD: 0.25,          // Legacy hard-snap distance in isotropic reference units
+        MAX_EXTRAPOLATION: 2.0,        // Legacy cap beyond the newest snapshot (seconds)
+        SNAPSHOT_BUFFER_SIZE: 6,       // Six snapshots retain five inter-snapshot intervals
+        // Legacy-only spawn bridge: after asteroid replacement, add a synthetic
+        // child snapshot on the parent's current display timeline. This softens
+        // the transition to the authoritative child trajectory. Synthetic
+        // samples are excluded from adaptive-delay estimation to avoid feedback.
         // 1 = enabled (default), 0 = disabled (revert to single-authority install).
         SPAWN_BRIDGE_ENABLED: 1,
     };
@@ -1817,13 +1835,15 @@
     }
 
     // ── Dead-reckoning replica (deterministic mode only) ────────────────────
-    // Replaces the legacy snapshot interpolation/extrapolation for remote
-    // objects. Stores only the latest authoritative kinematic state per object
-    // and advances it by constant velocity/rotation to cover the round-trip
-    // time until the next authoritative packet, which snaps it. Bounded by
-    // CONFIG.DEADRECKON_MAX_FRAMES so packet loss can't fling a replica away.
-    // No hermite, no adaptive delay — accuracy comes from the owner being the
-    // single source of truth plus short, deterministic forward integration.
+    // Replaces legacy buffered interpolation for remote objects. Stores only
+    // the latest authoritative kinematic state and advances it from a receiver-
+    // side baseline while waiting for the next ordered packet. Normal live
+    // packets are arrival-anchored, so this bridges the receiver's inter-arrival
+    // interval rather than predicting through network transit to the owner's
+    // present. New packets usually preserve the displayed pose with a decaying
+    // correction; they do not normally snap. Extrapolation is bounded by
+    // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
+    // No Hermite buffer or adaptive render delay is involved.
     const DeadReckon = {
         states: new Map(),
         // Parallel version gate (mirrors RemoteObjects.lastVersions) so we only
@@ -1857,15 +1877,14 @@
         // advanced from its spawn point and keeps an expiring object travelling
         // past where the owner's copy died until the delete packet lands
         // (visible "spawn ahead" / "over-travel"). Arrival-anchoring trades a
-        // constant ~latency positional lag for rendering only authoritative
-        // truth, matching the deterministic design intent (no extrapolation
-        // beyond short gap-bridging; correct on the next packet).
+        // constant ~one-way-latency positional lag for lifecycle continuity:
+        // no extrapolation beyond short gap-bridging, and bounded correction
+        // when the next packet arrives.
         //
-        // Continuity across successive packets does NOT depend on the anchor:
-        // as long as each new snapshot's base has advanced by the real elapsed
-        // motion (which it does once the wire delivers an advancing base), the
-        // handoff is seamless. The earlier "stuck bullet" sawtooth was a frozen
-        // base (a wire-decode bug), not an anchoring problem.
+        // For unchanged constant motion, each advancing owner snapshot agrees
+        // with the receiver's gap projection apart from timing jitter. Motion
+        // changes produce a real prediction error and enter the correction path
+        // below rather than relying on the baseline choice to hide it.
         //
         // Steady-state extrapolation is exact for constant velocity/rotation, so
         // each new snapshot agrees with the current extrapolation and seeds a
@@ -2147,12 +2166,11 @@
             return this._reckonAt(id, performance.now());
         },
 
-        // Authoritative RESTING pose: the latest snapshot with NO forward
-        // extrapolation and NO correction smoothing. Used when motion must stop
-        // and every session member must converge to the identical pose (game
-        // over). Extrapolating instead (getReckoned) would drift each member
-        // forward by a different, latency-dependent amount up to the
-        // DEADRECKON_MAX_FRAMES clamp, so resting positions would disagree.
+        // Latest authoritative snapshot with NO forward extrapolation or
+        // correction smoothing. Kept as an explicit clamp/diagnostic helper;
+        // deterministic game over currently uses the continuity-preserving
+        // shared ballistic freeze instead. Directly switching to this pose would
+        // remove prediction error but can visibly jump backward.
         getResting(id) {
             const s = this.states.get(id);
             if (!s) return null;
@@ -2177,10 +2195,10 @@
     // constant-velocity/rotation extrapolator, SendGate is the OWNER deciding
     // when a fresh authoritative packet would actually improve that receiver's
     // prediction. For ballistic objects (asteroids, bullets) it almost never
-    // does — the receiver re-anchors to the last SENT pose and integrates the
-    // same constant velocity, so it already shows the right place. The owner
-    // therefore suppresses the per-frame update and re-anchors only on a real
-    // discontinuity the receiver cannot predict:
+    // does: the receiver integrates the same constant velocity from the last
+    // accepted state. The owner therefore suppresses per-frame queueing and
+    // makes an update eligible only for a discontinuity the receiver cannot
+    // predict:
     //
     //   1. No baseline yet  → CREATION / ownership adoption: first send seeds
     //      the receiver. (Reconciliation discontinuity #1.)
@@ -2192,10 +2210,8 @@
     //      DeadReckon._reckonRaw does NOT wrap, so the receiver would fly off
     //      unwrapped; forcing a send re-anchors it (snapped via SNAP_DIST).
     //      (Discontinuity the dead-reckoner can't model.)
-    //   4. Heartbeat → bounds the receiver's dead-reckon clamp, packet-loss
-    //      recovery, and late-joiner staleness (the server only stores the last
-    //      SENT state). (Reconciliation discontinuity #2 — bounded to
-    //      SEND_ON_CHANGE_HEARTBEAT_MS of motion, self-corrected next heartbeat.)
+    //   4. Heartbeat → bounds the receiver's dead-reckon clamp, recovery after
+    //      an ordered delivery stall, and server-state age for joins.
     //
     // Time-based (performance.now) rather than frame-counted so it is robust to
     // variable-dt fallback paths (hidden-tab background loop). Tracked per owned
@@ -2203,11 +2219,12 @@
     const SendGate = {
         baselines: new Map(),
 
-        // Returns true if the owner should broadcast this object this frame and
-        // records the new baseline; false to suppress. `angle`/`rs` may be null
-        // for objects without rotation (bullets). Always returns true outside
-        // deterministic mode or when disabled, so legacy is byte-for-byte
-        // unchanged.
+        // Returns true if this frame should queue the object and records that
+        // gate baseline; false suppresses queueing. ObjectSync may coalesce the
+        // queued state, delay it behind an in-flight invoke, or retry only when
+        // a later frame queues the object again. `angle`/`rs` may be null for
+        // objects without rotation. Outside deterministic mode or when disabled,
+        // every frame remains eligible as in legacy behavior.
         shouldSend(id, x, y, angle, vx, vy, rs) {
             if (!CONFIG.SEND_ON_CHANGE_ENABLED || !isDeterministicMode()) return true;
             vx = vx || 0; vy = vy || 0; rs = rs || 0;
@@ -2247,15 +2264,11 @@
     };
 
     // Owner-side immediate-flush gate for the LOCAL ship's control edges (P1,
-    // deterministic mode only). Ships are excluded from SendGate (friction makes
-    // their motion non-linearly-predictable, so they keep per-frame sends), but
-    // those per-frame sends ride the adaptive 2-20 Hz throttle. A turn STOP that
-    // lands on the throttled path can sit unsent for up to a full send interval,
-    // and the remote over-rotates across it (the visible turning overshoot at
-    // high latency). This gate watches the ship's DERIVED control state and, when
-    // it crosses an overshoot-critical edge, tells syncLocalShip to flush
-    // IMMEDIATELY (bypassing the throttle) so the edge reaches the remote after
-    // only the one-way latency.
+    // deterministic mode only). This is independent of ShipSendGate: it marks an
+    // overshoot-critical state change as forced and asks ObjectSync to flush now
+    // rather than waiting for its adaptive 1-20Hz cadence. ObjectSync still
+    // serializes invokes, so an edge that occurs under backpressure remains
+    // coalesced until the in-flight invoke completes.
     //
     // Keying off DERIVED state (rotationSpeed / thrustInput / brakeInput /
     // thrusting), NOT individual input handlers, makes it scheme-agnostic:
@@ -2263,9 +2276,9 @@
     // funnel into these fields via handleInput. Only DISCONTINUITIES are edges —
     // rotation start/stop & sign reversal, thrust on/off, brake on/off. Analog
     // schemes vary magnitude continuously, but those mid-gesture changes are
-    // intentionally NOT edges: they ride the throttled per-frame path plus the
-    // heartbeat and are dead-reckoned in between. Promoting every analog frame to
-    // an immediate flush would defeat the adaptive throttle.
+    // intentionally NOT immediate edges: ShipSendGate queues changed replay
+    // intent normally, and ObjectSync batches it at the adaptive cadence.
+    // Promoting every analog frame to an immediate flush would defeat batching.
     const ShipControlGate = {
         last: null,
         // Epsilon for treating an analog magnitude as "active" (non-zero).
@@ -2322,16 +2335,17 @@
     //   3. invulnerable change → fires every frame of the ~2 s post-respawn
     //      countdown (keeps the remote blink phase fresh) AND catches the respawn
     //      teleport edge (0 → max, which the receiver snaps on) and its → 0 end.
-    //   4. Heartbeat → bounds dead-reckon clamp, packet-loss recovery and
-    //      late-joiner staleness, identical to SendGate (250 ms < 500 ms clamp).
+    //   4. Heartbeat → bounds dead-reckon clamp, ordered-stall recovery and
+    //      server-state age for late joiners, identical to SendGate.
     //
     // Velocity and position are deliberately NOT triggers: the receiver derives
     // them from the replayed inputs (friction decay, wrap) without a packet.
-    // The baseline holds the last SENT control state, so comparisons are against
-    // what the receiver last saw (a deadband), not the previous frame. Always
-    // returns true outside deterministic+replay mode or when disabled, so those
-    // paths keep their exact per-frame wire behaviour. The P1 immediate-edge
-    // flush passes force=true and always sends + re-baselines.
+    // The baseline holds the last state admitted by this gate, so comparisons
+    // use a deadband rather than the previous frame. Admission is not delivery:
+    // ObjectSync can coalesce the state or defer it under backpressure. Outside
+    // deterministic+replay mode, every frame remains eligible for the shared
+    // transport cadence. The P1 edge path passes force=true, queues the new
+    // baseline, and requests an immediate flush.
     const ShipSendGate = {
         baselines: new Map(),
 
@@ -2475,10 +2489,11 @@
         // and feeds them to _baseInterpolated as Hermite tangents AND as
         // the slope used to extrapolate forward when targetTime advances
         // past the latest snapshot. Dropping them silently zeroes both,
-        // which freezes the rendered asteroid in the extrapolation zone
-        // (visible as a 30 Hz / sendRate-aligned "stutter" whenever the
-        // adaptive interpolation buffer is shorter than the send interval,
-        // i.e. on a low-jitter LAN). +6 B per update.
+        // which freezes the rendered asteroid whenever targetTime passes the
+        // newest sample, followed by a jump at the next transport flush. The
+        // resulting stutter follows the current adaptive send cadence; it is
+        // unrelated to the deterministic 30-frame extrapolation cap.
+        // Cost: +6 B per update.
         { id: 3, fields: [
             ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
@@ -2561,7 +2576,9 @@
         '#FFFF00'   // Yellow (Player 4)
     ];
 
-    // Remote object state tracking for interpolation
+    // Legacy remote snapshot/interpolation state plus clock/RTT estimators shared
+    // by both simulation modes. Deterministic rendering uses DeadReckon instead
+    // of `states`, but still consumes the clock for join and lifecycle timing.
     const RemoteObjects = {
         // Map of objectId -> interpolation state
         states: new Map(),
@@ -2578,9 +2595,10 @@
         },
         // Round-trip time estimation (client→server→client) for application-
         // level broadcasts. Sampled from every OnObjectsUpdated echo of our
-        // own clientTimestamp (~10 Hz). EMA-smoothed asymmetric: rises fast,
-        // decays gradually. Drives adaptive send-rate (updateSendRate) and
-        // per-member jitter buffer sizing (computeAdaptiveDelayForMember).
+        // own clientTimestamp whenever our queued batch is actually flushed.
+        // EMA-smoothed asymmetric: rises fast, decays gradually. Drives the
+        // shared transport send cadence (ObjectSync.updateSendRate) and the RTT
+        // term in legacy adaptive-delay warm-up (recomputeAdaptiveDelay).
         //
         // INCLUDES SERVER HUB-METHOD PROCESSING TIME — not suitable for
         // wall-clock offset estimation. For pure transport RTT (offset
@@ -2595,10 +2613,11 @@
 
         // ── NTP-style client↔server clock-offset estimator ─────────────────
         //
-        // Lets every client compute serverNowMs() to within a few ms of the
-        // server's actual UTC clock, so spawn-position projection on
-        // OnObjectReplaced (Phase 2) is accurate for ALL members — not just
-        // the shooter — using the server as the common reference.
+        // Lets a client estimate the server UTC axis used by validAt. Min-RTT
+        // sampling and EMA reduce transient queue bias, but NTP's symmetric-path
+        // assumption means persistent uplink/downlink asymmetry remains as
+        // offset error. Callers that project state must therefore gate on
+        // initialization and bound the projection.
         //
         // Sampling cadence is decoupled from the game loop:
         //  * performance.now() for sub-ms RTT (immune to wall-clock slewing).
@@ -2654,8 +2673,9 @@
         /**
          * Pure: NTP offset formula.
          *   offset = serverTime + rtt/2 − t3Wall
-         * Assumes symmetric one-way latency. Residual bias is bounded by
-         * (oneWayUp − oneWayDown)/2; min-RTT selection minimises this.
+         * Assumes symmetric one-way latency. Residual path-asymmetry bias is
+         * (oneWayUp - oneWayDown)/2. Min-RTT selection reduces transient queue
+         * delay but cannot remove persistent directional asymmetry.
          */
         computeOffsetForSample(sample) {
             return sample.serverTime + sample.rtt / 2 - sample.t3Wall;
@@ -2684,12 +2704,13 @@
          *
          * `packetIntervals` tracks server-side packet spacing (used by the
          * legacy interval-based estimate as a fallback). `lagSamples` is the
-         * preferred metric: arrivalServerTime − sampleTime (validAt) per
-         * snapshot, which directly measures the send-jitter + queue delay
-         * the owner is currently injecting into our render axis. When we have
+         * preferred metric: arrivalServerTime − validAt per snapshot. Update
+         * validAt is stamped when the owner flushes, so this includes one-way
+         * post-flush delivery/queueing and receiver clock-offset residual, but
+         * not state age accumulated in the owner's pending queue. When we have
          * enough lagSamples we compute `rawDelay = lagMean + JITTER_MULT ×
-         * lagStddev + intervalStddev` so the renderer always trails the
-         * owner by enough to cover their worst recent jitter.
+         * lagStddev + intervalStddev`. This is a statistical cushion, not a
+         * guarantee against an arbitrary ordered stall.
          */
         createMemberDelay() {
             return {
@@ -2720,20 +2741,22 @@
          * @param {string} objectId - Object ID
          * @param {object} data - New object data from ObjectSync
          * @param {string} ownerMemberId - Owner member ID (for per-member delay lookup)
-         * @param {number} [validAt] - Owner-stamped server-time ms (NTP-aligned),
+         * @param {number} [validAt] - Owner-operation server-time ms,
          *   resolved by the server (clamped clientValidAt or hub-entry fallback).
+         *   Updates stamp flush time, so a coalesced pose can be older than this
+         *   key by its owner-side pending-queue wait.
          *   This is THE unified interpolation axis. Converted to perf.now-domain
          *   via validAtToPerfNow so bracket-search remains on a monotonic clock
-         *   while the snapshot key encodes the global server-time agreement —
-         *   network jitter no longer enters the snapshot key.
+         *   while the snapshot key encodes the estimated common server-time
+         *   axis; packet arrival jitter does not become the sample timestamp.
          *   When omitted (legacy callers), falls back to performance.now() which
          *   anchors the snapshot to receiver-local time as before.
          * @param {number} [arrivalServerTime] - Receiver's server-time estimate
          *   captured INSIDE the SignalR event handler (object-sync.js stamps it
          *   on `obj.arrivalServerTime`). Used as the "now" reference for the
-         *   lag-based adaptive-delay sample so the sample reflects only
-         *   network/queue delay, not game-loop processing latency. Falls back
-         *   to `this.serverNowMs()` when not provided.
+         *   lag-based adaptive-delay sample. It includes sender batching and
+         *   transport delay but excludes later game-loop polling latency.
+         *   Falls back to `this.serverNowMs()` when not provided.
          * @param {boolean} [recordSample=true] - When false, the snapshot is
          *   pushed into the bracket buffer but NOT fed into the lag-based
          *   adaptive delay metric. Used for synthetic spawn-bridge snapshots
@@ -2745,13 +2768,12 @@
             const now = (validAt != null)
                 ? this.validAtToPerfNow(validAt)
                 : performance.now();
-            // Per-object lag observation (Phase B): the cleanest signal of
-            // owner→receiver delay. Skipped silently when clock isn't
-            // initialized yet (serverNowMs would be a guess). Bridge snapshots
-            // pass recordSample=false to avoid biasing the metric with
-            // synthetic timestamps. arrivalServerTime is preferred over
-            // serverNowMs() because it was captured at the SignalR event
-            // boundary, not after game-loop dispatch.
+            // Per-object post-flush lag observation for legacy delay sizing.
+            // Skip until the receiver clock is initialized. Synthetic bridge
+            // snapshots pass recordSample=false because their timestamp is
+            // derived from the delay being estimated. arrivalServerTime is
+            // preferred because ObjectSync captured it at the SignalR boundary,
+            // before later game-loop polling.
             if (recordSample && validAt != null && ownerMemberId && this.isClockOffsetInitialized()) {
                 const arrival = (arrivalServerTime != null) ? arrivalServerTime : this.serverNowMs();
                 this.recordObjectSample(ownerMemberId, validAt, arrival);
@@ -2765,13 +2787,16 @@
             };
             
             if (existing) {
+                // Ownership-only versions are filtered before this call. The
+                // first real new-owner snapshot switches this state's delay
+                // lookup immediately; legacy mode does not blend between the old
+                // and new owners' target timelines, so materially different
+                // per-owner delays can cause a transient handoff correction.
                 existing.ownerMemberId = ownerMemberId;
-                // Keep snapshots strictly monotonic in time. With validAt as
-                // the source axis this is a tight invariant (owner serverNowMs
-                // is monotonic modulo NTP slewing, which is far below send
-                // interval), but we still guard against pathological reorders
-                // (e.g. SignalR delivering a delayed older batch after a fresh
-                // one) so the bracket search stays valid.
+                // Keep snapshot keys monotonic for bracket search. SignalR is
+                // ordered within a connection, but owner clock corrections,
+                // server monotonic caps, reconciliation, and synthetic bridge
+                // insertion can still produce equal or regressing validAt keys.
                 const latest = existing.snapshots[existing.snapshots.length - 1];
                 if (latest && snapshot.time < latest.time) {
                     snapshot.time = latest.time;
@@ -2800,7 +2825,10 @@
          */
         recordPacketArrival(serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp) {
             const now = responseTimestamp || Date.now();
-            // Server→client jitter estimation
+            // Server→client relative jitter estimate. `oneWay` includes the
+            // client's wall-clock offset, so its absolute value is not treated
+            // as one-way latency; subtracting the running minimum cancels a
+            // stable offset and exposes added queue/scheduling delay.
             if (serverTimestamp) {
                 const oneWay = now - serverTimestamp;
                 const jit = this.jitter;
@@ -2866,11 +2894,11 @@
         },
 
         /**
-         * Record an owner-stamped sample (validAt) and the receiver's server-time
-         * estimate of when it arrived. The lag = arrival − validAt is the most
-         * direct measure of the send-jitter + queue delay we need to cover with
-         * interpolation delay; it absorbs send-interval skew, NTP-residual, and
-         * network queue depth all in one number.
+         * Record an owner-operation validAt and the receiver's server-time
+         * estimate of arrival. For updates, lag = arrival - validAt measures
+         * post-flush one-way transit/queueing plus clock-offset residual. Flush
+         * spacing and owner-side batching age are represented only indirectly
+         * by the packet-interval term.
          *
          * Skipped when the receiver clock isn't initialized (offset would be
          * meaningless) or when validAt is missing on a snapshot.
@@ -2903,8 +2931,11 @@
          * Recompute `ad.computedDelay` from current sample buffers. Lag-based
          * path takes priority once we have ≥ MIN_SAMPLES lag observations:
          * delay covers lag mean + JITTER_MULT × lag stddev, plus an
-         * additional interval-stddev cushion to stay ahead of bursty send
-         * spacing. Falls back to the interval-based formula during warm-up.
+         * additional interval-stddev cushion for variable send spacing. During
+         * warm-up, the fallback combines the observed/advertised send interval,
+         * this receiver's broadcast RTT, interval deviation, and the configured
+         * network floor. Both paths EMA the result because changing delay shifts
+         * the legacy renderer's target timeline.
          */
         recomputeAdaptiveDelay(ad) {
             const minSamples = CONFIG.ADAPTIVE_DELAY_MIN_SAMPLES;
@@ -2997,7 +3028,7 @@
         },
 
         /**
-         * Convert an owner-stamped server-time ms (the unified interpolation
+         * Convert an owner-operation server-time ms (the unified interpolation
          * axis) into the receiver's performance.now() domain so it can be used
          * as a snapshot key in the bracket-search ring buffer.
          *
@@ -3005,12 +3036,15 @@
          *   wall_time_ms   = server_time_ms - offsetMs
          *   perf_now_ms    = wall_time_ms + (perf.now - Date.now)
          *
-         * If the offset isn't yet initialized we still produce a usable value
-         * by assuming offsetMs=0 — at worst a few-ms visual offset that snaps
-         * to the right place on the first ping burst. If wallToPerfDelta is
-         * missing we compute it on the fly.
+         * Before initialization, offsetMs=0 is only a bootstrap fallback. Its
+         * error can be materially larger than a frame when client and server
+         * wall clocks differ; interpolation/extrapolation bounds still apply,
+         * and later monotonic snapshot insertion prevents time from moving
+         * backward. Callers that project from this value must gate on
+         * isClockOffsetInitialized(). If wallToPerfDelta is missing, compute it
+         * on the fly.
          *
-         * @param {number} validAt - Owner-stamped server-time ms (NTP-aligned)
+         * @param {number} validAt - Server-validated operation-time estimate
          * @returns {number} performance.now-domain ms equivalent
          */
         validAtToPerfNow(validAt) {
@@ -3024,7 +3058,8 @@
 
         /**
          * Returns true once at least one ping burst has been integrated.
-         * Phase 2 spawn projection uses this as a gate.
+         * Projection and deterministic join-seeding callers use this gate;
+         * legacy timestamp conversion can still use the bootstrap fallback.
          */
         isClockOffsetInitialized() {
             return this.clock.offsetInitialized;
@@ -3032,9 +3067,10 @@
 
         /**
          * Get the latest min-RTT-per-burst sample's RTT, in milliseconds —
-         * pure transport round-trip on the dedicated Ping hub method (server
-         * processing time ≈ 0 by construction). Used internally as input to
-         * the outlier gate and offset computation.
+         * lightweight round-trip on the dedicated Ping hub method. It minimizes
+         * application work relative to object broadcasts, though transport,
+         * scheduling, and small server processing costs remain. Used by the
+         * outlier gate and offset computation.
          *
          * Returns the canonical Infinity until the first sample lands, so
          * the outlier gate's tolerance starts wide-open.
@@ -3062,9 +3098,9 @@
          * Per-ping capture uses BOTH performance.now() (for sub-ms RTT,
          * monotonic, immune to wall-clock corrections) AND Date.now() (for
          * offset alignment with the server's UTC ms). This is the
-         * insulation layer against quantized/variable game-loop cadence:
-         * the await-resolution microtask runs OUTSIDE requestAnimationFrame,
-         * so frame work cannot inflate the captured t3Perf.
+         * insulation layer against quantized/variable game-loop cadence: the
+         * measurement is not tied to requestAnimationFrame. Event-loop work can
+         * still inflate RTT, which is why each burst selects its minimum sample.
          *
          * If document.hidden becomes true mid-burst, we abort early — the
          * suspended event loop would inject huge unrepresentative RTT.
@@ -3122,10 +3158,10 @@
                     this.clock.offsetMs, candidate, this.clock.emaAlpha);
             }
             this.clock.lastSampleRtt = winner.rtt;
-            // Refresh wallToPerfDelta on every accepted burst. Stable to within
-            // a few ms over hours but the OS may slew Date.now() (NTP daemon)
-            // while perf.now() continues monotonic, so capping drift to one
-            // refresh interval keeps the snapshot-key conversion honest.
+            // Refresh wallToPerfDelta on every accepted burst. The OS may slew
+            // Date.now() while performance.now() remains monotonic, so limiting
+            // conversion drift to one refresh interval keeps snapshot keys on
+            // the current wall/performance relationship.
             this.clock.wallToPerfDelta = performance.now() - Date.now();
             this.clock.sampleCount++;
             return winner;
@@ -3153,8 +3189,8 @@
         /**
          * Internal: long-running loop. Runs an initial bootstrap burst, then
          * one refresh ping every refreshIntervalMs. Skips work while hidden
-         * and re-bootstraps on visibility return so the offset is fresh
-         * before any spawn event is rendered.
+         * and re-bootstraps on visibility return so later projection does not
+         * keep reusing a pre-suspension sample.
          */
         async clockSyncLoop(generation) {
             // Bootstrap: large burst gives several independent samples for
@@ -3190,9 +3226,9 @@
          */
         startClockSync() {
             if (this.clock.running) return;
-            // The UTC offset remains valid across a quick reconnect, but RTT is
-            // connection/region-specific. Gate age-aware join projection until
-            // this connection supplies a fresh minimum-RTT clock sample.
+            // Retain the last UTC-offset estimate as a reconnect bootstrap, but
+            // RTT is connection/region-specific. Gate age-aware join projection
+            // until this connection supplies a fresh minimum-RTT sample.
             this.clock.lastSampleRtt = Infinity;
             this.clock.running = true;
             const generation = ++this.clock.generation;
@@ -3207,8 +3243,9 @@
                 this.clock.visibilityHandler = () => {
                     if (!document.hidden && this.clock.running) {
                         // Wake the loop immediately (skip remaining refresh wait)
-                        // and run a fresh bootstrap burst before any new gameplay
-                        // event needs serverNowMs().
+                        // and start a fresh bootstrap burst promptly. Events can
+                        // still race the async burst; projection paths that need a
+                        // connection-fresh RTT gate on lastSampleRtt.
                         const wake = this.clock.wakeResolve;
                         const generation = this.clock.generation;
                         this.queuePingBurst(this.clock.bootstrapBurstSize, generation)
@@ -3223,8 +3260,9 @@
 
         /**
          * Stop the clock-sync loop. Resets the visibility handler.
-         * Does NOT clear offsetMs — the last-known offset stays usable in
-         * case a quick reconnect rebuilds the loop.
+         * Does NOT clear offsetMs: the last estimate remains the bootstrap
+         * fallback across a quick reconnect and is EMA-refreshed afterward.
+         * Connection-specific RTT is invalidated separately in startClockSync.
          */
         stopClockSync() {
             this.clock.running = false;
@@ -3246,7 +3284,7 @@
         // After validAt unification, REMOTE observers no longer need spawn
         // projection — the bracket-search/extrapolate path on the validAt
         // axis handles spawn timing automatically because snap[0].time is
-        // the owner's authored timeline.
+        // the owner replacement-operation timeline.
         //
         // The LOCAL OWNER (e.g. the shooter who fired the bullet that split
         // an asteroid) still needs forward projection: their local game
@@ -3257,8 +3295,9 @@
         // updateAstervoidsFromSync's adopt branch.
 
         /**
-         * Pure: compute the seconds to forward-extrapolate an owner-authored
-         * spawn snapshot from validAt to "right now" in server time. Capped
+         * Pure: compute the seconds to forward-extrapolate a replacement
+         * snapshot from its operation-time validAt to estimated server "now".
+         * Capped
          * to ±MAX_EXTRAPOLATION to avoid runaway projection from a poor
          * clock estimate.
          */
@@ -3294,22 +3333,16 @@
         },
 
         /**
-         * Compute the seed state to install on the local game-object when
-         * ownership of an interpolated remote object migrates to the local
-         * member (typically because the previous owner left the session).
+         * Historical projection helper: derive the latest legacy snapshot at
+         * estimated server "now". The active ownership-migration path
+         * deliberately does NOT call this. A newly promoted owner keeps the
+         * asteroid at its currently displayed puppet pose, because replacing it
+         * with a clock-projected seed would create a local one-frame jump.
          *
-         * The seed is the latest snapshot's data forward-projected to "now"
-         * in server time (constant-velocity dead-reckoning). This is the
-         * extrapolation that every observer's bracket-search would arrive
-         * at over the next few frames — so once the new owner starts
-         * authoring updates with this position as the baseline, observers'
-         * bracket interpolation flows continuously from the previous owner's
-         * last snapshot to the new owner's first snapshot with no visible
-         * hiccup. Velocity, rotation and other non-positional fields are
-         * carried straight from the latest snapshot's data.
-         *
-         * Returns null if no snapshots exist (object was just created and
-         * we never received an authored snapshot from any prior owner).
+         * Observers instead skip the metadata-only ownership version and ingest
+         * the first real new-owner state. Deterministic mode direction-smooths
+         * that correction; legacy mode switches to the new owner's adaptive
+         * delay at that point. Retained for explicit diagnostics/comparison.
          */
         getMigrationSeed(objectId) {
             const state = this.states.get(objectId);
@@ -3341,13 +3374,13 @@
         },
 
         /**
-         * Settling pose for game over: interpolate toward the latest snapshot
-         * but DO NOT extrapolate past it. As renderTime advances the replica
-         * glides from its current (delayed) pose up to the latest authoritative
-         * snapshot and then holds there — a smooth, pop-free stop. Because the
-         * snapshot is shared, every member converges to the identical pose.
-         * Contrast getInterpolated, which extrapolates past the latest snapshot
-         * (per-member overshoot → divergence) once the owner stops sending.
+         * Legacy remote-observer settling pose: interpolate toward the latest
+         * accepted snapshot but DO NOT extrapolate beyond it. As renderTime
+         * advances, replicas that hold the same final snapshot converge to that
+         * pose. The owning member is locally simulated and may retain a small
+         * final queue/flush difference, so this is not an absolute all-member
+         * identity guarantee. Contrast getInterpolated, which can extrapolate
+         * each observer a different amount once the owner stops sending.
          * @param {string} objectId - Object ID
          * @param {number} renderTime - Current render timestamp
          * @returns {object|null} Settling state, or null if not tracked.
@@ -3361,11 +3394,11 @@
         /**
          * Base interpolation: snapshot bracket-search + Hermite blend.
          *
-         * After validAt unification the single-snap and multi-snap regimes
-         * live on the SAME server-time axis: snapshot.time is computed via
+         * Legacy snapshots share one estimated server-time axis:
+         * snapshot.time is computed via
          * validAtToPerfNow(validAt). With one snapshot, targetTime
-         * (= renderTime − baseDelay) typically lies before snapshot[0].time
-         * (the owner's authored moment is in the receiver's near future
+         * (= renderTime - baseDelay) typically lies before snapshot[0].time
+         * (the owner-operation timestamp is in the receiver's near future
          * relative to its display delay), so bracket search clamps to
          * snap[0].data and the receiver renders the spawn in place until
          * either the next snapshot lands or extrapolation kicks in. No
@@ -3379,6 +3412,10 @@
                 return latest.data;
             }
 
+            // This is a presentation delay, not the ObjectSync transmit cadence.
+            // On migration, state.ownerMemberId changes with the first kinematic
+            // new-owner snapshot, so targetTime can shift if the two owners have
+            // different learned delays.
             const delay = this.getDelayForMember(state.ownerMemberId);
             const targetTime = renderTime - delay;
 
@@ -3387,11 +3424,10 @@
                 return snapshots[0].data;
             }
 
-            // After the newest snapshot: extrapolate with velocity cap — unless
-            // clamped (game over), where motion must stop and every member must
-            // converge to the SAME pose. Extrapolation would carry each member a
-            // latency-dependent amount past the last snapshot, so they'd disagree;
-            // clamping holds at the shared authoritative snapshot instead.
+            // After the newest snapshot: extrapolate with a velocity cap unless
+            // clamped for legacy game over. Remote observers that share the same
+            // final snapshot should converge to it rather than carrying
+            // per-member targetTime overshoot into their resting pose.
             if (targetTime >= latest.time) {
                 if (clampToLatest) {
                     return latest.data;
@@ -3415,13 +3451,12 @@
                     const timeDiff = curr.time - prev.time;
                     if (timeDiff <= 0) return curr.data;
 
-                    // Burst-arrival smoothing: when timeDiff is very small
-                    // (snapshots arriving in bursts), inflate the divisor to
-                    // delay*0.5 so `t` advances at the expected playback
-                    // cadence instead of jumping to ~1 immediately. The
-                    // PR #77 "fix" that replaced this with a snap-to-curr
-                    // caused visibly choppier remote motion under bursty
-                    // delivery, so it has been reverted.
+                    // Near-coincident-key smoothing: validAt monotonic caps,
+                    // reconciliation, or synthetic insertion can leave two
+                    // snapshots with a very small timeDiff. Inflate only the
+                    // Hermite duration to delay*0.5 so `t` does not jump to ~1
+                    // immediately. The stored authoritative times remain
+                    // unchanged; this is a legacy presentation cushion.
                     const minTimeDiff = delay * 0.5;
                     const effectiveTimeDiff = Math.max(timeDiff, minTimeDiff);
                     const t = (targetTime - prev.time) / effectiveTimeDiff;
@@ -3637,7 +3672,9 @@
         },
 
         /**
-         * Remove a member's adaptive delay tracking (on member departure)
+         * Remove a departed member's adaptive-delay samples. Any legacy object
+         * still keyed to that owner uses INTERPOLATION_DELAY until its first
+         * real new-owner snapshot updates the state owner.
          */
         removeMember(memberId) {
             this.memberDelays.delete(memberId);
@@ -5410,6 +5447,17 @@
     }
 
     let localImpactCueSequence = 0;
+    // Render-only collision acknowledgment shared by both simulation modes.
+    // Effects have no gameplay owner and never participate in collision,
+    // scoring, or synchronized transforms; their triggering evidence follows
+    // existing object authority:
+    //   - Cross-owner bullet hit: bullet owner publishes a pending claim; the
+    //     asteroid owner's replacement/deletion confirms and resolves it.
+    //   - Same-owner bullet hit: asteroid owner emits a target-owned cue event
+    //     before the ordered delete/replace operations.
+    //   - Ship hit: ship owner emits its monotonic hitCount and pre-reset pose.
+    // Keys deduplicate repeated observation, and replacement/deletion/session
+    // cleanup resolves effects without replaying them for late joiners.
     const CollisionEffects = {
         startAsteroidHit(source, target = null, impact = null) {
             if (!isSessionMode() || !source) return;
@@ -5773,10 +5821,10 @@
      */
     function syncLocalShip() {
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
-        // P1: sample control edges every frame (keeps the baseline fresh) and
-        // flush immediately on an overshoot-critical edge in deterministic mode,
-        // bypassing the adaptive send throttle. Steady-state position still rides
-        // the throttled per-frame path.
+        // Sample control edges every simulation frame. In deterministic mode an
+        // edge requests an immediate flush; transport backpressure can still
+        // defer it. Non-edge replay intent is queued through ShipSendGate and
+        // rides ObjectSync's normal adaptive batching cadence.
         const edge = ShipControlGate.isEdge(game.ship);
         const immediate = edge && CONFIG.SHIP_EDGE_SEND_ENABLED && isDeterministicMode();
         // P1b: under deterministic input-replay, suppress redundant per-frame
@@ -5811,6 +5859,10 @@
             payload);
     }
 
+    // Same-owner impacts have no pendingHit handshake for other members to
+    // observe, so send a target-owned cosmetic event before deleting/replacing
+    // the objects. Payload geometry is target-relative: receivers anchor it to
+    // their own currently displayed asteroid rather than trusting sender x/y.
     function emitOwnedAsteroidImpactCue(asteroid, bullet, impact) {
         if (!isSessionMode() || !asteroid?.syncObjectId || !bullet || !impact) return;
         const memberId = SessionClient.getCurrentMember()?.id || 'local';
@@ -5845,7 +5897,16 @@
      * Seed a pre-existing join-snapshot object onto the same latency-delayed
      * presentation timeline used by later arrival-anchored packets. This
      * removes heartbeat staleness without predicting through one-way transit.
-     * Regular live creates and ownerless idle orphans remain arrival-anchored.
+     *
+     * The marker is one-shot and is consumed even when seeding cannot be used,
+     * so a later live packet is never mistaken for the join snapshot. Seeding
+     * requires deterministic mode, a still-active owner, an initialized clock,
+     * finite validAt, and a finite Ping RTT from the current connection. Half
+     * RTT estimates one-way transit under a symmetric-path assumption; path
+     * asymmetry remains seed error. Update validAt is a flush timestamp, so
+     * state age accumulated before that flush is not recoverable here. Age is
+     * clamped to the existing 500ms dead-reckoning horizon. Live creates,
+     * ownerless idle orphans, and every fallback remain arrival-anchored.
      */
     function getDeterministicJoinBaselinePerf(obj) {
         if (!isDeterministicMode()
@@ -5872,6 +5933,20 @@
         return performance.now() - ageMs;
     }
 
+    /**
+     * Gate one ObjectSync version into the selected presentation model.
+     * Ownership migration increments the server version without changing
+     * kinematics, so an existing replica skips that metadata-only version
+     * rather than refreshing a stale pose as if it were current.
+     *
+     * The first later data-bearing version completes the handoff. Deterministic
+     * mode can extend that correction to preserve displayed motion direction.
+     * Legacy mode keeps normal interpolation; after the departed member's delay
+     * record is removed it temporarily uses the fallback delay, then switches
+     * to the new owner's learned delay when real state arrives. A replica with
+     * no presentation state must still ingest an ownership-marked version so
+     * join/reconciliation cannot leave it uninitialized.
+     */
     function beginReplicationVersion(obj) {
         const deterministic = isDeterministicMode();
         const versions = deterministic ? DeadReckon.lastVersions : RemoteObjects.lastVersions;
@@ -6074,9 +6149,10 @@
             if (asteroid.syncObjectId) {
                 const syncObj = ObjectSync.getObject(asteroid.syncObjectId);
                 if (syncObj && syncObj.ownerMemberId === myMemberId) {
-                    // Send-on-change: a ballistic asteroid is dead-reckoned
-                    // exactly by remotes, so suppress redundant per-frame
-                    // re-anchors (deterministic mode only; no-op in legacy).
+                    // Send-on-change: remotes predict a ballistic asteroid from
+                    // its transmitted constant kinematics, so deterministic mode
+                    // suppresses redundant per-frame re-anchors. Legacy remains
+                    // eligible every frame.
                     if (SendGate.shouldSend(
                             asteroid.syncObjectId, asteroid.x, asteroid.y,
                             asteroid.angle, asteroid.velocityX, asteroid.velocityY,
@@ -6118,8 +6194,9 @@
                     asteroid.syncObjectId = obj.id;
                     // Forward-project the LOCAL game asteroid for locally-owned
                     // children of an OnObjectReplaced event (asteroid splits we
-                    // just shot). obj.validAt was the moment of authority; we
-                    // adopt the child here ~RTT later. Without projection the
+                    // just shot). obj.validAt approximates the replacement
+                    // invocation/collision moment; we adopt the child here about
+                    // one operation round trip later. Without projection the
                     // local asteroid would lag forever by RTT * velocity vs the
                     // simulator. (Remote observers don't need projection — the
                     // interpolator handles that automatically via snap[0]
@@ -6241,12 +6318,12 @@
         for (const bullet of game.bullets) {
             // Only sync our own bullets
             if (bullet.ownerMemberId === myMemberId && bullet.syncObjectId) {
-                // Send-on-change: bullets fly ballistically (frictionless,
-                // constant velocity), so remotes dead-reckon them exactly and
-                // per-frame re-anchors are redundant. ALWAYS send when a hit is
-                // pending, though — pendingHit + the hit* fields are the hit
-                // reconciliation event the asteroid owner must receive, and
-                // they are not predictable from kinematics. (No-op in legacy.)
+                // Send-on-change: bullets are frictionless/ballistic, so remotes
+                // predict from transmitted constant velocity and do not need
+                // per-frame re-anchors. A pending hit always remains eligible:
+                // pendingHit + hit* fields are the owner-to-owner claim and are
+                // not derivable from kinematics. Legacy remains eligible every
+                // frame.
                 const gateSend = SendGate.shouldSend(
                     bullet.syncObjectId, bullet.x, bullet.y, null,
                     bullet.velocityX, bullet.velocityY, 0);
@@ -6257,37 +6334,32 @@
         }
     }
 
-    // Set once we have force-flushed our owned objects at game over, so the
-    // flush fires exactly once per game-over transition. Reset whenever we are
-    // no longer in game over (restart / new wave / rejoin).
+    // Set once we have queued our owned objects for a final game-over re-anchor,
+    // so the request runs once per transition. ObjectSync may coalesce those
+    // updates or defer them behind an in-flight batch.
     let gameOverFlushed = false;
 
     /**
-     * Force a final authoritative broadcast of every object WE own at the
-     * instant our local game enters game over.
+     * Queue a final authoritative state for every object WE own when this
+     * member observes game over.
      *
      * Why this is needed (deterministic + send-on-change): owners suppress
      * redundant per-frame re-anchors for ballistic asteroids/bullets
-     * (SendGate), so the last pose actually SENT can be up to one heartbeat
-     * stale versus the object's true freeze pose. At game over the gameplay
-     * sync pass (gated by lives > 0) stops, so no further sends happen. The
-     * owner renders its owned objects at their true frozen pose (owned objects
-     * are never dead-reckoned), but remotes converge via reingestAtRest +
-     * DeadReckon.getResting onto the owner's LAST-SENT (stale) snapshot — so
-     * owner and remotes disagree on the resting pose (visible on asteroids;
-     * ships are throttled too). Broadcasting the true current pose here makes
-     * the owner's final snapshot equal the freeze pose, so every member's
-     * getResting converges to it.
+     * (SendGate/ShipSendGate), so the server's stored pose can be up to one
+     * heartbeat plus transport/backpressure old when gameplay updates stop.
+     * Refreshing it reduces state age for reconciliation and for members that
+     * receive the batch before capturing their ballistic-freeze anchor. The
+     * freeze still starts from each member's current displayed pose; this send
+     * does not guarantee identical resting transforms.
      *
-     * Each member owns different objects and reaches game over at its own local
-     * time (shared lives arrive a round-trip apart), so flushing OUR owned
-     * objects when OUR lives hit 0 captures exactly the right final pose for
-     * the "GameState owner != object owner" timing the convergence depends on.
+     * Each object owner can observe the shared-lives transition at a different
+     * local time, so each member refreshes only objects it authoritatively owns.
      *
-     * Calls updateObject directly (immediate), bypassing SendGate (which is
-     * only consulted inside syncLocalAstervoids/syncLocalBullets), so the
-     * suppressed final pose is guaranteed to go out. Deterministic mode only;
-     * legacy always sends per-frame, so its final pose is never stale.
+     * Calls updateObject with `immediate=true`, bypassing game-layer gates and
+     * requesting a flush. An existing invoke still wins; pending states leave
+     * on the first later eligible tick. This is deterministic-only because
+     * legacy already queues moving state every gameplay frame, though its last
+     * accepted wire state can likewise trail the local pose.
      */
     function flushOwnedObjectsAtGameOver() {
         if (!isSessionMode() || !isDeterministicMode()) return;
@@ -7516,7 +7588,8 @@
      * Check all collisions between game entities
      * All collision checks work in pixel coordinates
      * Each player checks their OWN bullets and ship against all astervoids.
-     * Collision effects on astervoids are processed by the asteroid's owner.
+     * Asteroid mutation remains asteroid-owner-authoritative. Cosmetic cues
+     * acknowledge the claim/confirmation flow but never resolve a hit.
      */
     function checkCollisions() {
         const myMemberId = SessionClient.getCurrentMember()?.id;
@@ -7563,16 +7636,19 @@
                         const asteroidOwner = asteroidSyncObj?.ownerMemberId;
                         
                         if (asteroidOwner === myMemberId) {
-                            // We own both bullet and asteroid — process locally
+                            // Same owner: resolve gameplay locally. There is no
+                            // pendingHit transition for peers to observe, so emit
+                            // the target-owned cue before ordered delete/replace.
                             const points = asteroid.getPoints();
                             const offsetX = bullet.x - asteroid.x;
                             const offsetY = bullet.y - asteroid.y;
                             const relVelX = bullet.velocityX - asteroid.velocityX;
                             const relVelY = bullet.velocityY - asteroid.velocityY;
                             const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
-                            // The asteroid-owned event runs its handler locally
-                            // immediately and reaches every other member before
-                            // the ordered replacement broadcast.
+                            // The asteroid-owned event runs locally before send.
+                            // On a successful connection-ordered broadcast, peers
+                            // receive it before the subsequent replacement; a
+                            // rejected/failed event can remain local-only.
                             emitOwnedAsteroidImpactCue(asteroid, bullet, impact);
                             const removedBullet = game.bullets.splice(i, 1)[0];
                             if (removedBullet.syncObjectId) {
@@ -7586,7 +7662,10 @@
                                 emitShipStateChanged();
                             }
                         } else {
-                            // Asteroid owned by someone else — mark bullet with pendingHit
+                            // Cross-owner claim: hide the local bullet, show the
+                            // shooter cue immediately, and publish target-relative
+                            // hit data on the bullet. Only the asteroid owner can
+                            // confirm by replacing/deleting the target.
                             bullet.pendingHit = true;
                             bullet.hitTargetId = asteroid.syncObjectId;
                             bullet.pendingPoints = asteroid.getPoints();
@@ -7631,7 +7710,7 @@
             }
         }
         
-        // Asteroid owner scans remote bullets with pendingHit targeting our asteroids
+        // Asteroid owner confirms remote pendingHit claims targeting its objects.
         if (isSessionMode()) {
             const bulletObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.BULLET);
             for (const bulletObj of bulletObjects) {
@@ -7666,8 +7745,8 @@
                 }
             }
             
-            // Bullet owner checks for OnObjectReplaced confirmation via splitByBulletId
-            // Process pending bullets — check if target asteroid was replaced
+            // Bullet owner treats authoritative target removal/replacement as
+            // confirmation, awards its score, and retires the hidden bullet.
             for (let i = game.bullets.length - 1; i >= 0; i--) {
                 const bullet = game.bullets[i];
                 if (!bullet.pendingHit || bullet.ownerMemberId !== myMemberId) continue;
@@ -8033,8 +8112,10 @@
      * Main game loop - called every frame
      * @param {number} timestamp - Current time from requestAnimationFrame
      */
-    // Deterministic fixed-timestep scheduler state. Only used when
-    // isDeterministicMode() is true; legacy mode keeps the variable-dt path.
+    // Deterministic fixed-timestep scheduler state. This makes each OWNER's
+    // physics reproducible; clients do not co-simulate the same object. Remote
+    // presentation still comes from authoritative owner state plus replay/dead
+    // reckoning. Legacy mode keeps the variable-dt path.
     const fixedStep = {
         accumulatorMs: 0,
         // Render interpolation factor in [0,1): fraction of a step elapsed
@@ -8191,8 +8272,9 @@
     //
     // GAME OVER — "shared ballistic freeze": when the shared lives reach 0 the
     // gameplay sim (owned objects) and the dead-reckoning ingest (remotes) both
-    // stop, and every member must bring all objects to rest at as close to a
-    // single shared pose as possible WITHOUT any jump or blend. We do this by
+    // stop. The continuity-first goal is a common stop TIME without a jump or
+    // backward blend; arrival-anchored replicas are not guaranteed to share an
+    // identical stop pose. We do this by
     // projecting every synced object — owned AND remote — forward at its last
     // constant velocity from where it is CURRENTLY displayed to a single shared
     // stop instant T_freeze = gameOverAt + DEADRECKON_GAMEOVER_FREEZE_DELAY_MS,
@@ -8200,14 +8282,12 @@
     //   • No jump / no blend: the anchor is the object's current on-screen pose,
     //     so projection is C0-continuous with the last in-play frame; the object
     //     simply carries on at its real velocity and stops.
-    //   • Simultaneous cessation: T_freeze is a shared server-time, so all objects
-    //     on all members halt together (objects whose owner died later coast for
-    //     less time, but every object stops at the same instant).
-    //   • Least divergence without reversal: every member coasts the SAME object
-    //     along the SAME velocity to the SAME shared instant; the only residual is
-    //     the latency lag baked into each member's captured displayed pose, which
-    //     is strictly smaller than the (forbidden) backward correction needed to
-    //     pin onto the un-extrapolated base.
+    //   • Best-effort simultaneous cessation: T_freeze is one server timestamp.
+    //     Members evaluate it through their bounded-error clock estimates; an
+    //     event delivered after T_freeze cannot retroactively stop on time.
+    //   • No added reversal: every member coasts from its own displayed anchor.
+    //     Any latency/asymmetry error already baked into that anchor remains as
+    //     residual positional and angular disagreement.
     // Intentional warps are a non-issue here: at game over there are no respawns
     // (lives are 0) and a toroidal wrap during the coast is followed naturally by
     // the modulo wrap, not treated as a discontinuity.
@@ -8298,11 +8378,11 @@
                 // Project the angle linearly, exactly like position. The angular
                 // clamp used during play (to bound over-rotation across an
                 // unsignalled turn-stop) is deliberately NOT applied here: it
-                // saturates after DEADRECKON_ANGULAR_MAX_FRAMES, which would break
-                // the cross-member convergence that the unclamped linear
-                // projection guarantees (each member captures at a different
-                // anchorMs/base, and only a linear projection makes those
-                // differences cancel onto one shared resting heading).
+                // saturates after DEADRECKON_ANGULAR_MAX_FRAMES and would add a
+                // member-dependent stop within the coast. Linear projection
+                // preserves angular continuity to the shared stop time; any
+                // heading difference already present in captured display poses
+                // remains rather than being corrected backward.
                 obj.angle = base.angle + base.rot * frames;
             }
         };
@@ -8327,37 +8407,36 @@
         }
     }
 
-    // Legacy mode: settle remote objects onto the shared authoritative snapshot
-    // during game over, smoothly and without a pop.
+    // Legacy mode: settle each remote observer onto its latest accepted
+    // authoritative snapshot during game over, smoothly and without a pop.
     //
     // During play, legacy remotes are positioned by the gameplay sync pass
     // (updateAstervoidsFromSync / updateRemoteShips / updateBulletsFromSync),
     // which only runs while game.lives > 0. At game over that pass stops and the
     // owner stops sending updates. Without intervention each member is left at a
-    // DIFFERENT pose: it had been rendering the object interpolation-delayed in
-    // the past (or extrapolated ahead under loss), and that per-member offset is
-    // frozen in — so the members disagree on the resting state.
+    // different pose: it had been rendering on a per-owner delayed timeline or
+    // extrapolating beyond the newest sample, and that offset would freeze in.
     //
     // The shared reference is RemoteObjects.getSettling (the latest authoritative
-    // snapshot, with NO extrapolation past it). Pinning to it directly converges
-    // every member, but pops: game over is detected ~one network round-trip after
-    // the owner's final snapshot, so by then the replica has already drifted off
-    // that snapshot (interpolation lag or extrapolation), and the pin is a
-    // visible jump. Instead we EASE the visible transform (x, y, angle) toward
+    // snapshot, with NO extrapolation past it). Pinning directly can pop because
+    // game-over observation and final object delivery are asynchronous, and the
+    // replica may already be away from that sample. Instead we EASE its visible
+    // transform (x, y, angle) toward
     // the snapshot with a frame-rate-independent exponential decay
     // (LEGACY_GAMEOVER_SETTLE_MS): the first game-over frame doesn't move
-    // (k = 0), then each member glides onto the identical shared pose and holds.
-    // Owned objects have no RemoteObjects snapshot (getSettling → null) and stay
-    // at their local frozen pose, which equals the last broadcast snapshot, so
-    // they converge too. Deterministic mode handles the same requirement in
-    // repositionDeadReckonedRemotes.
+    // (k = 0), then remote observers with the same accepted final snapshot
+    // converge to it. Owned objects have no RemoteObjects snapshot and stay at
+    // their locally frozen pose; because ObjectSync cadence/backpressure may
+    // leave a final pose queued, a small owner-versus-observer difference can
+    // remain. Deterministic mode uses the different, continuity-first ballistic
+    // freeze above.
     //
     // CRUCIAL for the "GameState owner != object owner" case: the settle loop
     // ALSO keeps ingesting the owner's latest broadcast into RemoteObjects (see
     // the note inside `settle`). Otherwise each member would freeze at whatever
-    // snapshot it last ingested before its own lives hit 0 — a per-member moment
-    // that differs by a round-trip from the owner's actual final snapshot — and
-    // the resting poses would diverge even with the ease applied.
+    // snapshot it last ingested before its own lives hit 0. Re-ingestion lets
+    // remote observers converge on the latest update that ObjectSync accepted
+    // before the object's owner stopped.
     const legacyGameOverSettle = { active: false, lastTime: 0 };
 
     function easeRemoteTowardRest(obj, target, k) {
@@ -8408,15 +8487,16 @@
             // updateRemoteShips / updateBulletsFromSync, all gated by lives > 0),
             // which is the ONLY thing that feeds RemoteObjects.states. But the
             // object's owner keeps simulating and broadcasting until ITS OWN lives
-            // hit 0 — and when the GameState owner is a different member, the owner
-            // learns of game over a round-trip later, so it emits more snapshots
-            // after the fatal collision. Each member stops ingesting at the moment
+            // hit 0. When the GameState owner is a different member, operation
+            // delivery/flush timing can make that transition arrive later, so the
+            // object owner emits more snapshots after the fatal collision. Each
+            // member stops ingesting at the moment
             // ITS own lives reach 0 (a per-member time), so without re-ingesting
             // here every member would freeze RemoteObjects at a DIFFERENT snapshot
             // and the resting poses would disagree. ObjectSync keeps receiving the
             // owner's updates regardless of local game state, so pull the latest
-            // version in: once the owner finally stops, every member converges to
-            // the same authoritative final snapshot.
+            // version in. Remote observers that receive the same final accepted
+            // version then converge on the same target snapshot.
             const syncObj = ObjectSync.getObject(syncId);
             if (syncObj && syncObj.ownerMemberId !== myMemberId
                 && syncObj.version !== RemoteObjects.lastVersions.get(syncId)) {
@@ -8457,19 +8537,21 @@
         // still runs so the player sees the frozen game under the overlay.
         const frozenForReconnect = isSessionMode() && game.connectionLost;
 
-        // Tick ObjectSync frame counter for frame-count-based network sends.
-        // This is wall-clock cadence (network flush), not a sim step, so it
-        // runs once per rendered frame in both modes.
+        // Advance ObjectSync's approximate wall-clock flush cadence once per
+        // rendered frame in both modes. A tick sends only when updates are
+        // pending and no invoke is in flight; game-layer gates may queue nothing,
+        // and backpressure may coalesce several frames into one batch.
         if (isSessionMode() && !frozenForReconnect) {
             ObjectSync.tick(elapsed / 1000);
         }
 
         // --- UPDATE PHASE ---
         if (isDeterministicMode()) {
-            // Fixed-timestep accumulator: advance the sim in whole 1/TARGET_FPS
-            // steps (dt = 1.0 each) so physics is frame-rate independent and
-            // reproducible. Leftover fraction becomes the render interpolation
-            // alpha. The legacy variable-dt path is preserved in the else branch.
+            // Fixed-timestep accumulator: advance locally authoritative physics
+            // in whole 1/TARGET_FPS steps (dt = 1.0). Leftover time becomes
+            // render alpha. Dropping excessive backlog favors recovery over
+            // wall-clock catch-up; it does not transfer or duplicate authority.
+            // Legacy preserves one variable-dt update in the else branch.
             fixedStep.accumulatorMs = Math.min(
                 fixedStep.accumulatorMs + elapsed,
                 MAX_ACCUMULATED_MS
@@ -8640,8 +8722,9 @@
             }
             
             // --- SYNC (always runs while state is playing/waveDelay) ---
-            // Game state sync continues even when lives <= 0, ensuring all
-            // clients receive the final lives count and transition together.
+            // GameState authority continues queuing after lives <= 0 so peers
+            // receive the final shared count; each transitions when delivery and
+            // its local ObjectSync pass observe that version.
             if (isSessionMode() && isGameStateOwner()) {
                 syncGameState();
             }
@@ -8649,11 +8732,9 @@
                 updateGameStateFromSync();
             }
             
-            // Game over: broadcast a final authoritative pose for every object we
-            // own, exactly once, so send-on-change-suppressed asteroids/bullets
-            // don't leave remotes resting on a stale snapshot. Detect the
-            // transition off isGameOver() (per-member local time) so it composes
-            // with the "GameState owner != object owner" convergence path.
+            // Game over: once per local transition, queue a final state for every
+            // object we own. This reduces send-on-change server-state age; the
+            // ObjectSync comments describe coalescing/backpressure limits.
             if (isGameOver()) {
                 if (!gameOverFlushed) {
                     flushOwnedObjectsAtGameOver();
@@ -9878,6 +9959,10 @@
                 });
                 ObjectSync.registerEventKind(EVENT_KIND.ASTEROID_IMPACT_CUE, EVENT_KIND_BYTE.ASTEROID_IMPACT_CUE);
                 ObjectSync.on(`objectEvent:${EVENT_KIND.ASTEROID_IMPACT_CUE}`, (objectId, payload) => {
+                    // The event identifies an asteroid the sender owns. Rebuild
+                    // the cue from relative impact geometry and this receiver's
+                    // displayed target pose, so deterministic arrival lag or a
+                    // legacy interpolation delay does not import sender coords.
                     const obj = ObjectSync.getObject(objectId);
                     if (obj?.data?.type !== OBJECT_TYPES.ASTEROID
                         || typeof payload?.cueId !== 'string'
@@ -9912,39 +9997,23 @@
                         updatePickerButtons();
                     }
                 });
-                // Spawn-bridge for OnObjectReplaced (e.g. asteroid splits, fracture
-                // children). Without a bridge, a freshly-spawned remote child has
-                // only one snapshot at its authoritative collision moment, so
-                // bracket-search either clamps it at collision_pos (LAN case,
-                // targetTime ≤ snap[0].time) or extrapolates with child_vel
-                // (high-latency case). Either path produces a visible position
-                // discontinuity vs. the parent's last-rendered position — the
-                // "spawn hitch" the user observed, growing with network latency.
+                // Replacement always resolves target-bound cosmetic cues. The
+                // remaining synthetic bridge is consumed only by legacy remote
+                // interpolation; deterministic remotes use DeadReckon.
                 //
-                // Fix: synthesize a second snapshot at "local render time"
-                // carrying the parent's last-interpolated x/y/angle but with
-                // the child's identity (including velocity) for everything else.
-                // Bracket-search then has TWO snaps to interpolate between,
-                // smoothly walking the renderer from parent_pos to child's
-                // authority position over one display delay. After authority.time
-                // the EXTRAPOLATE arm continues along child's authoritative vel.
+                // A new child otherwise has one sample at the authoritative
+                // collision time, while the parent was displayed on a delayed
+                // timeline. Add a second child sample anchored to the parent's
+                // last displayed transform. When the bridge predates authority,
+                // Hermite interpolation spans bridge -> authority. When it is
+                // newer, the bridge becomes the extrapolation base on the child
+                // trajectory. The latter softens the install-time jump but does
+                // not guarantee zero later correction.
                 //
-                // LAN case (bridge older than authority): bridge installed first,
-                // authority second — bracket [bridge, authority] gives smooth
-                // transition. PERFECT smoothing.
-                //
-                // High-latency case (bridge newer than authority): authority
-                // installed first, bridge second — bracket [authority, bridge]
-                // means the renderer is past the bridge and EXTRAPOLATES from
-                // bridge using child_vel. The discontinuity is deferred (~one
-                // send_interval) instead of eliminated, but the bridge.pos
-                // anchor point is parent_interp_pos, so the renderer doesn't
-                // jump to collision_pos at install time — it walks forward from
-                // parent's last visual position. SOFTENED smoothing.
-                //
-                // Locally-owned children are skipped: they're driven by local
-                // physics (the adopt branch in updateAstervoidsFromSync), not
-                // by interpolation, so a bridge would be ignored.
+                // Locally-owned children are skipped because local physics, not
+                // RemoteObjects, drives their pose. Synthetic samples never feed
+                // adaptive-delay estimation; their time already depends on the
+                // current delay and would create positive feedback.
                 ObjectSync.on('onObjectReplaced', (deletedObjectId, createdObjects, batchValidAt) => {
                     CollisionEffects.resolveTarget(deletedObjectId);
                     if (!CONFIG.SPAWN_BRIDGE_ENABLED) return;
@@ -9965,8 +10034,7 @@
                         // their position, not the interpolator.
                         if (child.ownerMemberId === myMemberId) continue;
                         // All children in a Replace broadcast share the same
-                        // server-validated collision-time validAt (passed as the
-                        // batch-level argument).
+                        // server-validated replacement-operation validAt.
                         const childValidAt = batchValidAt;
                         // Bridge anchor in server-time: "where the renderer is
                         // currently displaying objects from this owner".
@@ -10076,24 +10144,24 @@
                         reconnectingOverlay.classList.remove('visible');
                     }
                 });
-                // Spawn-position projection is no longer needed for remote
-                // observers: validAt unification means snap[0].time is the
-                // owner's authored moment, and bracket-search clamps to that
-                // position until either the next snapshot arrives or
-                // extrapolation kicks in. The local-owner adopt branch still
-                // forward-projects from validAt to "now" (see
-                // updateAstervoidsFromSync), since the local game-physics
-                // path is not interpolated.
+                // Remote creates are not projected to owner "now": legacy keys
+                // the first sample on validAt and initially clamps its buffer;
+                // deterministic mode arrival-anchors lifecycle state. A local
+                // owner adopting replacement children still projects bounded
+                // validAt staleness because local physics is not interpolated.
                 // Apply configured sync timing and field compression map
                 ObjectSync.configure({
                     nominalFrameTime: CONFIG.SYNC_NOMINAL_FRAME_TIME,
                     minFrameTime: CONFIG.SYNC_MIN_FRAME_TIME,
                     deltaEncoding: CONFIG.DELTA_ENCODING_ENABLED,
                     adaptiveSendRate: CONFIG.ADAPTIVE_SEND_RATE,
-                    // Owner-stamp source for replaceObject's clientSpawnServerTime —
-                    // eliminates upload-time bias from the spawn anchor when the
-                    // local clock-offset estimator has bootstrapped. Server clamps
-                    // ±2s before forwarding.
+                    // Owner-stamp source for the `clientValidAt` carried by
+                    // create, update, replace, and object-event operations.
+                    // Updates sample it at ObjectSync flush time, so it excludes
+                    // client->server upload from the timestamp but does not
+                    // retain exact per-pose simulation time for coalesced state.
+                    // Persistent path asymmetry can bias the estimate; the server
+                    // clamps stamps to +/-2s and enforces per-object monotonicity.
                     clockSource: {
                         nowMs: () => RemoteObjects.serverNowMs(),
                         initialized: () => RemoteObjects.isClockOffsetInitialized()
@@ -10847,32 +10915,21 @@
         }
         if (info.migratedObjects && info.migratedObjects.length > 0) {
             ObjectSync.handleOwnershipMigration(info.migratedObjects);
-            // Migration handoff: deliberately do NOT re-anchor the local
-            // puppet asteroid to a forward-projected position. The puppet
-            // was being rendered from the interpolator (a delayed/extrap
-            // value), and the next local frame's asteroid.update(dt) will
-            // simply step that position by v·dt. That's continuous on the
-            // new owner's screen — exactly matching the prior frame's
-            // render, with no one-frame jump.
+            // Migration favors continuity on the newly promoted owner's screen:
+            // keep the asteroid at its current puppet pose and let local physics
+            // advance it next frame. Do not replace that pose with
+            // getMigrationSeed's clock-projected estimate, which could jump.
             //
-            // Earlier versions of this code seeded asteroid.x to
-            // RemoteObjects.getMigrationSeed(...) (latest snap extrapolated
-            // to "now") in an attempt to keep observers' brackets aligned
-            // with constant-velocity extrapolation. In practice this caused
-            // a visible one-frame discontinuity on the new owner's view
-            // (a forward jump of ~delay·v) with no observable benefit on
-            // observers (their bracket slope deviates only slightly when
-            // the seed is omitted, which is well below the visual threshold
-            // for the velocities and delays this game uses).
+            // Clear both presentation models when WE become owner, or their
+            // render pass would keep overwriting our authoritative simulation.
+            // Reset SendGate so our first owned update is eligible immediately.
             //
-            // Deterministic mode: when WE become the new owner we must drop
-            // the object's dead-reckon state. repositionDeadReckonedRemotes()
-            // re-pins any object still in DeadReckon.states to its (clamped,
-            // and thus eventually frozen) extrapolated pose every render
-            // frame — which would overwrite the position our own
-            // asteroid.update(dt) just simulated, leaving the asteroid
-            // stationary until it is destroyed. Clearing the replication
-            // state hands the object cleanly to local simulation.
+            // Other observers skip the metadata-only ownership version and keep
+            // displaying the prior trajectory until the first real new-owner
+            // update. Deterministic mode direction-smooths that handoff. Legacy
+            // mode temporarily falls back from the departed owner's removed
+            // delay record, then adopts the new owner's delay with no cross-delay
+            // blend; a transient timeline shift is therefore possible.
             const myMemberId = SessionClient.getCurrentMember()?.id;
             for (const migration of info.migratedObjects) {
                 if (migration.newOwnerId === myMemberId) {
