@@ -80,7 +80,11 @@ All wrappers route through `invokeHub()`, which enforces session membership and 
 | `deleteObject(objectId)` | `DeleteObject` | `objectId` | `{ success, memberSequence }` |
 | `getSessionState()` | `GetSessionState` | — | `{ members[], objects[], memberSequences{} }` |
 
-† `clientValidAt` is the owner's NTP-aligned server-time estimate of the simulation tick that authored this state. The server clamps it to ±2s of its own UtcNow and forwards as the broadcast's `validAt` field; if `null` (e.g. clock not yet initialized), the server falls back to its own hub-entry timestamp. Receivers use `validAt` as the unified interpolation snapshot key — see "Networking: validAt Axis" below.
+† `clientValidAt` is the owner's NTP-aligned operation timestamp. Updates sample
+it once at flush, after latest-state coalescing, so it is not an exact timestamp
+for every simulation pose. The server clamps it to ±2s of its own UtcNow and
+forwards `validAt`; if `null`, it falls back to hub-entry time. See
+"Networking: Unified `validAt` Interpolation Axis" below.
 
 #### Lifecycle and State Methods
 
@@ -799,7 +803,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph "RTT Estimation"
-        SAMPLE["RTT sample =<br/>responseTimestamp - clientTimestamp<br/>(captured locally on each invoke)"]
+        SAMPLE["RTT sample =<br/>responseTimestamp - clientTimestamp<br/>(captured on accepted update-batch echoes)"]
         EMA["Asymmetric EMA:<br/>spike: α=0.3 (fast up)<br/>decay: α=0.1 (slow down)<br/>rtt += α × (sample - rtt)"]
         SAMPLE --> EMA
     end
@@ -818,47 +822,68 @@ flowchart LR
     EMA --> BP
 ```
 
+TX is the shared ObjectSync flush cadence for both simulation modes. It is not
+the same as legacy BUF (render delay), and it is not a packet guarantee:
+game-layer send-on-change gates may queue nothing, while in-flight backpressure
+can coalesce multiple simulation frames into a later batch.
+
 ```mermaid
 flowchart TB
     subgraph "Per-Member BUF Calculation"
         direction TB
         PKT["Packet arrives from member X<br/>(remote broadcast only: clientTimestamp=null)"]
         MEM["getMemberDelay(senderMemberId)<br/>Independent state per member"]
+        LAG["lag = arrivalServerTime - validAt<br/>(post-flush transit + clock residual)"]
+        LAGREC["Retain valid lag sample<br/>(0-5000ms)"]
         INT["interval = serverTimestamp - lastServerTimestamp"]
         OUT{"interval > 2 × remoteSendInterval?"}
         SKIP["Outlier: skip interval<br/>(idle gap / delta suppression)"]
-        REC["Record interval in packetIntervals[]<br/>(sliding window, 30 samples)"]
+        INTREC["Retain packet interval<br/>(30-sample window)"]
 
         PKT --> MEM
+        MEM --> LAG
+        LAG --> LAGREC
         MEM --> INT
         INT --> OUT
         OUT -->|Yes| SKIP
-        OUT -->|No| REC
+        OUT -->|No| INTREC
     end
 
     subgraph "BUF Formula"
         direction TB
-        CALC["observedMean = mean(packetIntervals)<br/>σ = stddev(packetIntervals)<br/>mean = remoteSendInterval ∥ observedMean<br/><br/>networkFactor = min(1.0,<br/>  0.25 + RTT / (2 × mean))<br/><br/>rawDelay = max(16.67ms,<br/>  mean × networkFactor + 2σ)<br/><br/>computedDelay += 0.1 × (rawDelay - computedDelay)"]
+        READY{"At least 5 lag samples?"}
+        WARMREADY{"At least 5 interval samples?"}
+        LAGCALC["raw = max(16.67ms,<br/>lagMean + 2×lagStddev<br/>+ intervalStddev)"]
+        WARM["Warm-up fallback:<br/>mean = advertised interval ∥ observed mean<br/>factor = min(1, 0.8 + RTT/(2×mean))<br/>raw = max(16.67ms, mean×factor + 2σ)"]
+        HOLD["Keep current delay"]
+        EMA2["computedDelay += 0.1 ×<br/>(raw - computedDelay)"]
+        READY -->|Yes| LAGCALC
+        READY -->|No| WARMREADY
+        WARMREADY -->|Yes| WARM
+        WARMREADY -->|No| HOLD
+        LAGCALC --> EMA2
+        WARM --> EMA2
     end
 
-    subgraph "Example (localhost)"
-        EX["RTT=4ms, TX=50ms, σ=1.7ms<br/>nf = 0.25 + 4/(2×50) = 0.29<br/>raw = 50×0.29 + 2×1.7 = 17.9ms<br/>BUF converges to ~18ms"]
-    end
-
-    REC --> CALC
-    CALC --> EX
+    LAGREC --> READY
+    INTREC --> READY
 ```
 
 ## Networking: Unified `validAt` Interpolation Axis
 
-Every owner-authored object event (`CreateObject`, `UpdateObjects`, `ReplaceObject`) carries a single timestamp `validAt`: the owner's NTP-aligned server-time estimate of the simulation tick that produced this state. All receiver-side machinery — interpolation snapshot keys, spawn handling, ownership-migration handoff — operates on this one axis.
+Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
+events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
+`UpdateObjects` samples once at flush and fans that value across the coalesced
+batch, so it is an ordering/presentation anchor rather than an exact simulation
+timestamp for every pose. Legacy interpolation and replacement projection use
+this axis; deterministic live motion normally remains arrival-anchored.
 
 ```mermaid
 flowchart LR
     subgraph "Owner (sender)"
-        SIM["Local sim tick<br/>produces state"]
-        STAMP["clientValidAt =<br/>Math.round(serverNowMs())<br/>or null if NTP not yet bootstrapped"]
-        SIM --> STAMP
+        QUEUE["Game queues latest state<br/>(updates may coalesce)"]
+        STAMP["At operation/flush:<br/>clientValidAt = Math.round(serverNowMs())<br/>or null before clock bootstrap"]
+        QUEUE --> STAMP
     end
 
     subgraph "Server hub"
@@ -875,21 +900,26 @@ flowchart LR
     CLAMP -->|"validAt"| CONV
 ```
 
-* **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Lets every client compute `serverNowMs() = Date.now() + offsetMs` to within a few ms of the server's UTC.
+* **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Min-RTT sampling reduces transient queue bias, but persistent path asymmetry remains as clock error; projection callers gate initialization and cap elapsed time.
 * **`clock.wallToPerfDelta = performance.now() - Date.now()`** is refreshed on every accepted ping burst. The conversion `validAt → snapshot.time` runs through it so bracket-search stays on a monotonic clock while the snapshot key still encodes the global server-time agreement.
-* **No spawn projection on observers.** With snap[0].time = validAtToPerfNow(validAt), a freshly-created remote object's targetTime (= renderTime − baseDelay) typically lies before snap[0].time. The bracket clamp returns snap[0].data unchanged until either the next snapshot lands or extrapolation kicks in. No model switch, no transient smoother needed.
-* **Local-owner spawn projection.** The shooter who fires `replaceObject` adopts the resulting children ~RTT later. `updateAstervoidsFromSync` forward-projects from `obj.validAt` to `serverNowMs()` so the local sim asteroid's starting position matches the parent's continued motion (interpolation is not active for owned objects).
-* **Migration handoff.** When ownership migrates to the local member (previous owner left), `RemoteObjects.getMigrationSeed(objectId)` returns the latest snapshot dead-reckoned to `serverNowMs()`. The local game-object is seeded with that state, so the first authored snap on the new owner matches what every observer's bracket interpolation was already extrapolating — motion remains continuous through the handoff.
+* **No present-time spawn projection on observers.** Legacy mode keys the first snapshot at `validAt` and initially clamps/extrapolates on that delayed timeline. Deterministic mode arrival-anchors live lifecycle state instead.
+* **Local-owner replacement projection.** The shooter who invokes `replaceObject` adopts resulting children about one operation round trip later. `updateAstervoidsFromSync` forward-projects from bounded `obj.validAt` staleness because owned objects are driven by local physics, not interpolation. Clock asymmetry and pre-invocation work remain residual error.
+* **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; legacy mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
 
 ### Per-batch `validAt` collapse on `OnObjectsUpdated`
 
-The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole batch (rather than one per object) — `updatedObjects[0].ValidAt` — saving 8 B per object on every per-frame batch. This is safe in practice because:
+The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole
+batch (rather than one per object) — `updatedObjects[0].ValidAt` — saving 8 B
+per object. This bandwidth tradeoff relies on the following:
 
-* **Owners send monotonically.** Every batch is sampled from a single owner-tick, so the owner's `clientValidAt` is identical for every object in the batch. Per-object divergence cannot arise on the owner side.
-* **Server-side per-object monotonic cap is rarely heterogeneous within a batch.** `ObjectService.ValidateValidAt` clamps `result < previousValidAt → previousValidAt` per object. The cap only fires when the owner sends a `validAt` that's older than the prior accepted one for that object — a clock-skew or replay edge case. When it does fire, the clamp delta is bounded by the gap to the previous accepted `validAt`, typically tens of milliseconds.
-* **Receiver bracket-search tolerates small `validAt` jitter.** `RemoteObjects.updateState` runs the bracket search on the perf.now-converted snapshot times; sub-frame shifts in the snapshot key are absorbed by the existing interpolation hysteresis (no snap, no model switch).
+* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries begin with the same operation timestamp. It does not retain each pose's original simulation time.
+* **Server-side caps can still differ.** `ObjectService.ValidateValidAt` clamps a regressing value to each object's previous `ValidAt`. If objects had different prior values, their validated values can diverge even though the wire broadcast selects the first entry's value.
+* **Receiver insertion is monotonic.** `RemoteObjects.updateState` prevents regressing keys, and its near-coincident-key cushion avoids an immediate Hermite jump. This protects bracket ordering; it does not restore discarded per-object timestamps.
 
-Snapshot/join paths are NOT affected: `JoinSessionResponse` and `SessionStateSnapshot` carry a parallel `validAts: Dictionary<string, long>` so pre-existing objects with unrelated ages keep their per-object timing exactly. The collapse applies only to the per-frame `OnObjectsUpdated` hot path.
+Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
+`SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
+each object's last accepted operation timestamp. Those timestamps can still be
+older/newer than the exact underlying pose time because update writes coalesce.
 
 ## Ring Buffer Interpolation
 
@@ -1768,9 +1798,9 @@ The frontend `CONFIG` object in `index.html` defines all game constants (normali
 | **Asteroids** | `INITIAL_ASTEROID_RADIUS: 0.083`, `MIN_ASTEROID_RADIUS: 0.025`, `SPLIT_COUNT: 2`, `DEFLECTION_KICK: 1e-3`, `SEPARATION_ENERGY: 1e-4` |
 | **Scoring** | `POINTS_LARGE: 20`, `POINTS_MEDIUM: 50`, `POINTS_SMALL: 100` (smaller = more points) |
 | **Game** | `STARTING_LIVES: 3`, `MULTIPLAYER_LIVES: 3`, `INVULNERABILITY_TIME: 180 frames`, `WAVE_DELAY: 120 frames` |
-| **Sync** | `SYNC_NOMINAL_FRAME_TIME: 1/10 (10Hz)`, `ADAPTIVE_SEND_RATE: true`, `DELTA_ENCODING_ENABLED: true` |
-| **Interpolation** | `INTERPOLATION_DELAY: 33ms`, `ADAPTIVE_DELAY_ENABLED: true`, `SNAPSHOT_BUFFER_SIZE: 6`, `MAX_EXTRAPOLATION: 1.0s` |
-| **Adaptive Delay** | `ADAPTIVE_DELAY_NET_FLOOR: 0.25`, `ADAPTIVE_DELAY_JITTER_MULT: 2`, `ADAPTIVE_DELAY_SMOOTHING: 0.1`, `ADAPTIVE_DELAY_SAMPLES: 30` |
+| **Sync** | Initial `SYNC_NOMINAL_FRAME_TIME: 1/10 (10Hz)`; adaptive flush range `1–20Hz`; `DELTA_ENCODING_ENABLED: true` |
+| **Interpolation** | `INTERPOLATION_DELAY: 33ms`, `ADAPTIVE_DELAY_ENABLED: true`, `SNAPSHOT_BUFFER_SIZE: 6`, `MAX_EXTRAPOLATION: 2.0s` |
+| **Adaptive Delay** | `ADAPTIVE_DELAY_NET_FLOOR: 0.8`, `ADAPTIVE_DELAY_JITTER_MULT: 2`, `ADAPTIVE_DELAY_SMOOTHING: 0.1`, `ADAPTIVE_DELAY_SAMPLES: 30` |
 
 Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cyan, Magenta, Yellow (up to 4 players).
 
