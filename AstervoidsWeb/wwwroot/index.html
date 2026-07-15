@@ -1563,6 +1563,9 @@
         COLLISION_CUE_MIN_MS: 120,   // Minimum visible hold before a resolved cue fades
         COLLISION_CUE_FADE_MS: 180,  // Fade time after authoritative resolution
         COLLISION_CUE_MAX_MS: 1000,  // Safety cap for a pending cue with no resolution
+        ASTEROID_IMPACT_CUE_START_SCALE: 0.75,
+        ASTEROID_IMPACT_CUE_END_SCALE: 4.0,
+        ASTEROID_IMPACT_CUE_INNER_CROSS_SCALE: 0.8,
         
         // Start screen
         START_SCREEN_ASTERVOIDS: 4,  // Astervoids shown on start screen
@@ -5620,15 +5623,27 @@
                     ctx.stroke();
                 } else {
                     const base = Math.max(4, fromNormalizedSize(CONFIG.BULLET_RADIUS) * 2);
-                    const radius = base * (1 + 1.5 * progress);
+                    const easedProgress = 1 - Math.pow(1 - progress, 3);
+                    const scale = CONFIG.ASTEROID_IMPACT_CUE_START_SCALE
+                        + (CONFIG.ASTEROID_IMPACT_CUE_END_SCALE
+                            - CONFIG.ASTEROID_IMPACT_CUE_START_SCALE) * easedProgress;
+                    const radius = base * scale;
                     ctx.beginPath();
                     ctx.arc(x, y, radius, 0, Math.PI * 2);
                     ctx.stroke();
                     ctx.beginPath();
-                    ctx.moveTo(x - radius * 0.65, y);
-                    ctx.lineTo(x + radius * 0.65, y);
-                    ctx.moveTo(x, y - radius * 0.65);
-                    ctx.lineTo(x, y + radius * 0.65);
+                    const outerCrossHalfLength = radius * 0.65;
+                    ctx.moveTo(x - outerCrossHalfLength, y);
+                    ctx.lineTo(x + outerCrossHalfLength, y);
+                    ctx.moveTo(x, y - outerCrossHalfLength);
+                    ctx.lineTo(x, y + outerCrossHalfLength);
+                    const innerCrossHalfLength = outerCrossHalfLength
+                        * CONFIG.ASTEROID_IMPACT_CUE_INNER_CROSS_SCALE;
+                    const innerCrossAxisOffset = innerCrossHalfLength / Math.SQRT2;
+                    ctx.moveTo(x - innerCrossAxisOffset, y - innerCrossAxisOffset);
+                    ctx.lineTo(x + innerCrossAxisOffset, y + innerCrossAxisOffset);
+                    ctx.moveTo(x - innerCrossAxisOffset, y + innerCrossAxisOffset);
+                    ctx.lineTo(x + innerCrossAxisOffset, y - innerCrossAxisOffset);
                     ctx.stroke();
                 }
                 ctx.restore();
