@@ -1,6 +1,6 @@
 /**
  * Tests for the Fritsch–Carlson monotone-Hermite clamp applied to the
- * angle term inside RemoteObjects.hermite. Without the clamp, short-lived
+ * production interpolation policy. Without the clamp, short-lived
  * turn-input taps on the owner side produce a Hermite tangent bulge on
  * remote observers: prev.rotationSpeed ≈ ±SHIP_TURN_SPEED but the actual
  * endpoint chord dAngle is much smaller, so the cubic curves past a1
@@ -10,19 +10,21 @@
  *
  * Run with:  node --test AstervoidsWeb/hermite-angle-monotone.test.mjs
  *
- * Mirror with AstervoidsWeb/wwwroot/index.html (RemoteObjects.hermite,
- * angle branch).
+ * Exercises ReplicationPresentation.interpolateHermiteAngle directly.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
 const CONFIG = { TARGET_FPS: 60 };
+const require = createRequire(import.meta.url);
+const { interpolateHermiteAngle } = require(
+    './wwwroot/js/replication-presentation.js');
 
 /**
- * Pure-logic mirror of the angle branch of RemoteObjects.hermite with the
- * monotone clamp. Only the angle calculation is mirrored; position
- * tangents are intentionally not clamped in production.
+ * Adapter around the production angle interpolator. Position tangents are
+ * intentionally not clamped in production.
  *
  * Inputs:
  *   prevAngle, currAngle     — endpoint angles (radians)
@@ -31,32 +33,15 @@ const CONFIG = { TARGET_FPS: 60 };
  *   timeDiffMs               — bracket interval in milliseconds
  */
 function interpAngle(prevAngle, currAngle, prevRotSpeed, rotSpeed, t, timeDiffMs) {
-    const dt = timeDiffMs / 1000;
-    const t2 = t * t;
-    const t3 = t2 * t;
-    const h00 = 2 * t3 - 3 * t2 + 1;
-    const h10 = t3 - 2 * t2 + t;
-    const h01 = -2 * t3 + 3 * t2;
-    const h11 = t3 - t2;
-
-    let dAngle = currAngle - prevAngle;
-    while (dAngle > Math.PI) dAngle -= Math.PI * 2;
-    while (dAngle < -Math.PI) dAngle += Math.PI * 2;
-    if (Math.abs(dAngle) < 1e-6) return currAngle;
-
-    const a0 = prevAngle;
-    const a1 = a0 + dAngle;
-    const rpsToPerSec = CONFIG.TARGET_FPS;
-    let am0 = (prevRotSpeed || 0) * rpsToPerSec * dt;
-    let am1 = (rotSpeed || 0) * rpsToPerSec * dt;
-
-    const chord = dAngle;
-    const maxTangent = 3 * Math.abs(chord);
-    if (am0 * chord < 0) am0 = 0;
-    else if (Math.abs(am0) > maxTangent) am0 = Math.sign(am0) * maxTangent;
-    if (am1 * chord < 0) am1 = 0;
-    else if (Math.abs(am1) > maxTangent) am1 = Math.sign(am1) * maxTangent;
-    return h00 * a0 + h10 * am0 + h01 * a1 + h11 * am1;
+    return interpolateHermiteAngle({
+        previousAngle: prevAngle,
+        currentAngle: currAngle,
+        previousRotationSpeed: prevRotSpeed,
+        rotationSpeed: rotSpeed,
+        targetFps: CONFIG.TARGET_FPS,
+        t,
+        timeDiff: timeDiffMs
+    });
 }
 
 /** Same as above but WITHOUT the clamp, used to demonstrate the bug it fixes. */

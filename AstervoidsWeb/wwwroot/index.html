@@ -787,6 +787,13 @@
     <script src="/js/session-client.js"></script>
     <!-- Object sync module -->
     <script src="/js/object-sync.js"></script>
+    <!-- Replication clock and presentation policies -->
+    <script src="/js/replication-clock.js"></script>
+    <script src="/js/replication-presentation.js"></script>
+    <!-- Game-agnostic outbound replication policies -->
+    <script src="/js/replication-send-policy.js"></script>
+    <!-- Pull-driven canonical-record replication coordinator -->
+    <script src="/js/replication-runtime.js"></script>
 
     <script>
     /* ================================================================
@@ -1847,350 +1854,138 @@
     // correction; they do not normally snap. Extrapolation is bounded by
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
-    const DeadReckon = {
-        states: new Map(),
-        // Parallel version gate (mirrors RemoteObjects.lastVersions) so we only
-        // re-seed the snapshot when the authoritative version actually changes.
-        lastVersions: new Map(),
-        // Per-id visual error being decayed to zero (projective velocity
-        // blending). Seeded whenever a new snapshot disagrees with the replica's
-        // current on-screen extrapolation, and bled out over
-        // CONFIG.DEADRECKON_SMOOTH_MS so corrections ease in instead of snapping.
-        // Shape: { dx, dy, da, t0, tauMs } (da = signed shortest angular error).
-        smooth: new Map(),
-        // Incremental ship-replay cache (perf). Keyed by the snapshot STATE
-        // object so it is invalidated automatically when updateState installs a
-        // new snapshot (the old state object becomes unreachable → WeakMap entry
-        // is dropped). Holds the scratch ship pose after an integer number of
-        // whole dt=1 replay steps, so _replayShip can resume from there instead
-        // of re-simulating from the baseline every frame. See _replayShip.
-        replayCache: new WeakMap(),
+    function createDeadReckoningState(data, recvPerf) {
+        return {
+            x: data.x,
+            y: data.y,
+            angle: data.angle !== undefined ? data.angle : null,
+            velocityX: data.velocityX || 0,
+            velocityY: data.velocityY || 0,
+            rotationSpeed: data.rotationSpeed || 0,
+            clampAngular: data.type === OBJECT_TYPES.SHIP,
+            thrustInput: data.thrustInput || 0,
+            brakeInput: data.brakeInput || 0,
+            turnControlMode: data.turnControlMode === TURN_CONTROL_MODE.TARGET
+                ? TURN_CONTROL_MODE.TARGET
+                : TURN_CONTROL_MODE.RATE,
+            turnTarget: Number.isFinite(data.turnTarget)
+                ? data.turnTarget
+                : (CONFIG.SHIP_TURN_SPEED !== 0
+                    ? (data.rotationSpeed || 0) / CONFIG.SHIP_TURN_SPEED
+                    : 0),
+            turnTargetAngle: Number.isFinite(data.turnTargetAngle)
+                ? data.turnTargetAngle
+                : 0,
+            turnMagnitude: Number.isFinite(data.turnMagnitude)
+                ? Math.max(0, Math.min(1, data.turnMagnitude))
+                : 0,
+            turnBias: Number.isFinite(data.turnBias) ? data.turnBias : 0,
+            recvPerf
+        };
+    }
 
-        // `baselinePerf` is the performance.now()-domain instant this snapshot
-        // becomes the integration baseline. Callers anchor at ARRIVAL (omit the
-        // argument → defaults to performance.now()): getReckoned then projects
-        // forward only by the inter-packet gap (0..send-interval), so the
-        // replica renders the AUTHORITATIVE position the owner actually sent and
-        // dead-reckons just far enough to bridge to the next packet.
-        //
-        // We deliberately do NOT anchor at the owner's authoring instant
-        // (validAt mapped via validAtToPerfNow). Authoring-anchoring projects
-        // every replica straight through to "now" — i.e. predicts the owner's
-        // present pose — which makes a freshly-spawned object pop in already
-        // advanced from its spawn point and keeps an expiring object travelling
-        // past where the owner's copy died until the delete packet lands
-        // (visible "spawn ahead" / "over-travel"). Arrival-anchoring trades a
-        // constant ~one-way-latency positional lag for lifecycle continuity:
-        // no extrapolation beyond short gap-bridging, and bounded correction
-        // when the next packet arrives.
-        //
-        // For unchanged constant motion, each advancing owner snapshot agrees
-        // with the receiver's gap projection apart from timing jitter. Motion
-        // changes produce a real prediction error and enter the correction path
-        // below rather than relying on the baseline choice to hide it.
-        //
-        // Steady-state extrapolation is exact for constant velocity/rotation, so
-        // each new snapshot agrees with the current extrapolation and seeds a
-        // ~zero correction (no added lag). At a motion DISCONTINUITY (rotation or
-        // thrust start/stop) the extrapolation and the new snapshot disagree;
-        // that error is captured here and decayed smoothly by getReckoned rather
-        // than snapped — this is what removes the rotation overshoot/rubberband.
-        // `snap` forces an immediate, blend-free jump to the authoritative pose
-        // for INTENTIONAL discontinuities (e.g. ship death/respawn to the spawn
-        // point). The kinematic SNAP_DIST guard below only catches LARGE jumps;
-        // an intentional teleport can be small (dying near center), so the game
-        // layer signals it explicitly via this flag.
-        // `preserveDirection` is used for the first post-migration update: if
-        // the observer is ahead of the new owner's retained puppet pose, extend
-        // only that correction's decay enough to avoid visible reverse motion.
-        updateState(id, data, baselinePerf, snap, preserveDirection = false) {
-            const now = performance.now();
-            // Where the replica is CURRENTLY displayed (old extrapolation plus
-            // any in-flight correction), captured BEFORE installing the new
-            // snapshot so we can blend out the difference rather than jump.
-            // An explicit snap skips this so no decaying offset is seeded.
-            const displayed = (!snap && this.states.has(id)) ? this._reckonAt(id, now) : null;
-            this.states.set(id, {
-                x: data.x,
-                y: data.y,
-                angle: (data.angle !== undefined ? data.angle : null),
-                velocityX: data.velocityX || 0,
-                velocityY: data.velocityY || 0,
-                rotationSpeed: data.rotationSpeed || 0,
-                // P2: ships get a tighter ANGULAR extrapolation clamp than the
-                // positional one (rotationSpeed is a step → over-rotates across an
-                // unannounced stop). Ballistic spinners (asteroids/bullets) keep
-                // full-frame angular projection since their rotation is constant
-                // and therefore exact. Derived from the stored object type, which
-                // is present on the merged object data even though the ship's
-                // per-frame toUpdateData() omits it.
-                clampAngular: data.type === OBJECT_TYPES.SHIP,
-                // P3 input-replay seeds: control magnitudes and optional target-
-                // heading intent. Rate-mode turns use turnTarget directly;
-                // polar target-mode turns recompute attainableTurnTarget every
-                // replay substep so latency does not project a stale turn rate.
-                thrustInput: data.thrustInput || 0,
-                brakeInput: data.brakeInput || 0,
-                turnControlMode: data.turnControlMode === TURN_CONTROL_MODE.TARGET
-                    ? TURN_CONTROL_MODE.TARGET
-                    : TURN_CONTROL_MODE.RATE,
-                turnTarget: Number.isFinite(data.turnTarget)
-                    ? data.turnTarget
-                    : (CONFIG.SHIP_TURN_SPEED !== 0
-                        ? (data.rotationSpeed || 0) / CONFIG.SHIP_TURN_SPEED
-                        : 0),
-                turnTargetAngle: Number.isFinite(data.turnTargetAngle) ? data.turnTargetAngle : 0,
-                turnMagnitude: Number.isFinite(data.turnMagnitude)
-                    ? Math.max(0, Math.min(1, data.turnMagnitude))
-                    : 0,
-                turnBias: Number.isFinite(data.turnBias) ? data.turnBias : 0,
-                recvPerf: (typeof baselinePerf === 'number' && isFinite(baselinePerf))
-                    ? baselinePerf
-                    : now,
-            });
-            let tau = CONFIG.DEADRECKON_SMOOTH_MS;
-            if (displayed && tau > 0) {
-                const fresh = this._reckonRaw(id, now);
-                if (fresh) {
-                    let dx = displayed.x - fresh.x;
-                    let dy = displayed.y - fresh.y;
-                    let da = (displayed.angle != null && fresh.angle != null)
-                        ? shortestAngleDelta(displayed.angle, fresh.angle)
-                        : 0;
-                    // Wrap-seam / respawn guard: a big positional jump means the
-                    // object crossed the normalized wrap boundary or teleported —
-                    // snap there instead of sweeping the replica across the field.
-                    const snapDist = CONFIG.DEADRECKON_SNAP_DIST;
-                    if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) { dx = 0; dy = 0; }
-                    if (dx !== 0 || dy !== 0 || da !== 0) {
-                        if (preserveDirection) {
-                            const state = this.states.get(id);
-                            const stepMs = 1000 / CONFIG.TARGET_FPS;
-                            const motionX = velocityToNormalizedDeltaX(state.velocityX || 0);
-                            const motionY = velocityToNormalizedDeltaY(state.velocityY || 0);
-                            const motion = Math.hypot(motionX, motionY);
-                            if (motion > 1e-12) {
-                                const correctionAlong = (dx * motionX + dy * motionY) / motion;
-                                if (correctionAlong > 0) {
-                                    tau = Math.max(tau, correctionAlong * stepMs / motion);
-                                }
-                            }
-                            const angularMotion = state.rotationSpeed || 0;
-                            if (Math.abs(angularMotion) > 1e-12
-                                && Math.sign(da) === Math.sign(angularMotion)) {
-                                tau = Math.max(tau, Math.abs(da) * stepMs / Math.abs(angularMotion));
-                            }
-                            tau *= 1.05;
-                        }
-                        this.smooth.set(id, { dx, dy, da, t0: now, tauMs: tau });
-                        return;
-                    }
-                }
-            }
-            this.smooth.delete(id);
-        },
+    // Ship replay remains a game-layer callback: the presentation policy knows
+    // only that a kinematic state may opt into replay.
+    function replayDeadReckonedShip(state, frames, out, targetMode, context) {
+        const ship = context.scratch || (context.scratch = new Ship(0, 0, 0));
+        const whole = Math.floor(frames > 0 ? frames : 0);
+        const fraction = (frames > 0 ? frames : 0) - whole;
+        const turnSpeed = CONFIG.SHIP_TURN_SPEED;
+        const baseTurnInput = turnSpeed !== 0
+            ? state.rotationSpeed / turnSpeed
+            : 0;
+        const targetDrive = targetMode
+            && state.turnControlMode === TURN_CONTROL_MODE.TARGET
+            && state.angle !== null;
 
-        // Raw constant-velocity/rotation extrapolation of `id` at perf instant
-        // `nowPerf`, with NO correction smoothing applied.
-        _reckonRaw(id, nowPerf) {
-            const s = this.states.get(id);
-            if (!s) return null;
-            const stepMs = 1000 / CONFIG.TARGET_FPS;
-            let frames = stepMs > 0 ? (nowPerf - s.recvPerf) / stepMs : 0;
-            if (!(frames > 0)) frames = 0;
-            if (frames > CONFIG.DEADRECKON_MAX_FRAMES) frames = CONFIG.DEADRECKON_MAX_FRAMES;
-            const out = {
-                x: s.x,
-                y: s.y,
-                velocityX: s.velocityX,
-                velocityY: s.velocityY,
-                rotationSpeed: s.rotationSpeed,
-            };
-            if (frames > 0) {
-                out.x = s.x + velocityToNormalizedDeltaX(s.velocityX) * frames;
-                out.y = s.y + velocityToNormalizedDeltaY(s.velocityY) * frames;
-            }
-            const targetMode = s.clampAngular
-                && CONFIG.SHIP_ROTATION_TARGET_ENABLED
-                && isDeterministicMode();
-            if (s.angle !== null) {
-                if (targetMode) {
-                    // Ships target the owner's authoritative angle instead of
-                    // forward-projecting stale angular velocity. _reckonAt's
-                    // smoothing offset eases from the previously displayed angle
-                    // to this target, which can lag but cannot overshoot.
-                    out.angle = s.angle;
-                } else {
-                    // P2: clamp ANGULAR projection for ships to bound over-rotation
-                    // across an unannounced turn stop; positional projection keeps
-                    // the full DEADRECKON_MAX_FRAMES window above.
-                    let angFrames = frames;
-                    const angCap = CONFIG.DEADRECKON_ANGULAR_MAX_FRAMES;
-                    if (s.clampAngular && angCap >= 0 && angFrames > angCap) {
-                        angFrames = angCap;
-                    }
-                    out.angle = s.angle + s.rotationSpeed * angFrames;
-                }
-            }
-            // P3: for ships, replace the first-order linear projection above with
-            // a replay of Ship.update() forward from the baseline (same friction,
-            // rotating-heading thrust, clamp, brake the owner ran). Rate controls
-            // replay the transmitted turnTarget; polar controls replay target-
-            // heading intent, recomputing turnTarget each substep. In rotation
-            // target mode, rate/legacy-schema controls keep the authoritative
-            // display angle above while still replaying position/velocity.
-            if (s.clampAngular && CONFIG.SHIP_INPUT_REPLAY_ENABLED && isDeterministicMode()) {
-                this._replayShip(s, frames, out, targetMode);
-            }
-            return out;
-        },
+        let cached = context.replayCache.get(state);
+        let from;
+        if (cached && cached.whole <= whole) {
+            ship.x = cached.x;
+            ship.y = cached.y;
+            ship.angle = cached.angle;
+            ship.velocityX = cached.velocityX;
+            ship.velocityY = cached.velocityY;
+            ship.rotationSpeed = cached.rotationSpeed;
+            ship.turnInput = cached.turnInput;
+            from = cached.whole;
+        } else {
+            ship.x = state.x;
+            ship.y = state.y;
+            ship.angle = state.angle !== null ? state.angle : 0;
+            ship.velocityX = state.velocityX;
+            ship.velocityY = state.velocityY;
+            ship.rotationSpeed = state.rotationSpeed;
+            ship.turnInput = baseTurnInput;
+            from = 0;
+        }
+        ship.thrustInput = state.thrustInput || 0;
+        ship.brakeInput = state.brakeInput || 0;
+        ship.invulnerable = 0;
+        ship.shootCooldown = 0;
 
-        // Advance a scratch Ship through `frames` 60fps-equivalent steps from the
-        // baseline kinematic state `s`, writing the resulting pose into `out`.
-        // Steps in whole frames (matching the owner's fixed timestep) plus a
-        // fractional remainder. Pure kinematics: invulnerable/shootCooldown are
-        // zeroed so Ship.update's timer decrements are inert, and nothing else in
-        // Ship.update touches globals.
-        //
-        // PERF (many ships): a naive replay re-simulates from the baseline every
-        // call, which is O(frames) and runs up to ~2x per render frame per remote
-        // ship (updateRemoteShips ingest + repositionDeadReckonedRemotes), with
-        // `frames` saturating at DEADRECKON_MAX_FRAMES (30) at low send-rate/high
-        // latency. Because `_reckonRaw` is called with monotonically
-        // non-decreasing time for a FIXED snapshot, floor(frames) only grows, and
-        // whole dt=1 steps are exactly composable (identical float ops, constant
-        // per-snapshot inputs; target-drive recomputes turnTarget from ship state
-        // each step deterministically). So we cache the scratch pose after an
-        // integer number of whole steps (keyed by the snapshot object via the
-        // replayCache WeakMap, dropped automatically on the next snapshot) and
-        // RESUME from there, stepping only the new whole frames. The result is
-        // bit-for-bit identical to a from-baseline replay; at saturation
-        // (frames==30, frac==0) the call collapses to field copies. The
-        // fractional remainder is applied AFTER caching so it never pollutes the
-        // integer-frame baseline the next call resumes from.
-        _replayShip(s, frames, out, targetMode) {
-            const sh = this._scratch || (this._scratch = new Ship(0, 0, 0));
-            const f = frames > 0 ? frames : 0;
-            const whole = Math.floor(f);
-            const frac = f - whole;
-            const turnSpeed = CONFIG.SHIP_TURN_SPEED;
-            const baseTurnInput = turnSpeed !== 0 ? s.rotationSpeed / turnSpeed : 0;
-            const targetDrive = targetMode
-                && s.turnControlMode === TURN_CONTROL_MODE.TARGET
-                && s.angle !== null;
-
-            // Resume from the cached integer-frame pose when it has not advanced
-            // past where we need to be; otherwise (re)seed from the baseline.
-            let rc = this.replayCache.get(s);
-            let from;
-            if (rc && rc.whole <= whole) {
-                sh.x = rc.x; sh.y = rc.y; sh.angle = rc.angle;
-                sh.velocityX = rc.velocityX; sh.velocityY = rc.velocityY;
-                sh.rotationSpeed = rc.rotationSpeed; sh.turnInput = rc.turnInput;
-                from = rc.whole;
+        const driveTurn = (dt) => {
+            if (targetDrive) {
+                const delta = shortestAngleDelta(state.turnTargetAngle, ship.angle);
+                const targetTurn = attainableTurnTarget(
+                    delta,
+                    state.turnMagnitude || 0,
+                    CONFIG.SHIP_TURN_SPEED,
+                    dt);
+                ship.turnTarget = mergeTurnInputs(targetTurn, state.turnBias || 0);
             } else {
-                sh.x = s.x;
-                sh.y = s.y;
-                sh.angle = (s.angle !== null ? s.angle : 0);
-                sh.velocityX = s.velocityX;
-                sh.velocityY = s.velocityY;
-                sh.rotationSpeed = s.rotationSpeed;
-                sh.turnInput = baseTurnInput;
-                from = 0;
+                ship.turnTarget = Number.isFinite(state.turnTarget)
+                    ? state.turnTarget
+                    : baseTurnInput;
             }
-            sh.thrustInput = s.thrustInput || 0;
-            sh.brakeInput = s.brakeInput || 0;
-            sh.invulnerable = 0;
-            sh.shootCooldown = 0;
+        };
 
-            const driveTurn = (dt) => {
-                if (targetDrive) {
-                    const delta = shortestAngleDelta(s.turnTargetAngle, sh.angle);
-                    const targetTurn = attainableTurnTarget(
-                        delta,
-                        s.turnMagnitude || 0,
-                        CONFIG.SHIP_TURN_SPEED,
-                        dt);
-                    sh.turnTarget = mergeTurnInputs(targetTurn, s.turnBias || 0);
-                } else {
-                    sh.turnTarget = Number.isFinite(s.turnTarget) ? s.turnTarget : baseTurnInput;
-                }
-            };
+        for (let i = from; i < whole; i++) {
+            driveTurn(1);
+            ship.update(1);
+        }
+        if (!cached) {
+            cached = {};
+            context.replayCache.set(state, cached);
+        }
+        cached.whole = whole;
+        cached.x = ship.x;
+        cached.y = ship.y;
+        cached.angle = ship.angle;
+        cached.velocityX = ship.velocityX;
+        cached.velocityY = ship.velocityY;
+        cached.rotationSpeed = ship.rotationSpeed;
+        cached.turnInput = ship.turnInput;
 
-            for (let i = from; i < whole; i++) {
-                driveTurn(1);
-                sh.update(1);
-            }
-            // Persist the integer-frame pose for the next (later-time) call.
-            if (!rc) { rc = {}; this.replayCache.set(s, rc); }
-            rc.whole = whole;
-            rc.x = sh.x; rc.y = sh.y; rc.angle = sh.angle;
-            rc.velocityX = sh.velocityX; rc.velocityY = sh.velocityY;
-            rc.rotationSpeed = sh.rotationSpeed; rc.turnInput = sh.turnInput;
+        if (fraction > 1e-6) {
+            driveTurn(fraction);
+            ship.update(fraction);
+        }
+        out.x = ship.x;
+        out.y = ship.y;
+        out.velocityX = ship.velocityX;
+        out.velocityY = ship.velocityY;
+        out.rotationSpeed = ship.rotationSpeed;
+        if (state.angle !== null && (!targetMode || targetDrive)) {
+            out.angle = ship.angle;
+        }
+    }
 
-            // Fractional remainder — applied on the scratch ship after the cache
-            // is saved, so it does not corrupt the integer-frame baseline.
-            if (frac > 1e-6) {
-                driveTurn(frac);
-                sh.update(frac);
-            }
-
-            out.x = sh.x;
-            out.y = sh.y;
-            out.velocityX = sh.velocityX;
-            out.velocityY = sh.velocityY;
-            out.rotationSpeed = sh.rotationSpeed;
-            if (s.angle !== null && (!targetMode || targetDrive)) out.angle = sh.angle;
-        },
-
-        // Raw extrapolation plus the decaying correction offset, at `nowPerf`.
-        _reckonAt(id, nowPerf) {
-            const out = this._reckonRaw(id, nowPerf);
-            if (!out) return null;
-            const e = this.smooth.get(id);
-            if (e) {
-                const tau = e.tauMs || CONFIG.DEADRECKON_SMOOTH_MS;
-                const k = tau > 0 ? Math.exp(-(nowPerf - e.t0) / tau) : 0;
-                if (k <= 1e-3) {
-                    this.smooth.delete(id);
-                } else {
-                    out.x += e.dx * k;
-                    out.y += e.dy * k;
-                    if (out.angle !== undefined) out.angle += e.da * k;
-                }
-            }
-            return out;
-        },
-
-        // Return a sync-data-shaped object posed at the dead-reckoned transform
-        // (with correction smoothing), or null when no authoritative state has
-        // been seen yet.
-        getReckoned(id) {
-            return this._reckonAt(id, performance.now());
-        },
-
-        // Latest authoritative snapshot with NO forward extrapolation or
-        // correction smoothing. Kept as an explicit clamp/diagnostic helper;
-        // deterministic game over currently uses the continuity-preserving
-        // shared ballistic freeze instead. Directly switching to this pose would
-        // remove prediction error but can visibly jump backward.
-        getResting(id) {
-            const s = this.states.get(id);
-            if (!s) return null;
-            const out = {
-                x: s.x,
-                y: s.y,
-                velocityX: s.velocityX,
-                velocityY: s.velocityY,
-                rotationSpeed: s.rotationSpeed,
-            };
-            if (s.angle !== null) out.angle = s.angle;
-            return out;
-        },
-
-        remove(id) { this.states.delete(id); this.lastVersions.delete(id); this.smooth.delete(id); },
-        clear() { this.states.clear(); this.lastVersions.clear(); this.smooth.clear(); },
-    };
+    const DeadReckon = ReplicationPresentation.createDeadReckoningPolicy({
+        config: CONFIG,
+        nowMs: () => performance.now(),
+        velocityToDeltaX: velocityToNormalizedDeltaX,
+        velocityToDeltaY: velocityToNormalizedDeltaY,
+        shortestAngleDelta,
+        createState: createDeadReckoningState,
+        isRotationTarget: state => state.clampAngular
+            && CONFIG.SHIP_ROTATION_TARGET_ENABLED
+            && isDeterministicMode(),
+        shouldReplay: state => state.clampAngular
+            && CONFIG.SHIP_INPUT_REPLAY_ENABLED
+            && isDeterministicMode(),
+        replay: replayDeadReckonedShip
+    });
 
     // Owner-side "send-on-change" suppression gate (deterministic mode only).
     //
@@ -2219,52 +2014,11 @@
     // Time-based (performance.now) rather than frame-counted so it is robust to
     // variable-dt fallback paths (hidden-tab background loop). Tracked per owned
     // syncObjectId; cleared on delete (deleteSyncedObject) and session reset.
-    const SendGate = {
-        baselines: new Map(),
-
-        // Returns true if this frame should queue the object and records that
-        // gate baseline; false suppresses queueing. ObjectSync may coalesce the
-        // queued state, delay it behind an in-flight invoke, or retry only when
-        // a later frame queues the object again. `angle`/`rs` may be null for
-        // objects without rotation. Outside deterministic mode or when disabled,
-        // every frame remains eligible as in legacy behavior.
-        shouldSend(id, x, y, angle, vx, vy, rs) {
-            if (!CONFIG.SEND_ON_CHANGE_ENABLED || !isDeterministicMode()) return true;
-            vx = vx || 0; vy = vy || 0; rs = rs || 0;
-            const now = performance.now();
-            const b = this.baselines.get(id);
-            if (!b) { this._set(id, x, y, angle, vx, vy, rs, now); return true; }
-            let send = false;
-            if (Math.abs(vx - b.vx) > CONFIG.SEND_ON_CHANGE_VEL_EPS ||
-                Math.abs(vy - b.vy) > CONFIG.SEND_ON_CHANGE_VEL_EPS ||
-                Math.abs(rs - b.rs) > CONFIG.SEND_ON_CHANGE_ROT_EPS) {
-                send = true;
-            } else if (Math.abs(x - b.prevX) > CONFIG.SEND_ON_CHANGE_WRAP_JUMP ||
-                       Math.abs(y - b.prevY) > CONFIG.SEND_ON_CHANGE_WRAP_JUMP) {
-                send = true;
-            } else if ((now - b.lastSentMs) >= CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS) {
-                send = true;
-            }
-            if (send) {
-                this._set(id, x, y, angle, vx, vy, rs, now);
-            } else {
-                // Track every frame's pose (even while suppressing) so wrap
-                // detection compares against the immediately previous frame.
-                b.prevX = x; b.prevY = y; b.prevAngle = angle;
-            }
-            return send;
-        },
-
-        _set(id, x, y, angle, vx, vy, rs, now) {
-            this.baselines.set(id, {
-                x, y, angle, vx, vy, rs,
-                lastSentMs: now, prevX: x, prevY: y, prevAngle: angle,
-            });
-        },
-
-        remove(id) { this.baselines.delete(id); },
-        clear() { this.baselines.clear(); },
-    };
+    const SendGate = ReplicationSendPolicy.createBallisticGate({
+        config: CONFIG,
+        isDeterministic: isDeterministicMode,
+        nowMs: () => performance.now()
+    });
 
     // Owner-side immediate-flush gate for the LOCAL ship's control edges (P1,
     // deterministic mode only). This is independent of ShipSendGate: it marks an
@@ -2282,40 +2036,10 @@
     // intentionally NOT immediate edges: ShipSendGate queues changed replay
     // intent normally, and ObjectSync batches it at the adaptive cadence.
     // Promoting every analog frame to an immediate flush would defeat batching.
-    const ShipControlGate = {
-        last: null,
-        // Epsilon for treating an analog magnitude as "active" (non-zero).
-        EPS: 1e-4,
-
-        // Sample the ship's control state and return true iff it crossed an
-        // overshoot-critical edge since the previous sample. Must be called once
-        // per frame (it advances the baseline) regardless of mode so the baseline
-        // never goes stale; the caller gates the immediate flush on mode.
-        isEdge(ship) {
-            const rotEps = CONFIG.SEND_ON_CHANGE_ROT_EPS;
-            const eps = this.EPS;
-            const rs = ship.rotationSpeed || 0;
-            const th = ship.thrustInput || 0;
-            const br = ship.brakeInput || 0;
-            const thrusting = !!ship.thrusting;
-            const p = this.last;
-            this.last = { rs, th, br, thrusting };
-            if (!p) return false; // first sample seeds the baseline only
-            // Rotation start/stop: zero <-> non-zero crossing.
-            if ((Math.abs(rs) > rotEps) !== (Math.abs(p.rs) > rotEps)) return true;
-            // Rotation sign reversal (turn flipped direction without resting at 0).
-            if (rs * p.rs < 0) return true;
-            // Thrust flame flip (drives both visual and the thrust integration).
-            if (thrusting !== p.thrusting) return true;
-            // Analog thrust / brake on<->off (covers schemes where `thrusting`
-            // may not capture the magnitude edge).
-            if ((th > eps) !== (p.th > eps)) return true;
-            if ((br > eps) !== (p.br > eps)) return true;
-            return false;
-        },
-
-        reset() { this.last = null; },
-    };
+    const ShipControlGate = ReplicationSendPolicy.createControlEdgeGate({
+        getRotationEpsilon: () => CONFIG.SEND_ON_CHANGE_ROT_EPS,
+        epsilon: 1e-4
+    });
 
     // Owner-side "send-on-change" suppression gate for the LOCAL ship, the
     // ship-physics counterpart to SendGate (which covers ballistic asteroids /
@@ -2349,56 +2073,11 @@
     // deterministic+replay mode, every frame remains eligible for the shared
     // transport cadence. The P1 edge path passes force=true, queues the new
     // baseline, and requests an immediate flush.
-    const ShipSendGate = {
-        baselines: new Map(),
-
-        shouldSend(id, ship, force) {
-            if (!CONFIG.SHIP_SEND_ON_CHANGE_ENABLED ||
-                !CONFIG.SHIP_INPUT_REPLAY_ENABLED ||
-                !isDeterministicMode()) {
-                return true;
-            }
-            const now = performance.now();
-            const b = this.baselines.get(id);
-            if (force || !b) { this._set(id, ship, now); return true; }
-            const eps = CONFIG.SEND_ON_CHANGE_VEL_EPS;
-            const rotEps = CONFIG.SEND_ON_CHANGE_ROT_EPS;
-            let send = false;
-            if (Math.abs((ship.thrustInput || 0) - b.thrustInput) > eps ||
-                Math.abs((ship.brakeInput || 0) - b.brakeInput) > eps ||
-                Math.abs((ship.turnTarget || 0) - b.turnTarget) > eps ||
-                Math.abs((ship.turnMagnitude || 0) - b.turnMagnitude) > eps ||
-                Math.abs((ship.turnBias || 0) - b.turnBias) > eps ||
-                Math.abs((ship.turnTargetAngle || 0) - b.turnTargetAngle) > rotEps ||
-                (ship.turnControlMode || 0) !== b.turnControlMode ||
-                !!ship.thrusting !== b.thrusting ||
-                (ship.invulnerable || 0) !== b.invulnerable) {
-                send = true;
-            } else if ((now - b.lastSentMs) >= CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS) {
-                send = true;
-            }
-            if (send) this._set(id, ship, now);
-            return send;
-        },
-
-        _set(id, ship, now) {
-            this.baselines.set(id, {
-                thrustInput: ship.thrustInput || 0,
-                brakeInput: ship.brakeInput || 0,
-                turnControlMode: ship.turnControlMode || 0,
-                turnTarget: ship.turnTarget || 0,
-                turnTargetAngle: ship.turnTargetAngle || 0,
-                turnMagnitude: ship.turnMagnitude || 0,
-                turnBias: ship.turnBias || 0,
-                thrusting: !!ship.thrusting,
-                invulnerable: ship.invulnerable || 0,
-                lastSentMs: now,
-            });
-        },
-
-        remove(id) { this.baselines.delete(id); },
-        clear() { this.baselines.clear(); },
-    };
+    const ShipSendGate = ReplicationSendPolicy.createShipGate({
+        config: CONFIG,
+        isDeterministic: isDeterministicMode,
+        nowMs: () => performance.now()
+    });
 
     // ============================================
     // SECTION 1B: MULTIPLAYER CONSTANTS
@@ -2582,13 +2261,91 @@
     // Legacy remote snapshot/interpolation state plus clock/RTT estimators shared
     // by both simulation modes. Deterministic rendering uses DeadReckon instead
     // of `states`, but still consumes the clock for join and lifecycle timing.
+    const replicationClock = ReplicationClock.create({
+        ping: () => SessionClient.ping(),
+        monotonicNowMs: () => performance.now(),
+        wallNowMs: () => Date.now(),
+        setTimeout: (callback, delay) => setTimeout(callback, delay),
+        clearTimeout: timer => clearTimeout(timer),
+        visibility: typeof document !== 'undefined' ? document : null
+    });
+    const adaptiveDelayPolicy = ReplicationPresentation.createAdaptiveDelayPolicy({
+        config: CONFIG,
+        getRttMs: () => RemoteObjects.rtt.estimatedRtt
+    });
+    function getRemoteBoundingRadius(data) {
+        if (!data || !data.type) return 0;
+        if (data.type === OBJECT_TYPES.ASTEROID) {
+            const vertices = data.vertices;
+            if (Array.isArray(vertices) && vertices.length > 0) {
+                let maximum = 0;
+                for (const vertex of vertices) {
+                    const distance = vertex ? vertex.distance || 0 : 0;
+                    if (distance > maximum) maximum = distance;
+                }
+                if (maximum > 0) return maximum;
+            }
+            return (data.radius || 0) * (1 + CONFIG.ASTEROID_JAGGEDNESS);
+        }
+        if (data.type === OBJECT_TYPES.SHIP) return CONFIG.SHIP_SIZE;
+        if (data.type === OBJECT_TYPES.BULLET) return CONFIG.BULLET_RADIUS;
+        return 0;
+    }
+    function remoteVelocityToNormalizedX(velocity) {
+        return velocity * getReferenceDimension() / getGameWidth();
+    }
+    function remoteVelocityToNormalizedY(velocity) {
+        return velocity * getReferenceDimension() / getGameHeight();
+    }
+    function shortestRemoteDeltaX(from, to, data) {
+        const range = 1 + 2 * wrapMarginX(getRemoteBoundingRadius(data));
+        let delta = to - from;
+        if (delta > range / 2) delta -= range;
+        else if (delta < -range / 2) delta += range;
+        return delta;
+    }
+    function shortestRemoteDeltaY(from, to, data) {
+        const range = 1 + 2 * wrapMarginY(getRemoteBoundingRadius(data));
+        let delta = to - from;
+        if (delta > range / 2) delta -= range;
+        else if (delta < -range / 2) delta += range;
+        return delta;
+    }
+    function wrapRemoteX(value, data) {
+        return wrapNormalized(
+            value, wrapMarginX(getRemoteBoundingRadius(data)));
+    }
+    function wrapRemoteY(value, data) {
+        return wrapNormalized(
+            value, wrapMarginY(getRemoteBoundingRadius(data)));
+    }
+    function remoteDistanceBetween(a, b) {
+        const dx = shortestRemoteDeltaX(a.x, b.x, b);
+        const dy = shortestRemoteDeltaY(a.y || 0, b.y || 0, b);
+        const refDim = getReferenceDimension();
+        const dxRef = dx * getGameWidth() / refDim;
+        const dyRef = dy * getGameHeight() / refDim;
+        return Math.sqrt(dxRef * dxRef + dyRef * dyRef);
+    }
+    const legacySnapshotPolicy = ReplicationPresentation.createSnapshotInterpolationPolicy({
+        config: CONFIG,
+        nowMs: () => performance.now(),
+        validAtToTime: validAt => replicationClock.validAtToMonotonicMs(validAt),
+        getDelayForMember: memberId => adaptiveDelayPolicy.getDelayForMember(memberId),
+        velocityToDeltaX: remoteVelocityToNormalizedX,
+        velocityToDeltaY: remoteVelocityToNormalizedY,
+        shortestDeltaX: shortestRemoteDeltaX,
+        shortestDeltaY: shortestRemoteDeltaY,
+        wrapX: wrapRemoteX,
+        wrapY: wrapRemoteY,
+        distanceBetween: remoteDistanceBetween
+    });
     const RemoteObjects = {
-        // Map of objectId -> interpolation state
-        states: new Map(),
-        // Map of objectId -> last version fed to interpolation
-        lastVersions: new Map(),
+        // Facade maps remain directly queryable by game-over and migration paths.
+        states: legacySnapshotPolicy.states,
+        lastVersions: legacySnapshotPolicy.lastVersions,
         // Per-member adaptive delay state: Map<memberId, AdaptiveDelayState>
-        memberDelays: new Map(),
+        memberDelays: adaptiveDelayPolicy.memberDelays,
         // One-way jitter estimation (server→client)
         jitter: {
             minOneWay: Infinity,
@@ -2632,45 +2389,13 @@
         // render / GC / event-loop jitter — those raise RTT without raising
         // accuracy. Pure-logic helpers below are mirrored by
         // AstervoidsWeb/clock-offset.test.mjs.
-        clock: {
-            offsetMs: 0,
-            offsetInitialized: false,
-            // Difference between performance.now() and Date.now() captured at
-            // each ping burst. Used by validAtToPerfNow to convert server-time
-            // ms (the unified interpolation axis) into the perf.now domain
-            // that bracket-search runs in. Refreshed every ping so OS-level
-            // wall-clock slewing (NTP daemon) doesn't drift the snapshot key
-            // off the bracket axis. ~ms-stable over hours in practice.
-            wallToPerfDelta: null,
-            lastSampleRtt: Infinity,
-            sampleCount: 0,
-            rejectedCount: 0,
-            // Tunables
-            bootstrapBurstSize: 5,
-            bootstrapIntervalMs: 100,
-            refreshIntervalMs: 30000,
-            emaAlpha: 0.3,
-            outlierGateMs: 20,
-            outlierGateRttMul: 3,
-            // Loop / lifecycle
-            running: false,
-            generation: 0,
-            burstOperation: null,
-            loopPromise: null,
-            visibilityHandler: null,
-            wakeResolve: null,
-        },
+        clock: replicationClock.state,
 
         /**
          * Pure: pick the sample with the smallest rtt. Tiebreak first occurrence.
          */
         pickMinRttSample(samples) {
-            if (!samples || samples.length === 0) return null;
-            let best = samples[0];
-            for (let i = 1; i < samples.length; i++) {
-                if (samples[i].rtt < best.rtt) best = samples[i];
-            }
-            return best;
+            return ReplicationClock.pickMinRttSample(samples);
         },
 
         /**
@@ -2681,7 +2406,7 @@
          * delay but cannot remove persistent directional asymmetry.
          */
         computeOffsetForSample(sample) {
-            return sample.serverTime + sample.rtt / 2 - sample.t3Wall;
+            return ReplicationClock.computeOffsetForSample(sample);
         },
 
         /**
@@ -2690,16 +2415,14 @@
          * current offset by more than max(gateMs, gateRttMul · lastRtt).
          */
         passesOutlierGate(args) {
-            if (!args.initialized) return true;
-            const tolerance = Math.max(args.gateMs, args.gateRttMul * args.lastSampleRtt);
-            return Math.abs(args.candidateOffset - args.currentOffset) <= tolerance;
+            return ReplicationClock.passesOutlierGate(args);
         },
 
         /**
          * Pure: single-alpha EMA. Returns current + alpha · (target − current).
          */
         emaUpdate(current, target, alpha) {
-            return current + alpha * (target - current);
+            return ReplicationClock.emaUpdate(current, target, alpha);
         },
 
         /**
@@ -2716,26 +2439,14 @@
          * guarantee against an arbitrary ordered stall.
          */
         createMemberDelay() {
-            return {
-                packetIntervals: [],
-                lagSamples: [],
-                computedDelay: CONFIG.INTERPOLATION_DELAY,
-                lastServerTimestamp: 0,
-                lastValidAt: 0,
-                remoteSendInterval: 0
-            };
+            return adaptiveDelayPolicy.createMemberDelay();
         },
 
         /**
          * Get or create adaptive delay state for a member
          */
         getMemberDelay(memberId) {
-            let delay = this.memberDelays.get(memberId);
-            if (!delay) {
-                delay = this.createMemberDelay();
-                this.memberDelays.set(memberId, delay);
-            }
-            return delay;
+            return adaptiveDelayPolicy.getMemberDelay(memberId);
         },
         
         /**
@@ -2768,52 +2479,15 @@
          *   the computed delay up toward the current delay value.
          */
         updateState(objectId, data, ownerMemberId, validAt, arrivalServerTime, recordSample = true) {
-            const now = (validAt != null)
-                ? this.validAtToPerfNow(validAt)
-                : performance.now();
-            // Per-object post-flush lag observation for legacy delay sizing.
-            // Skip until the receiver clock is initialized. Synthetic bridge
-            // snapshots pass recordSample=false because their timestamp is
-            // derived from the delay being estimated. arrivalServerTime is
-            // preferred because ObjectSync captured it at the SignalR boundary,
-            // before later game-loop polling.
-            if (recordSample && validAt != null && ownerMemberId && this.isClockOffsetInitialized()) {
-                const arrival = (arrivalServerTime != null) ? arrivalServerTime : this.serverNowMs();
+            if (recordSample && validAt != null && ownerMemberId
+                && this.isClockOffsetInitialized()) {
+                const arrival = arrivalServerTime != null
+                    ? arrivalServerTime
+                    : this.serverNowMs();
                 this.recordObjectSample(ownerMemberId, validAt, arrival);
             }
-            const existing = this.states.get(objectId);
-            const snapshot = {
-                data: { ...data },
-                time: now,
-                velocity: { x: data.velocityX || 0, y: data.velocityY || 0 },
-                rotationSpeed: data.rotationSpeed || 0
-            };
-            
-            if (existing) {
-                // Ownership-only versions are filtered before this call. The
-                // first real new-owner snapshot switches this state's delay
-                // lookup immediately; legacy mode does not blend between the old
-                // and new owners' target timelines, so materially different
-                // per-owner delays can cause a transient handoff correction.
-                existing.ownerMemberId = ownerMemberId;
-                // Keep snapshot keys monotonic for bracket search. SignalR is
-                // ordered within a connection, but owner clock corrections,
-                // server monotonic caps, reconciliation, and synthetic bridge
-                // insertion can still produce equal or regressing validAt keys.
-                const latest = existing.snapshots[existing.snapshots.length - 1];
-                if (latest && snapshot.time < latest.time) {
-                    snapshot.time = latest.time;
-                }
-                existing.snapshots.push(snapshot);
-                if (existing.snapshots.length > CONFIG.SNAPSHOT_BUFFER_SIZE) {
-                    existing.snapshots.shift();
-                }
-            } else {
-                this.states.set(objectId, {
-                    ownerMemberId: ownerMemberId,
-                    snapshots: [snapshot]
-                });
-            }
+            legacySnapshotPolicy.updateState(
+                objectId, data, ownerMemberId, validAt);
         },
 
         /**
@@ -2889,11 +2563,7 @@
          * lag-based path in `recomputeAdaptiveDelay` takes precedence.
          */
         recordMemberPacketInterval(ad, interval) {
-            ad.packetIntervals.push(interval);
-            if (ad.packetIntervals.length > CONFIG.ADAPTIVE_DELAY_SAMPLES) {
-                ad.packetIntervals.shift();
-            }
-            this.recomputeAdaptiveDelay(ad);
+            adaptiveDelayPolicy.recordPacketInterval(ad, interval);
         },
 
         /**
@@ -2907,27 +2577,8 @@
          * meaningless) or when validAt is missing on a snapshot.
          */
         recordObjectSample(memberId, validAt, arrivalServerTime) {
-            if (!CONFIG.ADAPTIVE_DELAY_ENABLED) return;
-            if (!memberId || validAt == null || arrivalServerTime == null) return;
-            const ad = this.getMemberDelay(memberId);
-            const lag = arrivalServerTime - validAt;
-            if (!Number.isFinite(lag) || lag < 0 || lag > 5000) return;
-            ad.lagSamples.push(lag);
-            if (ad.lagSamples.length > CONFIG.ADAPTIVE_DELAY_SAMPLES) {
-                ad.lagSamples.shift();
-            }
-            // Track per-member sample-time monotonicity → packet-interval fallback.
-            if (ad.lastValidAt > 0) {
-                const interval = validAt - ad.lastValidAt;
-                if (interval > 0 && interval < 5000) {
-                    this.recordMemberPacketInterval(ad, interval);
-                } else {
-                    this.recomputeAdaptiveDelay(ad);
-                }
-            } else {
-                this.recomputeAdaptiveDelay(ad);
-            }
-            ad.lastValidAt = validAt;
+            adaptiveDelayPolicy.recordObjectSample(
+                memberId, validAt, arrivalServerTime);
         },
 
         /**
@@ -2941,39 +2592,7 @@
          * the legacy renderer's target timeline.
          */
         recomputeAdaptiveDelay(ad) {
-            const minSamples = CONFIG.ADAPTIVE_DELAY_MIN_SAMPLES;
-            const useLagBased = ad.lagSamples.length >= minSamples;
-
-            if (useLagBased) {
-                const lagMean = ad.lagSamples.reduce((s, v) => s + v, 0) / ad.lagSamples.length;
-                const lagVar = ad.lagSamples.reduce((s, v) => s + (v - lagMean) ** 2, 0) / ad.lagSamples.length;
-                const lagStddev = Math.sqrt(lagVar);
-                let intervalStddev = 0;
-                if (ad.packetIntervals.length >= minSamples) {
-                    const iMean = ad.packetIntervals.reduce((s, v) => s + v, 0) / ad.packetIntervals.length;
-                    const iVar = ad.packetIntervals.reduce((s, v) => s + (v - iMean) ** 2, 0) / ad.packetIntervals.length;
-                    intervalStddev = Math.sqrt(iVar);
-                }
-                const rawDelay = Math.max(CONFIG.ADAPTIVE_DELAY_MIN,
-                    lagMean + CONFIG.ADAPTIVE_DELAY_JITTER_MULT * lagStddev + intervalStddev);
-                ad.computedDelay += CONFIG.ADAPTIVE_DELAY_SMOOTHING * (rawDelay - ad.computedDelay);
-                return;
-            }
-
-            if (ad.packetIntervals.length >= minSamples) {
-                const observedMean = ad.packetIntervals.reduce((s, v) => s + v, 0) / ad.packetIntervals.length;
-                const variance = ad.packetIntervals.reduce((s, v) => s + (v - observedMean) ** 2, 0) / ad.packetIntervals.length;
-                const stddev = Math.sqrt(variance);
-
-                const mean = ad.remoteSendInterval > 0 ? ad.remoteSendInterval : observedMean;
-                const rtt = this.rtt.estimatedRtt || 0;
-                const networkFactor = Math.min(1.0,
-                    CONFIG.ADAPTIVE_DELAY_NET_FLOOR + rtt / (CONFIG.ADAPTIVE_DELAY_NET_SCALE * mean));
-                const rawDelay = Math.max(CONFIG.ADAPTIVE_DELAY_MIN,
-                    mean * networkFactor + CONFIG.ADAPTIVE_DELAY_JITTER_MULT * stddev);
-
-                ad.computedDelay += CONFIG.ADAPTIVE_DELAY_SMOOTHING * (rawDelay - ad.computedDelay);
-            }
+            adaptiveDelayPolicy.recomputeAdaptiveDelay(ad);
         },
 
         /**
@@ -2981,21 +2600,14 @@
          * Returns the member's computed delay, or INTERPOLATION_DELAY if unknown.
          */
         getDelayForMember(memberId) {
-            if (!CONFIG.ADAPTIVE_DELAY_ENABLED) return CONFIG.INTERPOLATION_DELAY;
-            const ad = memberId ? this.memberDelays.get(memberId) : null;
-            return ad ? ad.computedDelay : CONFIG.INTERPOLATION_DELAY;
+            return adaptiveDelayPolicy.getDelayForMember(memberId);
         },
 
         /**
          * Get the current interpolation delay (max across all members for HUD display)
          */
         getDelay() {
-            if (!CONFIG.ADAPTIVE_DELAY_ENABLED) return CONFIG.INTERPOLATION_DELAY;
-            let maxDelay = CONFIG.ADAPTIVE_DELAY_MIN;
-            for (const ad of this.memberDelays.values()) {
-                if (ad.computedDelay > maxDelay) maxDelay = ad.computedDelay;
-            }
-            return maxDelay;
+            return adaptiveDelayPolicy.getDelay();
         },
 
         /**
@@ -3027,7 +2639,7 @@
          * project; otherwise the bootstrap window would over-project).
          */
         serverNowMs() {
-            return Date.now() + this.clock.offsetMs;
+            return replicationClock.serverNowMs();
         },
 
         /**
@@ -3051,12 +2663,7 @@
          * @returns {number} performance.now-domain ms equivalent
          */
         validAtToPerfNow(validAt) {
-            if (validAt == null || !isFinite(validAt)) return performance.now();
-            const delta = (this.clock.wallToPerfDelta != null)
-                ? this.clock.wallToPerfDelta
-                : (performance.now() - Date.now());
-            const offset = this.clock.offsetInitialized ? this.clock.offsetMs : 0;
-            return validAt - offset + delta;
+            return replicationClock.validAtToMonotonicMs(validAt);
         },
 
         /**
@@ -3065,7 +2672,7 @@
          * legacy timestamp conversion can still use the bootstrap fallback.
          */
         isClockOffsetInitialized() {
-            return this.clock.offsetInitialized;
+            return replicationClock.isInitialized();
         },
 
         /**
@@ -3083,7 +2690,7 @@
          * hub-method latency.
          */
         getClockSampleRtt() {
-            return this.clock.lastSampleRtt;
+            return replicationClock.getSampleRtt();
         },
 
         /**
@@ -3091,7 +2698,7 @@
          * Positive = server clock is ahead of client clock.
          */
         getClockOffsetMs() {
-            return this.clock.offsetMs;
+            return replicationClock.getOffsetMs();
         },
 
         /**
@@ -3112,81 +2719,11 @@
          * @returns {Promise<object|null>} the accepted sample or null
          */
         async runPingBurst(burstSize, generation = this.clock.generation) {
-            if (!this.clock.running || generation !== this.clock.generation) return null;
-            const samples = [];
-            for (let i = 0; i < burstSize; i++) {
-                if (!this.clock.running || generation !== this.clock.generation) return null;
-                if (typeof document !== 'undefined' && document.hidden) break;
-                if (i > 0) {
-                    await new Promise(r => setTimeout(r, this.clock.bootstrapIntervalMs));
-                    if (!this.clock.running || generation !== this.clock.generation) return null;
-                }
-                let sample;
-                try {
-                    const t0Perf = performance.now();
-                    const serverTime = await SessionClient.ping();
-                    if (!this.clock.running || generation !== this.clock.generation) return null;
-                    const t3Perf = performance.now();
-                    const t3Wall = Date.now();
-                    if (typeof serverTime !== 'number' || !isFinite(serverTime)) continue;
-                    sample = { rtt: t3Perf - t0Perf, serverTime, t3Wall };
-                } catch (e) {
-                    // Ping invocation failed (transient disconnect, etc.).
-                    // Skip this sample; the loop will retry on next refresh.
-                    continue;
-                }
-                samples.push(sample);
-            }
-            const winner = this.pickMinRttSample(samples);
-            if (!this.clock.running || generation !== this.clock.generation) return null;
-            if (!winner) return null;
-            const candidate = this.computeOffsetForSample(winner);
-            const accepted = this.passesOutlierGate({
-                currentOffset: this.clock.offsetMs,
-                lastSampleRtt: this.clock.lastSampleRtt,
-                candidateOffset: candidate,
-                gateMs: this.clock.outlierGateMs,
-                gateRttMul: this.clock.outlierGateRttMul,
-                initialized: this.clock.offsetInitialized,
-            });
-            if (!accepted) {
-                this.clock.rejectedCount++;
-                return null;
-            }
-            if (!this.clock.offsetInitialized) {
-                this.clock.offsetMs = candidate;
-                this.clock.offsetInitialized = true;
-            } else {
-                this.clock.offsetMs = this.emaUpdate(
-                    this.clock.offsetMs, candidate, this.clock.emaAlpha);
-            }
-            this.clock.lastSampleRtt = winner.rtt;
-            // Refresh wallToPerfDelta on every accepted burst. The OS may slew
-            // Date.now() while performance.now() remains monotonic, so limiting
-            // conversion drift to one refresh interval keeps snapshot keys on
-            // the current wall/performance relationship.
-            this.clock.wallToPerfDelta = performance.now() - Date.now();
-            this.clock.sampleCount++;
-            return winner;
+            return replicationClock.runPingBurst(burstSize, generation);
         },
 
         queuePingBurst(burstSize, generation = this.clock.generation) {
-            const previous = this.clock.burstOperation;
-            const waitForPrevious = previous?.generation === generation
-                ? previous.promise.catch(() => {})
-                : Promise.resolve();
-            const operation = {
-                generation,
-                promise: null,
-            };
-            operation.promise = waitForPrevious.then(
-                () => this.runPingBurst(burstSize, generation));
-            this.clock.burstOperation = operation;
-            return operation.promise.finally(() => {
-                if (this.clock.burstOperation === operation) {
-                    this.clock.burstOperation = null;
-                }
-            });
+            return replicationClock.queuePingBurst(burstSize, generation);
         },
 
         /**
@@ -3196,31 +2733,7 @@
          * keep reusing a pre-suspension sample.
          */
         async clockSyncLoop(generation) {
-            // Bootstrap: large burst gives several independent samples for
-            // min-RTT selection, so the first usable offset lands fast.
-            await this.queuePingBurst(this.clock.bootstrapBurstSize, generation);
-            while (this.clock.running && generation === this.clock.generation) {
-                await new Promise(resolve => {
-                    let timer = null;
-                    const wake = () => {
-                        if (timer != null) clearTimeout(timer);
-                        if (this.clock.wakeResolve === wake) {
-                            this.clock.wakeResolve = null;
-                        }
-                        resolve();
-                    };
-                    this.clock.wakeResolve = wake;
-                    timer = setTimeout(wake, this.clock.refreshIntervalMs);
-                });
-                if (!this.clock.running || generation !== this.clock.generation) break;
-                if (typeof document !== 'undefined' && document.hidden) {
-                    // Skip refreshes while hidden — frame throttling pollutes RTT.
-                    // The visibilitychange handler will fire a fresh burst when
-                    // we return to foreground.
-                    continue;
-                }
-                await this.queuePingBurst(1, generation);
-            }
+            return replicationClock.syncLoop(generation);
         },
 
         /**
@@ -3228,37 +2741,7 @@
          * handler so a fresh bootstrap burst runs on tab reactivation.
          */
         startClockSync() {
-            if (this.clock.running) return;
-            // Retain the last UTC-offset estimate as a reconnect bootstrap, but
-            // RTT is connection/region-specific. Gate age-aware join projection
-            // until this connection supplies a fresh minimum-RTT sample.
-            this.clock.lastSampleRtt = Infinity;
-            this.clock.running = true;
-            const generation = ++this.clock.generation;
-            this.clock.loopPromise = this.clockSyncLoop(generation).catch(() => {
-                // Loop exited unexpectedly; clear running so a future
-                // startClockSync() call can restart it.
-                if (generation === this.clock.generation) {
-                    this.clock.running = false;
-                }
-            });
-            if (typeof document !== 'undefined' && !this.clock.visibilityHandler) {
-                this.clock.visibilityHandler = () => {
-                    if (!document.hidden && this.clock.running) {
-                        // Wake the loop immediately (skip remaining refresh wait)
-                        // and start a fresh bootstrap burst promptly. Events can
-                        // still race the async burst; projection paths that need a
-                        // connection-fresh RTT gate on lastSampleRtt.
-                        const wake = this.clock.wakeResolve;
-                        const generation = this.clock.generation;
-                        this.queuePingBurst(this.clock.bootstrapBurstSize, generation)
-                            .then(
-                                () => { if (wake) wake(); },
-                                () => { if (wake) wake(); });
-                    }
-                };
-                document.addEventListener('visibilitychange', this.clock.visibilityHandler);
-            }
+            replicationClock.start();
         },
 
         /**
@@ -3268,18 +2751,7 @@
          * Connection-specific RTT is invalidated separately in startClockSync.
          */
         stopClockSync() {
-            this.clock.running = false;
-            this.clock.generation++;
-            if (this.clock.wakeResolve) {
-                const r = this.clock.wakeResolve;
-                this.clock.wakeResolve = null;
-                r();
-            }
-            if (typeof document !== 'undefined' && this.clock.visibilityHandler) {
-                document.removeEventListener('visibilitychange', this.clock.visibilityHandler);
-                this.clock.visibilityHandler = null;
-            }
-            this.clock.loopPromise = null;
+            replicationClock.stop();
         },
 
         // ── Local-owner spawn projection helpers ───────────────────────────
@@ -3362,311 +2834,52 @@
             return this.projectSpawnData(latest.data, stalenessSec);
         },
 
-        /**
-         * Get interpolated position for rendering.
-         * Bracket-searches the ring buffer for the two snapshots surrounding targetTime,
-         * then Hermite-interpolates between them.
-         * @param {string} objectId - Object ID
-         * @param {number} renderTime - Current render timestamp
-         * @returns {object|null} Interpolated state or null if not found
-         */
+        /** Delegate legacy validAt-axis sampling to the extracted policy. */
         getInterpolated(objectId, renderTime) {
-            const state = this.states.get(objectId);
-            if (!state || state.snapshots.length === 0) return null;
-            return this._baseInterpolated(state, renderTime);
+            return legacySnapshotPolicy.getInterpolated(objectId, renderTime);
         },
 
-        /**
-         * Legacy remote-observer settling pose: interpolate toward the latest
-         * accepted snapshot but DO NOT extrapolate beyond it. As renderTime
-         * advances, replicas that hold the same final snapshot converge to that
-         * pose. The owning member is locally simulated and may retain a small
-         * final queue/flush difference, so this is not an absolute all-member
-         * identity guarantee. Contrast getInterpolated, which can extrapolate
-         * each observer a different amount once the owner stops sending.
-         * @param {string} objectId - Object ID
-         * @param {number} renderTime - Current render timestamp
-         * @returns {object|null} Settling state, or null if not tracked.
-         */
         getSettling(objectId, renderTime) {
-            const state = this.states.get(objectId);
-            if (!state || state.snapshots.length === 0) return null;
-            return this._baseInterpolated(state, renderTime, /* clampToLatest */ true);
+            return legacySnapshotPolicy.getSettling(objectId, renderTime);
         },
 
-        /**
-         * Base interpolation: snapshot bracket-search + Hermite blend.
-         *
-         * Legacy snapshots share one estimated server-time axis:
-         * snapshot.time is computed via
-         * validAtToPerfNow(validAt). With one snapshot, targetTime
-         * (= renderTime - baseDelay) typically lies before snapshot[0].time
-         * (the owner-operation timestamp is in the receiver's near future
-         * relative to its display delay), so bracket search clamps to
-         * snap[0].data and the receiver renders the spawn in place until
-         * either the next snapshot lands or extrapolation kicks in. No
-         * model switch, no renderError smoother needed.
-         */
         _baseInterpolated(state, renderTime, clampToLatest = false) {
-            const snapshots = state.snapshots;
-            const latest = snapshots[snapshots.length - 1];
-
-            if (!CONFIG.INTERPOLATION_ENABLED) {
-                return latest.data;
-            }
-
-            // This is a presentation delay, not the ObjectSync transmit cadence.
-            // On migration, state.ownerMemberId changes with the first kinematic
-            // new-owner snapshot, so targetTime can shift if the two owners have
-            // different learned delays.
-            const delay = this.getDelayForMember(state.ownerMemberId);
-            const targetTime = renderTime - delay;
-
-            // Before the oldest snapshot: return oldest (clamped)
-            if (targetTime <= snapshots[0].time) {
-                return snapshots[0].data;
-            }
-
-            // After the newest snapshot: extrapolate with a velocity cap unless
-            // clamped for legacy game over. Remote observers that share the same
-            // final snapshot should converge to it rather than carrying
-            // per-member targetTime overshoot into their resting pose.
-            if (targetTime >= latest.time) {
-                if (clampToLatest) {
-                    return latest.data;
-                }
-                const extraTime = Math.min((targetTime - latest.time) / 1000, CONFIG.MAX_EXTRAPOLATION);
-                const refDim = getReferenceDimension();
-                const r = this.getBoundingRadius(latest.data);
-                return {
-                    ...latest.data,
-                    x: wrapNormalized(latest.data.x + latest.velocity.x * (refDim / getGameWidth()) * extraTime, wrapMarginX(r)),
-                    y: wrapNormalized(latest.data.y + latest.velocity.y * (refDim / getGameHeight()) * extraTime, wrapMarginY(r)),
-                    angle: latest.data.angle + (latest.rotationSpeed || 0) * CONFIG.TARGET_FPS * extraTime
-                };
-            }
-
-            // Bracket search: find [i, i+1] where snapshots[i].time <= targetTime < snapshots[i+1].time
-            for (let i = snapshots.length - 2; i >= 0; i--) {
-                if (targetTime >= snapshots[i].time) {
-                    const prev = snapshots[i];
-                    const curr = snapshots[i + 1];
-                    const timeDiff = curr.time - prev.time;
-                    if (timeDiff <= 0) return curr.data;
-
-                    // Near-coincident-key smoothing: validAt monotonic caps,
-                    // reconciliation, or synthetic insertion can leave two
-                    // snapshots with a very small timeDiff. Inflate only the
-                    // Hermite duration to delay*0.5 so `t` does not jump to ~1
-                    // immediately. The stored authoritative times remain
-                    // unchanged; this is a legacy presentation cushion.
-                    const minTimeDiff = delay * 0.5;
-                    const effectiveTimeDiff = Math.max(timeDiff, minTimeDiff);
-                    const t = (targetTime - prev.time) / effectiveTimeDiff;
-
-                    if (this.shouldSnap(prev.data, curr.data)) {
-                        return curr.data;
-                    }
-
-                    const pseudoState = {
-                        previous: prev.data,
-                        previousVelocity: prev.velocity,
-                        previousRotationSpeed: prev.rotationSpeed,
-                        current: curr.data,
-                        velocity: curr.velocity,
-                        rotationSpeed: curr.rotationSpeed
-                    };
-                    return this.hermite(pseudoState, Math.min(t, 1), effectiveTimeDiff);
-                }
-            }
-
-            // Fallback (should not reach given checks above)
-            return latest.data;
+            return legacySnapshotPolicy._baseInterpolated(
+                state, renderTime, clampToLatest);
         },
 
-        /**
-         * Check if positions are far enough apart to warrant a snap.
-         *
-         * Both x and y are stored in normalized coordinates BUT in DIFFERENT
-         * units — x is a fraction of game width, y is a fraction of height.
-         * Combining them with √(dx² + dy²) and comparing to a single scalar
-         * threshold is non-isotropic at non-square aspect ratios. Convert both
-         * deltas to reference-dimension units (the same isotropic spatial unit
-         * used by velocityX/Y, bullet impact physics, and the Hermite tangent
-         * conversion) before computing the magnitude. SNAP_THRESHOLD is then
-         * interpreted as a ref-dim distance — on a square viewport behaviour
-         * is unchanged; on a wide viewport horizontal snaps trigger at a
-         * smaller normalized-X delta and vertical snaps trigger at the same
-         * normalized-Y delta, so a given visual pixel jump triggers the same
-         * way regardless of direction.
-         */
         shouldSnap(a, b) {
-            if (a.x === undefined || b.x === undefined) return false;
-            const r = this.getBoundingRadius(b);
-            const rangeX = 1 + 2 * wrapMarginX(r);
-            const rangeY = 1 + 2 * wrapMarginY(r);
-            let dx = b.x - a.x;
-            let dy = (b.y || 0) - (a.y || 0);
-            // Wrap-aware distance using extended range
-            if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
-            if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
-            // Convert per-axis normalized deltas to ref-dim before combining.
-            const refDim = getReferenceDimension();
-            const dxRef = dx * getGameWidth() / refDim;
-            const dyRef = dy * getGameHeight() / refDim;
-            return Math.sqrt(dxRef * dxRef + dyRef * dyRef) > CONFIG.SNAP_THRESHOLD;
+            return legacySnapshotPolicy.shouldSnap(a, b);
         },
-        
-        /**
-         * Hermite interpolation using position and velocity at both endpoints
-         */
+
         hermite(state, t, timeDiff) {
-            const result = { ...state.current };
-            const dt = timeDiff / 1000; // interval in seconds
-            
-            // Hermite basis functions
-            const t2 = t * t;
-            const t3 = t2 * t;
-            const h00 = 2 * t3 - 3 * t2 + 1;
-            const h10 = t3 - 2 * t2 + t;
-            const h01 = -2 * t3 + 3 * t2;
-            const h11 = t3 - t2;
-            
-            // Position interpolation with tangents from velocity (scaled by interval)
-            // velocityX/Y are in reference-dimension per second; positions are in normalized [0,1]
-            // Convert velocity to normalized-position-per-second for correct tangents
-            const refDim = getReferenceDimension();
-            const velScaleX = refDim / getGameWidth();
-            const velScaleY = refDim / getGameHeight();
-            const r = this.getBoundingRadius(state.current);
-            const rangeX = 1 + 2 * wrapMarginX(r);
-            const rangeY = 1 + 2 * wrapMarginY(r);
-            if (state.previous.x !== undefined && state.current.x !== undefined) {
-                let dx = state.current.x - state.previous.x;
-                if (dx > rangeX / 2) dx -= rangeX; else if (dx < -rangeX / 2) dx += rangeX;
-                const p0 = state.previous.x;
-                const p1 = p0 + dx;
-                const m0 = (state.previousVelocity.x || 0) * velScaleX * dt;
-                const m1 = (state.velocity.x || 0) * velScaleX * dt;
-                result.x = wrapNormalized(h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1, wrapMarginX(r));
-            }
-            if (state.previous.y !== undefined && state.current.y !== undefined) {
-                let dy = state.current.y - state.previous.y;
-                if (dy > rangeY / 2) dy -= rangeY; else if (dy < -rangeY / 2) dy += rangeY;
-                const p0 = state.previous.y;
-                const p1 = p0 + dy;
-                const m0 = (state.previousVelocity.y || 0) * velScaleY * dt;
-                const m1 = (state.velocity.y || 0) * velScaleY * dt;
-                result.y = wrapNormalized(h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1, wrapMarginY(r));
-            }
-            
-            // Angle interpolation with Hermite using rotationSpeed as tangents
-            // rotationSpeed is in radians-per-frame (at 60fps), convert to per-second for tangent
-            if (state.previous.angle !== undefined && state.current.angle !== undefined) {
-                let dAngle = state.current.angle - state.previous.angle;
-                while (dAngle > Math.PI) dAngle -= Math.PI * 2;
-                while (dAngle < -Math.PI) dAngle += Math.PI * 2;
-                // Short-circuit when both endpoints have the same angle (e.g.
-                // spawn-bridge for fracture children: bridge.angle=auth.angle=0
-                // because vertices are pre-rotated to world frame). Without
-                // this guard, Hermite uses the non-zero rotationSpeed tangents
-                // (auth's rotSpeed for extrapolation past auth, kept on the
-                // bridge snapshot too) and the cubic curves spuriously through
-                // the middle — producing a ~1° wobble for ~3 frames after
-                // spawn that the user perceives as a "1-frame rotation
-                // glitch". Constant-angle => constant-rendered-angle is the
-                // physically correct behaviour; tangent matching is irrelevant
-                // when the slope between endpoints is zero.
-                if (Math.abs(dAngle) < 1e-6) {
-                    result.angle = state.current.angle;
-                } else {
-                    const a0 = state.previous.angle;
-                    const a1 = a0 + dAngle;
-                    const rpsToPerSec = CONFIG.TARGET_FPS;
-                    let am0 = (state.previousRotationSpeed || 0) * rpsToPerSec * dt;
-                    let am1 = (state.rotationSpeed || 0) * rpsToPerSec * dt;
-                    // Fritsch–Carlson monotone-Hermite clamp on the angle
-                    // tangents so the cubic cannot overshoot the [a0, a1]
-                    // chord. Without this, short turn-input taps (where
-                    // prev.rotationSpeed ≈ ±SHIP_TURN_SPEED but the actual
-                    // endpoint chord dAngle is small) produce visible
-                    // angular overshoot on remote observers even with no
-                    // extrapolation and good network conditions. The owner
-                    // doesn't see this because they render the live Ship
-                    // and never sample the snapshot buffer. Position
-                    // tangents are intentionally NOT clamped: linear
-                    // velocity is far more continuous than turn input, so
-                    // the position Hermite rarely overshoots in practice.
-                    // The sufficient condition |am| ≤ 3·|chord| (with same
-                    // sign as chord) guarantees a monotone cubic on the
-                    // parameter interval.
-                    const chord = dAngle;
-                    const maxTangent = 3 * Math.abs(chord);
-                    if (am0 * chord < 0) am0 = 0;
-                    else if (Math.abs(am0) > maxTangent) am0 = Math.sign(am0) * maxTangent;
-                    if (am1 * chord < 0) am1 = 0;
-                    else if (Math.abs(am1) > maxTangent) am1 = Math.sign(am1) * maxTangent;
-                    result.angle = h00 * a0 + h10 * am0 + h01 * a1 + h11 * am1;
-                }
-            }
-            
-            return result;
+            return legacySnapshotPolicy.hermite(state, t, timeDiff);
         },
-        
-        /**
-         * Interpolate angles handling wraparound
-         */
+
         lerpAngle(a, b, t) {
-            let diff = b - a;
-            while (diff > Math.PI) diff -= Math.PI * 2;
-            while (diff < -Math.PI) diff += Math.PI * 2;
-            return a + diff * t;
+            return legacySnapshotPolicy.lerpAngle(a, b, t);
         },
-        
+
         /**
          * Get bounding radius from sync state data for wrap margin calculation
          */
         getBoundingRadius(data) {
-            if (!data || !data.type) return 0;
-            if (data.type === OBJECT_TYPES.ASTEROID) {
-                // Mirror Asteroid.boundRadius from the sender so the receiver's
-                // wrap-detection range matches the sender's actual extended
-                // wrap margin (otherwise wrap-crossings can read as snaps).
-                // Vertices ride along on every snapshot for both spawn (seed-
-                // generated) and fracture (explicit) asteroids; if for any
-                // reason they're missing, fall back to the upper bound for
-                // jaggedness-generated polygons.
-                const verts = data.vertices;
-                if (Array.isArray(verts) && verts.length > 0) {
-                    let maxD = 0;
-                    for (let i = 0; i < verts.length; i++) {
-                        const d = verts[i] ? verts[i].distance || 0 : 0;
-                        if (d > maxD) maxD = d;
-                    }
-                    if (maxD > 0) return maxD;
-                }
-                return (data.radius || 0) * (1 + CONFIG.ASTEROID_JAGGEDNESS);
-            }
-            if (data.type === OBJECT_TYPES.SHIP) return CONFIG.SHIP_SIZE;
-            if (data.type === OBJECT_TYPES.BULLET) return CONFIG.BULLET_RADIUS;
-            return 0;
+            return getRemoteBoundingRadius(data);
         },
 
         /**
          * Remove object from tracking
          */
         remove(objectId) {
-            this.states.delete(objectId);
-            this.lastVersions.delete(objectId);
+            legacySnapshotPolicy.remove(objectId);
         },
         
         /**
          * Clear all tracked objects
          */
         clear() {
-            this.states.clear();
-            this.lastVersions.clear();
-            this.memberDelays.clear();
+            legacySnapshotPolicy.clear();
+            adaptiveDelayPolicy.clear();
             this.jitter.minOneWay = Infinity;
             this.jitter.estimatedJitter = 0;
             this.jitter.samples = [];
@@ -3680,7 +2893,7 @@
          * real new-owner snapshot updates the state owner.
          */
         removeMember(memberId) {
-            this.memberDelays.delete(memberId);
+            adaptiveDelayPolicy.removeMember(memberId);
         }
     };
 
@@ -5432,11 +4645,10 @@
             processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
             collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
             seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
-            seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
-            // Object ids present in the session snapshot at join. Locally adopted
-            // orphans use this to suppress spawn projection; remote objects with
-            // a live owner may use it for bounded, latency-delayed initial seeding.
-            joinSnapshotObjectIds: new Set()
+            seenShipHitCounts: new Map() // objectId -> highest hitCount already cued
+            // Join-snapshot tracking (which orphans/replicas should skip spawn
+            // projection or seed onto the delayed timeline) now lives inside
+            // replicationRuntime (facts.joinSnapshot), consumed one-shot per id.
         },
         // Cosmetic astervoids for start screen (separate from game astervoids)
         cosmeticAstervoids: [],
@@ -5913,77 +5125,364 @@
      * presentation timeline used by later arrival-anchored packets. This
      * removes heartbeat staleness without predicting through one-way transit.
      *
-     * The marker is one-shot and is consumed even when seeding cannot be used,
-     * so a later live packet is never mistaken for the join snapshot. Seeding
-     * requires deterministic mode, a still-active owner, an initialized clock,
-     * finite validAt, and a finite Ping RTT from the current connection. Half
-     * RTT estimates one-way transit under a symmetric-path assumption; path
+     * The one-shot join marker is owned and consumed by ReplicationRuntime
+     * itself (facts.joinSnapshot); this helper only decides whether the
+     * marker earns a projected baseline. Seeding requires deterministic mode,
+     * a still-active owner (facts.ownerIsActive), an initialized clock, finite
+     * validAt, and a finite Ping RTT from the current connection. Half RTT
+     * estimates one-way transit under a symmetric-path assumption; path
      * asymmetry remains seed error. Update validAt is a flush timestamp, so
      * state age accumulated before that flush is not recoverable here. Age is
      * clamped to the existing 500ms dead-reckoning horizon. Live creates,
      * ownerless idle orphans, and every fallback remain arrival-anchored.
      */
-    function getDeterministicJoinBaselinePerf(obj) {
-        if (!isDeterministicMode()
-            || !obj
-            || !game.multiplayer.joinSnapshotObjectIds.has(obj.id)) {
+    function getDeterministicJoinBaselinePerf(record, facts) {
+        if (!isDeterministicMode() || !record || !facts.joinSnapshot) {
             return undefined;
         }
-        // This marker identifies the first remote ingest only. Even when the
-        // clock is not ready enough to seed, later packets must return to the
-        // normal arrival-anchored path rather than being projected repeatedly.
-        game.multiplayer.joinSnapshotObjectIds.delete(obj.id);
-        if (!RemoteObjects.isClockOffsetInitialized() || !Number.isFinite(obj.validAt)) {
+        if (!RemoteObjects.isClockOffsetInitialized() || !Number.isFinite(record.validAt)) {
             return undefined;
         }
-        const session = SessionClient.getCurrentSession();
-        const ownerIsActive = !!obj.ownerMemberId
-            && !!session?.members?.some(member => member.id === obj.ownerMemberId);
         const clockRtt = RemoteObjects.getClockSampleRtt();
-        if (!ownerIsActive || !Number.isFinite(clockRtt)) return undefined;
+        if (!facts.ownerIsActive || !Number.isFinite(clockRtt)) return undefined;
 
         const presentationNow = RemoteObjects.serverNowMs() - Math.max(0, clockRtt) / 2;
         const maxAgeMs = CONFIG.DEADRECKON_MAX_FRAMES * (1000 / CONFIG.TARGET_FPS);
-        const ageMs = Math.min(maxAgeMs, Math.max(0, presentationNow - obj.validAt));
+        const ageMs = Math.min(maxAgeMs, Math.max(0, presentationNow - record.validAt));
         return performance.now() - ageMs;
     }
 
     /**
-     * Gate one ObjectSync version into the selected presentation model.
-     * Ownership migration increments the server version without changing
-     * kinematics, so an existing replica skips that metadata-only version
-     * rather than refreshing a stale pose as if it were current.
+     * Shared presentation adapter for every kinematic replicated type (ship,
+     * asteroid, bullet). Delegates to DeadReckon (deterministic mode) or
+     * RemoteObjects (legacy interpolation) based on isDeterministicMode(),
+     * exactly mirroring the per-frame model selection the four receive loops
+     * used to inline individually.
      *
-     * The first later data-bearing version completes the handoff. Deterministic
-     * mode can extend that correction to preserve displayed motion direction.
-     * Legacy mode keeps normal interpolation; after the departed member's delay
-     * record is removed it temporarily uses the fallback delay, then switches
-     * to the new owner's learned delay when real state arrives. A replica with
-     * no presentation state must still ingest an ownership-marked version so
-     * join/reconciliation cannot leave it uninitialized.
+     * Ownership migration increments the server version without changing
+     * kinematics, so ReplicationRuntime already skips ingest for a
+     * metadata-only version when a replica has presentation state — this
+     * adapter only ever sees versions worth ingesting. facts.preserveDirection
+     * marks the first later data-bearing version after such a migration so
+     * DeadReckon can smooth the handoff instead of snapping.
      */
-    function beginReplicationVersion(obj) {
-        const deterministic = isDeterministicMode();
-        const versions = deterministic ? DeadReckon.lastVersions : RemoteObjects.lastVersions;
-        if (obj.version === versions.get(obj.id)) return null;
-        const ownershipVersion = obj.ownershipMigrationVersion === obj.version;
-        const hasReplicationState = deterministic
-            ? DeadReckon.states.has(obj.id)
-            : RemoteObjects.states.has(obj.id);
-        const ownershipOnly = ownershipVersion && hasReplicationState;
+    function createKinematicPresentation() {
         return {
-            deterministic,
-            versions,
-            ownershipOnly,
-            preserveDirection: !ownershipVersion && obj.ownershipMigrationPending === true
+            has(id) {
+                return isDeterministicMode()
+                    ? DeadReckon.states.has(id)
+                    : RemoteObjects.states.has(id);
+            },
+            ingest(id, data, facts, record, context) {
+                if (isDeterministicMode()) {
+                    // Intentional respawn teleport (ship-only): the
+                    // invulnerability counter only ever decreases during play
+                    // and jumps back up to its max on Ship.reset(). A jump UP
+                    // means death/respawn, so we snap to the spawn pose
+                    // instead of gliding the replica there.
+                    let isTeleport = false;
+                    if (facts.type === OBJECT_TYPES.SHIP) {
+                        const existingShip = game.multiplayer.remoteShips.get(id);
+                        const prevInvuln = existingShip ? existingShip.invulnerable : undefined;
+                        isTeleport = DeadReckon.states.has(id)
+                            && typeof prevInvuln === 'number'
+                            && (data.invulnerable || 0) > prevInvuln;
+                    }
+                    // Arrival-anchored: render authoritative truth, dead-reckon
+                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    DeadReckon.updateState(
+                        id,
+                        data,
+                        getDeterministicJoinBaselinePerf(record, facts),
+                        isTeleport,
+                        facts.preserveDirection);
+                } else {
+                    RemoteObjects.updateState(
+                        id, data, record.ownerMemberId, record.validAt, record.arrivalServerTime);
+                }
+            },
+            sample(id, facts, record, context) {
+                if (isDeterministicMode()) {
+                    DeadReckon.lastVersions.set(id, record.version);
+                    return DeadReckon.getReckoned(id) || record.data;
+                }
+                // repositionLegacyRemotesAtRest's settle() keeps re-ingesting
+                // this object's latest broadcast into RemoteObjects once the
+                // gameplay sync loop stops running (lives <= 0), gated on
+                // RemoteObjects.lastVersions to avoid a redundant duplicate
+                // ingest of a version already seen here. Keep that facade map
+                // mirroring the record's latest version every frame so the
+                // gate is accurate for whatever version was in flight the
+                // instant this loop stopped.
+                RemoteObjects.lastVersions.set(id, record.version);
+                return RemoteObjects.getInterpolated(id, context.renderTime) || record.data;
+            },
+            remove(id, reason, facts, record, context) {
+                RemoteObjects.remove(id);
+                DeadReckon.remove(id);
+            },
+            reset(facts, context) {
+                RemoteObjects.clear();
+                DeadReckon.clear();
+            }
         };
     }
+    const kinematicPresentation = createKinematicPresentation();
 
-    function finishReplicationVersion(obj, change) {
-        change.versions.set(obj.id, obj.version);
-        if (change.preserveDirection) {
-            obj.ownershipMigrationPending = false;
+    // Ship descriptor: own ship is never adopted via receive (it is created
+    // and driven locally by createSyncedShip/syncLocalShip); a remote ship is
+    // only a replica while its owning member is still active.
+    const shipReplicationDescriptor = {
+        type: OBJECT_TYPES.SHIP,
+        classify(record, facts) {
+            if (record.data.memberId === facts.currentMemberId) return 'ignore';
+            return facts.activeMemberIds.includes(record.data.memberId) ? 'replica' : 'ignore';
+        },
+        getInstance(id) {
+            return game.multiplayer.remoteShips.get(id);
+        },
+        getInstances() {
+            return game.multiplayer.remoteShips;
+        },
+        createReplica(record) {
+            const remoteShip = new Ship(record.data.x, record.data.y, record.data.colorIndex || 0);
+            game.multiplayer.remoteShips.set(record.id, remoteShip);
+            return remoteShip;
+        },
+        apply(instance, data) {
+            instance.fromSyncData(data);
+            // Apply invulnerable and thrusting directly from sync
+            if (data.invulnerable !== undefined) instance.invulnerable = data.invulnerable;
+            if (data.thrusting !== undefined) instance.thrusting = data.thrusting;
+        },
+        remove(instance, reason, facts) {
+            const id = facts.objectId;
+            game.multiplayer.remoteShips.delete(id);
+            game.multiplayer.seenShipHitCounts.delete(id);
+        },
+        presentation: kinematicPresentation
+    };
+
+    // Asteroid descriptor: owned iff we are the ownerMemberId; a remote
+    // asteroid is a replica only while its owner is still active (otherwise
+    // ignored until the pending ownership migration lands).
+    const asteroidReplicationDescriptor = {
+        type: OBJECT_TYPES.ASTEROID,
+        classify(record, facts) {
+            if (record.ownerMemberId === facts.currentMemberId) return 'owned';
+            return facts.ownerIsActive ? 'replica' : 'ignore';
+        },
+        getInstance(id) {
+            return game.astervoids.find(a => a.syncObjectId === id);
+        },
+        getInstances() {
+            const entries = [];
+            for (const asteroid of game.astervoids) {
+                if (asteroid.syncObjectId) entries.push([asteroid.syncObjectId, asteroid]);
+            }
+            return entries;
+        },
+        createReplica(record) {
+            const asteroid = Asteroid.fromSyncData(record.data);
+            asteroid.syncObjectId = record.id;
+            game.astervoids.push(asteroid);
+            return asteroid;
+        },
+        adoptOwned(record, instance, facts) {
+            // Already tracked locally (e.g. ownership just migrated to us) —
+            // local physics keeps driving it; nothing left to project.
+            if (instance) return instance;
+            // Adopt a locally-owned child we don't have yet (created on our
+            // behalf, e.g. an OnObjectReplaced split we just shot).
+            const asteroid = Asteroid.fromSyncData(record.data);
+            asteroid.syncObjectId = record.id;
+            // Forward-project the LOCAL game asteroid for locally-owned
+            // children of a replacement event. record.validAt approximates
+            // the replacement invocation/collision moment; we adopt the child
+            // here about one operation round trip later. Without projection
+            // the local asteroid would lag forever by RTT * velocity vs the
+            // simulator. (Remote observers don't need projection — the
+            // interpolator handles that automatically via snap[0] anchored at
+            // validAt on the unified axis.)
+            if (record.validAt != null && !record.spawnHandled && !facts.joinSnapshot
+                && RemoteObjects.isClockOffsetInitialized()) {
+                const stalenessSec = RemoteObjects.computeSpawnStaleness(
+                    RemoteObjects.serverNowMs(), record.validAt);
+                const projected = RemoteObjects.projectSpawnData(record.data, stalenessSec);
+                asteroid.x = projected.x;
+                asteroid.y = projected.y;
+                asteroid.angle = projected.angle;
+            }
+            record.spawnHandled = true;
+            game.astervoids.push(asteroid);
+            return asteroid;
+        },
+        apply(instance, data) {
+            instance.fromSyncData(data);
+        },
+        remove(instance, reason, facts) {
+            const id = facts.objectId;
+            game.astervoids = game.astervoids.filter(a => a !== instance);
+            if (reason === ReplicationRuntime.RemovalReason.DELETED
+                || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
+                CollisionEffects.resolveTarget(id);
+                // Remote asteroid destroyed — play explosion sound based on size
+                const size = instance.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large'
+                    : instance.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+                AudioSystem.playExplosion(size);
+            }
+            // Owner-side send-on-change baseline must be released too. An
+            // asteroid we owned and then SPLIT is replaced (replaceObject)
+            // rather than deleteSyncedObject'd, so its SendGate baseline is
+            // never cleared on that path — without this, every fracture
+            // leaks one baseline entry for the life of the session.
+            SendGate.remove(id);
+        },
+        presentation: kinematicPresentation
+    };
+
+    // Bullet descriptor: owned iff data.ownerMemberId is us (local bullets are
+    // created and driven by createSyncedBullet/syncLocalBullets, never
+    // adopted here); a remote bullet is a replica only while its owner is
+    // still active.
+    const bulletReplicationDescriptor = {
+        type: OBJECT_TYPES.BULLET,
+        classify(record, facts) {
+            const ownerId = record.data.ownerMemberId;
+            if (ownerId === facts.currentMemberId) return 'owned';
+            return !!ownerId && facts.activeMemberIds.includes(ownerId) ? 'replica' : 'ignore';
+        },
+        getInstance(id) {
+            return game.bullets.find(b => b.syncObjectId === id);
+        },
+        getInstances() {
+            const entries = [];
+            for (const bullet of game.bullets) {
+                if (bullet.syncObjectId) entries.push([bullet.syncObjectId, bullet]);
+            }
+            return entries;
+        },
+        createReplica(record) {
+            // Create new bullet from sync data — play fire sound for remote player
+            const bullet = Bullet.fromSyncData(record.data);
+            bullet.syncObjectId = record.id;
+            game.bullets.push(bullet);
+            AudioSystem.playFire();
+            return bullet;
+        },
+        apply(instance, data, facts) {
+            instance.fromSyncData(data);
+            // DeadReckon/RemoteObjects only carry kinematics. Apply the
+            // hit-handshake fields directly from the raw record so a pending
+            // remote bullet is hidden and can cue impact, every frame.
+            const record = ObjectSync.getObject(facts.objectId);
+            const raw = record ? record.data : data;
+            instance.pendingHit = !!raw.pendingHit;
+            instance.hitTargetId = raw.hitTargetId || null;
+            instance.hitImpactTorque = raw.hitImpactTorque || 0;
+            instance.hitBulletAngle = raw.hitBulletAngle || 0;
+            instance.hitOffsetN = raw.hitOffsetN || 0;
+            if (raw.pendingHit) {
+                CollisionEffects.startAsteroidHit({
+                    ...raw,
+                    syncObjectId: facts.objectId
+                });
+            }
+        },
+        remove(instance, reason, facts) {
+            const id = facts.objectId;
+            game.bullets = game.bullets.filter(b => b !== instance);
+            if (reason === ReplicationRuntime.RemovalReason.DELETED
+                || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
+                CollisionEffects.resolveBullet(id);
+            }
+        },
+        presentation: kinematicPresentation
+    };
+
+    // GameState descriptor: owned by the GameState owner (drives it locally
+    // via syncGameState); every other member applies the raw aggregated state
+    // directly — GameState has no kinematics, so it uses no presentation.
+    const gameStateReplicationDescriptor = {
+        type: OBJECT_TYPES.GAME_STATE,
+        classify(record, facts) {
+            return record.ownerMemberId === facts.currentMemberId ? 'owned' : 'replica';
+        },
+        getInstance(id) {
+            return game.multiplayer.gameStateObjectId === id ? id : undefined;
+        },
+        getInstances() {
+            return game.multiplayer.gameStateObjectId != null
+                ? [[game.multiplayer.gameStateObjectId, game.multiplayer.gameStateObjectId]]
+                : [];
+        },
+        createReplica(record) {
+            game.multiplayer.gameStateObjectId = record.id;
+            return record.id;
+        },
+        adoptOwned(record) {
+            game.multiplayer.gameStateObjectId = record.id;
+            return record.id;
+        },
+        apply(instance, data) {
+            // Update game state from sync — all fields including state
+            // are applied for both lobby spectators and entered players
+            if (data.wave !== undefined) game.wave = data.wave;
+            const oldLives = game.lives;
+            if (data.lives !== undefined) game.lives = data.lives;
+            if (data.score !== undefined) game.score = data.score;
+            if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
+            if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
+
+            // Handle lives reaching zero — stop audio
+            if (game.lives <= 0 && oldLives > 0) {
+                AudioSystem.beat.stop();
+                AudioSystem.thrustSound.stop();
+            }
+
+            // Handle state transitions — lobby spectators also receive state
+            // updates so game.state always reflects the actual game state
+            if (data.state && data.state !== game.state) {
+                const oldState = game.state;
+                game.state = data.state;
+
+                // Handle state change audio effects (skip for lobby
+                // spectators — no audio yet)
+                if (!isLobbySpectating() && data.state === 'playing' && oldState === 'waveDelay') {
+                    AudioSystem.playNewWave();
+                }
+            }
+        },
+        remove(instance) {
+            if (game.multiplayer.gameStateObjectId === instance) {
+                game.multiplayer.gameStateObjectId = null;
+            }
         }
+    };
+
+    const replicationRuntime = ReplicationRuntime.createRuntime({
+        objectStore: ObjectSync,
+        getCurrentMemberId: () => SessionClient.getCurrentMember()?.id,
+        getActiveMemberIds: () => new Set(
+            (SessionClient.getCurrentSession()?.members || []).map(m => m.id)),
+        monotonicNowMs: () => performance.now(),
+        descriptors: [
+            shipReplicationDescriptor,
+            asteroidReplicationDescriptor,
+            bulletReplicationDescriptor,
+            gameStateReplicationDescriptor
+        ]
+    });
+
+    // Shared context builder for every reconcileType call so join/receive
+    // paths agree on the current session epoch and render sampling instant.
+    function buildReplicationContext() {
+        const now = performance.now();
+        return {
+            epoch: SessionClient.getSessionEpoch(),
+            renderTime: now,
+            now
+        };
     }
 
     /**
@@ -5992,82 +5491,7 @@
      */
     function updateRemoteShips() {
         if (!isSessionMode()) return;
-        
-        const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
-        const myMemberId = SessionClient.getCurrentMember()?.id;
-        const currentRemoteIds = new Set();
-        const renderTime = performance.now();
-        
-        for (const obj of shipObjects) {
-            // Skip our own ship
-            if (obj.data.memberId === myMemberId) continue;
-            
-            currentRemoteIds.add(obj.id);
-            
-            // Only feed kinematic versions to replication. Ownership migration
-            // increments the version without changing data, so re-anchoring on
-            // that version would replay a stale pose as a fresh snapshot.
-            const replicationChange = beginReplicationVersion(obj);
-            if (replicationChange) {
-                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
-                    // Intentional respawn teleport: the invulnerability counter
-                    // only ever decreases during play and jumps back up to its
-                    // max on Ship.reset(). A jump UP means death/respawn, so we
-                    // snap to the spawn pose instead of gliding the replica there.
-                    const existingShip = game.multiplayer.remoteShips.get(obj.id);
-                    const prevInvuln = existingShip ? existingShip.invulnerable : undefined;
-                    const isTeleport = typeof prevInvuln === 'number'
-                        && (obj.data.invulnerable || 0) > prevInvuln;
-                    // Arrival-anchored: render authoritative truth, dead-reckon
-                    // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(
-                        obj.id,
-                        obj.data,
-                        getDeterministicJoinBaselinePerf(obj),
-                        isTeleport,
-                        replicationChange.preserveDirection);
-                } else if (!replicationChange.ownershipOnly) {
-                    RemoteObjects.updateState(
-                        obj.id,
-                        obj.data,
-                        obj.ownerMemberId,
-                        obj.validAt,
-                        obj.arrivalServerTime);
-                }
-                finishReplicationVersion(obj, replicationChange);
-            }
-            
-            // Get or create remote ship instance
-            let remoteShip = game.multiplayer.remoteShips.get(obj.id);
-            if (!remoteShip) {
-                remoteShip = new Ship(obj.data.x, obj.data.y, obj.data.colorIndex || 0);
-                game.multiplayer.remoteShips.set(obj.id, remoteShip);
-            }
-            
-            // Apply replicated state for smooth rendering (position/angle)
-            const interpolated = isDeterministicMode()
-                ? DeadReckon.getReckoned(obj.id)
-                : RemoteObjects.getInterpolated(obj.id, renderTime);
-            if (interpolated) {
-                remoteShip.fromSyncData(interpolated);
-            } else {
-                remoteShip.fromSyncData(obj.data);
-            }
-            
-            // Apply invulnerable and thrusting directly from sync
-            if (obj.data.invulnerable !== undefined) remoteShip.invulnerable = obj.data.invulnerable;
-            if (obj.data.thrusting !== undefined) remoteShip.thrusting = obj.data.thrusting;
-        }
-        
-        // Remove ships that no longer exist
-        for (const [objectId, ship] of game.multiplayer.remoteShips) {
-            if (!currentRemoteIds.has(objectId)) {
-                game.multiplayer.remoteShips.delete(objectId);
-                game.multiplayer.seenShipHitCounts.delete(objectId);
-                RemoteObjects.remove(objectId);
-                DeadReckon.remove(objectId);
-            }
-        }
+        replicationRuntime.reconcileType(OBJECT_TYPES.SHIP, buildReplicationContext());
     }
 
     /**
@@ -6117,7 +5541,6 @@
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
         game.multiplayer.processedPendingBullets.clear();
-        game.multiplayer.joinSnapshotObjectIds.clear();
         CollisionEffects.clear();
         game.astervoids = [];
         game.bullets = [];
@@ -6127,6 +5550,12 @@
         ShipControlGate.reset();
         ShipSendGate.clear();
         ObjectSync.clear();
+        // Tear down replicationRuntime's bindings/consumed-versions/join-marker
+        // bookkeeping for whatever session it currently thinks is active. Reason
+        // is 'session-reset', so descriptor.remove callbacks suppress
+        // explosion/audio cues — the collection clears above already handle
+        // the visible cleanup.
+        replicationRuntime.resetSession();
         // Clear background sync interval if running (tab hidden during session)
         if (typeof backgroundInterval !== 'undefined' && backgroundInterval) {
             clearInterval(backgroundInterval);
@@ -6193,114 +5622,12 @@
      */
     function updateAstervoidsFromSync() {
         if (!isSessionMode()) return;
-        
-        const myMemberId = SessionClient.getCurrentMember()?.id;
-        const asteroidObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.ASTEROID);
-        const currentSyncIds = new Set();
-        const renderTime = performance.now();
-        
-        for (const obj of asteroidObjects) {
-            // Skip astervoids we own — we update those locally
-            if (obj.ownerMemberId === myMemberId) {
-                // Adopt if we own it but don't have it locally (created remotely on our behalf)
-                const existing = game.astervoids.find(a => a.syncObjectId === obj.id);
-                if (!existing) {
-                    const asteroid = Asteroid.fromSyncData(obj.data);
-                    asteroid.syncObjectId = obj.id;
-                    // Forward-project the LOCAL game asteroid for locally-owned
-                    // children of an OnObjectReplaced event (asteroid splits we
-                    // just shot). obj.validAt approximates the replacement
-                    // invocation/collision moment; we adopt the child here about
-                    // one operation round trip later. Without projection the
-                    // local asteroid would lag forever by RTT * velocity vs the
-                    // simulator. (Remote observers don't need projection — the
-                    // interpolator handles that automatically via snap[0]
-                    // anchored at validAt on the unified axis.)
-                    if (obj.validAt != null && !obj.spawnHandled
-                        && !game.multiplayer.joinSnapshotObjectIds.has(obj.id)
-                        && RemoteObjects.isClockOffsetInitialized()) {
-                        const stalenessSec = RemoteObjects.computeSpawnStaleness(
-                            RemoteObjects.serverNowMs(), obj.validAt);
-                        const projected = RemoteObjects.projectSpawnData(obj.data, stalenessSec);
-                        asteroid.x = projected.x;
-                        asteroid.y = projected.y;
-                        asteroid.angle = projected.angle;
-                    }
-                    obj.spawnHandled = true;
-                    game.multiplayer.joinSnapshotObjectIds.delete(obj.id);
-                    game.astervoids.push(asteroid);
-                }
-                continue;
-            }
-            
-            currentSyncIds.add(obj.id);
-            
-            const replicationChange = beginReplicationVersion(obj);
-            if (replicationChange) {
-                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
-                    // Arrival-anchored: render authoritative truth, dead-reckon
-                    // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(
-                        obj.id,
-                        obj.data,
-                        getDeterministicJoinBaselinePerf(obj),
-                        false,
-                        replicationChange.preserveDirection);
-                } else if (!replicationChange.ownershipOnly) {
-                    RemoteObjects.updateState(
-                        obj.id,
-                        obj.data,
-                        obj.ownerMemberId,
-                        obj.validAt,
-                        obj.arrivalServerTime);
-                }
-                finishReplicationVersion(obj, replicationChange);
-            }
-            
-            // Find existing asteroid by sync ID
-            let asteroid = game.astervoids.find(a => a.syncObjectId === obj.id);
-            
-            if (!asteroid) {
-                // Create new asteroid from sync data
-                asteroid = Asteroid.fromSyncData(obj.data);
-                asteroid.syncObjectId = obj.id;
-                game.astervoids.push(asteroid);
-            }
-            
-            // Apply replicated state for smooth movement
-            const interpolated = isDeterministicMode()
-                ? DeadReckon.getReckoned(obj.id)
-                : RemoteObjects.getInterpolated(obj.id, renderTime);
-            if (interpolated) {
-                asteroid.fromSyncData(interpolated);
-            } else {
-                asteroid.fromSyncData(obj.data);
-            }
-        }
-        
-        // Remove remote astervoids that no longer exist in sync (skip locally-owned)
-        game.astervoids = game.astervoids.filter(a => {
-            if (!a.syncObjectId) return !isSessionMode(); // In session mode, unsynced = orphan
-            const syncObj = ObjectSync.getObject(a.syncObjectId);
-            if (syncObj && syncObj.ownerMemberId === myMemberId) return true; // Keep our own
-            if (!currentSyncIds.has(a.syncObjectId)) {
-                CollisionEffects.resolveTarget(a.syncObjectId);
-                // Remote asteroid destroyed — play explosion sound based on size
-                const size = a.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
-                             a.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                AudioSystem.playExplosion(size);
-                RemoteObjects.remove(a.syncObjectId);
-                DeadReckon.remove(a.syncObjectId);
-                // Owner-side send-on-change baseline must be released too. An
-                // asteroid we owned and then SPLIT is replaced (replaceObject)
-                // rather than deleteSyncedObject'd, so its SendGate baseline is
-                // never cleared on that path — without this, every fracture
-                // leaks one baseline entry for the life of the session.
-                SendGate.remove(a.syncObjectId);
-                return false;
-            }
-            return true;
-        });
+        replicationRuntime.reconcileType(OBJECT_TYPES.ASTEROID, buildReplicationContext());
+        // Orphaned local astervoids with no syncObjectId (defensive — should
+        // not normally occur once in session mode) are not tracked by
+        // replicationRuntime (it only enumerates synced instances); drop them
+        // here, matching the old sync loop's unconditional orphan removal.
+        game.astervoids = game.astervoids.filter(a => !!a.syncObjectId);
     }
 
     /**
@@ -6415,89 +5742,7 @@
      */
     function updateBulletsFromSync() {
         if (!isSessionMode()) return;
-        
-        const bulletObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.BULLET);
-        const myMemberId = SessionClient.getCurrentMember()?.id;
-        const currentSyncIds = new Set();
-        const renderTime = performance.now();
-        
-        for (const obj of bulletObjects) {
-            // Skip our own bullets (we already manage them locally)
-            if (obj.data.ownerMemberId === myMemberId) continue;
-            
-            currentSyncIds.add(obj.id);
-            
-            const replicationChange = beginReplicationVersion(obj);
-            if (replicationChange) {
-                if (!replicationChange.ownershipOnly && replicationChange.deterministic) {
-                    // Arrival-anchored: render authoritative truth, dead-reckon
-                    // only the inter-packet gap (no spawn-ahead / over-travel).
-                    DeadReckon.updateState(
-                        obj.id,
-                        obj.data,
-                        getDeterministicJoinBaselinePerf(obj),
-                        false,
-                        replicationChange.preserveDirection);
-                } else if (!replicationChange.ownershipOnly) {
-                    RemoteObjects.updateState(
-                        obj.id,
-                        obj.data,
-                        obj.ownerMemberId,
-                        obj.validAt,
-                        obj.arrivalServerTime);
-                }
-                finishReplicationVersion(obj, replicationChange);
-            }
-            
-            // Find existing bullet by sync ID
-            let bullet = game.bullets.find(b => b.syncObjectId === obj.id);
-            
-            if (!bullet) {
-                // Create new bullet from sync data — play fire sound for remote player
-                bullet = Bullet.fromSyncData(obj.data);
-                bullet.syncObjectId = obj.id;
-                game.bullets.push(bullet);
-                AudioSystem.playFire();
-            }
-            
-            // Apply replicated state for smooth movement
-            const interpolated = isDeterministicMode()
-                ? DeadReckon.getReckoned(obj.id)
-                : RemoteObjects.getInterpolated(obj.id, renderTime);
-            if (interpolated) {
-                bullet.fromSyncData(interpolated);
-            } else {
-                bullet.fromSyncData(obj.data);
-            }
-            // DeadReckon contains only kinematics. Apply hit-handshake fields
-            // directly so a pending remote bullet is hidden and can cue impact.
-            bullet.pendingHit = !!obj.data.pendingHit;
-            bullet.hitTargetId = obj.data.hitTargetId || null;
-            bullet.hitImpactTorque = obj.data.hitImpactTorque || 0;
-            bullet.hitBulletAngle = obj.data.hitBulletAngle || 0;
-            bullet.hitOffsetN = obj.data.hitOffsetN || 0;
-            if (obj.data.pendingHit) {
-                CollisionEffects.startAsteroidHit({
-                    ...obj.data,
-                    syncObjectId: obj.id
-                });
-            }
-        }
-        
-        // Remove remote bullets that no longer exist in sync
-        game.bullets = game.bullets.filter(b => {
-            // Keep local bullets (they expire normally)
-            if (b.ownerMemberId === myMemberId) return true;
-            
-            // Remove remote bullets that are gone from sync
-            if (b.syncObjectId && !currentSyncIds.has(b.syncObjectId)) {
-                CollisionEffects.resolveBullet(b.syncObjectId);
-                RemoteObjects.remove(b.syncObjectId);
-                DeadReckon.remove(b.syncObjectId);
-                return false;
-            }
-            return true;
-        });
+        replicationRuntime.reconcileType(OBJECT_TYPES.BULLET, buildReplicationContext());
     }
 
     /**
@@ -6645,48 +5890,12 @@
     }
 
     /**
-     * Update local game state from ObjectSync (non-GameState-owner clients)
-     * Called every frame by clients who don't own GameState
+     * Reconcile the GameState marker and apply it for non-owners.
+     * Owners still reconcile lifecycle/ownership bookkeeping without applying.
      */
     function updateGameStateFromSync() {
-        if (!isSessionMode() || isGameStateOwner()) return;
-        
-        const gameStateObj = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
-        if (!gameStateObj || !gameStateObj.data) return;
-        
-        const data = gameStateObj.data;
-        
-        // Update game state from sync — all fields including state
-        // are applied for both lobby spectators and entered players
-        if (data.wave !== undefined) game.wave = data.wave;
-        const oldLives = game.lives;
-        if (data.lives !== undefined) game.lives = data.lives;
-        if (data.score !== undefined) game.score = data.score;
-        if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
-        if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
-        
-        // Handle lives reaching zero — stop audio
-        if (game.lives <= 0 && oldLives > 0) {
-            AudioSystem.beat.stop();
-            AudioSystem.thrustSound.stop();
-        }
-        
-        // Handle state transitions — lobby spectators also receive state updates
-        // so game.state always reflects the actual game state
-        if (data.state && data.state !== game.state) {
-            const oldState = game.state;
-            game.state = data.state;
-            
-            // Handle state change audio effects (skip for lobby spectators — no audio yet)
-            if (!isLobbySpectating() && data.state === 'playing' && oldState === 'waveDelay') {
-                AudioSystem.playNewWave();
-            }
-        }
-        
-        // Store the gameStateObjectId if we don't have it
-        if (!game.multiplayer.gameStateObjectId) {
-            game.multiplayer.gameStateObjectId = gameStateObj.id;
-        }
+        if (!isSessionMode()) return;
+        replicationRuntime.reconcileType(OBJECT_TYPES.GAME_STATE, buildReplicationContext());
     }
 
     /**
@@ -8740,10 +7949,10 @@
             // GameState authority continues queuing after lives <= 0 so peers
             // receive the final shared count; each transitions when delivery and
             // its local ObjectSync pass observe that version.
-            if (isSessionMode() && isGameStateOwner()) {
-                syncGameState();
-            }
-            if (isSessionMode() && !isGameStateOwner()) {
+            if (isSessionMode()) {
+                if (isGameStateOwner()) {
+                    syncGameState();
+                }
                 updateGameStateFromSync();
             }
             
@@ -10124,10 +9333,16 @@
                             RemoteObjects.updateState(child.id, child.data, child.ownerMemberId, childValidAt, child.arrivalServerTime);
                             RemoteObjects.updateState(child.id, bridgeData, child.ownerMemberId, bridgeValidAt, null, false);
                         }
-                        // Pre-set lastVersions so the next frame's
-                        // updateAstervoidsFromSync (or updateBulletsFromSync) skips
-                        // a duplicate authority install — we already did it.
+                        // Pre-set lastVersions so repositionLegacyRemotesAtRest's
+                        // settle() (and any other out-of-band legacy consumer)
+                        // doesn't treat this version as unseen. Also tell
+                        // replicationRuntime the version is already consumed so
+                        // its own next reconcile does not re-ingest it (which
+                        // would blow away the bridge sample we just installed).
                         RemoteObjects.lastVersions.set(child.id, child.version);
+                        replicationRuntime.markVersionConsumed(
+                            child.id, child.version,
+                            { epoch: SessionClient.getSessionEpoch() });
                     }
                 });
                 // Handle reconciliation failure after auto-reconnect: the transport
@@ -10250,8 +9465,10 @@
             if (result) {
                 // Record pre-existing object ids so we don't spawn-project
                 // adopted orphans (e.g. entering an emptied session).
-                game.multiplayer.joinSnapshotObjectIds = new Set(
-                    (result.session.objects || []).map(o => o.id));
+                replicationRuntime.beginSession({
+                    epoch: SessionClient.getSessionEpoch(),
+                    snapshotObjectIds: (result.session.objects || []).map(o => o.id)
+                });
                 // Enter lobby state (not playing yet)
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -10320,8 +9537,10 @@
             });
             if (result) {
                 // Newly created session: no pre-existing objects to guard.
-                game.multiplayer.joinSnapshotObjectIds = new Set(
-                    (result.session.objects || []).map(o => o.id));
+                replicationRuntime.beginSession({
+                    epoch: SessionClient.getSessionEpoch(),
+                    snapshotObjectIds: (result.session.objects || []).map(o => o.id)
+                });
                 // Enter lobby state as server
                 game.state = 'lobby';
                 game.mode = 'session';
@@ -10736,8 +9955,10 @@
                     if (result) {
                         // Record pre-existing object ids so re-adopted orphans
                         // aren't spawn-projected on rejoin.
-                        game.multiplayer.joinSnapshotObjectIds = new Set(
-                            (result.session.objects || []).map(o => o.id));
+                        replicationRuntime.beginSession({
+                            epoch: SessionClient.getSessionEpoch(),
+                            snapshotObjectIds: (result.session.objects || []).map(o => o.id)
+                        });
                         _log('[Rejoin] Success! Session:', result.session.name,
                             'Role:', result.member.role, 'Objects:', result.session.objects?.length);
                         setPickerStatus('Reconnected!', 'connected');
@@ -10910,34 +10131,30 @@
         ObjectSync.trackEventSequence(senderMemberId, memberSequence);
         // Clean up per-member adaptive delay tracking
         RemoteObjects.removeMember(info.memberId);
+        const epoch = SessionClient.getSessionEpoch();
         // Handle object cleanup from member departure
         if (info.deletedObjectIds && info.deletedObjectIds.length > 0) {
             ObjectSync.handleMemberDeparture(info.deletedObjectIds);
-            // Remove from local game state
-            for (const objectId of info.deletedObjectIds) {
-                // Clean up remote ship
-                if (game.multiplayer.remoteShips.has(objectId)) {
-                    game.multiplayer.remoteShips.delete(objectId);
-                    game.multiplayer.seenShipHitCounts.delete(objectId);
-                    RemoteObjects.remove(objectId);
-                    DeadReckon.remove(objectId);
-                }
-                // Clean up bullets owned by departing member
-                CollisionEffects.resolveBullet(objectId);
-                CollisionEffects.resolveTarget(objectId);
-                game.bullets = game.bullets.filter(b => b.syncObjectId !== objectId);
-            }
+            // replicationRuntime removes each bound instance via its own
+            // descriptor (ship/asteroid/bullet remove()), which plays the
+            // same type-scoped explosion/hit-resolution effects the old
+            // per-object loop used to call unconditionally for every id.
+            replicationRuntime.handleDeletedObjectIds(info.deletedObjectIds, { epoch });
         }
         if (info.migratedObjects && info.migratedObjects.length > 0) {
             ObjectSync.handleOwnershipMigration(info.migratedObjects);
+            replicationRuntime.handleOwnershipMigrations(info.migratedObjects, { epoch });
             // Migration favors continuity on the newly promoted owner's screen:
             // keep the asteroid at its current puppet pose and let local physics
             // advance it next frame. Do not replace that pose with
             // getMigrationSeed's clock-projected estimate, which could jump.
             //
-            // Clear both presentation models when WE become owner, or their
-            // render pass would keep overwriting our authoritative simulation.
-            // Reset SendGate so our first owned update is eligible immediately.
+            // Clear both presentation models immediately when WE become owner
+            // rather than waiting for replicationRuntime's own lazy
+            // OWNERSHIP_GAINED cleanup on its next reconcile — the render pass
+            // for this frame would otherwise draw one stale interpolated frame
+            // over our fresh authoritative simulation. Reset SendGate so our
+            // first owned update is eligible immediately.
             //
             // Other observers skip the metadata-only ownership version and keep
             // displaying the prior trajectory until the first real new-owner
@@ -10950,7 +10167,6 @@
                 if (migration.newOwnerId === myMemberId) {
                     const migratedObject = ObjectSync.getObject(migration.objectId);
                     if (migratedObject) migratedObject.ownershipMigrationPending = false;
-                    game.multiplayer.joinSnapshotObjectIds.delete(migration.objectId);
                     DeadReckon.remove(migration.objectId);
                     RemoteObjects.remove(migration.objectId);
                     // Drop any stale send-on-change baseline so our first sync
@@ -11076,8 +10292,8 @@
                     
                     // Update remote state
                     updateRemoteShips();
-                    if (!isGameStateOwner()) updateGameStateFromSync();
                     if (isGameStateOwner()) syncGameState();
+                    updateGameStateFromSync();
                 }, targetFrameTime);
             }
         } else {

@@ -29,55 +29,15 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
-// ── Pure-logic mirror of RemoteObjects.clock helpers ──────────────────────
-
-/**
- * Pick the sample with the minimum rtt. Ties broken by first occurrence.
- * Returns null for empty input.
- * @param {Array<{rtt:number}>} samples
- */
-function pickMinRttSample(samples) {
-    if (!samples || samples.length === 0) return null;
-    let best = samples[0];
-    for (let i = 1; i < samples.length; i++) {
-        if (samples[i].rtt < best.rtt) best = samples[i];
-    }
-    return best;
-}
-
-/**
- * NTP offset formula assuming symmetric one-way latency:
- *   offset = serverTime + rtt/2 − t3Wall
- * where serverTime is the server's UTC ms captured during the ping, and
- * t3Wall is the client's Date.now() captured immediately after the await
- * resolved.
- * @param {{serverTime:number, rtt:number, t3Wall:number}} sample
- * @returns {number}
- */
-function computeOffsetForSample(sample) {
-    return sample.serverTime + sample.rtt / 2 - sample.t3Wall;
-}
-
-/**
- * Outlier gate. Returns true if the candidate offset is acceptable.
- * Until `initialized` is true, every sample passes (we have no baseline to
- * gate against). Once initialized, reject any sample whose offset diverges
- * from `currentOffset` by more than max(gateMs, gateRttMul · lastSampleRtt).
- * @param {{currentOffset:number, lastSampleRtt:number, candidateOffset:number, gateMs:number, gateRttMul:number, initialized:boolean}} args
- */
-function passesOutlierGate(args) {
-    if (!args.initialized) return true;
-    const tolerance = Math.max(args.gateMs, args.gateRttMul * args.lastSampleRtt);
-    return Math.abs(args.candidateOffset - args.currentOffset) <= tolerance;
-}
-
-/**
- * Simple EMA: current + alpha · (target − current). Alpha in [0, 1].
- */
-function emaUpdate(current, target, alpha) {
-    return current + alpha * (target - current);
-}
+const require = createRequire(import.meta.url);
+const {
+    pickMinRttSample,
+    computeOffsetForSample,
+    passesOutlierGate,
+    emaUpdate
+} = require('./wwwroot/js/replication-clock.js');
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
@@ -395,4 +355,3 @@ test('wallToPerfDelta + offsetMs: round-trip validAt → perf.now → validAt is
     assert.equal(perfTime, perfNow + 250,
         'perfTime must be perfNow advanced by exactly the same 250ms the validAt was offset from "now"');
 });
-

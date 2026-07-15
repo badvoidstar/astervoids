@@ -24,7 +24,9 @@
  *   3. Implement a `selector(data, kind, ctx)` returning the schemaId
  *      for each (type, kind) pair (return 0 to keep the legacy MsgPack
  *      dict path).
- *   4. Wire it up: `ObjectSync.setSchemaIdSelector(selector)` after
+ *   4. Register `ReplicationRuntime` type adapters for replica
+ *      classification and create/apply/adopt/remove behavior.
+ *   5. Wire it up: `ObjectSync.setSchemaIdSelector(selector)` after
  *      `ObjectSync.init()` and `SchemaCodec.replaceAll(schemas)`.
  *
  * The sync layer also exposes a generic event channel
