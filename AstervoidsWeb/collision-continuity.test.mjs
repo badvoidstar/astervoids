@@ -10,6 +10,9 @@ const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8
 const CUE_MIN_MS = 120;
 const CUE_FADE_MS = 180;
 const CUE_MAX_MS = 1000;
+const ASTEROID_CUE_START_SCALE = 0.75;
+const ASTEROID_CUE_END_SCALE = 4.0;
+const ASTEROID_CUE_INNER_CROSS_SCALE = 0.8;
 
 function impactOffset(radius, bulletAngle, offsetN) {
     const clamped = Math.max(-1, Math.min(1, offsetN));
@@ -29,6 +32,13 @@ function cueAlpha(startedAt, resolvedAt, now) {
         : Math.max(resolvedAt, startedAt + CUE_MIN_MS);
     if (now >= fadeStart + CUE_FADE_MS) return 0;
     return now <= fadeStart ? 1 : 1 - (now - fadeStart) / CUE_FADE_MS;
+}
+
+function asteroidCueScale(ageMs) {
+    const progress = Math.min(1, Math.max(0, ageMs) / (CUE_MIN_MS + CUE_FADE_MS));
+    const easedProgress = 1 - Math.pow(1 - progress, 3);
+    return ASTEROID_CUE_START_SCALE
+        + (ASTEROID_CUE_END_SCALE - ASTEROID_CUE_START_SCALE) * easedProgress;
 }
 
 class CueDeduper {
@@ -91,6 +101,46 @@ test('unresolved pending cues have a bounded lifetime', () => {
     assert.equal(cueAlpha(0, null, CUE_MAX_MS - CUE_FADE_MS), 1);
     assert.ok(cueAlpha(0, null, CUE_MAX_MS - CUE_FADE_MS / 2) > 0);
     assert.equal(cueAlpha(0, null, CUE_MAX_MS), 0);
+});
+
+test('asteroid impact cues ease out from 0.75x to 4x across their animation', () => {
+    assert.equal(asteroidCueScale(0), ASTEROID_CUE_START_SCALE);
+    assert.equal(
+        asteroidCueScale(CUE_MIN_MS + CUE_FADE_MS),
+        ASTEROID_CUE_END_SCALE);
+    const earlyGrowth = asteroidCueScale(100) - asteroidCueScale(0);
+    const middleGrowth = asteroidCueScale(200) - asteroidCueScale(100);
+    const lateGrowth = asteroidCueScale(300) - asteroidCueScale(200);
+    assert.ok(earlyGrowth > middleGrowth);
+    assert.ok(middleGrowth > lateGrowth);
+    assert.ok(lateGrowth > 0);
+    assert.ok(ASTEROID_CUE_START_SCALE < 1);
+    assert.ok(ASTEROID_CUE_END_SCALE > 1);
+    assert.match(productionSource, /ASTEROID_IMPACT_CUE_START_SCALE: 0\.75/);
+    assert.match(productionSource, /ASTEROID_IMPACT_CUE_END_SCALE: 4\.0/);
+    assert.match(productionSource, /const easedProgress = 1 - Math\.pow\(1 - progress, 3\);/);
+    assert.match(
+        productionSource,
+        /const radius = base \* scale;/);
+});
+
+test('asteroid impact cue adds an 80%-size cross rotated by 45 degrees', () => {
+    for (const radius of [3, 10, 40]) {
+        const outerHalfLength = radius * 0.65;
+        const innerHalfLength = outerHalfLength * ASTEROID_CUE_INNER_CROSS_SCALE;
+        const axisOffset = innerHalfLength / Math.SQRT2;
+        assert.equal(innerHalfLength / outerHalfLength, 0.8);
+        assert.ok(Math.abs(Math.hypot(axisOffset, axisOffset) - innerHalfLength) < 1e-12);
+    }
+    assert.match(
+        productionSource,
+        /ASTEROID_IMPACT_CUE_INNER_CROSS_SCALE: 0\.8/);
+    assert.match(
+        productionSource,
+        /const innerCrossHalfLength = outerCrossHalfLength[\s\S]*\/ Math\.SQRT2;/);
+    assert.match(
+        productionSource,
+        /moveTo\(x - innerCrossAxisOffset, y - innerCrossAxisOffset\);[\s\S]*lineTo\(x \+ innerCrossAxisOffset, y \+ innerCrossAxisOffset\);/);
 });
 
 test('collision acknowledgment precedes authoritative replacement across the network matrix', () => {
