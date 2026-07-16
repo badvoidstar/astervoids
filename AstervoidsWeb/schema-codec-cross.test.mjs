@@ -187,3 +187,28 @@ test('cross-wire (Phase 4E): ship-create positional encoding length is byte-stab
     assert.equal(decoded.x, 0.5);
     assert.equal(decoded.y, 0.25);
 });
+
+test('cross-wire: persisted ship terminal target uses exact f64 fields', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(12, [
+        ['terminalEpoch', 'f64'],
+        ['terminalX', 'f64'],
+        ['terminalY', 'f64'],
+        ['terminalAngle', 'f64'],
+    ]);
+    const bytes = SchemaCodec.encode(schema, {
+        terminalEpoch: 1000,
+        terminalX: 0.25,
+        terminalY: 0.75,
+        terminalAngle: Math.PI,
+    });
+    const hex = Array.from(bytes)
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+    assert.equal(
+        hex,
+        '0f'
+        + '0000000000408f40'
+        + '000000000000d03f'
+        + '000000000000e83f'
+        + '182d4454fb210940');
+});

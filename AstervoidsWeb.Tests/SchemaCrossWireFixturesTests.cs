@@ -136,4 +136,27 @@ public class SchemaCrossWireFixturesTests
         });
         Hex(bytes).Should().Be("01" + "04000000" + "deadbeef");
     }
+
+    [Fact]
+    public void Fixture_ShipTerminalTarget_ExactF64Fields()
+    {
+        var schema = Schema(12,
+            ("terminalEpoch", "f64"),
+            ("terminalX", "f64"),
+            ("terminalY", "f64"),
+            ("terminalAngle", "f64"));
+        var bytes = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
+        {
+            ["terminalEpoch"] = 1000d,
+            ["terminalX"] = 0.25d,
+            ["terminalY"] = 0.75d,
+            ["terminalAngle"] = Math.PI
+        });
+        Hex(bytes).Should().Be(
+            "0f" +
+            "0000000000408f40" +
+            "000000000000d03f" +
+            "000000000000e83f" +
+            "182d4454fb210940");
+    }
 }

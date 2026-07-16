@@ -631,6 +631,77 @@ test('stale flush cannot mutate or unlock a new session flush', async () => {
     await thirdFlush;
 });
 
+test('outbound confirmation is tracked with delta encoding disabled', async () => {
+    const client = makeObjectSyncClient();
+    client.updateObjects = async () => ({
+        versions: { accepted: 2 },
+        memberSequence: 1
+    });
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: false });
+
+    client.transition();
+    client.join({
+        objects: [
+            objectInfo('accepted', 1, { x: 0 }),
+            objectInfo('rejected', 1, { x: 0 })
+        ],
+        validAts: {},
+        metadata: {}
+    });
+    const terminal = {
+        terminalEpoch: 10,
+        terminalX: 0.25,
+        terminalY: 0.75
+    };
+    objectSync.updateObject('accepted', terminal);
+    objectSync.updateObject('rejected', terminal);
+    assert.equal(objectSync.isDataConfirmed('accepted', terminal), false);
+
+    await objectSync.flushUpdates();
+
+    assert.equal(objectSync.isDataConfirmed('accepted', terminal), true);
+    assert.equal(objectSync.isDataConfirmed('rejected', terminal), false);
+    assert.equal(objectSync.isDataConfirmed(
+        'accepted',
+        { ...terminal, terminalX: 0.5 }), false);
+});
+
+test('authoritative reconciliation confirms a write whose response was lost', async () => {
+    const client = makeObjectSyncClient();
+    const terminal = {
+        terminalEpoch: 10,
+        terminalX: 0.25,
+        terminalY: 0.75
+    };
+    client.updateObjects = async () => {
+        throw new Error('response lost after server commit');
+    };
+    client.getSessionState = async () => ({
+        objects: [objectInfo('shared', 2, { x: 0, ...terminal }, 'me')],
+        validAts: {},
+        memberSequences: {}
+    });
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: false });
+
+    client.transition();
+    client.join({
+        objects: [objectInfo('shared', 1, { x: 0 }, 'me')],
+        validAts: {},
+        metadata: {}
+    });
+    objectSync.updateObject('shared', terminal);
+    await objectSync.flushUpdates();
+    assert.equal(objectSync.isDataConfirmed('shared', terminal), false);
+
+    await objectSync.triggerReconciliation();
+
+    assert.equal(objectSync.isDataConfirmed('shared', terminal), true);
+});
+
 test('immediate update flushes now and coalesces behind in-flight backpressure', async () => {
     const client = makeObjectSyncClient();
     const firstUpdate = deferred();

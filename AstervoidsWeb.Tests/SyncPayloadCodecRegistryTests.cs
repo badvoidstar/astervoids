@@ -35,6 +35,10 @@ public class SyncPayloadCodecRegistryTests : TestBase
             new PositionalSchemaCodec.FieldSpec("type", "str"),
             new PositionalSchemaCodec.FieldSpec("x", "f64"),
             new PositionalSchemaCodec.FieldSpec("y", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalEpoch", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
         });
 
     private static Dictionary<string, object?> ShipCreateDict() => new()
@@ -156,6 +160,36 @@ public class SyncPayloadCodecRegistryTests : TestBase
 
         obj.Should().NotBeNull();
         obj!.SchemaId.Should().Be(0);
+    }
+
+    [Fact]
+    public void ObjectService_TerminalUpdateSurvivesShipSnapshotReencode()
+    {
+        var (session, creator) = CreateTestSession();
+        var schema = ShipCreateSchema();
+        var registry = new SyncSchemaRegistry();
+        registry.SetSessionSchemas(session.Id, new[] { schema });
+        var obj = ObjectService.CreateObject(
+            session.Id, creator.Id, ObjectScope.Member, ShipCreateDict(),
+            ownerMemberId: null, clientValidAt: null, serverReceiveTimeMs: null,
+            schemaId: schema.Id)!;
+
+        obj = ObjectService.UpdateObject(session.Id, obj.Id, new Dictionary<string, object?>
+        {
+            ["terminalEpoch"] = 1000d,
+            ["terminalX"] = 0.25d,
+            ["terminalY"] = 0.75d,
+            ["terminalAngle"] = Math.PI
+        })!;
+
+        var snapshotPayload = SyncPayloadCodec.EncodeDict(
+            obj.SchemaId, obj.Data, registry, session.Id);
+        var decoded = SyncPayloadCodec.DecodeDict(
+            snapshotPayload, session.Id, registry);
+        decoded["terminalEpoch"].Should().Be(1000d);
+        decoded["terminalX"].Should().Be(0.25d);
+        decoded["terminalY"].Should().Be(0.75d);
+        decoded["terminalAngle"].Should().Be(Math.PI);
     }
 
     [Fact]

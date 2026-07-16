@@ -274,6 +274,7 @@ These methods have no corresponding hub RPC.
 | `getObjectByType(type)` | O(1) singleton lookup (e.g. `GameState`) via `typeIndex` |
 | `getObjectCount()` | Returns the number of locally tracked objects |
 | `getReconciliationCount()` | Returns the number of completed reconciliations in this session |
+| `isDataConfirmed(id, data)` | Shallow-checks fields against the latest server-confirmed response or authoritative snapshot |
 | `getSendRate()` | Returns the current effective send rate in Hz (`round(1 / nominalFrameTime)`) |
 | `isReconciling()` | `true` while a `GetSessionState` reconciliation round-trip is in progress |
 
@@ -1035,6 +1036,45 @@ Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
 `SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
 each object's last accepted operation timestamp. Those timestamps can still be
 older/newer than the exact underlying pose time because update writes coalesce.
+
+## Deterministic Terminal Convergence
+
+Deterministic sessions persist a canonical end pose instead of freezing each
+member at its latency-dependent displayed pose:
+
+1. The GameState owner stamps immutable `gameOverAt` and `terminalAt` values
+   when shared lives first reach zero.
+2. Each ship, asteroid, and bullet owner projects its authoritative object to
+   `terminalAt` and writes `terminalEpoch`, `terminalX`, `terminalY`, and, when
+   applicable, `terminalAngle` onto that same object record.
+3. Existing members start from the exact transform rendered on their preceding
+   frame and use a quintic trajectory that preserves position, velocity, and
+   acceleration while reaching the persisted target at rest.
+4. A member joining an already-terminal session creates no ship and seeds
+   replicas directly at persisted targets. Target-less snapshot or late-create
+   records remain hidden until their target-bearing version arrives.
+
+Terminal writes retry until `ObjectSync` reports their fields in a
+server-confirmed response; this works whether delta encoding is enabled or not.
+A failed write or ownership race therefore remains eligible without creating
+ongoing wire traffic. Member-scoped ships and bullets
+still disappear when their owner leaves. Session-scoped asteroids retain the
+target through migration; if migration happens before any target was accepted,
+the new owner derives a stable bounded target from the canonical record.
+Create, replace, delete, migration, reconciliation, and hidden-tab paths keep
+running terminal maintenance after gameplay physics and collisions stop.
+
+The target fields remain opaque replicated data below the Astervoids adapter:
+`ReplicationRuntime`, `ObjectSync`, SignalR, and the backend do not interpret
+kinematics. Ship creation schema 2 includes the persistence-only fields because
+join snapshots re-encode stored ship dictionaries with their original creation
+schema. Asteroids and bullets already use legacy dictionary snapshots.
+
+If a target arrives too late to use the shared `terminalAt` without a visible
+discontinuity, that member uses a short local settle window. Exact eventual pose
+and continuous motion take precedence over pretending it stopped at a time that
+has already passed. Legacy adaptive-delay sessions retain their existing
+authoritative-snapshot settle behavior and do not wait for terminal targets.
 
 ## Ring Buffer Interpolation
 
@@ -1926,6 +1966,7 @@ The frontend `CONFIG` object in `index.html` defines all game constants (normali
 | **Game** | `STARTING_LIVES: 3`, `MULTIPLAYER_LIVES: 3`, `INVULNERABILITY_TIME: 180 frames`, `WAVE_DELAY: 120 frames` |
 | **Sync** | Initial `SYNC_NOMINAL_FRAME_TIME: 1/10 (10Hz)`; adaptive flush range `1–20Hz`; `DELTA_ENCODING_ENABLED: true` |
 | **Interpolation** | `INTERPOLATION_DELAY: 33ms`, `ADAPTIVE_DELAY_ENABLED: true`, `SNAPSHOT_BUFFER_SIZE: 6`, `MAX_EXTRAPOLATION: 2.0s` |
+| **Terminal convergence** | `DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750ms`, `DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180ms`, `DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300ms` |
 | **Adaptive Delay** | `ADAPTIVE_DELAY_NET_FLOOR: 0.8`, `ADAPTIVE_DELAY_JITTER_MULT: 2`, `ADAPTIVE_DELAY_SMOOTHING: 0.1`, `ADAPTIVE_DELAY_SAMPLES: 30` |
 
 Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cyan, Magenta, Yellow (up to 4 players).

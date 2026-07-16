@@ -1211,22 +1211,18 @@
         // member can retain up to its final unsent/queued pose difference.
         // 0 = hard snap.
         LEGACY_GAMEOVER_SETTLE_MS: 140,
-        // Deterministic mode only: game-over "shared ballistic freeze" coast
-        // window (ms). At game over every synced object (owned AND remote) stops
-        // being simulated / dead-reckoned and is instead projected forward at its
-        // last constant velocity from where it is currently displayed to a single
-        // shared stop instant T_freeze = gameOverAt + this delay, where gameOverAt
-        // is the authoritative server-time the shared lives hit 0 (broadcast on
-        // the GameState object, so identical on every member). Each object coasts
-        // forward from its current displayed pose and then holds, avoiding a
-        // correction at the transition. The common stop time synchronizes
-        // cessation but does not erase arrival-delay error already present in
-        // different members' displayed anchors; doing so would require a visible
-        // correction. The delay is a tolerance window for GameState propagation,
-        // not a guarantee: a sufficiently long ordered stall can deliver the
-        // shared instant after it has passed, in which case that member stops
-        // from its current pose without a backward catch-up.
-        DEADRECKON_GAMEOVER_FREEZE_DELAY_MS: 400,
+        // Deterministic mode only: shared lead time before the immutable terminal
+        // object targets take effect. Object owners project their authoritative
+        // pose to terminalAt = gameOverAt + this delay and persist that target on
+        // the object record. Existing members converge continuously to it; late
+        // joiners initialize there before their first rendered frame.
+        DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750,
+        // If a canonical target arrives too close to or after terminalAt, extend
+        // only that member's presentation transition rather than introducing a
+        // position/velocity discontinuity. Exact eventual pose wins over common
+        // stop time under an extreme ordered stall.
+        DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300,
+        DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
 
         // Deterministic mode only: owner-side "send-on-change" suppression.
         // For purely ballistic objects (asteroids, bullets) the receiver
@@ -2164,6 +2160,13 @@
             ['colorIndex', 'u8'],
             ['memberId', 'guid'],
             ['score', 'u32'], ['hitCount', 'u16'],
+            // Persistence-only terminal fields. Terminal updates intentionally
+            // use the legacy dict path, but JoinSession snapshots re-encode a
+            // ship with its creation schema (id 2), so these fields must live
+            // here as well or late joiners silently lose the canonical target.
+            ['terminalEpoch', 'f64'],
+            ['terminalX', 'f64'], ['terminalY', 'f64'],
+            ['terminalAngle', 'f64'],
         ]},
         // Asteroid update schema. velocityX/Y and rotationSpeed are NOT
         // optional even though asteroid kinematics are constant in steady
@@ -2224,6 +2227,10 @@
     };
     function selectWireoptSchemaId(data, kind, ctx) {
         if (kind === 'update') {
+            // A terminal write is one-shot and persistence-sensitive. Use the
+            // legacy dictionary so every target field reaches the server even
+            // though normal ship/asteroid update schemas stay compact.
+            if (data && data.terminalEpoch !== undefined) return 0;
             const obj = ctx && ctx.object;
             const type = obj && obj.data && obj.data.type;
             // P3/P3b: replay-enabled sessions carry control intent on ship
@@ -3083,6 +3090,14 @@
         if (value < lo) return value + range;
         if (value > hi) return value - range;
         return value;
+    }
+
+    // Modulo variant for convergence paths that can traverse more than one
+    // field span before reaching their terminal target.
+    function wrapNormalizedMod(value, margin = 0) {
+        const lo = -margin;
+        const range = 1 + 2 * margin;
+        return lo + (((value - lo) % range) + range) % range;
     }
 
     /**
@@ -4890,8 +4905,85 @@
 
     // Helper to check if game is over (lives depleted during active play)
     function isGameOver() {
-        return game.state === 'gameover' ||
-            (game.lives <= 0 && (game.state === 'playing' || game.state === 'waveDelay'));
+        if (game.state === 'gameover'
+            || (game.lives <= 0
+                && (game.state === 'playing' || game.state === 'waveDelay'))) {
+            return true;
+        }
+        // ObjectSync may already contain the terminal GameState version one
+        // frame (or one throttled hidden-tab tick) before the runtime adapter
+        // copies lives into `game`. Treat canonical receipt as terminal now so
+        // no more local simulation/collision work races that accepted version.
+        return isSessionMode() && !!resolveTerminalSession();
+    }
+
+    const deterministicTerminalState = {
+        transitions: new Map(),
+        directTargetIds: new Set(),
+        pendingBootstrapIds: new Set(),
+        bootstrapEpoch: null,
+        ownedWrites: new Map()
+    };
+
+    function clearDeterministicTerminalState() {
+        deterministicTerminalState.transitions.clear();
+        deterministicTerminalState.directTargetIds.clear();
+        deterministicTerminalState.pendingBootstrapIds.clear();
+        deterministicTerminalState.bootstrapEpoch = null;
+        deterministicTerminalState.ownedWrites.clear();
+    }
+
+    function forgetDeterministicTerminalObject(id) {
+        deterministicTerminalState.transitions.delete(id);
+        deterministicTerminalState.directTargetIds.delete(id);
+        deterministicTerminalState.pendingBootstrapIds.delete(id);
+        deterministicTerminalState.ownedWrites.delete(id);
+    }
+
+    function resolveTerminalSession(data = null) {
+        const gameStateData = data
+            || ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE)?.data;
+        const epoch = gameStateData?.gameOverAt;
+        if (!(gameStateData?.lives <= 0) || !Number.isFinite(epoch)) return null;
+        const configuredAt = gameStateData?.terminalAt;
+        const terminalAt = Number.isFinite(configuredAt)
+            ? configuredAt
+            : epoch + CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS;
+        return Object.freeze({ epoch, terminalAt });
+    }
+
+    function hasPersistedTerminalTarget(record, terminal = resolveTerminalSession()) {
+        const data = record?.data;
+        return !!terminal
+            && data?.terminalEpoch === terminal.epoch
+            && Number.isFinite(data.terminalX)
+            && Number.isFinite(data.terminalY)
+            && (!Number.isFinite(data.angle)
+                || Number.isFinite(data.terminalAngle));
+    }
+
+    function normalizeTerminalAngle(angle) {
+        if (!Number.isFinite(angle)) return null;
+        const span = Math.PI * 2;
+        return ((angle % span) + span) % span;
+    }
+
+    function shouldDeferTerminalBootstrap(record) {
+        if (!isDeterministicMode()) return false;
+        const terminal = resolveTerminalSession();
+        if (!terminal
+            || deterministicTerminalState.bootstrapEpoch !== terminal.epoch) {
+            return false;
+        }
+        if (hasPersistedTerminalTarget(record, terminal)) {
+            deterministicTerminalState.pendingBootstrapIds.delete(record.id);
+            return false;
+        }
+        // A terminal join can race an in-flight create/replacement that was not
+        // in the original snapshot. Defer any such late record too; it has no
+        // prior displayed pose whose continuity needs preserving.
+        deterministicTerminalState.pendingBootstrapIds.add(record.id);
+        return true;
     }
 
     // Pause menu element reference
@@ -5140,6 +5232,10 @@
         if (!isDeterministicMode() || !record || !facts.joinSnapshot) {
             return undefined;
         }
+        // A terminal snapshot is not live motion. Projecting it toward the join
+        // time makes a long-finished object advance by the full dead-reckoning
+        // cap and then permanently freezes that invented pose.
+        if (resolveTerminalSession()) return undefined;
         if (!RemoteObjects.isClockOffsetInitialized() || !Number.isFinite(record.validAt)) {
             return undefined;
         }
@@ -5150,6 +5246,49 @@
         const maxAgeMs = CONFIG.DEADRECKON_MAX_FRAMES * (1000 / CONFIG.TARGET_FPS);
         const ageMs = Math.min(maxAgeMs, Math.max(0, presentationNow - record.validAt));
         return performance.now() - ageMs;
+    }
+
+    function getKinematicInstance(type, id) {
+        if (type === OBJECT_TYPES.SHIP) {
+            if (game.multiplayer.myShipObjectId === id) return game.ship;
+            return game.multiplayer.remoteShips.get(id);
+        }
+        if (type === OBJECT_TYPES.ASTEROID) {
+            return game.astervoids.find(value => value.syncObjectId === id);
+        }
+        if (type === OBJECT_TYPES.BULLET) {
+            return game.bullets.find(value => value.syncObjectId === id);
+        }
+        return null;
+    }
+
+    function seedReplicaAtTerminalTarget(instance, record) {
+        if (!instance || !hasPersistedTerminalTarget(record)) return instance;
+        instance.x = record.data.terminalX;
+        instance.y = record.data.terminalY;
+        if (Number.isFinite(record.data.terminalAngle)
+            && typeof instance.angle === 'number') {
+            instance.angle = record.data.terminalAngle;
+        }
+        deterministicTerminalState.directTargetIds.add(record.id);
+        return instance;
+    }
+
+    function currentKinematicData(type, id, record) {
+        const instance = getKinematicInstance(type, id);
+        if (!instance) return record.data;
+        const data = {
+            ...record.data,
+            x: instance.x,
+            y: instance.y,
+            velocityX: instance.velocityX || 0,
+            velocityY: instance.velocityY || 0
+        };
+        if (typeof instance.angle === 'number') data.angle = instance.angle;
+        if (typeof instance.rotationSpeed === 'number') {
+            data.rotationSpeed = instance.rotationSpeed;
+        }
+        return data;
     }
 
     /**
@@ -5175,6 +5314,14 @@
             },
             ingest(id, data, facts, record, context) {
                 if (isDeterministicMode()) {
+                    if (resolveTerminalSession()) {
+                        // Terminal versions carry a destination, not a fresh
+                        // arrival-time baseline. The render-side convergence
+                        // policy consumes the persisted target without allowing
+                        // DeadReckon to overwrite the current displayed pose.
+                        DeadReckon.remove(id);
+                        return;
+                    }
                     // Intentional respawn teleport (ship-only): the
                     // invulnerability counter only ever decreases during play
                     // and jumps back up to its max on Ship.reset(). A jump UP
@@ -5204,6 +5351,9 @@
             sample(id, facts, record, context) {
                 if (isDeterministicMode()) {
                     DeadReckon.lastVersions.set(id, record.version);
+                    if (resolveTerminalSession()) {
+                        return currentKinematicData(facts.type, id, record);
+                    }
                     return DeadReckon.getReckoned(id) || record.data;
                 }
                 // repositionLegacyRemotesAtRest's settle() keeps re-ingesting
@@ -5235,6 +5385,7 @@
     const shipReplicationDescriptor = {
         type: OBJECT_TYPES.SHIP,
         classify(record, facts) {
+            if (shouldDeferTerminalBootstrap(record)) return 'ignore';
             if (record.data.memberId === facts.currentMemberId) return 'ignore';
             return facts.activeMemberIds.includes(record.data.memberId) ? 'replica' : 'ignore';
         },
@@ -5247,7 +5398,7 @@
         createReplica(record) {
             const remoteShip = new Ship(record.data.x, record.data.y, record.data.colorIndex || 0);
             game.multiplayer.remoteShips.set(record.id, remoteShip);
-            return remoteShip;
+            return seedReplicaAtTerminalTarget(remoteShip, record);
         },
         apply(instance, data) {
             instance.fromSyncData(data);
@@ -5259,6 +5410,7 @@
             const id = facts.objectId;
             game.multiplayer.remoteShips.delete(id);
             game.multiplayer.seenShipHitCounts.delete(id);
+            forgetDeterministicTerminalObject(id);
         },
         presentation: kinematicPresentation
     };
@@ -5269,6 +5421,7 @@
     const asteroidReplicationDescriptor = {
         type: OBJECT_TYPES.ASTEROID,
         classify(record, facts) {
+            if (shouldDeferTerminalBootstrap(record)) return 'ignore';
             if (record.ownerMemberId === facts.currentMemberId) return 'owned';
             return facts.ownerIsActive ? 'replica' : 'ignore';
         },
@@ -5286,7 +5439,7 @@
             const asteroid = Asteroid.fromSyncData(record.data);
             asteroid.syncObjectId = record.id;
             game.astervoids.push(asteroid);
-            return asteroid;
+            return seedReplicaAtTerminalTarget(asteroid, record);
         },
         adoptOwned(record, instance, facts) {
             // Already tracked locally (e.g. ownership just migrated to us) —
@@ -5315,7 +5468,7 @@
             }
             record.spawnHandled = true;
             game.astervoids.push(asteroid);
-            return asteroid;
+            return seedReplicaAtTerminalTarget(asteroid, record);
         },
         apply(instance, data) {
             instance.fromSyncData(data);
@@ -5326,10 +5479,12 @@
             if (reason === ReplicationRuntime.RemovalReason.DELETED
                 || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
                 CollisionEffects.resolveTarget(id);
-                // Remote asteroid destroyed — play explosion sound based on size
-                const size = instance.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large'
-                    : instance.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                AudioSystem.playExplosion(size);
+                if (!resolveTerminalSession()) {
+                    // Remote asteroid destroyed — play explosion sound based on size
+                    const size = instance.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large'
+                        : instance.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+                    AudioSystem.playExplosion(size);
+                }
             }
             // Owner-side send-on-change baseline must be released too. An
             // asteroid we owned and then SPLIT is replaced (replaceObject)
@@ -5337,6 +5492,7 @@
             // never cleared on that path — without this, every fracture
             // leaks one baseline entry for the life of the session.
             SendGate.remove(id);
+            forgetDeterministicTerminalObject(id);
         },
         presentation: kinematicPresentation
     };
@@ -5348,6 +5504,7 @@
     const bulletReplicationDescriptor = {
         type: OBJECT_TYPES.BULLET,
         classify(record, facts) {
+            if (shouldDeferTerminalBootstrap(record)) return 'ignore';
             const ownerId = record.data.ownerMemberId;
             if (ownerId === facts.currentMemberId) return 'owned';
             return !!ownerId && facts.activeMemberIds.includes(ownerId) ? 'replica' : 'ignore';
@@ -5367,8 +5524,8 @@
             const bullet = Bullet.fromSyncData(record.data);
             bullet.syncObjectId = record.id;
             game.bullets.push(bullet);
-            AudioSystem.playFire();
-            return bullet;
+            if (!resolveTerminalSession()) AudioSystem.playFire();
+            return seedReplicaAtTerminalTarget(bullet, record);
         },
         apply(instance, data, facts) {
             instance.fromSyncData(data);
@@ -5396,9 +5553,32 @@
                 || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
                 CollisionEffects.resolveBullet(id);
             }
+            forgetDeterministicTerminalObject(id);
         },
         presentation: kinematicPresentation
     };
+
+    function applyGameStateData(data) {
+        if (data.wave !== undefined) game.wave = data.wave;
+        const oldLives = game.lives;
+        if (data.lives !== undefined) game.lives = data.lives;
+        if (data.score !== undefined) game.score = data.score;
+        if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
+        if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
+
+        if (game.lives <= 0 && oldLives > 0) {
+            AudioSystem.beat.stop();
+            AudioSystem.thrustSound.stop();
+        }
+
+        if (data.state && data.state !== game.state) {
+            const oldState = game.state;
+            game.state = data.state;
+            if (!isLobbySpectating() && data.state === 'playing' && oldState === 'waveDelay') {
+                AudioSystem.playNewWave();
+            }
+        }
+    }
 
     // GameState descriptor: owned by the GameState owner (drives it locally
     // via syncGameState); every other member applies the raw aggregated state
@@ -5425,33 +5605,7 @@
             return record.id;
         },
         apply(instance, data) {
-            // Update game state from sync — all fields including state
-            // are applied for both lobby spectators and entered players
-            if (data.wave !== undefined) game.wave = data.wave;
-            const oldLives = game.lives;
-            if (data.lives !== undefined) game.lives = data.lives;
-            if (data.score !== undefined) game.score = data.score;
-            if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
-            if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
-
-            // Handle lives reaching zero — stop audio
-            if (game.lives <= 0 && oldLives > 0) {
-                AudioSystem.beat.stop();
-                AudioSystem.thrustSound.stop();
-            }
-
-            // Handle state transitions — lobby spectators also receive state
-            // updates so game.state always reflects the actual game state
-            if (data.state && data.state !== game.state) {
-                const oldState = game.state;
-                game.state = data.state;
-
-                // Handle state change audio effects (skip for lobby
-                // spectators — no audio yet)
-                if (!isLobbySpectating() && data.state === 'playing' && oldState === 'waveDelay') {
-                    AudioSystem.playNewWave();
-                }
-            }
+            applyGameStateData(data);
         },
         remove(instance) {
             if (game.multiplayer.gameStateObjectId === instance) {
@@ -5501,6 +5655,7 @@
      */
     function drawRemoteShips(ctx) {
         for (const [objectId, ship] of game.multiplayer.remoteShips) {
+            rememberRenderedPose(ship);
             ship.draw(ctx);
         }
     }
@@ -5549,6 +5704,7 @@
         SendGate.clear();
         ShipControlGate.reset();
         ShipSendGate.clear();
+        clearDeterministicTerminalState();
         ObjectSync.clear();
         // Tear down replicationRuntime's bindings/consumed-versions/join-marker
         // bookkeeping for whatever session it currently thinks is active. Reason
@@ -5676,54 +5832,106 @@
         }
     }
 
-    // Set once we have queued our owned objects for a final game-over re-anchor,
-    // so the request runs once per transition. ObjectSync may coalesce those
-    // updates or defer them behind an in-flight batch.
-    let gameOverFlushed = false;
+    function buildTerminalTargetPayload(instance, record, terminal) {
+        const data = instance || record.data;
+        const stepMs = 1000 / CONFIG.TARGET_FPS;
+        const nowServer = RemoteObjects.serverNowMs();
+        let frames;
+        if (instance) {
+            frames = Math.max(0, (terminal.terminalAt - nowServer) / stepMs);
+        } else {
+            // Ownership can migrate before a local instance is adopted. In that
+            // narrow path, derive a stable bounded target from the canonical
+            // record rather than from the current join/reconciliation time.
+            const validAt = Number.isFinite(record.validAt) ? record.validAt : nowServer;
+            frames = Math.max(0, (terminal.terminalAt - validAt) / stepMs);
+            frames = Math.min(CONFIG.DEADRECKON_MAX_FRAMES, frames);
+        }
+
+        const radius = instance
+            ? wrapRadiusFor(instance)
+            : RemoteObjects.getBoundingRadius(record.data);
+        const marginX = wrapMarginX(radius);
+        const marginY = wrapMarginY(radius);
+        const velocityX = data.velocityX || 0;
+        const velocityY = data.velocityY || 0;
+        const terminalX = wrapNormalizedMod(
+            data.x + velocityToNormalizedDeltaX(velocityX) * frames,
+            marginX);
+        const terminalY = wrapNormalizedMod(
+            data.y + velocityToNormalizedDeltaY(velocityY) * frames,
+            marginY);
+        const terminalAngle = Number.isFinite(data.angle)
+            ? normalizeTerminalAngle(
+                data.angle + (data.rotationSpeed || 0) * frames)
+            : null;
+        const payload = {
+            x: data.x,
+            y: data.y,
+            terminalEpoch: terminal.epoch,
+            terminalX,
+            terminalY
+        };
+        if (Number.isFinite(data.angle)) payload.angle = data.angle;
+        if (terminalAngle != null) payload.terminalAngle = terminalAngle;
+        return payload;
+    }
 
     /**
-     * Queue a final authoritative state for every object WE own when this
-     * member observes game over.
-     *
-     * Why this is needed (deterministic + send-on-change): owners suppress
-     * redundant per-frame re-anchors for ballistic asteroids/bullets
-     * (SendGate/ShipSendGate), so the server's stored pose can be up to one
-     * heartbeat plus transport/backpressure old when gameplay updates stop.
-     * Refreshing it reduces state age for reconciliation and for members that
-     * receive the batch before capturing their ballistic-freeze anchor. The
-     * freeze still starts from each member's current displayed pose; this send
-     * does not guarantee identical resting transforms.
-     *
-     * Each object owner can observe the shared-lives transition at a different
-     * local time, so each member refreshes only objects it authoritatively owns.
-     *
-     * Calls updateObject with `immediate=true`, bypassing game-layer gates and
-     * requesting a flush. An existing invoke still wins; pending states leave
-     * on the first later eligible tick. This is deterministic-only because
-     * legacy already queues moving state every gameplay frame, though its last
-     * accepted wire state can likewise trail the local pose.
+     * Persist one canonical target per object from its current authoritative
+     * owner. Re-queueing every 250ms is intentional: ObjectSync exposes only
+     * server-confirmed outbound fields here, so a failed or ownership-raced
+     * write remains eligible without relying on optimistic local record data.
      */
-    function flushOwnedObjectsAtGameOver() {
+    function publishOwnedTerminalTargets() {
         if (!isSessionMode() || !isDeterministicMode()) return;
+        const terminal = resolveTerminalSession();
+        if (!terminal) return;
+        for (const id of deterministicTerminalState.pendingBootstrapIds) {
+            if (!ObjectSync.getObject(id)) {
+                deterministicTerminalState.pendingBootstrapIds.delete(id);
+            }
+        }
         const myMemberId = SessionClient.getCurrentMember()?.id;
         if (!myMemberId) return;
-        const ownedByUs = (syncId) => {
-            if (!syncId) return false;
-            const o = ObjectSync.getObject(syncId);
-            return !!o && o.ownerMemberId === myMemberId;
-        };
-        for (const asteroid of game.astervoids) {
-            if (ownedByUs(asteroid.syncObjectId)) {
-                ObjectSync.updateObject(asteroid.syncObjectId, asteroid.toUpdateData(), true);
+
+        const now = performance.now();
+        const retained = new Set();
+        for (const type of [
+            OBJECT_TYPES.SHIP,
+            OBJECT_TYPES.ASTEROID,
+            OBJECT_TYPES.BULLET
+        ]) {
+            for (const record of ObjectSync.getObjectsByType(type)) {
+                if (record.ownerMemberId !== myMemberId) continue;
+                retained.add(record.id);
+
+                let write = deterministicTerminalState.ownedWrites.get(record.id);
+                if (write && ObjectSync.isDataConfirmed(record.id, write.payload)) {
+                    deterministicTerminalState.ownedWrites.delete(record.id);
+                    continue;
+                }
+                if (hasPersistedTerminalTarget(record, terminal) && !write) continue;
+                if (!write || write.epoch !== terminal.epoch) {
+                    const instance = getKinematicInstance(type, record.id);
+                    write = {
+                        epoch: terminal.epoch,
+                        payload: buildTerminalTargetPayload(
+                            instance, record, terminal),
+                        lastAttempt: -Infinity
+                    };
+                    deterministicTerminalState.ownedWrites.set(record.id, write);
+                }
+                if (now - write.lastAttempt < 250) continue;
+                write.lastAttempt = now;
+                ObjectSync.updateObject(record.id, write.payload, true);
             }
         }
-        for (const bullet of game.bullets) {
-            if (ownedByUs(bullet.syncObjectId)) {
-                ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
+
+        for (const id of deterministicTerminalState.ownedWrites.keys()) {
+            if (!retained.has(id)) {
+                deterministicTerminalState.ownedWrites.delete(id);
             }
-        }
-        if (game.ship && ownedByUs(game.multiplayer.myShipObjectId)) {
-            ObjectSync.updateObject(game.multiplayer.myShipObjectId, game.ship.toUpdateData(), true);
         }
     }
 
@@ -5769,11 +5977,11 @@
                 processedHits: {},
                 peakShipCount: shipObjects.length,
                 // Authoritative server-time (ms) at which the shared lives reached
-                // 0. Null until game over; stamped once by the GameState owner in
-                // syncGameState. Every member reads this identical value to anchor
-                // the deterministic game-over ballistic freeze (see
-                // DEADRECKON_GAMEOVER_FREEZE_DELAY_MS).
-                gameOverAt: null
+                // 0. Null until game over; stamped once by the GameState owner.
+                // terminalAt is the shared end of the deterministic convergence
+                // window and is likewise immutable for this terminal epoch.
+                gameOverAt: null,
+                terminalAt: null
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -5851,13 +6059,17 @@
 
         // Stamp the authoritative game-over instant exactly once, the first sync
         // where the shared lives reach 0. Carried on the GameState object so every
-        // member converges on the SAME server-time anchor (gameOverAt) for the
-        // deterministic ballistic freeze, independent of when each member's local
+        // member converges on the SAME server-time anchor (gameOverAt) for
+        // deterministic terminal convergence, independent of when each member's local
         // lives counter observes the transition. Preserve any value already set
         // (gsObj.data) so later syncs don't move the anchor.
         let gameOverAt = gsObj?.data?.gameOverAt ?? null;
         if (lives <= 0 && gameOverAt == null) {
             gameOverAt = Math.round(RemoteObjects.serverNowMs());
+        }
+        let terminalAt = gsObj?.data?.terminalAt ?? null;
+        if (gameOverAt != null && terminalAt == null) {
+            terminalAt = gameOverAt + CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS;
         }
         
         // If game.state is 'lobby' (spectator who just inherited ownership),
@@ -5881,7 +6093,8 @@
             processedHits: processedHits,
             processedScores: processedScores,
             peakShipCount: peakShipCount,
-            gameOverAt: gameOverAt
+            gameOverAt: gameOverAt,
+            terminalAt: terminalAt
         };
         
         // Note: this queues into pendingUpdates (same batch as ship/asteroid/bullet updates).
@@ -5935,29 +6148,35 @@
         if (isSessionMode()) {
             const member = SessionClient.getCurrentMember();
             game.multiplayer.isAuthority = member?.role === 'Server';
-            
-            // Get a color for this player
-            const colorIndex = getNextColorIndex();
-            
-            // Create synced ship for multiplayer
-            await createSyncedShip(colorIndex);
-            if (!isCurrentStart()) return false;
-            
-            // Fallback: if ship creation failed, create local ship
-            if (!game.ship) {
-                _warn('[Game] Ship creation failed, creating local fallback');
-                game.ship = new Ship(0.5, 0.5, colorIndex);
-                game.ship.memberId = member?.id;
-                game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
-                game.multiplayer.myColorIndex = colorIndex;
-            }
-            
+
             // Detect whether we're entering an in-progress game (GameState already exists)
             // vs starting a brand-new game. A promoted Server who inherited GS ownership
             // must adopt the existing state — not reset to defaults.
             const existingGsObj = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
             const gameAlreadyInProgress = !!existingGsObj;
-            
+            const terminalSession = resolveTerminalSession(existingGsObj?.data);
+
+            // A finished session is view-only. Creating a member-scoped ship here
+            // would broadcast a brand-new live entity into every member's frozen
+            // final scene before this client had even applied GameState.
+            if (!terminalSession) {
+                const colorIndex = getNextColorIndex();
+                await createSyncedShip(colorIndex);
+                if (!isCurrentStart()) return false;
+
+                // Fallback: if ship creation failed, create local ship
+                if (!game.ship) {
+                    _warn('[Game] Ship creation failed, creating local fallback');
+                    game.ship = new Ship(0.5, 0.5, colorIndex);
+                    game.ship.memberId = member?.id;
+                    game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
+                    game.multiplayer.myColorIndex = colorIndex;
+                }
+            } else {
+                game.ship = null;
+                game.multiplayer.myShipObjectId = null;
+            }
+
             if (isAuthority() && !gameAlreadyInProgress) {
                 // Server starting a fresh game — reset everything
                 game.lives = CONFIG.MULTIPLAYER_LIVES;
@@ -5965,6 +6184,41 @@
                 game.bullets = [];
                 game.score = 0;
                 game.wave = 0;
+            } else if (terminalSession) {
+                // Apply terminal GameState before any kinematic record. Records
+                // without their owner-authored target remain unbound until the
+                // target-bearing version arrives, preventing a provisional
+                // age-projected pose from appearing and then correcting.
+                freshGameStart = false;
+                game.multiplayer.gameStateObjectId = existingGsObj.id;
+                applyGameStateData(existingGsObj.data);
+                game.astervoids = [];
+                game.bullets = [];
+                game.multiplayer.remoteShips.clear();
+                deterministicTerminalState.pendingBootstrapIds.clear();
+                deterministicTerminalState.bootstrapEpoch = isDeterministicMode()
+                    ? terminalSession.epoch
+                    : null;
+                if (isDeterministicMode()) {
+                    for (const type of [
+                        OBJECT_TYPES.SHIP,
+                        OBJECT_TYPES.ASTEROID,
+                        OBJECT_TYPES.BULLET
+                    ]) {
+                        for (const record of ObjectSync.getObjectsByType(type)) {
+                            if (!hasPersistedTerminalTarget(record, terminalSession)) {
+                                deterministicTerminalState.pendingBootstrapIds.add(record.id);
+                            }
+                        }
+                    }
+                }
+                // If ownership migrated to this joining member, author a stable
+                // bounded target from the canonical record before reconciling.
+                publishOwnedTerminalTargets();
+                updateGameStateFromSync();
+                updateRemoteShips();
+                updateAstervoidsFromSync();
+                updateBulletsFromSync();
             } else if (isGameStateOwner()) {
                 // GS owner entering an in-progress game (either promoted Server
                 // or non-server spectator who inherited ownership): adopt the
@@ -6034,7 +6288,7 @@
         
         // Start background beat
         AudioSystem.beat.stop();
-        AudioSystem.beat.start();
+        if (!isGameOver()) AudioSystem.beat.start();
         
         // Start first wave and create GameState only for fresh starts.
         // When entering an in-progress game, the wave and GameState already exist.
@@ -7411,11 +7665,34 @@
         return CONFIG.SHIP_SIZE; // Ship (and ship-like renderables)
     }
 
+    function rememberRenderedPose(obj) {
+        obj._lastRenderedX = obj.x;
+        obj._lastRenderedY = obj.y;
+        if (typeof obj.angle === 'number') {
+            obj._lastRenderedAngle = obj.angle;
+        }
+    }
+
+    function lastRenderedPose(obj) {
+        return {
+            x: Number.isFinite(obj._lastRenderedX)
+                ? obj._lastRenderedX
+                : obj.x,
+            y: Number.isFinite(obj._lastRenderedY)
+                ? obj._lastRenderedY
+                : obj.y,
+            angle: typeof obj.angle === 'number'
+                ? (Number.isFinite(obj._lastRenderedAngle)
+                    ? obj._lastRenderedAngle
+                    : obj.angle)
+                : null
+        };
+    }
+
     // Run `drawFn` with every local renderable temporarily posed at its
     // interpolated transform, restoring true sim state afterward. No-op (draws
     // current state directly) in legacy mode or when alpha has reached 1.
     function withLocalRenderInterpolation(alpha, drawFn) {
-        if (!isDeterministicMode() || alpha >= 1) { drawFn(); return; }
         const objs = [];
         if (game.ship) objs.push(game.ship);
         for (const a of game.astervoids) objs.push(a);
@@ -7424,20 +7701,31 @@
             for (const c of game.cosmeticAstervoids) objs.push(c);
         }
         const saved = [];
+        const shouldInterpolate = isDeterministicMode() && alpha < 1;
         for (const o of objs) {
-            if (typeof o._prevX !== 'number' || typeof o._prevY !== 'number') continue;
+            if (!shouldInterpolate
+                || typeof o._prevX !== 'number'
+                || typeof o._prevY !== 'number') {
+                rememberRenderedPose(o);
+                continue;
+            }
             // Skip dead-reckoned remote objects: they are already positioned
             // smoothly to "now" by DeadReckon.getReckoned every frame. Blending
             // them between fixed-step snapshots double-smooths (adds lag) and,
             // at a wrap seam, pulls them backward — visible as a remote bullet
             // that fails to travel its full path. Render interpolation is only
             // for objects THIS client simulates in discrete fixed steps.
-            if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) continue;
-            // Skip objects under the game-over ballistic freeze: repositionDead-
-            // ReckonedRemotes already places them at their shared projected pose
-            // each render frame. Interpolating prev→curr here would blend that
-            // projection against the now-stale last sim pose, reintroducing a pop.
-            if (o.syncObjectId && deterministicGameOverFreeze.bases.has(o.syncObjectId)) continue;
+            if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) {
+                rememberRenderedPose(o);
+                continue;
+            }
+            // Terminal convergence already samples these objects at render time.
+            // Fixed-step interpolation would double-smooth the trajectory.
+            if (o.syncObjectId
+                && deterministicTerminalState.transitions.has(o.syncObjectId)) {
+                rememberRenderedPose(o);
+                continue;
+            }
             saved.push([o, o.x, o.y, o.angle]);
             const r = wrapRadiusFor(o);
             o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
@@ -7445,6 +7733,7 @@
             if (typeof o.angle === 'number' && typeof o._prevAngle === 'number') {
                 o.angle = interpAngle(o._prevAngle, o.angle, alpha);
             }
+            rememberRenderedPose(o);
         }
         try {
             drawFn();
@@ -7453,37 +7742,231 @@
         }
     }
 
-    // Deterministic game-over "shared ballistic freeze" state.
-    //
-    //   bases  – syncObjectId → the captured kinematic anchor used to project the
-    //            object to the shared stop instant. Captured once, the first
-    //            game-over frame the object is seen, from where it is CURRENTLY
-    //            displayed (so the freeze starts seamlessly — no jump), together
-    //            with its last constant velocity and the local server-time of
-    //            capture. Cleared whenever we are not in the game-over freeze.
-    //   freezeAtMs – the latched shared stop instant (server-time). Resolved from
-    //            the authoritative gameOverAt (GameState) so every member stops at
-    //            the SAME instant; falls back to a local estimate only if the
-    //            anchor has not propagated yet.
-    const deterministicGameOverFreeze = { bases: new Map(), freezeAtMs: null };
+    function sampleTerminalTransition(entry, nowServer) {
+        if (entry.kind === 'held') {
+            return {
+                x: entry.x,
+                y: entry.y,
+                angle: entry.angle,
+                velocityX: 0,
+                velocityY: 0,
+                angularVelocity: 0,
+                accelerationX: 0,
+                accelerationY: 0,
+                angularAcceleration: 0,
+                done: true
+            };
+        }
+        if (entry.kind === 'ballistic') {
+            const elapsed = Math.max(
+                0,
+                Math.min(nowServer, entry.endTime) - entry.startTime);
+            const moving = nowServer < entry.endTime;
+            return {
+                x: entry.x + entry.velocityX * elapsed,
+                y: entry.y + entry.velocityY * elapsed,
+                angle: entry.angle == null
+                    ? null
+                    : entry.angle + entry.angularVelocity * elapsed,
+                velocityX: moving ? entry.velocityX : 0,
+                velocityY: moving ? entry.velocityY : 0,
+                angularVelocity: moving ? entry.angularVelocity : 0,
+                accelerationX: 0,
+                accelerationY: 0,
+                angularAcceleration: 0,
+                done: !moving
+            };
+        }
 
-    // Toroidal wrap that tolerates an excursion of more than one field width
-    // (constant-velocity projection over the whole coast window can exceed a
-    // single wrapNormalized step for very fast objects). Mirrors wrapNormalized's
-    // [-margin, 1+margin) span via modulo.
-    function wrapNormalizedMod(value, margin) {
-        const lo = -margin;
-        const range = 1 + 2 * margin;
-        return lo + (((value - lo) % range) + range) % range;
+        const x = ReplicationPresentation.sampleMinimumJerkTransition(
+            entry.xTransition, nowServer);
+        const y = ReplicationPresentation.sampleMinimumJerkTransition(
+            entry.yTransition, nowServer);
+        const angle = entry.angleTransition
+            ? ReplicationPresentation.sampleMinimumJerkTransition(
+                entry.angleTransition, nowServer)
+            : null;
+        return {
+            x: x.value,
+            y: y.value,
+            angle: angle ? angle.value : null,
+            velocityX: x.velocity,
+            velocityY: y.velocity,
+            angularVelocity: angle ? angle.velocity : 0,
+            accelerationX: x.acceleration,
+            accelerationY: y.acceleration,
+            angularAcceleration: angle ? angle.acceleration : 0,
+            done: x.done && y.done && (!angle || angle.done)
+        };
     }
 
-    // Resolve the authoritative shared game-over instant (server-time ms) the
-    // freeze projects toward, or null if it is not yet known. Read from the
-    // GameState object so it is identical on every member.
-    function resolveSharedGameOverAtMs() {
-        const gs = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
-        const v = gs?.data?.gameOverAt;
-        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    function createProvisionalTerminalTransition(obj, terminal, nowServer) {
+        const stepMs = 1000 / CONFIG.TARGET_FPS;
+        const displayed = lastRenderedPose(obj);
+        const remaining = terminal.terminalAt - nowServer;
+        const endTime = remaining >= CONFIG.DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS
+            ? terminal.terminalAt
+            : nowServer + CONFIG.DEADRECKON_GAMEOVER_LATE_SETTLE_MS;
+        const duration = endTime - nowServer;
+        const velocityX = velocityToNormalizedDeltaX(obj.velocityX || 0) / stepMs;
+        const velocityY = velocityToNormalizedDeltaY(obj.velocityY || 0) / stepMs;
+        const angularVelocity = (obj.rotationSpeed || 0) / stepMs;
+        return {
+            kind: 'convergence',
+            epoch: terminal.epoch,
+            canonical: false,
+            xTransition: ReplicationPresentation.createMinimumJerkTransition({
+                start: displayed.x,
+                target: displayed.x + velocityX * duration,
+                startVelocity: velocityX,
+                startTime: nowServer,
+                endTime
+            }),
+            yTransition: ReplicationPresentation.createMinimumJerkTransition({
+                start: displayed.y,
+                target: displayed.y + velocityY * duration,
+                startVelocity: velocityY,
+                startTime: nowServer,
+                endTime
+            }),
+            angleTransition: displayed.angle != null
+                ? ReplicationPresentation.createMinimumJerkTransition({
+                    start: displayed.angle,
+                    target: displayed.angle + angularVelocity * duration,
+                    startVelocity: angularVelocity,
+                    startTime: nowServer,
+                    endTime
+                })
+                : null
+        };
+    }
+
+    function createCanonicalTerminalTransition(
+        obj,
+        record,
+        terminal,
+        nowServer,
+        previous
+    ) {
+        const data = record.data;
+        if (deterministicTerminalState.directTargetIds.delete(record.id)) {
+            return {
+                kind: 'held',
+                epoch: terminal.epoch,
+                canonical: true,
+                targetX: data.terminalX,
+                targetY: data.terminalY,
+                targetAngle: Number.isFinite(data.terminalAngle)
+                    ? data.terminalAngle
+                    : null,
+                x: data.terminalX,
+                y: data.terminalY,
+                angle: Number.isFinite(data.terminalAngle)
+                    ? data.terminalAngle
+                    : null
+            };
+        }
+
+        const displayed = lastRenderedPose(obj);
+        const current = previous
+            ? sampleTerminalTransition(previous, nowServer)
+            : {
+                x: displayed.x,
+                y: displayed.y,
+                angle: displayed.angle,
+                velocityX: velocityToNormalizedDeltaX(obj.velocityX || 0)
+                    / (1000 / CONFIG.TARGET_FPS),
+                velocityY: velocityToNormalizedDeltaY(obj.velocityY || 0)
+                    / (1000 / CONFIG.TARGET_FPS),
+                angularVelocity: (obj.rotationSpeed || 0)
+                    / (1000 / CONFIG.TARGET_FPS),
+                accelerationX: 0,
+                accelerationY: 0,
+                angularAcceleration: 0
+            };
+        const remaining = terminal.terminalAt - nowServer;
+        const endTime = remaining >= CONFIG.DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS
+            ? terminal.terminalAt
+            : nowServer + CONFIG.DEADRECKON_GAMEOVER_LATE_SETTLE_MS;
+        const duration = endTime - nowServer;
+        const radius = wrapRadiusFor(obj);
+        const marginX = wrapMarginX(radius);
+        const marginY = wrapMarginY(radius);
+        const targetX = ReplicationPresentation.unwrapConvergenceTarget({
+            start: current.x,
+            target: data.terminalX,
+            span: 1 + 2 * marginX,
+            velocity: current.velocityX,
+            duration
+        });
+        const targetY = ReplicationPresentation.unwrapConvergenceTarget({
+            start: current.y,
+            target: data.terminalY,
+            span: 1 + 2 * marginY,
+            velocity: current.velocityY,
+            duration
+        });
+        let targetAngle = null;
+        let angleTransition = null;
+        if (current.angle != null && Number.isFinite(data.terminalAngle)) {
+            targetAngle = ReplicationPresentation.unwrapConvergenceTarget({
+                start: current.angle,
+                target: data.terminalAngle,
+                span: Math.PI * 2,
+                velocity: current.angularVelocity,
+                duration
+            });
+            angleTransition = ReplicationPresentation.createMinimumJerkTransition({
+                start: current.angle,
+                target: targetAngle,
+                startVelocity: current.angularVelocity,
+                startAcceleration: current.angularAcceleration,
+                startTime: nowServer,
+                endTime
+            });
+        }
+
+        return {
+            kind: 'convergence',
+            epoch: terminal.epoch,
+            canonical: true,
+            targetX: data.terminalX,
+            targetY: data.terminalY,
+            targetAngle: Number.isFinite(data.terminalAngle)
+                ? data.terminalAngle
+                : null,
+            marginX,
+            marginY,
+            xTransition: ReplicationPresentation.createMinimumJerkTransition({
+                start: current.x,
+                target: targetX,
+                startVelocity: current.velocityX,
+                startAcceleration: current.accelerationX,
+                startTime: nowServer,
+                endTime
+            }),
+            yTransition: ReplicationPresentation.createMinimumJerkTransition({
+                start: current.y,
+                target: targetY,
+                startVelocity: current.velocityY,
+                startAcceleration: current.accelerationY,
+                startTime: nowServer,
+                endTime
+            }),
+            angleTransition
+        };
+    }
+
+    function terminalTargetMatches(entry, record, terminal) {
+        const data = record.data;
+        return entry?.canonical === true
+            && entry.epoch === terminal.epoch
+            && entry.targetX === data.terminalX
+            && entry.targetY === data.terminalY
+            && entry.targetAngle === (
+                Number.isFinite(data.terminalAngle)
+                    ? data.terminalAngle
+                    : null);
     }
 
     // Reposition every dead-reckoned remote object (ships, asteroids, bullets)
@@ -7494,32 +7977,15 @@
     // only move on frames where a sim step runs (visible stutter on >60 Hz
     // displays). Locals are smoothed separately by render interpolation.
     //
-    // GAME OVER — "shared ballistic freeze": when the shared lives reach 0 the
-    // gameplay sim (owned objects) and the dead-reckoning ingest (remotes) both
-    // stop. The continuity-first goal is a common stop TIME without a jump or
-    // backward blend; arrival-anchored replicas are not guaranteed to share an
-    // identical stop pose. We do this by
-    // projecting every synced object — owned AND remote — forward at its last
-    // constant velocity from where it is CURRENTLY displayed to a single shared
-    // stop instant T_freeze = gameOverAt + DEADRECKON_GAMEOVER_FREEZE_DELAY_MS,
-    // then holding. Properties:
-    //   • No jump / no blend: the anchor is the object's current on-screen pose,
-    //     so projection is C0-continuous with the last in-play frame; the object
-    //     simply carries on at its real velocity and stops.
-    //   • Best-effort simultaneous cessation: T_freeze is one server timestamp.
-    //     Members evaluate it through their bounded-error clock estimates; an
-    //     event delivered after T_freeze cannot retroactively stop on time.
-    //   • No added reversal: every member coasts from its own displayed anchor.
-    //     Any latency/asymmetry error already baked into that anchor remains as
-    //     residual positional and angular disagreement.
-    // Intentional warps are a non-issue here: at game over there are no respawns
-    // (lives are 0) and a toroidal wrap during the coast is followed naturally by
-    // the modulo wrap, not treated as a discontinuity.
+    // GAME OVER — every object owner persists one canonical terminal target.
+    // Existing members start from their exact displayed pose and derivative,
+    // then follow a C2 finite-time trajectory to that target at zero velocity.
+    // A target received after terminalAt gets a local grace interval rather than
+    // a transform discontinuity. Late joiners seed directly at the persisted
+    // target before their first render.
     function repositionDeadReckonedRemotes() {
-        const freeze = deterministicGameOverFreeze;
         if (!isDeterministicMode() || !isSessionMode()) {
-            freeze.bases.clear();
-            freeze.freezeAtMs = null;
+            clearDeterministicTerminalState();
             return;
         }
         const myMemberId = SessionClient.getCurrentMember()?.id;
@@ -7538,8 +8004,7 @@
             // snapshot (object-sync sets ownerMemberId without touching
             // DeadReckon) if a client missed the OnMemberLeft broadcast. Clearing
             // here makes "owned ⇒ not dead-reckoned" hold for every path.
-            freeze.bases.clear();
-            freeze.freezeAtMs = null;
+            clearDeterministicTerminalState();
             const place = (obj, syncId) => {
                 if (ownedByUs(syncId)) { DeadReckon.remove(syncId); return; }
                 const r = DeadReckon.getReckoned(syncId);
@@ -7557,76 +8022,65 @@
             return;
         }
 
-        // GAME OVER: shared ballistic freeze.
+        const terminal = resolveTerminalSession();
+        if (!terminal) return;
         const nowServer = RemoteObjects.serverNowMs();
-        const delay = CONFIG.DEADRECKON_GAMEOVER_FREEZE_DELAY_MS;
-        // Latch the stop instant. Prefer the authoritative shared anchor; only
-        // estimate locally while it has not propagated, and upgrade to the
-        // authoritative value as soon as it arrives so all members agree.
-        const sharedAt = resolveSharedGameOverAtMs();
-        if (sharedAt != null) {
-            freeze.freezeAtMs = sharedAt + delay;
-        } else if (freeze.freezeAtMs == null) {
-            freeze.freezeAtMs = nowServer + delay;
-        }
-        const tEval = Math.min(nowServer, freeze.freezeAtMs);
-        const stepMs = 1000 / CONFIG.TARGET_FPS;
-
         const seen = new Set();
-        const applyFreeze = (obj, syncId) => {
+        const applyTerminal = (obj, syncId) => {
             if (!syncId) return;
             seen.add(syncId);
-            let base = freeze.bases.get(syncId);
-            if (!base) {
-                // Capture the anchor from the CURRENT displayed pose so the coast
-                // is seamless. Velocity is the object's last authoritative value
-                // (set from sync for remotes, from the sim for owned).
-                base = {
-                    x: obj.x,
-                    y: obj.y,
-                    angle: (typeof obj.angle === 'number') ? obj.angle : null,
-                    vNx: velocityToNormalizedDeltaX(obj.velocityX || 0),
-                    vNy: velocityToNormalizedDeltaY(obj.velocityY || 0),
-                    rot: obj.rotationSpeed || 0,
-                    anchorMs: nowServer,
-                };
-                freeze.bases.set(syncId, base);
+            const record = ObjectSync.getObject(syncId);
+            let entry = deterministicTerminalState.transitions.get(syncId);
+            if (entry && entry.epoch !== terminal.epoch) entry = null;
+            if (hasPersistedTerminalTarget(record, terminal)) {
+                if (!terminalTargetMatches(entry, record, terminal)) {
+                    entry = createCanonicalTerminalTransition(
+                        obj, record, terminal, nowServer, entry);
+                    deterministicTerminalState.transitions.set(syncId, entry);
+                }
+            } else if (!entry) {
+                entry = createProvisionalTerminalTransition(
+                    obj, terminal, nowServer);
+                deterministicTerminalState.transitions.set(syncId, entry);
             }
-            let frames = (tEval - base.anchorMs) / stepMs;
-            if (!(frames > 0)) frames = 0;
-            const r = wrapRadiusFor(obj);
-            const marginX = wrapMarginX(r), marginY = wrapMarginY(r);
-            obj.x = wrapNormalizedMod(base.x + base.vNx * frames, marginX);
-            obj.y = wrapNormalizedMod(base.y + base.vNy * frames, marginY);
-            if (base.angle !== null) {
-                // Project the angle linearly, exactly like position. The angular
-                // clamp used during play (to bound over-rotation across an
-                // unsignalled turn-stop) is deliberately NOT applied here: it
-                // saturates after DEADRECKON_ANGULAR_MAX_FRAMES and would add a
-                // member-dependent stop within the coast. Linear projection
-                // preserves angular continuity to the shared stop time; any
-                // heading difference already present in captured display poses
-                // remains rather than being corrected backward.
-                obj.angle = base.angle + base.rot * frames;
+
+            const sample = sampleTerminalTransition(entry, nowServer);
+            const radius = wrapRadiusFor(obj);
+            obj.x = wrapNormalizedMod(sample.x, wrapMarginX(radius));
+            obj.y = wrapNormalizedMod(sample.y, wrapMarginY(radius));
+            if (sample.angle != null && typeof obj.angle === 'number') {
+                obj.angle = sample.angle;
+            }
+            if (sample.done && entry.canonical && record) {
+                // Use the literal persisted values after the continuous path
+                // completes so every member and future join snapshot agrees
+                // bit-for-bit, not merely modulo a local unwrap.
+                obj.x = record.data.terminalX;
+                obj.y = record.data.terminalY;
+                if (Number.isFinite(record.data.terminalAngle)
+                    && typeof obj.angle === 'number') {
+                    obj.angle = record.data.terminalAngle;
+                }
             }
         };
         for (const b of game.bullets) {
-            if (b.syncObjectId) applyFreeze(b, b.syncObjectId);
+            if (b.syncObjectId) applyTerminal(b, b.syncObjectId);
         }
         for (const a of game.astervoids) {
-            if (a.syncObjectId) applyFreeze(a, a.syncObjectId);
+            if (a.syncObjectId) applyTerminal(a, a.syncObjectId);
         }
         for (const [id, ship] of game.multiplayer.remoteShips) {
-            applyFreeze(ship, id);
+            applyTerminal(ship, id);
         }
         if (game.ship && game.multiplayer.myShipObjectId) {
-            applyFreeze(game.ship, game.multiplayer.myShipObjectId);
+            applyTerminal(game.ship, game.multiplayer.myShipObjectId);
         }
-        // Drop anchors for objects that no longer exist so a later episode starts
-        // clean (objects can be deleted by their owner during the freeze).
-        if (freeze.bases.size > seen.size) {
-            for (const id of freeze.bases.keys()) {
-                if (!seen.has(id)) freeze.bases.delete(id);
+        if (deterministicTerminalState.transitions.size > seen.size) {
+            for (const id of deterministicTerminalState.transitions.keys()) {
+                if (!seen.has(id)) {
+                    deterministicTerminalState.transitions.delete(id);
+                    deterministicTerminalState.directTargetIds.delete(id);
+                }
             }
         }
     }
@@ -7652,8 +8106,8 @@
     // converge to it. Owned objects have no RemoteObjects snapshot and stay at
     // their locally frozen pose; because ObjectSync cadence/backpressure may
     // leave a final pose queued, a small owner-versus-observer difference can
-    // remain. Deterministic mode uses the different, continuity-first ballistic
-    // freeze above.
+    // remain. Deterministic mode instead uses persisted owner-authored targets
+    // and the finite-time convergence path above.
     //
     // CRUCIAL for the "GameState owner != object owner" case: the settle loop
     // ALSO keeps ingesting the owner's latest broadcast into RemoteObjects (see
@@ -7956,18 +8410,19 @@
                 updateGameStateFromSync();
             }
             
-            // Game over: once per local transition, queue a final state for every
-            // object we own. This reduces send-on-change server-state age; the
-            // ObjectSync comments describe coalescing/backpressure limits.
-            if (isGameOver()) {
-                if (!gameOverFlushed) {
-                    flushOwnedObjectsAtGameOver();
-                    gameOverFlushed = true;
-                }
-            } else {
-                gameOverFlushed = false;
-            }
-            
+            updateHUD();
+        }
+
+        // Terminal maintenance is deliberately outside the playing/waveDelay
+        // block. It keeps consuming target-bearing versions and ownership
+        // migrations even if a future GameState explicitly uses "gameover".
+        if (!frozenForReconnect && isSessionMode()
+            && isDeterministicMode() && isGameOver()) {
+            updateGameStateFromSync();
+            updateRemoteShips();
+            updateAstervoidsFromSync();
+            updateBulletsFromSync();
+            publishOwnedTerminalTargets();
             updateHUD();
         }
         
@@ -9408,7 +9863,10 @@
                         gameStarted: 'gs', wave: 'w', state: 'st', lives: 'lv',
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
-                        groupScore: 'gr', peakShipCount: 'pk'
+                        groupScore: 'gr', peakShipCount: 'pk',
+                        gameOverAt: 'go', terminalAt: 'ta',
+                        terminalEpoch: 'te', terminalX: 'tx',
+                        terminalY: 'ty', terminalAngle: 'tg'
                     }
                 });
                 
@@ -10210,7 +10668,10 @@
     let backgroundInterval = null;
     let hiddenTimestamp = null;
     document.addEventListener('visibilitychange', () => {
-        if (document.hidden && isSessionMode() && (game.state === 'playing' || game.state === 'waveDelay')) {
+        if (document.hidden && isSessionMode()
+            && (game.state === 'playing'
+                || game.state === 'waveDelay'
+                || isGameOver())) {
             hiddenTimestamp = Date.now();
             // Tab hidden during multiplayer - use setInterval as fallback
             if (!backgroundInterval) {
@@ -10224,6 +10685,20 @@
                     
                     // Tick ObjectSync for frame-count-based sends
                     ObjectSync.tick(elapsed / 1000);
+
+                    // The visible loop gates gameplay at zero lives. Mirror that
+                    // invariant here so a hidden tab cannot keep simulating,
+                    // colliding, or replacing objects after their terminal target
+                    // has been chosen.
+                    if (isGameOver()) {
+                        updateGameStateFromSync();
+                        updateRemoteShips();
+                        updateAstervoidsFromSync();
+                        updateBulletsFromSync();
+                        publishOwnedTerminalTargets();
+                        repositionDeadReckonedRemotes();
+                        return;
+                    }
                     
                     // Update local ship (spectators have no ship — naturally skipped)
                     if (game.ship) {

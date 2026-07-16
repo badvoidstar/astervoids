@@ -1177,8 +1177,10 @@ test('production join baseline reads runtime facts (joinSnapshot/ownerIsActive) 
     // ReplicationRuntime already computed, whether to seed a projected
     // baseline.
     let clockInitialized = true;
+    let terminal = false;
     const helper = loadJoinBaselineHelper({
         isDeterministicMode: () => true,
+        resolveTerminalSession: () => terminal ? { epoch: 1500, terminalAt: 2250 } : null,
         RemoteObjects: {
             isClockOffsetInitialized: () => clockInitialized,
             getClockSampleRtt: () => 100,
@@ -1202,6 +1204,11 @@ test('production join baseline reads runtime facts (joinSnapshot/ownerIsActive) 
     assert.equal(helper(moving, { joinSnapshot: false, ownerIsActive: true }), undefined);
     // Even on the join-snapshot version, an inactive owner must not seed.
     assert.equal(helper(moving, { joinSnapshot: true, ownerIsActive: false }), undefined);
+    terminal = true;
+    assert.equal(
+        helper(moving, { joinSnapshot: true, ownerIsActive: true }), undefined,
+        'an already-terminal snapshot must never be projected toward join time');
+    terminal = false;
 
     clockInitialized = false;
     const clockless = {
