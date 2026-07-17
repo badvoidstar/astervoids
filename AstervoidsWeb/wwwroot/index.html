@@ -9015,12 +9015,36 @@
     }
 
     function updatePickerConnectionStatus() {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+            setPickerStatus('Offline - Solo play only', 'error');
+            return;
+        }
+
+        if (sessionPicker.connectionState === 'reconnecting') {
+            setPickerStatus('Reconnecting...', 'connecting');
+            return;
+        }
+
+        const regionalAssessmentActive = sessionPicker.regionDiscoveryState === 'loading'
+            || (sessionPicker.regions?.length ?? 0) > 1;
+        if (!sessionPicker.currentSessionId && regionalAssessmentActive) {
+            const readiness = getRegionalCreateReadiness();
+            if (!readiness.assessmentsComplete) {
+                setPickerStatus('Connecting...', 'connecting');
+            } else if (readiness.hasAvailableRegion) {
+                setPickerStatus(
+                    `Connected - ${sessionPicker.sessions.length}/${sessionPicker.maxSessions} sessions`,
+                    'connected');
+            } else {
+                setPickerStatus('Regional servers unavailable', 'error');
+            }
+            return;
+        }
+
         if (sessionPicker.connectionState === 'connecting') {
             setPickerStatus('Connecting...', 'connecting');
-        } else if (sessionPicker.connectionState === 'reconnecting') {
-            setPickerStatus('Reconnecting...', 'connecting');
         } else if (sessionPicker.connectionState === 'offline') {
-            setPickerStatus('Offline - Solo play only', 'error');
+            setPickerStatus('Connection unavailable', 'error');
         } else if (!updateCurrentSessionStatus()) {
             setPickerStatus(`Connected - ${sessionPicker.sessions.length}/${sessionPicker.maxSessions} sessions`, 'connected');
         }
@@ -9918,7 +9942,10 @@
             }
         } catch (err) {
             _error('Session hub connection failed:', err);
-            setPickerConnectionState('offline');
+            setPickerConnectionState(
+                typeof navigator !== 'undefined' && navigator.onLine === false
+                    ? 'offline'
+                    : 'connecting');
             updatePickerConnectionStatus();
             updatePickerButtons();
         }
@@ -10575,7 +10602,10 @@
     });
 
     SessionClient.on('onDisconnected', (error) => {
-        setPickerConnectionState('offline');
+        setPickerConnectionState(
+            typeof navigator !== 'undefined' && navigator.onLine === false
+                ? 'offline'
+                : 'reconnecting');
         updatePickerButtons();
         // Stop the clock-sync loop until the transport reconnects. The loop's
         // try/catch tolerates ping failures, but a quiet stop keeps the event
@@ -10714,6 +10744,9 @@
             }, Math.random() * 500);
         }
     });
+
+    window.addEventListener('online', updatePickerConnectionStatus);
+    window.addEventListener('offline', updatePickerConnectionStatus);
 
     // Leave session on page unload
     window.addEventListener('beforeunload', () => {
@@ -10908,6 +10941,7 @@
         if (!window.RegionService) {
             sessionPicker.regionDiscoveryState = 'fallback';
             updatePickerButtons();
+            updatePickerConnectionStatus();
             return;
         }
         window.RegionService.on('rttUpdated', (regionId) => {
@@ -10925,6 +10959,7 @@
             }
             renderCreateRegionSelector();
             updatePickerButtons();
+            updatePickerConnectionStatus();
         });
         window.RegionService.on('coldStart', (regionId) => {
             _log('[RegionService] cold start:', regionId);
@@ -10937,6 +10972,7 @@
             renderCreateRegionSelector();
             renderSessionList();
             updatePickerButtons();
+            updatePickerConnectionStatus();
 
             // Phase 3: spin up the multi-region picker plumbing when N>1.
             // Single-region deployments use the legacy SignalR same-origin
@@ -10952,6 +10988,7 @@
             _warn('[RegionService] load failed (single-region fallback):', err);
             sessionPicker.regionDiscoveryState = 'fallback';
             updatePickerButtons();
+            updatePickerConnectionStatus();
         }
     }
 
