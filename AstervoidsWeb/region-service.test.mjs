@@ -11,7 +11,14 @@ const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const RegionService = require(resolve(here, 'wwwroot/js/region-service.js'));
 
-const { initialRttState, applyBurstSample, pickBestRegion } = RegionService._internals;
+const {
+    initialRttState,
+    unavailableRttState,
+    applyBurstSample,
+    pickBestRegion,
+    areRegionsAssessed,
+    isRttStateAvailable,
+} = RegionService._internals;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // initialRttState
@@ -26,6 +33,49 @@ describe('initialRttState', () => {
         assert.equal(s.sampleCount, 0);
         assert.equal(s.confidence, 0);
         assert.equal(s.lastSampleAt, null);
+    });
+});
+
+describe('regional assessment readiness', () => {
+    test('every region must leave warming, while unavailable concludes assessment', () => {
+        const measured = {
+            valueMs: 55,
+            confidence: 0.2,
+            sampleCount: 2,
+            lastSampleAt: 1700000000000,
+            state: 'measuring',
+        };
+        const states = new Map([
+            ['westus2', measured],
+            ['eastus', initialRttState()],
+        ]);
+
+        assert.equal(
+            areRegionsAssessed(states, ['westus2', 'eastus']),
+            false,
+            'one warming region must keep Create unavailable even when another has an RTT');
+
+        const unavailable = unavailableRttState(initialRttState(), 1700000005000);
+        states.set('eastus', unavailable);
+
+        assert.equal(
+            areRegionsAssessed(states, ['westus2', 'eastus']),
+            true,
+            'an all-failed assessment is conclusive and must not leave Create waiting forever');
+        assert.equal(isRttStateAvailable(unavailable), false,
+            'an unavailable region concludes assessment but must never be chosen for Create');
+        assert.equal(isRttStateAvailable(measured), true);
+    });
+
+    test('a later successful sample recovers an unavailable region', () => {
+        const unavailable = unavailableRttState(initialRttState(), 1700000000000);
+        const { next, coldStart } = applyBurstSample(unavailable, 1800, 1700000005000);
+
+        assert.equal(coldStart, false,
+            'a region that already failed assessment must not suppress its recovery sample as a cold start');
+        assert.equal(next.state, 'measuring');
+        assert.equal(next.valueMs, 1800);
+        assert.equal(isRttStateAvailable(next), true);
     });
 });
 
@@ -374,7 +424,11 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
             RegionService._configure({ BURST_STAGGER_MAX_MS: 0, BURST_INTERVAL_MS: 60_000 });
             await RegionService.load();
             const rttUpdates = [];
-            RegionService.on('rttUpdated', id => rttUpdates.push(id));
+            const bestAtUpdate = [];
+            RegionService.on('rttUpdated', id => {
+                rttUpdates.push(id);
+                bestAtUpdate.push(RegionService.bestRegion());
+            });
             RegionService.start();
             // Yield until burst completes: 3 pings, each awaiting one microtask cycle.
             await new Promise(resolve => setTimeout(resolve, 50));
@@ -384,6 +438,8 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
                 'after a successful bootstrap burst, region must leave warming so picker can recommend it');
             assert.equal(rtt.valueMs, 50, 'EMA seeded with the burst minimum (50ms)');
             assert.deepEqual(rttUpdates, ['r1'], 'rttUpdated emitted exactly once per burst');
+            assert.deepEqual(bestAtUpdate, ['r1'],
+                'the picker must receive the best-region recommendation with the first usable RTT update');
         } finally {
             RegionService.stop();
             restore();
@@ -416,6 +472,83 @@ describe('RegionService load + bootstrap burst (stubbed fetch)', () => {
             assert.equal(rtt.state, 'warming',
                 'cold-start sample must NOT advance state — region stays warming until a real sample arrives');
             assert.equal(rtt.valueMs, null, 'EMA must NOT be polluted by container start-up time');
+        } finally {
+            RegionService.stop();
+            restore();
+        }
+    });
+
+    test('an all-failed warming burst concludes as unavailable', async () => {
+        const restore = installFetchStub([
+            ['/api/regions', async () => ({
+                body: {
+                    regionId: 'r1',
+                    displayName: 'Region 1',
+                    regions: [{ id: 'r1', displayName: 'Region 1', hostname: 'https://r1.example.com' }],
+                },
+            })],
+            ['/api/ping', async () => ({
+                body: '',
+                ok: false,
+                status: 503,
+            })],
+        ]);
+        let unsubscribe;
+        try {
+            RegionService._configure({ BURST_STAGGER_MAX_MS: 0, BURST_INTERVAL_MS: 60_000 });
+            await RegionService.load();
+            const updates = [];
+            unsubscribe = RegionService.on('rttUpdated', id => updates.push(id));
+            RegionService.start();
+            await new Promise(resolve => setTimeout(resolve, 50));
+
+            const rtt = RegionService.getRtt('r1');
+            assert.equal(rtt.state, 'unavailable',
+                'a complete failed burst must conclude rather than leave the region warming forever');
+            assert.equal(rtt.valueMs, null);
+            assert.equal(RegionService.areAllRegionsAssessed(), true,
+                'an unavailable region is a completed assessment for picker gating');
+            assert.equal(RegionService.isRegionAvailable('r1'), false,
+                'the picker must not route Create to an unreachable region');
+            assert.deepEqual(updates, ['r1']);
+        } finally {
+            unsubscribe?.();
+            RegionService.stop();
+            restore();
+        }
+    });
+
+    test('a reachable warm-up followed by failed samples stays warming', async () => {
+        let pingCount = 0;
+        const restore = installFetchStub([
+            ['/api/regions', async () => ({
+                body: {
+                    regionId: 'r1',
+                    displayName: 'Region 1',
+                    regions: [{ id: 'r1', displayName: 'Region 1', hostname: 'https://r1.example.com' }],
+                },
+            })],
+            ['/api/ping', async () => {
+                pingCount++;
+                return pingCount === 1
+                    ? { body: '', delayMs: 50 }
+                    : { body: '', ok: false, status: 503 };
+            }],
+        ]);
+        try {
+            RegionService._configure({ BURST_STAGGER_MAX_MS: 0, BURST_INTERVAL_MS: 60_000 });
+            await RegionService.load();
+            RegionService.start();
+            await new Promise(resolve => setTimeout(resolve, 50));
+
+            assert.equal(pingCount, 3);
+            const rtt = RegionService.getRtt('r1');
+            assert.equal(rtt.state, 'warming',
+                'a successful discarded warm-up proves reachability, so later failed samples must not mark it unavailable');
+            assert.notEqual(rtt.lastSampleAt, null,
+                'the successful warm-up must prevent the next burst from discarding another first response');
+            assert.equal(RegionService.areAllRegionsAssessed(), false,
+                'Create must remain gated until a retained RTT or a fully failed burst concludes the assessment');
         } finally {
             RegionService.stop();
             restore();

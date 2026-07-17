@@ -1080,5 +1080,5 @@ test('inline async systems are generation-scoped in production source', () => {
     assert.match(source, /startGameOperation === operation\s*&& isGameStartContextCurrent\(context\)/);
     assert.match(source, /await init\(isCurrent\)/);
     assert.match(source, /await spawnWave\(isCurrentStart\)/);
-    assert.match(source, /connectToSessionHub\(true, reconnectHubHostname\)/);
+    assert.match(source, /connectToSessionHub\(true, reconnectHubHostname, false\)/);
 });

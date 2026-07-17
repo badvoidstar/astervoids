@@ -282,6 +282,10 @@
             color: #ffff00;
         }
 
+        #session-picker .picker-status.connected {
+            color: #6fce6f;
+        }
+
         #session-list {
             width: 100%;
             max-height: 150px;
@@ -387,6 +391,7 @@
         .session-item .session-ping.ok     { color: #d5d557; }
         .session-item .session-ping.bad    { color: #ff6464; }
         .session-item .session-ping.warming { color: #888; font-style: italic; }
+        .session-item .session-ping.unavailable { color: #ff6464; font-style: italic; }
         .session-stale {
             display: inline-block;
             margin-left: 4px;
@@ -8987,10 +8992,12 @@
         maxSessions: 6,
         canCreate: false,
         connected: false,
+        connectionState: 'connecting',
         // Regional state (Phase 1 region awareness). selectedCreateRegion is sticky
         // within a picker session — once the user explicitly chooses a region from
         // the dropdown, subsequent bestRegion() changes don't override it.
         regions: [],
+        regionDiscoveryState: 'loading',
         rttByRegion: {},
         selectedCreateRegion: null,
         userOverrodeCreateRegion: false
@@ -9000,6 +9007,23 @@
     function setPickerStatus(message, type = '') {
         sessionPicker.statusEl.textContent = message;
         sessionPicker.statusEl.className = 'picker-status' + (type ? ' ' + type : '');
+    }
+
+    function setPickerConnectionState(state) {
+        sessionPicker.connectionState = state;
+        sessionPicker.connected = state === 'connected';
+    }
+
+    function updatePickerConnectionStatus() {
+        if (sessionPicker.connectionState === 'connecting') {
+            setPickerStatus('Connecting...', 'connecting');
+        } else if (sessionPicker.connectionState === 'reconnecting') {
+            setPickerStatus('Reconnecting...', 'connecting');
+        } else if (sessionPicker.connectionState === 'offline') {
+            setPickerStatus('Offline - Solo play only', 'error');
+        } else if (!updateCurrentSessionStatus()) {
+            setPickerStatus(`Connected - ${sessionPicker.sessions.length}/${sessionPicker.maxSessions} sessions`, 'connected');
+        }
     }
 
     function updateCurrentSessionStatus() {
@@ -9032,6 +9056,7 @@
     // for SchemaCodec in ObjectSync init.
 
     function rttClassFor(state, valueMs) {
+        if (state === 'unavailable') return 'unavailable';
         if (state === 'warming' || valueMs == null) return 'warming';
         if (valueMs < 80) return 'good';
         if (valueMs < 200) return 'ok';
@@ -9064,6 +9089,32 @@
         return sessionPicker.rttByRegion[regionId] ?? { state: 'warming', valueMs: null, confidence: 0 };
     }
 
+    function getRegionalCreateReadiness() {
+        if (sessionPicker.regionDiscoveryState === 'loading') {
+            return { assessmentsComplete: false, hasAvailableRegion: false };
+        }
+        if (sessionPicker.regions.length === 0) {
+            return { assessmentsComplete: true, hasAvailableRegion: true };
+        }
+        if (!window.RegionService
+            || typeof window.RegionService.areAllRegionsAssessed !== 'function'
+            || typeof window.RegionService.isRegionAvailable !== 'function') {
+            return { assessmentsComplete: false, hasAvailableRegion: false };
+        }
+        return {
+            assessmentsComplete: window.RegionService.areAllRegionsAssessed(),
+            hasAvailableRegion: sessionPicker.regions.some(
+                region => window.RegionService.isRegionAvailable(region.id)),
+        };
+    }
+
+    function isCreateRegionAvailable(regionId) {
+        return !!regionId
+            && !!window.RegionService
+            && typeof window.RegionService.isRegionAvailable === 'function'
+            && window.RegionService.isRegionAvailable(regionId);
+    }
+
     // Render session list
     function renderSessionList() {
         const { listEl, sessions, currentSessionId } = sessionPicker;
@@ -9079,8 +9130,8 @@
         const sortedSessions = sessions.slice().sort((a, b) => {
             const pa = pingForRegion(a.regionId);
             const pb = pingForRegion(b.regionId);
-            const aWarm = pa.state === 'warming' || pa.valueMs == null;
-            const bWarm = pb.state === 'warming' || pb.valueMs == null;
+            const aWarm = pa.state === 'warming' || pa.state === 'unavailable' || pa.valueMs == null;
+            const bWarm = pb.state === 'warming' || pb.state === 'unavailable' || pb.valueMs == null;
             if (aWarm !== bWarm) return aWarm ? 1 : -1;
             if (aWarm && bWarm) return 0;
             return (pa.valueMs - pb.valueMs) || (pb.confidence - pa.confidence);
@@ -9101,12 +9152,16 @@
 
             const ping = pingForRegion(session.regionId);
             const pingClass = rttClassFor(ping.state, ping.valueMs);
-            const pingText = ping.state === 'warming' || ping.valueMs == null
-                ? '🔥 Warming…'
-                : `${Math.round(ping.valueMs)} ms`;
-            const pingTitle = ping.state === 'warming'
-                ? 'Server is starting up — first measurement coming shortly.'
-                : `Round-trip time to ${regionDisplayName(session.regionId)} (confidence ${(ping.confidence * 100).toFixed(0)}%)`;
+            const pingText = ping.state === 'unavailable'
+                ? '⚠ Unavailable'
+                : ping.state === 'warming' || ping.valueMs == null
+                    ? '🔥 Warming…'
+                    : `${Math.round(ping.valueMs)} ms`;
+            const pingTitle = ping.state === 'unavailable'
+                ? `${regionDisplayName(session.regionId)} could not be reached during assessment.`
+                : ping.state === 'warming'
+                    ? 'Server is starting up — first measurement coming shortly.'
+                    : `Round-trip time to ${regionDisplayName(session.regionId)} (confidence ${(ping.confidence * 100).toFixed(0)}%)`;
             // Stale-region indicator: spectator WebSocket has been in Reconnecting
             // state for >10s. Sessions in that region may have grown/shrunk without
             // the picker hearing about it — the REST 30s repoll covers eventual
@@ -9136,13 +9191,22 @@
     function updatePingCellsForRegion(regionId) {
         const ping = pingForRegion(regionId);
         const pingClass = rttClassFor(ping.state, ping.valueMs);
-        const pingText = ping.state === 'warming' || ping.valueMs == null
-            ? '🔥 Warming…'
-            : `${Math.round(ping.valueMs)} ms`;
+        const pingText = ping.state === 'unavailable'
+            ? '⚠ Unavailable'
+            : ping.state === 'warming' || ping.valueMs == null
+                ? '🔥 Warming…'
+                : `${Math.round(ping.valueMs)} ms`;
+        const pingTitle = ping.state === 'unavailable'
+            ? `${regionDisplayName(regionId)} could not be reached during assessment.`
+            : ping.state === 'warming'
+                ? 'Server is starting up — first measurement coming shortly.'
+                : `Round-trip time to ${regionDisplayName(regionId)} (confidence ${(ping.confidence * 100).toFixed(0)}%)`;
         const items = sessionPicker.listEl.querySelectorAll(`.session-item[data-region-id="${regionId}"] .session-ping`);
         items.forEach(el => {
             el.className = `session-ping ${pingClass}`;
             el.innerHTML = `${pingText}${renderConfidenceBar(ping.confidence)}`;
+            el.title = pingTitle;
+            el.setAttribute('aria-label', pingTitle);
         });
     }
 
@@ -9170,26 +9234,41 @@
             return;
         }
         row.style.display = '';
-        const desired = sessionPicker.selectedCreateRegion
-            || (window.RegionService && window.RegionService.bestRegion())
-            || regions[0].id;
+        const readiness = getRegionalCreateReadiness();
         const bestId = (window.RegionService && window.RegionService.bestRegion()) || null;
+        const desired = isCreateRegionAvailable(sessionPicker.selectedCreateRegion)
+            ? sessionPicker.selectedCreateRegion
+            : (isCreateRegionAvailable(bestId) ? bestId : null);
         // Rebuild options only when the region list or RTTs changed enough to
         // matter. The text format must include live RTT so touch users can
         // see latency INSIDE the native sheet (no hover tooltip available).
         sel.innerHTML = '';
+        if (!desired) {
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.disabled = true;
+            placeholder.selected = true;
+            placeholder.textContent = readiness.assessmentsComplete
+                ? 'No assessed region is available'
+                : 'Assessing regions...';
+            sel.appendChild(placeholder);
+        }
         for (const r of regions) {
             const opt = document.createElement('option');
             opt.value = r.id;
             const ping = pingForRegion(r.id);
-            const rttText = ping.state === 'warming' || ping.valueMs == null
-                ? 'warming…'
-                : `${Math.round(ping.valueMs)} ms`;
+            const rttText = ping.state === 'unavailable'
+                ? 'unavailable'
+                : ping.state === 'warming' || ping.valueMs == null
+                    ? 'warming...'
+                    : `${Math.round(ping.valueMs)} ms`;
             const bestTag = r.id === bestId ? ' ★ best ★' : '';
             opt.textContent = `${r.displayName} · ${rttText}${bestTag}`;
+            opt.disabled = ping.state === 'unavailable';
             if (r.id === desired) opt.selected = true;
             sel.appendChild(opt);
         }
+        sel.disabled = !readiness.assessmentsComplete || !readiness.hasAvailableRegion;
         // Only attach the change handler once.
         if (!sel.dataset.bound) {
             sel.dataset.bound = '1';
@@ -9200,20 +9279,17 @@
             });
         }
         sessionPicker.selectedCreateRegion = desired;
+        if (!desired) sessionPicker.userOverrodeCreateRegion = false;
     }
 
     function getCreateRegionId() {
-        // Phase 1: Region service may not have loaded, or the manifest may have
-        // only one entry. Fall back to a stable string so SessionClient can
-        // route the SignalR connect appropriately when Phase 3 ships.
-        if (sessionPicker.selectedCreateRegion) return sessionPicker.selectedCreateRegion;
-        if (window.RegionService) {
-            const best = window.RegionService.bestRegion();
-            if (best) return best;
-            const local = window.RegionService.getLocalRegionId();
-            if (local) return local;
+        if (isCreateRegionAvailable(sessionPicker.selectedCreateRegion)) {
+            return sessionPicker.selectedCreateRegion;
         }
-        return null;
+        const best = window.RegionService && window.RegionService.bestRegion
+            ? window.RegionService.bestRegion()
+            : null;
+        return isCreateRegionAvailable(best) ? best : null;
     }
 
     function getCreateRegionDisplayName(regionId) {
@@ -9247,22 +9323,26 @@
             // Not in a session - show Create. Label includes destination region
             // so the user knows where their session will land BEFORE they click
             // (essential on touch where hover tooltips don't exist).
-            const regionId = getCreateRegionId();
-            const regionName = getCreateRegionDisplayName(regionId);
+            const createEligibility = getCreateEligibility();
+            const regionName = getCreateRegionDisplayName(createEligibility.regionId);
             const multiRegion = sessionPicker.regions.length > 1;
-            // Static-apex mode has no same-origin /sessionHub, so the initial
-            // SessionClient.connect() can be offline while Create is still fully
-            // functional via explicit region-targeted connect in handleCreateSession().
-            const canCreateNow = canCreate && (multiRegion ? !!getCreateRegionHostname() : connected);
             btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
                 ? `Create in ${regionName}`
                 : 'Create';
-            btnLeaveCreate.disabled = !canCreateNow;
+            btnLeaveCreate.disabled = !createEligibility.canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
             if (!canCreate) {
                 btnLeaveCreate.title = 'Maximum sessions reached';
-            } else if (!canCreateNow && multiRegion) {
+            } else if (!createEligibility.assessmentsComplete) {
+                btnLeaveCreate.title = 'Assessing performance for every region';
+            } else if (!createEligibility.hasAvailableRegion) {
+                btnLeaveCreate.title = 'No assessed region is available';
+            } else if (!createEligibility.canCreateNow && multiRegion) {
                 btnLeaveCreate.title = 'Waiting for region routing information';
+            } else if (!createEligibility.canCreateNow) {
+                btnLeaveCreate.title = connected
+                    ? 'Waiting for region routing information'
+                    : 'Connecting to server';
             } else if (regionName && sessionPicker.regions.length > 1) {
                 btnLeaveCreate.title = `Create a new session hosted in ${regionName}`;
             } else {
@@ -9335,10 +9415,7 @@
         renderSessionList();
         updatePickerButtons();
         
-        // Update status based on current state
-        if (!updateCurrentSessionStatus()) {
-            setPickerStatus(`${sessionPicker.sessions.length}/${sessionPicker.maxSessions} sessions`);
-        }
+        updatePickerConnectionStatus();
     }
 
     // ── Multi-region session aggregation ────────────────────────────────────
@@ -9555,8 +9632,10 @@
     }
 
     // Connect to session hub
-    async function connectToSessionHub(force = false, hubHostname = '') {
-        setPickerStatus('Connecting...', 'connecting');
+    async function connectToSessionHub(force = false, hubHostname = '', refreshSessions = true) {
+        setPickerConnectionState('connecting');
+        updatePickerConnectionStatus();
+        updatePickerButtons();
 
         try {
             // Forced reconnects can replace the HubConnection without firing
@@ -9823,20 +9902,24 @@
                     }
                 });
                 
-                sessionPicker.connected = true;
+                setPickerConnectionState('connected');
+                updatePickerButtons();
                 // Start the NTP-style clock-offset estimator now that the
                 // hub is reachable. Idempotent — visibility-driven re-bootstraps
                 // happen automatically inside the loop.
                 RemoteObjects.startClockSync();
-                await refreshSessionList();
+                if (refreshSessions) {
+                    updatePickerConnectionStatus();
+                    await refreshSessionList();
+                }
                 // No polling - we rely on SignalR push notifications
             } else {
                 throw new Error('Connection failed');
             }
         } catch (err) {
             _error('Session hub connection failed:', err);
-            setPickerStatus('Offline - Solo play only', 'error');
-            sessionPicker.connected = false;
+            setPickerConnectionState('offline');
+            updatePickerConnectionStatus();
             updatePickerButtons();
         }
     }
@@ -9868,7 +9951,8 @@
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
                 if (targetHostname) {
-                    await connectToSessionHub(true, targetHostname);
+                    await connectToSessionHub(true, targetHostname, false);
+                    setPickerStatus('Joining...', 'connecting');
                 }
             }
 
@@ -9916,6 +10000,17 @@
 
     // Handle create session - creates and enters lobby
     async function handleCreateSession() {
+        const createEligibility = getCreateEligibility();
+        if (!createEligibility.canCreateNow) {
+            updatePickerButtons();
+            if (!createEligibility.assessmentsComplete) {
+                setPickerStatus('Assessing regional performance...', 'connecting');
+            } else if (!createEligibility.hasAvailableRegion) {
+                setPickerStatus('No assessed region is available', 'error');
+            }
+            return;
+        }
+
         setPickerStatus('Creating...', 'connecting');
         sessionPicker.btnLeaveCreate.disabled = true;
 
@@ -9934,7 +10029,8 @@
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
                 if (targetHostname) {
-                    await connectToSessionHub(true, targetHostname);
+                    await connectToSessionHub(true, targetHostname, false);
+                    setPickerStatus('Creating...', 'connecting');
                 }
             }
 
@@ -10337,7 +10433,7 @@
                     // WebSocket is dead. Forcing ensures ObjectSync.init() is called
                     // on the new connection and cancels any stale auto-reconnect.
                     setPickerStatus(`Reconnecting... (connecting)`, 'error');
-                    await connectToSessionHub(true, reconnectHubHostname);
+                    await connectToSessionHub(true, reconnectHubHostname, false);
                     if (!SessionClient.isConnected()) {
                         _warn('[Rejoin] Connect failed on attempt', attempt + 1);
                         setPickerStatus(`Reconnecting... (connect failed)`, 'error');
@@ -10388,7 +10484,7 @@
                         sessionPicker.gameStarted = (result.session.objects || []).some(
                             obj => obj.data?.type === OBJECT_TYPES.GAME_STATE
                         );
-                        sessionPicker.connected = true;
+                        setPickerConnectionState('connected');
                         updateCurrentSessionStatus();
                         resizeCanvas(true);
 
@@ -10437,6 +10533,9 @@
     // Freeze gameplay when SignalR enters reconnecting state
     SessionClient.on('onReconnecting', (error) => {
         RemoteObjects.stopClockSync();
+        setPickerConnectionState('reconnecting');
+        updatePickerButtons();
+        setPickerStatus('Reconnecting...', 'connecting');
         if (isSessionMode() && (game.state === 'playing' || game.state === 'waveDelay')) {
             game.connectionLost = true;
             reconnectingOverlay.classList.add('visible');
@@ -10449,6 +10548,7 @@
 
     // Clear connection-lost state when SignalR reconnects (or initial connect)
     SessionClient.on('onConnected', () => {
+        const wasReconnecting = sessionPicker.connectionState === 'reconnecting';
         if (game.connectionLost && SessionClient.isInSession() && !ObjectSync.isReconciling()
             && !rejoinInProgress) {
             // Only unfreeze here for SignalR auto-reconnect (member still in session)
@@ -10460,15 +10560,23 @@
             game.lastFrameTime = 0; // Reset to prevent delta time jump
             reconnectingOverlay.classList.remove('visible');
         }
-        sessionPicker.connected = true;
+        setPickerConnectionState('connected');
+        updatePickerButtons();
         // Restart clock-sync after auto-reconnect (idempotent if already running).
         // Pings issued while the transport was down would have failed; the loop's
         // try/catch absorbed them, but the offset estimate may be stale.
         RemoteObjects.startClockSync();
+        if (wasReconnecting) {
+            updatePickerConnectionStatus();
+            if (!sessionPicker.currentSessionId) {
+                refreshSessionList().catch(err => _warn('[Picker] Failed to refresh after reconnect:', err));
+            }
+        }
     });
 
     SessionClient.on('onDisconnected', (error) => {
-        sessionPicker.connected = false;
+        setPickerConnectionState('offline');
+        updatePickerButtons();
         // Stop the clock-sync loop until the transport reconnects. The loop's
         // try/catch tolerates ping failures, but a quiet stop keeps the event
         // loop unloaded during the disconnected window.
@@ -10483,6 +10591,8 @@
         sessionPicker.currentSessionId = null;
         sessionPicker.isServer = false;
         sessionPicker.gameStarted = false;
+        updatePickerButtons();
+        updatePickerConnectionStatus();
         
         // Ensure gameplay is frozen if still in a playing state
         if (lostSessionId && (game.state === 'playing' || game.state === 'waveDelay')) {
@@ -10502,7 +10612,6 @@
             game.state = 'start';
             game.mode = 'solo';
             game.sessionInfo = null;
-            setPickerStatus('Disconnected - reconnecting...', 'error');
             // Try to reconnect after a delay
             setTimeout(connectToSessionHub, 2000);
         }
@@ -10796,12 +10905,21 @@
     // picker simply shows no region/ping cells. We bind the rttUpdated/coldStart
     // listeners BEFORE awaiting load() so even synchronous emissions are caught.
     async function initRegionService() {
-        if (!window.RegionService) return;
+        if (!window.RegionService) {
+            sessionPicker.regionDiscoveryState = 'fallback';
+            updatePickerButtons();
+            return;
+        }
         window.RegionService.on('rttUpdated', (regionId) => {
             updatePingCellsForRegion(regionId);
             renderRegionBanner();
             // Best-region may have flipped; refresh the create row + button label
             // so the user sees the new default immediately.
+            if (sessionPicker.selectedCreateRegion
+                && !isCreateRegionAvailable(sessionPicker.selectedCreateRegion)) {
+                sessionPicker.selectedCreateRegion = null;
+                sessionPicker.userOverrodeCreateRegion = false;
+            }
             if (!sessionPicker.userOverrodeCreateRegion) {
                 sessionPicker.selectedCreateRegion = null; // let getCreateRegionId() recompute
             }
@@ -10814,6 +10932,7 @@
         });
         window.RegionService.on('regionsLoaded', async ({ regions }) => {
             sessionPicker.regions = regions;
+            sessionPicker.regionDiscoveryState = 'loaded';
             renderRegionBanner();
             renderCreateRegionSelector();
             renderSessionList();
@@ -10831,6 +10950,8 @@
             window.RegionService.start();
         } catch (err) {
             _warn('[RegionService] load failed (single-region fallback):', err);
+            sessionPicker.regionDiscoveryState = 'fallback';
+            updatePickerButtons();
         }
     }
 
@@ -10992,6 +11113,25 @@
         const regionId = getCreateRegionId();
         const r = regions.find(x => x.id === regionId);
         return r ? r.hostname : '';
+    }
+
+    function getCreateEligibility() {
+        const readiness = getRegionalCreateReadiness();
+        const regionId = getCreateRegionId();
+        const regions = sessionPicker.regions;
+        const hasRoute = regions.length === 0
+            ? sessionPicker.connected
+            : regions.length === 1
+                ? sessionPicker.connected && !!regionId
+                : !!getCreateRegionHostname();
+        return {
+            ...readiness,
+            regionId,
+            canCreateNow: sessionPicker.canCreate
+                && readiness.assessmentsComplete
+                && readiness.hasAvailableRegion
+                && hasRoute,
+        };
     }
 
     function getRegionHostnameById(regionId) {
