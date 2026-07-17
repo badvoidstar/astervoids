@@ -358,6 +358,208 @@ const ReplicationPresentation = (function () {
         };
     }
 
+    /**
+     * Build a scalar quintic trajectory with continuous position, velocity,
+     * and acceleration at both ends. Velocities are expressed per millisecond.
+     */
+    function createMinimumJerkTransition({
+        start,
+        target,
+        startVelocity = 0,
+        targetVelocity = 0,
+        startAcceleration = 0,
+        targetAcceleration = 0,
+        startTime,
+        endTime
+    }) {
+        for (const [name, value] of Object.entries({
+            start,
+            target,
+            startVelocity,
+            targetVelocity,
+            startAcceleration,
+            targetAcceleration,
+            startTime,
+            endTime
+        })) {
+            if (!Number.isFinite(value)) {
+                throw new TypeError(`${name} must be finite`);
+            }
+        }
+        if (!(endTime > startTime)) {
+            throw new RangeError('endTime must be greater than startTime');
+        }
+
+        const duration = endTime - startTime;
+        const duration2 = duration * duration;
+        const delta = target - start;
+        const c0 = start;
+        const c1 = startVelocity * duration;
+        const c2 = startAcceleration * duration2 / 2;
+        const c3 = 10 * delta
+            - (6 * startVelocity + 4 * targetVelocity) * duration
+            - (1.5 * startAcceleration - 0.5 * targetAcceleration) * duration2;
+        const c4 = -15 * delta
+            + (8 * startVelocity + 7 * targetVelocity) * duration
+            + (1.5 * startAcceleration - targetAcceleration) * duration2;
+        const c5 = 6 * delta
+            - 3 * (startVelocity + targetVelocity) * duration
+            - 0.5 * (startAcceleration - targetAcceleration) * duration2;
+
+        return Object.freeze({
+            startTime,
+            endTime,
+            duration,
+            target,
+            targetVelocity,
+            targetAcceleration,
+            coefficients: Object.freeze([c0, c1, c2, c3, c4, c5])
+        });
+    }
+
+    function sampleMinimumJerkTransition(transition, now) {
+        if (!transition || !Array.isArray(transition.coefficients)) {
+            throw new TypeError('transition is required');
+        }
+        if (!Number.isFinite(now)) throw new TypeError('now must be finite');
+        const [c0, c1, c2, c3, c4, c5] = transition.coefficients;
+        if (now <= transition.startTime) {
+            return Object.freeze({
+                value: c0,
+                velocity: c1 / transition.duration,
+                acceleration: 2 * c2 / (transition.duration * transition.duration),
+                done: false
+            });
+        }
+        if (now >= transition.endTime) {
+            return Object.freeze({
+                value: transition.target,
+                velocity: transition.targetVelocity,
+                acceleration: transition.targetAcceleration,
+                done: true
+            });
+        }
+
+        const s = (now - transition.startTime) / transition.duration;
+        const s2 = s * s;
+        const s3 = s2 * s;
+        const s4 = s3 * s;
+        const value = c0 + c1 * s + c2 * s2 + c3 * s3 + c4 * s4 + c5 * s4 * s;
+        const velocity = (c1
+            + 2 * c2 * s
+            + 3 * c3 * s2
+            + 4 * c4 * s3
+            + 5 * c5 * s4) / transition.duration;
+        const acceleration = (2 * c2
+            + 6 * c3 * s
+            + 12 * c4 * s2
+            + 20 * c5 * s3)
+            / (transition.duration * transition.duration);
+        return Object.freeze({ value, velocity, acceleration, done: false });
+    }
+
+    /**
+     * Select a congruent target on a wrapping axis. When already moving, keep
+     * the target far enough in that direction for the zero-end-velocity
+     * quintic to remain monotone (the scalar threshold is 0.4 * v * duration).
+     */
+    function unwrapConvergenceTarget({
+        start,
+        target,
+        span,
+        velocity = 0,
+        duration = 0,
+        minimumTravelRatio = 0.4
+    }) {
+        for (const [name, value] of Object.entries({
+            start,
+            target,
+            span,
+            velocity,
+            duration,
+            minimumTravelRatio
+        })) {
+            if (!Number.isFinite(value)) {
+                throw new TypeError(`${name} must be finite`);
+            }
+        }
+        if (!(span > 0)) throw new RangeError('span must be greater than zero');
+        if (duration < 0) throw new RangeError('duration cannot be negative');
+        if (minimumTravelRatio < 0) {
+            throw new RangeError('minimumTravelRatio cannot be negative');
+        }
+
+        let delta = target - start;
+        delta -= Math.round(delta / span) * span;
+        if (Math.abs(velocity) <= 1e-12 || duration === 0) {
+            return start + delta;
+        }
+
+        const direction = Math.sign(velocity);
+        const minimumTravel = minimumTravelRatio * Math.abs(velocity) * duration;
+        const directedTravel = direction * delta;
+        if (directedTravel < minimumTravel) {
+            const wraps = Math.ceil((minimumTravel - directedTravel) / span);
+            delta += direction * wraps * span;
+        }
+        return start + delta;
+    }
+
+    /**
+     * Build a wrapped terminal transition. In a degraded late-settle path,
+     * discard incoming derivatives only when preserving their direction would
+     * select an additional full winding over the nearest equivalent target.
+     */
+    function createWrappedConvergenceTransition({
+        start,
+        target,
+        span,
+        startVelocity = 0,
+        startAcceleration = 0,
+        startTime,
+        endTime,
+        relaxExtraWinding = false
+    }) {
+        const duration = endTime - startTime;
+        let selectedTarget = unwrapConvergenceTarget({
+            start,
+            target,
+            span,
+            velocity: startVelocity,
+            duration
+        });
+        let effectiveVelocity = startVelocity;
+        let effectiveAcceleration = startAcceleration;
+        let relaxed = false;
+
+        if (relaxExtraWinding) {
+            const nearestTarget = unwrapConvergenceTarget({
+                start,
+                target,
+                span
+            });
+            if (Math.abs(selectedTarget - nearestTarget) > span / 2) {
+                selectedTarget = nearestTarget;
+                effectiveVelocity = 0;
+                effectiveAcceleration = 0;
+                relaxed = true;
+            }
+        }
+
+        return Object.freeze({
+            target: selectedTarget,
+            relaxed,
+            transition: createMinimumJerkTransition({
+                start,
+                target: selectedTarget,
+                startVelocity: effectiveVelocity,
+                startAcceleration: effectiveAcceleration,
+                startTime,
+                endTime
+            })
+        });
+    }
+
     function interpolateHermiteAngle(options) {
         const previousAngle = options.previousAngle;
         const currentAngle = options.currentAngle;
@@ -619,6 +821,10 @@ const ReplicationPresentation = (function () {
         createMemberDelay,
         findSnapshotBracket,
         hermiteBasis,
+        createMinimumJerkTransition,
+        createWrappedConvergenceTransition,
+        sampleMinimumJerkTransition,
+        unwrapConvergenceTarget,
         interpolateHermiteAngle,
         recomputeAdaptiveDelay
     };

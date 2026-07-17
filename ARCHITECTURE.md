@@ -46,7 +46,7 @@ graph TB
     GAME["index.html<br/>Game loop · Rendering · Input · Gameplay rules"]
     RR["ReplicationRuntime  (replication-runtime.js)<br/>Replica lifecycle · Version consumption<br/>Join markers · Ownership transitions"]
     POL["Replication policies<br/>replication-clock.js · replication-presentation.js<br/>replication-send-policy.js"]
-    OS["ObjectSync  (object-sync.js)<br/>Object registry · Delta encoding · Batched flush<br/>Per-member sequencing · Reconciliation · Field-name compression"]
+    OS["ObjectSync  (object-sync.js)<br/>Object registry · Delta encoding · Batched flush<br/>Per-member sequencing · Reconciliation · Schema dispatch"]
     SC["SessionClient  (session-client.js)<br/>SignalR lifecycle · Hub RPC wrappers<br/>Stale-connection guard() · GUID normalization"]
     GU["GuidUtils  (guid-utils.js)<br/>bytesToGuid · transformBinaryGuids"]
     HUB["/sessionHub<br/>ASP.NET Core SignalR — MessagePack"]
@@ -274,6 +274,7 @@ These methods have no corresponding hub RPC.
 | `getObjectByType(type)` | O(1) singleton lookup (e.g. `GameState`) via `typeIndex` |
 | `getObjectCount()` | Returns the number of locally tracked objects |
 | `getReconciliationCount()` | Returns the number of completed reconciliations in this session |
+| `isDataConfirmed(id, data)` | Shallow-checks fields against the latest server-confirmed response or authoritative snapshot |
 | `getSendRate()` | Returns the current effective send rate in Hz (`round(1 / nominalFrameTime)`) |
 | `isReconciling()` | `true` while a `GetSessionState` reconciliation round-trip is in progress |
 
@@ -349,10 +350,16 @@ Cross-reference: [SignalR Reconnection & Reconciliation](#signalr-reconnection--
 
 `ObjectSync.compressData` / `expandData` apply the configured `fieldMap` exactly at the wire boundary:
 
-- **Before send**: after delta computation, field names are compressed (e.g. `velocityX` → `vx`).
-- **After receive**: field names are expanded before dispatch to game callbacks.
+- **Schema 0 and object events**: after delta computation, field names are
+  compressed (for example, `velocityX` → `vx`) before MessagePack map
+  encoding, then expanded after decoding.
+- **Positional schemas**: readable names are used only to select slots locally;
+  no field names are transmitted, so applying `fieldMap` would be both
+  redundant and incorrect.
 
-Game logic always uses readable field names. An empty `fieldMap` (the default) means pass-through — compression is purely opt-in via `configure({ fieldMap: { ... } })`.
+Game logic always uses readable field names. An empty `fieldMap` (the default)
+means pass-through; map-key compression is opt-in via
+`configure({ fieldMap: { ... } })`.
 
 ---
 
@@ -1036,6 +1043,52 @@ Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
 each object's last accepted operation timestamp. Those timestamps can still be
 older/newer than the exact underlying pose time because update writes coalesce.
 
+## Deterministic Terminal Convergence
+
+Deterministic sessions persist a canonical end pose instead of freezing each
+member at its latency-dependent displayed pose:
+
+1. The GameState owner stamps immutable `gameOverAt` and `terminalAt` values
+   when shared lives first reach zero.
+2. Each ship, asteroid, and bullet owner projects its authoritative object to
+   `terminalAt` and writes `terminalEpoch`, `terminalX`, `terminalY`, and, when
+   applicable, `terminalAngle` onto that same object record.
+3. Existing members start from the exact transform rendered on their preceding
+   frame and use a quintic trajectory that preserves position, velocity, and
+   acceleration while reaching the persisted target at rest.
+4. A member joining an already-terminal session creates no ship and seeds
+   replicas directly at persisted targets. Target-less snapshot or late-create
+   records remain hidden until their target-bearing version arrives.
+
+Terminal writes retry until `ObjectSync` reports their fields in a
+server-confirmed response; this works whether delta encoding is enabled or not.
+A failed write or ownership race therefore remains eligible without creating
+ongoing wire traffic. Member-scoped ships and bullets
+still disappear when their owner leaves. Session-scoped asteroids retain the
+target through migration; if migration happens before any target was accepted,
+the new owner derives a stable bounded target from the canonical record.
+Create, replace, delete, migration, reconciliation, and hidden-tab paths keep
+running terminal maintenance after gameplay physics and collisions stop.
+
+The target fields remain opaque replicated data below the Astervoids adapter:
+`ReplicationRuntime`, `ObjectSync`, SignalR, and the backend do not interpret
+kinematics. Each known object type has one superset positional schema containing
+both its live and terminal fields. This is essential because the server retains
+an object's creation schema when it re-encodes later updates and join snapshots.
+Optional presence bits keep mode-specific and terminal fields absent from the
+body until needed.
+
+If a target arrives too late to use the shared `terminalAt` without a visible
+discontinuity, that member uses a short local settle window. Exact eventual pose
+and continuous motion take precedence over pretending it stopped at a time that
+has already passed. Within that degraded path, each position/angle axis normally
+retains its incoming derivatives; if doing so would add a complete toroidal
+winding, only that axis switches to the nearest equivalent target and drops its
+presentation velocity/acceleration. This prevents a late asteroid from crossing
+the whole screen—or a ship/asteroid from making a full extra turn—just to stop at
+an equivalent pose. Legacy adaptive-delay sessions retain their existing
+authoritative-snapshot settle behavior and do not wait for terminal targets.
+
 ## Ring Buffer Interpolation
 
 ```mermaid
@@ -1291,9 +1344,9 @@ flowchart TB
 flowchart TB
     subgraph "SignalR transport (binary MessagePack)"
         direction TB
-        MP["AddMessagePackProtocol with CompositeResolver:<br/>• BinaryGuidResolver (16-byte binary GUIDs<br/>  via BinaryGuidFormatter / NullableGuidFormatter)<br/>• ContractlessStandardResolver (DTOs + collections)<br/>• MessagePackSecurity.UntrustedData<br/>~25-30% smaller payloads vs JSON;<br/>~19 bytes saved per GUID over the wire."]
-        DTO["Hub DTOs (HubDtos.cs) annotated with<br/>[MessagePackObject] + [Key('camelCaseName')]<br/>so the JS contract is preserved (camelCase names)."]
-        JSGUID["JS client transforms binary GUIDs to strings<br/>at the boundary via GuidUtils.transformBinaryGuids<br/>(applied to handler args + invokeHub responses).<br/>See: Client Architecture — Dependency Invariants."]
+        MP["AddMessagePackProtocol with CompositeResolver:<br/>• BinaryGuidResolver (16-byte binary GUIDs)<br/>• annotated positional DTOs<br/>• ContractlessStandardResolver for outer response records<br/>• MessagePackSecurity.UntrustedData"]
+        DTO["Hot object DTOs are integer-key arrays:<br/>ObjectInfo · updates · requests · replacements · events.<br/>SyncPayload is [schemaId, dataBytes]."]
+        JSGUID["SessionClient normalizes compact arrays to named JS objects,<br/>transforms binary GUIDs to strings, then unwraps SyncPayload.<br/>Game/ObjectSync code keeps an ergonomic object contract."]
     end
 
     subgraph "REST API (camelCase JSON)"
@@ -1312,13 +1365,28 @@ flowchart TB
     REST --> SMS_API
 ```
 
-## Networking: Wire Optimization (Phases 3-5)
+## Networking: Compact Wire Protocol
 
 The hot-path object payload (`ObjectInfo.Data`, `ObjectUpdateInfo.Data`,
 `ObjectUpdateRequest.Data`) does not flow as a `Dictionary<string, object?>`
-on the wire. It is wrapped in a `SyncPayload(byte SchemaId, byte[] Data)`
-envelope so encoding can be selected per object type without re-shaping the
-DTOs.
+on the wire. It is wrapped in the positional
+`SyncPayload(byte SchemaId, byte[] Data)` array `[schemaId, dataBytes]`, so
+encoding can be selected per object without changing the game-facing data
+contract.
+
+The surrounding hot DTOs also use integer MessagePack keys:
+
+| DTO | Wire shape |
+| --- | --- |
+| `ObjectInfo` | `[id, creatorId, ownerId, scope, syncPayload, version]` |
+| `ObjectUpdateInfo` | `[id, syncPayload, version]` |
+| `ObjectUpdateRequest` | `[id, syncPayload]` |
+| `ObjectReplacedEvent` | `[deletedObjectId, createdObjects]` |
+| `ObjectEventInfo` | `[objectId, eventKind, payloadBytes]` |
+| create/update/delete responses | `[result, memberSequence, timestamp?]` |
+
+`session-client.js` converts these arrays to named objects immediately at every
+invoke, live-event, snapshot, replacement, and reconciliation boundary.
 
 ### Schema registry (game-agnostic)
 
@@ -1328,7 +1396,7 @@ DTOs.
 2. `ObjectSync.setSchemaIdSelector((data, kind, ctx) => id)` — given a
    payload + its kind (`'create' | 'update' | 'replace'`) + context
    (`{objectId, object}` for updates, where `data.type` may be absent),
-   return the byte schemaId or `0` for the legacy MsgPack dict path.
+   return the byte schema ID or `0` for the generic MessagePack-map path.
 3. Pass `schemas: [...]` into `SessionClient.createSession({...})` so
    late joiners receive the same registry via `metadata.schemas`.
 
@@ -1361,10 +1429,11 @@ prior state (matching the existing `Object.assign` semantics in JS and
 | `bytes`         | 4+N   | 4-byte LE len + raw  |                                |
 | `nullable-str`  | 1+…   | flag + (str)         |                                |
 | `nullable-guid` | 1+…   | flag + (guid)        |                                |
-| `q16`           | 2     | [0, 1)               | resolution ≈ 1.5e-5; clamps    |
+| `q16`           | 2     | [0, 1]                | resolution ≈ 1.5e-5; clamps    |
+| `q16w`          | 2     | [-0.5, 1.5]           | wrap-extended coordinates      |
 | `q16s`          | 2     | [-1, 1]              | resolution ≈ 3.0e-5; clamps    |
 | `q16_2pi`       | 2     | [0, 2π)              | ~0.0055°; wraps negatives      |
-| `q8`            | 1     | [0, 1)               | resolution ≈ 4e-3; clamps      |
+| `q8`            | 1     | [0, 1]                | resolution ≈ 4e-3; clamps      |
 
 `q16_2pi` normalizes via `((v % 2π) + 2π) % 2π` before quantizing so
 boundary inputs (e.g. -0.0001 vs +0.0001) round to angularly-close
@@ -1374,47 +1443,81 @@ Both codecs use half-away-from-zero rounding (JS `Math.round`,
 C# `MidpointRounding.AwayFromZero`) to keep cross-wire bytes identical
 on midpoint inputs.
 
-### Game adoption (current)
+### Production schemas
 
 Registered in `index.html` `WIREOPT_SCHEMAS`:
 
-| SchemaId | Type             | Fields (positional)                                                              |
-| -------- | ---------------- | -------------------------------------------------------------------------------- |
-| 1        | ship-update      | x q16, y q16, angle q16_2pi, vx q16s, vy q16s, rotSpeed q16s, thrusting bool, invul bool |
-| 3        | asteroid-update  | x q16, y q16, angle q16_2pi                                                      |
+| SchemaId | Type | Fields (positional, all optional per payload) |
+| --- | --- | --- |
+| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose |
+| 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
+| 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; peak ships; game-over/terminal times |
 
-Bullets (create + update) intentionally remain on `SchemaId=0` (legacy
-MsgPack dict) because the `pendingHit` 3-way handshake still rides on the
-per-frame data; converting it cleanly needs a multiplayer integration test
-harness that the suite doesn't yet have. See Phase 2.2 deferral note.
+Every known gameplay type uses exactly one superset schema for create, update,
+replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
+deterministic ships therefore share schema 1: the presence mask omits replay or
+terminal slots when a mode does not produce them. This prevents a later update
+from introducing fields that the object's retained creation schema cannot
+encode.
+
+Schema 0 remains reserved as the generic extension/fallback path. Its body is a
+MessagePack map and can preserve nested maps, arrays, nulls, binary values, and
+unknown fields. No current Astervoids gameplay object selects it, but JS and C#
+cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
+
+### Nested compact data
+
+- **Asteroid vertices:** seeded polygons are reproducible and transmit no
+  vertices; `ASTEROID_VERTICES` and `ASTEROID_JAGGEDNESS` are locked in session
+  metadata so every client regenerates identical geometry. Explicit fracture
+  geometry uses four bytes per vertex: q16 wrapped angle followed by q16
+  normalized distance.
+- **GameState ledgers:** processed hit/score maps are sorted by GUID and encoded
+  as fixed 20-byte entries (16-byte binary GUID + little-endian uint32 count).
+  `ObjectSync` compares byte arrays by content so repacking an unchanged map
+  does not defeat delta suppression or confirmation tracking.
+- **Object events:** payload maps are field-aliased, MessagePack-encoded once by
+  the sender, and relayed by the hub as opaque `byte[]`. The receiver decodes
+  and expands aliases before calling the game handler.
 
 ### Wire-size measurements (locked into `WireSizeBenchTests.cs`)
 
-| Payload                | Phase 3 | Phase 4 | Phase 5 | Total ↓ |
-| ---------------------- | ------- | ------- | ------- | ------- |
-| asteroid update        | 78 B    | 65 B    | 47 B    | -40%    |
-| ship update            | 164 B   | 91 B    | 47 B    | -71%    |
-| 3-asteroid batch       | 235 B   | 196 B   | 142 B   | -40%    |
-| 7-object mixed batch   | 901 B   | —       | ~640 B  | -29%    |
-
-(7-object batch includes 2 bullets which are still on SchemaId=0.)
+| Payload | Current compact size |
+| --- | ---: |
+| ship create body | 47 B |
+| seeded asteroid create body | 34 B |
+| bullet create body | 37 B |
+| GameState create body | 48 B |
+| asteroid x/y/angle update DTO | 29–35 B |
+| ballistic bullet update DTO | 29–35 B |
+| pending-hit bullet update DTO | 50–60 B |
+| full replay-capable ship update DTO | 52–62 B |
+| three-asteroid update batch | 90–105 B |
+| seven-object mixed steady-state batch | 235–255 B |
+| three-version update acknowledgement | 72 B |
+| aliased ship-state object event | 35–45 B |
 
 ### Hazards verified by tests
 
-- **L6** delta encoding survives positional packing (bitmask preserves
-  partial updates) — `Phase4_AsteroidUpdate_DeltaOnly_Positional` /
-  `quantized fields work with delta encoding`.
-- **L8** joiner schema race: `handleSessionJoined` calls
-  `SchemaCodec.replaceAll(metadata.schemas)` BEFORE iterating
-  `response.objects`. JS is single-threaded so this is sequential.
-- **L10** angle wrap at 0/2π — `q16_2pi roundtrip: angle near 0 vs
+- Delta encoding survives positional packing: the mask preserves partial
+  updates for every production schema.
+- Byte-valued fields use content equality for delta and confirmation checks.
+- Joiner schema race: `joinSessionCore` calls
+  `SyncPayload.replaceSchemas(metadata.schemas)` before unwrapping
+  `response.objects`; `ObjectSync` reapplies the same contract defensively when
+  it receives the completed session callback.
+- Angle wrap at 0/2π: `q16_2pi roundtrip: angle near 0 vs
   near 2π wrap correctly`.
-- **L11** extrapolation drift: receiver uses `pos = snapshot.x + dt *
+- Extrapolation drift: receiver uses `pos = snapshot.x + dt *
   snapshot.vx` (non-integrating). 3600-frame simulation asserts max
   render error stays within `quantum + lag × velocity_quantum`.
-- **L14** `validAt` continuity preserved — existing `validAt-axis`,
+- `validAt` continuity is preserved: existing `validAt-axis`,
   `spawn-extrapolation`, and `clock-offset` suites stay green at every
   phase.
+- JS/C# golden fixtures pin every field type, production schema layout,
+  schema-0 structured values, compact DTO shape, and representative byte
+  budgets.
 
 ## Networking: Regional Deployment
 
@@ -1827,12 +1930,16 @@ astervoids/
 │           ├── session-client.js                  # SignalR lifecycle, hub RPC wrappers, stale-connection
 │           │                                      # guard(), GUID normalization. See: Client Architecture.
 │           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,
-│           │                                      # per-member sequencing, reconciliation, field-name compression.
+│           │                                      # per-member sequencing, reconciliation, and schema dispatch.
 │           │                                      # See: Client Architecture.
 │           ├── replication-clock.js               # Injected server-clock estimator and validAt conversion
 │           ├── replication-presentation.js        # Adaptive delay, interpolation, and dead-reckoning policies
 │           ├── replication-send-policy.js         # Ballistic/ship send eligibility and immediate-edge decisions
 │           ├── replication-runtime.js             # Pull-driven replica lifecycle, versions, joins, and ownership
+│           ├── schema-codec.js                     # Positional presence-mask codec and schema registry
+│           ├── sync-payload.js                     # Schema-id/binary-body envelope adapter
+│           ├── msgpack-codec.js                    # Generic schema-0 and object-event map codec
+│           ├── astervoids-wire-codec.js            # Packed asteroid vertices and GameState ledgers
 │           ├── guid-utils.js                      # bytesToGuid · transformBinaryGuids (binary GUID → string)
 │           ├── signalr.min.js                     # SignalR client library (local copy)
 │           └── signalr-protocol-msgpack.min.js    # MessagePack protocol for SignalR client
@@ -1926,6 +2033,7 @@ The frontend `CONFIG` object in `index.html` defines all game constants (normali
 | **Game** | `STARTING_LIVES: 3`, `MULTIPLAYER_LIVES: 3`, `INVULNERABILITY_TIME: 180 frames`, `WAVE_DELAY: 120 frames` |
 | **Sync** | Initial `SYNC_NOMINAL_FRAME_TIME: 1/10 (10Hz)`; adaptive flush range `1–20Hz`; `DELTA_ENCODING_ENABLED: true` |
 | **Interpolation** | `INTERPOLATION_DELAY: 33ms`, `ADAPTIVE_DELAY_ENABLED: true`, `SNAPSHOT_BUFFER_SIZE: 6`, `MAX_EXTRAPOLATION: 2.0s` |
+| **Terminal convergence** | `DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750ms`, `DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180ms`, `DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300ms` |
 | **Adaptive Delay** | `ADAPTIVE_DELAY_NET_FLOOR: 0.8`, `ADAPTIVE_DELAY_JITTER_MULT: 2`, `ADAPTIVE_DELAY_SMOOTHING: 0.1`, `ADAPTIVE_DELAY_SAMPLES: 30` |
 
 Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cyan, Magenta, Yellow (up to 4 players).

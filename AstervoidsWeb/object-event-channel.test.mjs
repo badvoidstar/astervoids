@@ -11,13 +11,17 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
 
 function loadObjectSync(stubs) {
     // Stubs we feed into the global before evaluating object-sync.js.
     const globals = {
         SessionClient: stubs.SessionClient,
+        MsgpackCodec,
         signalR: { HubConnectionState: { Connected: 'Connected', Reconnecting: 'Reconnecting' } },
         window: { ASTERVOIDS_DEBUG: false },
         console
@@ -93,6 +97,8 @@ test('emitEvent: invokes local handler synchronously then sends', async () => {
     assert.equal(received[0].local, true);
     assert.equal(stub.sentEvents.length, 1, 'sent over wire');
     assert.equal(stub.sentEvents[0].eventKind, 1);
+    assert.ok(stub.sentEvents[0].payload instanceof Uint8Array);
+    assert.deepEqual(MsgpackCodec.decode(stub.sentEvents[0].payload), { score: 100 });
 });
 
 test('emitEvent: silent no-op when kind unregistered', async () => {
@@ -143,6 +149,26 @@ test('dispatch: unknown kind byte → silent (warn only)', () => {
     onObjectEvent({ objectId: 'obj-1', eventKind: 99, payload: {} }, 's', 1, null);
 });
 
+test('event payload field aliases round-trip through opaque bytes', () => {
+    const stub = makeSessionClientStub();
+    const ObjectSync = loadObjectSync({ SessionClient: stub });
+    ObjectSync.init();
+    ObjectSync.configure({ fieldMap: { score: 'sc', hitCount: 'hc' } });
+    ObjectSync.registerEventKind('ship-state-changed', 1);
+
+    let received = null;
+    ObjectSync.on('objectEvent:ship-state-changed', (_id, payload) => {
+        received = payload;
+    });
+    stub.handlers.onObjectEvent({
+        objectId: 'obj-1',
+        eventKind: 1,
+        payload: MsgpackCodec.encode({ sc: 100, hc: 2 })
+    }, 'sender', 1, null);
+
+    assert.deepEqual(received, { score: 100, hitCount: 2 });
+});
+
 test('dispatch: handler throw is caught (does not propagate)', () => {
     const stub = makeSessionClientStub();
     const ObjectSync = loadObjectSync({ SessionClient: stub });
@@ -154,6 +180,23 @@ test('dispatch: handler throw is caught (does not propagate)', () => {
     const onObjectEvent = stub.handlers['onObjectEvent'];
     // Should not throw upward.
     onObjectEvent({ objectId: 'obj-1', eventKind: 5, payload: {} }, 's', 1, null);
+});
+
+test('dispatch: malformed opaque payload is contained', () => {
+    const stub = makeSessionClientStub();
+    const ObjectSync = loadObjectSync({ SessionClient: stub });
+    ObjectSync.init();
+    ObjectSync.registerEventKind('bad-payload', 6);
+    let calls = 0;
+    ObjectSync.on('objectEvent:bad-payload', () => { calls++; });
+
+    const onObjectEvent = stub.handlers.onObjectEvent;
+    assert.doesNotThrow(() => onObjectEvent({
+        objectId: 'obj-1',
+        eventKind: 6,
+        payload: new Uint8Array([0xc1])
+    }, 's', 1, null));
+    assert.equal(calls, 0);
 });
 
 test('on(objectEvent:KIND, null): unregisters handler', () => {

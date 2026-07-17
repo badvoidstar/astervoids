@@ -190,8 +190,9 @@ const ObjectSync = (function() {
     // removing this guard allows a later reconciliation to restore server truth.
     const pendingDeletes = new Set();
     
-    // Delta encoding: track last server-confirmed data per object so rejected
-    // or later re-queued states can be diffed from an accepted baseline.
+    // Track last server-confirmed data per object (from an update response or
+    // authoritative snapshot) so rejected or re-queued states can be diffed
+    // from an accepted baseline and one-shot producers can detect persistence.
     const lastSentData = new Map();
     let deltaEncodingEnabled = false;
     // Optional clock source for owner-operation validAt times. Provided via
@@ -501,10 +502,8 @@ const ObjectSync = (function() {
      * legitimately mixes objects of different ages.
      */
     function handleSessionJoined(session, member) {
-        // Phase 4 wireopt: register positional schemas published by the
-        // session creator via metadata.schemas BEFORE processing any objects,
-        // so SyncPayload.unwrap can dispatch positional payloads. Failures are
-        // logged but non-fatal — the legacy SchemaId=0 path still works.
+        // SessionClient installs these before snapshot decoding. Reapply here
+        // defensively for direct integrations that inject joined sessions.
         try {
             const schemas = session && session.metadata && session.metadata.schemas;
             if (schemas && typeof window !== 'undefined' && window.SchemaCodec) {
@@ -553,6 +552,7 @@ const ObjectSync = (function() {
                         changed = true;
                     }
                     if (changed) markObjectMutation(existing.id);
+                    lastSentData.set(existing.id, { ...existing.data });
                     continue;
                 }
 
@@ -569,6 +569,7 @@ const ObjectSync = (function() {
                     if (va !== undefined && va !== null) {
                         existing.validAt = va;
                     }
+                    lastSentData.set(existing.id, { ...existing.data });
                     continue;
                 }
 
@@ -580,6 +581,9 @@ const ObjectSync = (function() {
                 const va = validAts[obj.id];
                 if (registered && va !== undefined && va !== null) {
                     registered.validAt = va;
+                }
+                if (registered) {
+                    lastSentData.set(registered.id, { ...registered.data });
                 }
             }
         }
@@ -924,6 +928,7 @@ const ObjectSync = (function() {
                         if (snapValidAt !== undefined && snapValidAt !== null) {
                             existing.validAt = snapValidAt;
                         }
+                        lastSentData.set(existing.id, { ...existing.data });
                         markObjectMutation(existing.id);
                         // Reconciliation snapshots now carry the same validated
                         // server-time validAt as live broadcasts (monotonically
@@ -970,6 +975,7 @@ const ObjectSync = (function() {
                     if (snapValidAt !== undefined && snapValidAt !== null) {
                         localObj.validAt = snapValidAt;
                     }
+                    lastSentData.set(localObj.id, { ...localObj.data });
                     if (callbacks.onObjectCreated) {
                         callbacks.onObjectCreated(localObj);
                     }
@@ -1228,7 +1234,7 @@ const ObjectSync = (function() {
      *
      * IMPORTANT: lastSentData is NOT updated here. It is only updated after the
      * server confirms the batch, so that rejected or failed deltas are re-included
-     * in the next flush. See confirmSentDeltas().
+     * in the next flush. See confirmSentData().
      */
     function computeDelta(objectId, data, forceFullSync) {
         const prev = lastSentData.get(objectId);
@@ -1239,7 +1245,7 @@ const ObjectSync = (function() {
         const delta = {};
         let hasChanges = false;
         for (const key in data) {
-            if (data[key] !== prev[key]) {
+            if (!dataValueEquals(data[key], prev[key])) {
                 delta[key] = data[key];
                 hasChanges = true;
             }
@@ -1250,15 +1256,37 @@ const ObjectSync = (function() {
         return delta;
     }
 
+    function dataValueEquals(left, right) {
+        if (Object.is(left, right)) return true;
+        if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)
+            || left.length !== right.length) {
+            return false;
+        }
+        for (let i = 0; i < left.length; i++) {
+            if (left[i] !== right[i]) return false;
+        }
+        return true;
+    }
+
+    function snapshotDataValues(data) {
+        const snapshot = { ...data };
+        for (const key in snapshot) {
+            if (snapshot[key] instanceof Uint8Array) {
+                snapshot[key] = new Uint8Array(snapshot[key]);
+            }
+        }
+        return snapshot;
+    }
+
     /**
-     * Confirm that deltas were accepted by the server for the given object IDs.
+     * Confirm that outbound data was accepted by the server for the given object IDs.
      * Updates lastSentData only for confirmed objects so that rejected fields
      * are re-sent on the next flush.
-     * @param {Map<string, object>} sentDeltas - Map of objectId → delta data that was sent
+     * @param {Map<string, object>} sentData - Map of objectId to data that was sent
      * @param {object} confirmedVersions - Server response versions map (objectId → version)
      */
-    function confirmSentDeltas(sentDeltas, confirmedVersions) {
-        for (const [objectId, delta] of sentDeltas) {
+    function confirmSentData(sentData, confirmedVersions) {
+        for (const [objectId, delta] of sentData) {
             if (confirmedVersions[objectId] === undefined) continue;
             const prev = lastSentData.get(objectId);
             if (prev) {
@@ -1270,10 +1298,22 @@ const ObjectSync = (function() {
     }
 
     /**
+     * Return whether every supplied field matches the most recently observed
+     * server-confirmed value for the object. Byte arrays compare by content;
+     * other values retain the normal shallow comparison semantics.
+     */
+    function isDataConfirmed(objectId, data) {
+        const confirmed = lastSentData.get(objectId);
+        if (!confirmed || !data || typeof data !== 'object') return false;
+        return Object.entries(data).every(
+            ([key, value]) => dataValueEquals(confirmed[key], value));
+    }
+
+    /**
      * Flush all pending updates to the server.
      * Guarded to prevent overlapping flushes.
      *
-     * Delta encoding defers lastSentData updates until the server confirms the batch.
+     * Confirmation tracking defers lastSentData updates until the server confirms the batch.
      * On partial success, only confirmed objects update their delta baseline.
      * On complete failure, no baselines are updated. Sent entries are not
      * automatically reinserted into pendingUpdates here; when a producer queues
@@ -1288,13 +1328,12 @@ const ObjectSync = (function() {
 
         let updates;
         // Track deltas sent per object for deferred confirmation
-        let sentDeltas = null;
+        const sentData = new Map();
         if (deltaEncodingEnabled) {
             const forceFullSync = (++fullSyncCounter >= FULL_SYNC_INTERVAL);
             if (forceFullSync) fullSyncCounter = 0;
 
             updates = [];
-            sentDeltas = new Map();
             for (const [objectId, data] of pendingUpdates) {
                 const delta = computeDelta(objectId, data, forceFullSync);
                 if (delta) {
@@ -1302,13 +1341,14 @@ const ObjectSync = (function() {
                         objectId: objectId,
                         data: delta
                     });
-                    sentDeltas.set(objectId, delta);
+                    sentData.set(objectId, snapshotDataValues(delta));
                 }
             }
         } else {
             updates = [];
             for (const [objectId, data] of pendingUpdates) {
                 updates.push({ objectId: objectId, data: data });
+                sentData.set(objectId, snapshotDataValues(data));
             }
         }
         pendingUpdates.clear();
@@ -1373,9 +1413,7 @@ const ObjectSync = (function() {
                         }
                     }
                     // Confirm delta baselines only for objects the server accepted
-                    if (sentDeltas) {
-                        confirmSentDeltas(sentDeltas, response.versions);
-                    }
+                    confirmSentData(sentData, response.versions);
                 }
                 // Track own member sequence from response
                 trackOwnMemberSequence(response.memberSequence);
@@ -1385,7 +1423,7 @@ const ObjectSync = (function() {
                     callbacks.onBatchReceived(response.serverTimestamp, clientTimestamp, undefined, undefined, responseTimestamp);
                 }
             }
-            // If response is null/undefined (server returned null), sentDeltas are
+            // If response is null/undefined (server returned null), sent data is
             // NOT confirmed — all fields will be re-sent on next flush.
         } catch (err) {
             if (!isAsyncContextCurrent(context)) return;
@@ -1598,7 +1636,9 @@ const ObjectSync = (function() {
         const validAt = clockSource && typeof clockSource.nowMs === 'function'
             ? Math.round(clockSource.nowMs())
             : null;
-        return SessionClient.broadcastObjectEvent(objectId, kindByte, payload, validAt);
+        const wirePayload = MsgpackCodec.encode(compressData(payload || {}));
+        return SessionClient.broadcastObjectEvent(
+            objectId, kindByte, wirePayload, validAt);
     }
 
     /**
@@ -1615,14 +1655,21 @@ const ObjectSync = (function() {
         const handler = eventHandlers.get(kindName);
         if (!handler) return; // silently ignore — game may not subscribe to all kinds
         try {
-            handler(eventInfo.objectId, eventInfo.payload, {
+            let payload = eventInfo.payload;
+            if (payload instanceof Uint8Array) {
+                payload = expandData(MsgpackCodec.decode(payload));
+            } else {
+                // Keep direct test/game injections ergonomic.
+                payload = expandData(payload || {});
+            }
+            handler(eventInfo.objectId, payload, {
                 local: false,
                 senderMemberId,
                 memberSequence,
                 validAt
             });
         } catch (e) {
-            _warn('[ObjectSync] OnObjectEvent handler threw:', e);
+            _warn('[ObjectSync] OnObjectEvent payload/handler failed:', e);
         }
     }
 
@@ -1695,6 +1742,7 @@ const ObjectSync = (function() {
         createObject,
         replaceObject,
         updateObject,
+        isDataConfirmed,
         deleteObject,
         flushUpdates,
         tick,

@@ -131,6 +131,77 @@ const SessionClient = (function() {
             && pendingSessionTransition.targetSessionId === expiredSessionId;
     }
 
+    function normalizeObjectInfo(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            id: value[0],
+            creatorMemberId: value[1],
+            ownerMemberId: value[2],
+            scope: value[3],
+            data: value[4],
+            version: value[5]
+        };
+    }
+
+    function normalizeObjectUpdateInfo(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            id: value[0],
+            data: value[1],
+            version: value[2]
+        };
+    }
+
+    function normalizeObjectReplacedEvent(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            deletedObjectId: value[0],
+            createdObjects: value[1]
+        };
+    }
+
+    function normalizeObjectEventInfo(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            objectId: value[0],
+            eventKind: value[1],
+            payload: value[2]
+        };
+    }
+
+    function normalizeCreateObjectResponse(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            objectInfo: value[0],
+            memberSequence: value[1],
+            validAt: value[2]
+        };
+    }
+
+    function normalizeUpdateObjectsResponse(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            versions: value[0],
+            memberSequence: value[1],
+            serverTimestamp: value[2]
+        };
+    }
+
+    function normalizeDeleteObjectResponse(value) {
+        if (!Array.isArray(value)) return value;
+        return {
+            success: value[0],
+            memberSequence: value[1]
+        };
+    }
+
+    function replaceSessionSchemas(metadata) {
+        if (typeof SyncPayload === 'undefined'
+            || typeof SyncPayload.replaceSchemas !== 'function') return;
+        const schemas = metadata?.schemas;
+        SyncPayload.replaceSchemas(Array.isArray(schemas) ? schemas : []);
+    }
+
     function reconnectIdentityFromResponse(response, sessionId, memberId) {
         if (typeof response?.reconnectToken !== 'string'
             || response.reconnectToken.length === 0) {
@@ -294,14 +365,17 @@ const SessionClient = (function() {
      */
     function setupEventHandlers(thisConnection, thisConnectionEpoch) {
 
-        // Guard wrapper: skips handler if connection was replaced (stale handler from mobile background disconnect)
-        // Also transforms binary GUIDs (16-byte Uint8Array) to strings in all arguments
-        const guard = (fn, sessionScoped = false) => (...args) => {
+        // Guard wrapper: skips stale handlers and normally transforms binary
+        // GUIDs in all arguments. Opaque byte payload handlers opt out and
+        // transform only their known GUID slots.
+        const guard = (fn, sessionScoped = false, transformGuids = true) => (...args) => {
             if (connection === thisConnection
                 && connectionEpoch === thisConnectionEpoch
                 && (!sessionScoped || acceptsSessionEvents())) {
-                for (let i = 0; i < args.length; i++) {
-                    args[i] = GuidUtils.transformBinaryGuids(args[i]);
+                if (transformGuids) {
+                    for (let i = 0; i < args.length; i++) {
+                        args[i] = GuidUtils.transformBinaryGuids(args[i]);
+                    }
                 }
                 fn(...args);
             }
@@ -391,6 +465,7 @@ const SessionClient = (function() {
         // SessionStateSnapshot) carry a parallel validAts dictionary keyed by
         // objectId so each pre-existing object keeps its own age.
         thisConnection.on('OnObjectCreated', guard((objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+            objectInfo = normalizeObjectInfo(objectInfo);
             WireEnum.translateObject(objectInfo);
             SyncPayload.unwrapObjectData(objectInfo);
             if (callbacks.onObjectCreated) {
@@ -400,7 +475,10 @@ const SessionClient = (function() {
 
         thisConnection.on('OnObjectsUpdated', guard((objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
             if (Array.isArray(objects)) {
-                for (const u of objects) SyncPayload.unwrapObjectData(u);
+                for (let i = 0; i < objects.length; i++) {
+                    objects[i] = normalizeObjectUpdateInfo(objects[i]);
+                    SyncPayload.unwrapObjectData(objects[i]);
+                }
             }
             if (callbacks.onObjectsUpdated) {
                 callbacks.onObjectsUpdated(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs, validAt);
@@ -414,10 +492,13 @@ const SessionClient = (function() {
         }, true));
 
         thisConnection.on('OnObjectReplaced', guard((event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+            event = normalizeObjectReplacedEvent(event);
             if (event && Array.isArray(event.createdObjects)) {
-                for (const o of event.createdObjects) {
-                    WireEnum.translateObject(o);
-                    SyncPayload.unwrapObjectData(o);
+                for (let i = 0; i < event.createdObjects.length; i++) {
+                    const objectInfo = normalizeObjectInfo(event.createdObjects[i]);
+                    event.createdObjects[i] = objectInfo;
+                    WireEnum.translateObject(objectInfo);
+                    SyncPayload.unwrapObjectData(objectInfo);
                 }
             }
             if (callbacks.onObjectReplaced) {
@@ -426,13 +507,18 @@ const SessionClient = (function() {
         }, true));
 
         // Generic per-object event channel (Phase 2.1).
-        // Server is a relay — eventInfo.payload is opaque (game-defined dict).
-        // ObjectSync dispatches to game-registered handlers by eventKind byte.
+        // Server relays eventInfo.payload as opaque game-encoded bytes.
+        // ObjectSync decodes and dispatches by eventKind byte.
         thisConnection.on('OnObjectEvent', guard((eventInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+            eventInfo = normalizeObjectEventInfo(eventInfo);
+            if (eventInfo) {
+                eventInfo.objectId = GuidUtils.transformBinaryGuids(eventInfo.objectId);
+            }
+            senderMemberId = GuidUtils.transformBinaryGuids(senderMemberId);
             if (callbacks.onObjectEvent) {
                 callbacks.onObjectEvent(eventInfo, senderMemberId, memberSequence, validAt);
             }
-        }, true));
+        }, true, false));
 
         // Session list changed (signal only - fetch data separately)
         thisConnection.on('OnSessionsChanged', guard(() => {
@@ -522,6 +608,7 @@ const SessionClient = (function() {
                 finishSessionTransition(thisSessionEpoch);
                 return null;
             }
+            replaceSessionSchemas(response.metadata);
 
             const createdMember = {
                 id: response.memberId,
@@ -606,15 +693,21 @@ const SessionClient = (function() {
                 return null;
             }
 
-            // Translate Phase-1 wire-byte enums and pair-array snapshots to the legacy shapes
-            // game code expects (string roles/scopes, object-keyed validAts).
+            // Install the session contract before decoding any snapshot object.
+            // The local registry is already populated for same-version clients;
+            // metadata remains authoritative for this specific session.
+            replaceSessionSchemas(response.metadata);
+
+            // Translate compact enums/pairs to the ergonomic game-side shapes.
             if (Array.isArray(response.members)) {
                 for (const m of response.members) WireEnum.translateMember(m);
             }
             if (Array.isArray(response.objects)) {
-                for (const o of response.objects) {
-                    WireEnum.translateObject(o);
-                    SyncPayload.unwrapObjectData(o);
+                for (let i = 0; i < response.objects.length; i++) {
+                    const objectInfo = normalizeObjectInfo(response.objects[i]);
+                    response.objects[i] = objectInfo;
+                    WireEnum.translateObject(objectInfo);
+                    SyncPayload.unwrapObjectData(objectInfo);
                 }
             }
 
@@ -769,14 +862,17 @@ const SessionClient = (function() {
      */
     async function createObject(data, scope = 'Member', ownerMemberId = null, clientValidAt = null, schemaId = 0) {
         const context = captureSessionContext();
-        const response = await invokeHub('CreateObject', SyncPayload.wrap(data, schemaId), scope, ownerMemberId, clientValidAt);
+        let response = await invokeHub('CreateObject', SyncPayload.wrap(data, schemaId), scope, ownerMemberId, clientValidAt);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
+        response = normalizeCreateObjectResponse(response);
         // Phase 3 envelope: response.objectInfo.data arrives as a SyncPayload
         // [schemaId, Uint8Array]; unwrap so the owner-side path in object-sync.js
         // sees the same plain dict shape as remote receivers.
         if (response && response.objectInfo) {
+            response.objectInfo = normalizeObjectInfo(response.objectInfo);
+            WireEnum.translateObject(response.objectInfo);
             SyncPayload.unwrapObjectData(response.objectInfo);
         }
         return response;
@@ -806,16 +902,17 @@ const SessionClient = (function() {
                 const u = updates[i];
                 if (u && u.data !== undefined) {
                     const id = (u.schemaId === undefined || u.schemaId === null) ? 0 : u.schemaId;
-                    wrapped[i] = { objectId: u.objectId, data: SyncPayload.wrap(u.data, id) };
+                    wrapped[i] = [u.objectId, SyncPayload.wrap(u.data, id)];
                 } else {
                     wrapped[i] = u;
                 }
             }
         }
-        const response = await invokeHub('UpdateObjects', wrapped, senderSequence, senderSendIntervalMs, clientValidAt);
+        let response = await invokeHub('UpdateObjects', wrapped, senderSequence, senderSendIntervalMs, clientValidAt);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
+        response = normalizeUpdateObjectsResponse(response);
         // Phase 1 wire-shape: response.versions is GuidLongPair[] on the wire (each
         // entry deserialized as [guidString, long]). Game code expects a string-keyed
         // object so it can do `versions[id]` and `Object.entries(versions)`.
@@ -852,7 +949,11 @@ const SessionClient = (function() {
         // Server returns List<ObjectInfo> for the owner; unwrap each so any
         // downstream consumer sees the canonical dict shape.
         if (Array.isArray(created)) {
-            for (const info of created) SyncPayload.unwrapObjectData(info);
+            for (let i = 0; i < created.length; i++) {
+                created[i] = normalizeObjectInfo(created[i]);
+                WireEnum.translateObject(created[i]);
+                SyncPayload.unwrapObjectData(created[i]);
+            }
         }
         return created;
     }
@@ -862,16 +963,16 @@ const SessionClient = (function() {
      */
     async function deleteObject(objectId) {
         const context = captureSessionContext();
-        const response = await invokeHub('DeleteObject', objectId);
+        let response = await invokeHub('DeleteObject', objectId);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
-        return response;
+        return normalizeDeleteObjectResponse(response);
     }
 
     /**
      * Broadcast a per-object event to all other members of the session.
-     * Server is a relay — payload is opaque (game-defined dict). Caller
+     * Server is a relay — payload is opaque game-encoded bytes. Caller
      * must own objectId; the server enforces this and returns false on
      * mismatch. Use for low-frequency state transitions that don't
      * belong on the per-frame update path.
@@ -902,9 +1003,11 @@ const SessionClient = (function() {
                 for (const m of snapshot.members) WireEnum.translateMember(m);
             }
             if (Array.isArray(snapshot.objects)) {
-                for (const o of snapshot.objects) {
-                    WireEnum.translateObject(o);
-                    SyncPayload.unwrapObjectData(o);
+                for (let i = 0; i < snapshot.objects.length; i++) {
+                    const objectInfo = normalizeObjectInfo(snapshot.objects[i]);
+                    snapshot.objects[i] = objectInfo;
+                    WireEnum.translateObject(objectInfo);
+                    SyncPayload.unwrapObjectData(objectInfo);
                 }
             }
             snapshot.validAts = WireEnum.pairsToObject(snapshot.validAts);

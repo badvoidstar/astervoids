@@ -115,8 +115,17 @@ const SyncPayload = (function () {
         return obj;
     }
 
+    function replaceSchemas(schemas) {
+        const codec = getSchemaCodec();
+        if (!codec) {
+            throw new Error('SyncPayload.replaceSchemas requires SchemaCodec to be loaded');
+        }
+        codec.replaceAll(Array.isArray(schemas) ? schemas : []);
+    }
+
     return {
         LEGACY_DICT_SCHEMA_ID,
+        replaceSchemas,
         wrap,
         unwrap,
         unwrapObjectData,

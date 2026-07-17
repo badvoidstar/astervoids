@@ -26,7 +26,7 @@
  *   - 'nullable-guid': 1-byte presence flag + (if present) 16 bytes
  *
  * Phase 5 quantized type tags (lossy fixed-point, 2 bytes each):
- *   - 'q16'      : uint16 over [0, 1)        — resolution 1/65535 ≈ 1.5e-5
+ *   - 'q16'      : uint16 over [0, 1]        — resolution 1/65535 ≈ 1.5e-5
  *   - 'q16w'     : uint16 over [-0.5, 1.5]   — wrap-extended position; covers
  *                  the off-screen margin region used by wrapNormalized so
  *                  asteroids/ships transit smoothly across edges instead of
@@ -34,7 +34,7 @@
  *                  (sub-pixel on a 4K canvas).
  *   - 'q16s'     : int16  over [-1, 1]       — resolution 2/65534 ≈ 3.0e-5
  *   - 'q16_2pi'  : uint16 over [0, 2π)       — resolution ≈ 9.6e-5 rad ≈ 0.0055°
- *   - 'q8'       : uint8  over [0, 1)        — resolution 1/255 ≈ 4e-3
+ *   - 'q8'       : uint8  over [0, 1]        — resolution 1/255 ≈ 4e-3
  *
  * All quantized encoders clamp / wrap into the canonical range before
  * rounding. Decoders return float in the same range.
