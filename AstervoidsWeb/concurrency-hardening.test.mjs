@@ -631,6 +631,50 @@ test('stale flush cannot mutate or unlock a new session flush', async () => {
     await thirdFlush;
 });
 
+test('immediate update flushes now and coalesces behind in-flight backpressure', async () => {
+    const client = makeObjectSyncClient();
+    const firstUpdate = deferred();
+    const calls = [];
+    client.updateObjects = (updates, senderSequence) => {
+        calls.push({ updates, senderSequence });
+        if (calls.length === 1) return firstUpdate.promise;
+        return Promise.resolve({
+            versions: { shared: 3 },
+            memberSequence: 2,
+            serverTimestamp: Date.now()
+        });
+    };
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: false });
+
+    client.transition();
+    client.join({
+        objects: [objectInfo('shared', 1, { x: 1 })],
+        validAts: {},
+        metadata: {}
+    });
+
+    objectSync.updateObject('shared', { x: 2 }, true);
+    assert.equal(calls.length, 1, 'immediate update enters the transport in the same turn');
+    assert.equal(calls[0].updates[0].data.x, 2);
+
+    objectSync.updateObject('shared', { x: 3 }, true);
+    assert.equal(calls.length, 1, 'an immediate edge never overlaps an in-flight invoke');
+
+    firstUpdate.resolve({
+        versions: { shared: 2 },
+        memberSequence: 1,
+        serverTimestamp: Date.now()
+    });
+    await drainMicrotasks();
+
+    objectSync.tick(1);
+    await drainMicrotasks();
+    assert.equal(calls.length, 2, 'coalesced state leaves on the first eligible tick');
+    assert.equal(calls[1].updates[0].data.x, 3);
+});
+
 test('stale create completion is ignored after reset', async () => {
     const client = makeObjectSyncClient();
     const createGate = deferred();

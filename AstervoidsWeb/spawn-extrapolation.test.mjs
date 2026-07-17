@@ -24,6 +24,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { createSnapshotInterpolationPolicy } = require(
+    './wwwroot/js/replication-presentation.js');
 
 const CONFIG = {
     MAX_EXTRAPOLATION: 1.0,   // seconds
@@ -61,20 +66,32 @@ function projectSpawnDataNoWrap(data, stalenessSec) {
 }
 
 /**
- * Mirror of the single-snap extrapolation arm inside `_baseInterpolated`.
+ * Production single-snapshot extrapolation with identity test geometry.
  * Returns null if no snaps; clamps to snap[0].data if targetTime ≤ snap[0].time;
  * otherwise extrapolates by velocity for at most MAX_EXTRAPOLATION seconds.
  */
 function singleSnapExtrapolate(snap, targetTime) {
     if (!snap) return null;
-    if (targetTime <= snap.time) return { ...snap.data };
-    const extraTime = Math.min((targetTime - snap.time) / 1000, CONFIG.MAX_EXTRAPOLATION);
-    return {
-        ...snap.data,
-        x: (snap.data.x || 0) + (snap.velocity.x || 0) * extraTime,
-        y: (snap.data.y || 0) + (snap.velocity.y || 0) * extraTime,
-        angle: (snap.data.angle || 0) + (snap.rotationSpeed || 0) * CONFIG.TARGET_FPS * extraTime,
-    };
+    const policy = createSnapshotInterpolationPolicy({
+        config: {
+            ...CONFIG,
+            INTERPOLATION_ENABLED: true,
+            SNAPSHOT_BUFFER_SIZE: 6,
+            SNAP_THRESHOLD: Infinity
+        },
+        nowMs: () => targetTime,
+        validAtToTime: value => value,
+        getDelayForMember: () => 0,
+        velocityToDeltaX: value => value,
+        velocityToDeltaY: value => value,
+        shortestDeltaX: (from, to) => to - from,
+        shortestDeltaY: (from, to) => to - from,
+        wrapX: value => value,
+        wrapY: value => value,
+        distanceBetween: () => 0
+    });
+    policy.updateState('object', snap.data, 'owner', snap.time);
+    return policy.getInterpolated('object', targetTime);
 }
 
 function makeSnap(data, time) {
@@ -244,31 +261,29 @@ test('continuity: receiver bracket-extrapolates to same x as local-owner spawn p
 
 // ── Adopt-branch gate: suppress spawn projection for join-snapshot orphans ──
 //
-// Mirror of the gate in updateAstervoidsFromSync's adopt branch:
-//   project iff obj.validAt != null && !obj.spawnHandled
-//            && !joinSnapshotObjectIds.has(obj.id) && clockReady
+// Mirror of the gate in asteroidReplicationDescriptor.adoptOwned (index.html):
+//   project iff record.validAt != null && !record.spawnHandled
+//            && !facts.joinSnapshot && clockReady
 // Split children spawned during active membership ARE projected (they were
 // moving since validAt). Orphans present in the join snapshot are NOT — they
 // sat idle while the session was empty, so projecting them forward by up to
 // MAX_EXTRAPOLATION of velocity would teleport them on adoption.
 
-function shouldSpawnProject(obj, joinSnapshotObjectIds, clockReady = true) {
+function shouldSpawnProject(obj, facts, clockReady = true) {
     return obj.validAt != null
         && !obj.spawnHandled
-        && !joinSnapshotObjectIds.has(obj.id)
+        && !facts.joinSnapshot
         && clockReady;
 }
 
 test('adopt gate: split child spawned after join IS projected', () => {
-    const joinIds = new Set(['orphan-1', 'orphan-2']);
     const child = { id: 'child-fresh', validAt: 1250 };
-    assert.equal(shouldSpawnProject(child, joinIds), true);
+    assert.equal(shouldSpawnProject(child, { joinSnapshot: false }), true);
 });
 
 test('adopt gate: orphan present at join is NOT projected (no teleport)', () => {
-    const joinIds = new Set(['orphan-1', 'orphan-2']);
     const orphan = { id: 'orphan-1', validAt: 1000 };
-    assert.equal(shouldSpawnProject(orphan, joinIds), false);
+    assert.equal(shouldSpawnProject(orphan, { joinSnapshot: true }), false);
 });
 
 test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected', () => {
@@ -281,18 +296,19 @@ test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected
     const data = { x: 0.5, y: 0, velocityX: 200, velocityY: 0, angle: 0, rotationSpeed: 0 };
     const projected = projectSpawnDataNoWrap(data, staleness);
     assert.equal(projected.x, 200.5, 'WOULD jump forward by 1s of velocity if projected');
-    // The gate prevents this: orphan is in the join snapshot set.
-    const joinIds = new Set(['orphan-idle']);
-    assert.equal(shouldSpawnProject({ id: 'orphan-idle', validAt }, joinIds), false);
+    // The gate prevents this: runtime identifies an initial snapshot record.
+    assert.equal(shouldSpawnProject(
+        { id: 'orphan-idle', validAt },
+        { joinSnapshot: true }), false);
 });
 
 test('adopt gate: spawnHandled flag still suppresses re-projection', () => {
-    const joinIds = new Set();
     const obj = { id: 'child', validAt: 1250, spawnHandled: true };
-    assert.equal(shouldSpawnProject(obj, joinIds), false);
+    assert.equal(shouldSpawnProject(obj, { joinSnapshot: false }), false);
 });
 
 test('adopt gate: missing validAt suppresses projection', () => {
-    const joinIds = new Set();
-    assert.equal(shouldSpawnProject({ id: 'x', validAt: null }, joinIds), false);
+    assert.equal(shouldSpawnProject(
+        { id: 'x', validAt: null },
+        { joinSnapshot: false }), false);
 });

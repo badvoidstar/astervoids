@@ -1,10 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
-// These mirror the inline deterministic-simulation helpers in
-// wwwroot/index.html (the game layer). Per the repo convention (see
-// config-overrides.test.mjs), pure inline logic is re-implemented here and
-// asserted, since index.html is not a importable module.
+const require = createRequire(import.meta.url);
+const { createDeadReckoningPolicy } = require(
+    './wwwroot/js/replication-presentation.js');
+
+// Most helpers mirror inline deterministic game-layer logic. Dead reckoning
+// exercises the importable production presentation policy directly.
 
 // ── Mode normalization (mirrors normalizeSimMode) ───────────────────────────
 const SIM_MODES = { LEGACY: 'legacy', DETERMINISTIC: 'deterministic' };
@@ -55,26 +58,25 @@ function stepFixed(accumulatorMs, elapsed, stepMs, maxSteps, maxAccum) {
     return { steps, accumulatorMs, alpha };
 }
 
-// ── Dead-reckoning integrator (mirrors DeadReckon.getReckoned) ──────────────
+// ── Production dead-reckoning integrator ────────────────────────────────────
 function reckon(state, nowPerf, stepMs, maxFrames, velToDeltaX, velToDeltaY) {
-    let frames = stepMs > 0 ? (nowPerf - state.recvPerf) / stepMs : 0;
-    if (!(frames > 0)) frames = 0;
-    if (frames > maxFrames) frames = maxFrames;
-    const out = {
-        x: state.x,
-        y: state.y,
-        velocityX: state.velocityX,
-        velocityY: state.velocityY,
-        rotationSpeed: state.rotationSpeed,
-    };
-    if (frames > 0) {
-        out.x = state.x + velToDeltaX(state.velocityX) * frames;
-        out.y = state.y + velToDeltaY(state.velocityY) * frames;
-    }
-    if (state.angle !== null && state.angle !== undefined) {
-        out.angle = state.angle + state.rotationSpeed * frames;
-    }
-    return out;
+    const policy = createDeadReckoningPolicy({
+        config: {
+            TARGET_FPS: 1000 / stepMs,
+            DEADRECKON_MAX_FRAMES: maxFrames,
+            DEADRECKON_ANGULAR_MAX_FRAMES: maxFrames,
+            DEADRECKON_SMOOTH_MS: 0,
+            DEADRECKON_SNAP_DIST: Infinity
+        },
+        nowMs: () => nowPerf,
+        velocityToDeltaX: velToDeltaX,
+        velocityToDeltaY: velToDeltaY,
+        shortestAngleDelta: (target, current) =>
+            Math.atan2(Math.sin(target - current), Math.cos(target - current)),
+        createState: data => data
+    });
+    policy.states.set('object', state);
+    return policy._reckonRaw('object', nowPerf);
 }
 
 // ───────────────────────────────── tests ───────────────────────────────────

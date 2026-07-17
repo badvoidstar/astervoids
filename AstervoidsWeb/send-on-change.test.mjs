@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { createBallisticGate } = require('./wwwroot/js/replication-send-policy.js');
 
 // Mirrors the inline owner-side `SendGate` send-on-change suppression in
 // wwwroot/index.html (the game layer). Per repo convention (see
@@ -32,41 +36,11 @@ function makeClock() {
 }
 
 function makeGate(clock, deterministic = true, config = CONFIG) {
-    return {
-        baselines: new Map(),
-        shouldSend(id, x, y, angle, vx, vy, rs) {
-            if (!config.SEND_ON_CHANGE_ENABLED || !deterministic) return true;
-            vx = vx || 0; vy = vy || 0; rs = rs || 0;
-            const now = clock.now();
-            const b = this.baselines.get(id);
-            if (!b) { this._set(id, x, y, angle, vx, vy, rs, now); return true; }
-            let send = false;
-            if (Math.abs(vx - b.vx) > config.SEND_ON_CHANGE_VEL_EPS ||
-                Math.abs(vy - b.vy) > config.SEND_ON_CHANGE_VEL_EPS ||
-                Math.abs(rs - b.rs) > config.SEND_ON_CHANGE_ROT_EPS) {
-                send = true;
-            } else if (Math.abs(x - b.prevX) > config.SEND_ON_CHANGE_WRAP_JUMP ||
-                       Math.abs(y - b.prevY) > config.SEND_ON_CHANGE_WRAP_JUMP) {
-                send = true;
-            } else if ((now - b.lastSentMs) >= config.SEND_ON_CHANGE_HEARTBEAT_MS) {
-                send = true;
-            }
-            if (send) {
-                this._set(id, x, y, angle, vx, vy, rs, now);
-            } else {
-                b.prevX = x; b.prevY = y; b.prevAngle = angle;
-            }
-            return send;
-        },
-        _set(id, x, y, angle, vx, vy, rs, now) {
-            this.baselines.set(id, {
-                x, y, angle, vx, vy, rs,
-                lastSentMs: now, prevX: x, prevY: y, prevAngle: angle,
-            });
-        },
-        remove(id) { this.baselines.delete(id); },
-        clear() { this.baselines.clear(); },
-    };
+    return createBallisticGate({
+        config,
+        isDeterministic: () => deterministic,
+        nowMs: clock.now
+    });
 }
 
 // ── creation / first send ───────────────────────────────────────────────────

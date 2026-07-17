@@ -1,16 +1,21 @@
 /**
  * Tests for Phase B lag-based adaptive interpolation delay.
  *
- * Mirrors RemoteObjects.recordObjectSample / recomputeAdaptiveDelay so the
- * test exercises the same arithmetic the renderer uses without dragging in
- * the entire game module. The mirror IS the contract: any change to the
- * production code must be reflected here too.
+ * Exercises ReplicationPresentation's production adaptive-delay policy
+ * directly, without loading the game composition root.
  *
  * Run with:  node --test AstervoidsWeb/adaptive-delay.test.mjs
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const {
+    createAdaptiveDelayPolicy,
+    recomputeAdaptiveDelay: recomputeProductionDelay
+} = require('./wwwroot/js/replication-presentation.js');
 
 const CONFIG = {
     ADAPTIVE_DELAY_MIN: 1000 / 60,
@@ -18,75 +23,31 @@ const CONFIG = {
     ADAPTIVE_DELAY_SMOOTHING: 0.1,
     ADAPTIVE_DELAY_SAMPLES: 30,
     ADAPTIVE_DELAY_MIN_SAMPLES: 5,
-    ADAPTIVE_DELAY_NET_FLOOR: 0.5,
-    ADAPTIVE_DELAY_NET_SCALE: 4,
-    INTERPOLATION_DELAY: 100
+    ADAPTIVE_DELAY_NET_FLOOR: 0.8,
+    ADAPTIVE_DELAY_NET_SCALE: 2,
+    INTERPOLATION_DELAY: 1000 / 30,
+    ADAPTIVE_DELAY_ENABLED: true
 };
 
+const policies = new WeakMap();
+
 function createMemberDelay() {
-    return {
-        packetIntervals: [],
-        lagSamples: [],
-        computedDelay: CONFIG.INTERPOLATION_DELAY,
-        lastServerTimestamp: 0,
-        lastValidAt: 0,
-        remoteSendInterval: 0
-    };
+    const policy = createAdaptiveDelayPolicy({
+        config: CONFIG,
+        getRttMs: () => 0
+    });
+    const delay = policy.getMemberDelay('test-member');
+    policies.set(delay, policy);
+    return delay;
 }
 
 function recomputeAdaptiveDelay(ad, rttMs = 0) {
-    const minSamples = CONFIG.ADAPTIVE_DELAY_MIN_SAMPLES;
-    const useLagBased = ad.lagSamples.length >= minSamples;
-
-    if (useLagBased) {
-        const lagMean = ad.lagSamples.reduce((s, v) => s + v, 0) / ad.lagSamples.length;
-        const lagVar = ad.lagSamples.reduce((s, v) => s + (v - lagMean) ** 2, 0) / ad.lagSamples.length;
-        const lagStddev = Math.sqrt(lagVar);
-        let intervalStddev = 0;
-        if (ad.packetIntervals.length >= minSamples) {
-            const iMean = ad.packetIntervals.reduce((s, v) => s + v, 0) / ad.packetIntervals.length;
-            const iVar = ad.packetIntervals.reduce((s, v) => s + (v - iMean) ** 2, 0) / ad.packetIntervals.length;
-            intervalStddev = Math.sqrt(iVar);
-        }
-        const rawDelay = Math.max(CONFIG.ADAPTIVE_DELAY_MIN,
-            lagMean + CONFIG.ADAPTIVE_DELAY_JITTER_MULT * lagStddev + intervalStddev);
-        ad.computedDelay += CONFIG.ADAPTIVE_DELAY_SMOOTHING * (rawDelay - ad.computedDelay);
-        return;
-    }
-
-    if (ad.packetIntervals.length >= minSamples) {
-        const observedMean = ad.packetIntervals.reduce((s, v) => s + v, 0) / ad.packetIntervals.length;
-        const variance = ad.packetIntervals.reduce((s, v) => s + (v - observedMean) ** 2, 0) / ad.packetIntervals.length;
-        const stddev = Math.sqrt(variance);
-
-        const mean = ad.remoteSendInterval > 0 ? ad.remoteSendInterval : observedMean;
-        const networkFactor = Math.min(1.0,
-            CONFIG.ADAPTIVE_DELAY_NET_FLOOR + rttMs / (CONFIG.ADAPTIVE_DELAY_NET_SCALE * mean));
-        const rawDelay = Math.max(CONFIG.ADAPTIVE_DELAY_MIN,
-            mean * networkFactor + CONFIG.ADAPTIVE_DELAY_JITTER_MULT * stddev);
-        ad.computedDelay += CONFIG.ADAPTIVE_DELAY_SMOOTHING * (rawDelay - ad.computedDelay);
-    }
+    recomputeProductionDelay(ad, CONFIG, rttMs);
 }
 
 function recordObjectSample(ad, validAt, arrivalServerTime) {
-    if (validAt == null || arrivalServerTime == null) return;
-    const lag = arrivalServerTime - validAt;
-    if (!Number.isFinite(lag) || lag < 0 || lag > 5000) return;
-    ad.lagSamples.push(lag);
-    if (ad.lagSamples.length > CONFIG.ADAPTIVE_DELAY_SAMPLES) {
-        ad.lagSamples.shift();
-    }
-    if (ad.lastValidAt > 0) {
-        const interval = validAt - ad.lastValidAt;
-        if (interval > 0 && interval < 5000) {
-            ad.packetIntervals.push(interval);
-            if (ad.packetIntervals.length > CONFIG.ADAPTIVE_DELAY_SAMPLES) {
-                ad.packetIntervals.shift();
-            }
-        }
-    }
-    ad.lastValidAt = validAt;
-    recomputeAdaptiveDelay(ad);
+    policies.get(ad).recordObjectSample(
+        'test-member', validAt, arrivalServerTime);
 }
 
 test('recordObjectSample: warm-up window does not drive lag-based delay', () => {
@@ -168,7 +129,7 @@ test('recordObjectSample: lag-based path beats interval-based once ≥ MIN_SAMPL
         recomputeAdaptiveDelay(adInterval, /*rttMs*/ 0);
     }
 
-    // Lag-based converges toward 80; interval-based converges toward 25.
+    // Lag-based converges toward 80; production warm-up converges toward 40.
     assert.ok(adLag.computedDelay > adInterval.computedDelay,
         `lag-based (${adLag.computedDelay}) should exceed interval-based (${adInterval.computedDelay}) when lag is the dominant signal`);
 });

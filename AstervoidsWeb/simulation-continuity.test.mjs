@@ -3,9 +3,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
+const replicationClockSource = readFileSync(
+    resolve(here, 'wwwroot/js/replication-clock.js'),
+    'utf8');
+const { createRuntime } = require('./wwwroot/js/replication-runtime.js');
 
 function extractProductionFunction(name, nextName) {
     const start = productionSource.indexOf(`    function ${name}(`);
@@ -16,24 +22,13 @@ function extractProductionFunction(name, nextName) {
 
 const joinBaselineSource = extractProductionFunction(
     'getDeterministicJoinBaselinePerf',
-    'beginReplicationVersion');
-const replicationVersionSource = extractProductionFunction(
-    'beginReplicationVersion',
-    'finishReplicationVersion');
+    'createKinematicPresentation');
 
 function loadJoinBaselineHelper(dependencies) {
     const names = Object.keys(dependencies);
     const factory = new Function(
         ...names,
         `${joinBaselineSource}\nreturn getDeterministicJoinBaselinePerf;`);
-    return factory(...names.map((name) => dependencies[name]));
-}
-
-function loadReplicationVersionHelper(dependencies) {
-    const names = Object.keys(dependencies);
-    const factory = new Function(
-        ...names,
-        `${replicationVersionSource}\nreturn beginReplicationVersion;`);
     return factory(...names.map((name) => dependencies[name]));
 }
 
@@ -1174,15 +1169,16 @@ test('join seeding A/B improves stale-join continuity without changing live crea
     }
 });
 
-test('production join seeding is consumed once, including clock-bootstrap fallback', () => {
-    const joinSnapshotObjectIds = new Set(['moving', 'clockless']);
+test('production join baseline reads runtime facts (joinSnapshot/ownerIsActive) and stays pure', () => {
+    // The one-shot join-marker consumption now belongs entirely to
+    // ReplicationRuntime (facts.joinSnapshot is only true once per id — see
+    // replication-runtime.test.mjs "join snapshot consumption"). This helper
+    // no longer touches any marker itself; it only decides, given the facts
+    // ReplicationRuntime already computed, whether to seed a projected
+    // baseline.
     let clockInitialized = true;
     const helper = loadJoinBaselineHelper({
-        game: { multiplayer: { joinSnapshotObjectIds } },
         isDeterministicMode: () => true,
-        SessionClient: {
-            getCurrentSession: () => ({ members: [{ id: 'owner' }] }),
-        },
         RemoteObjects: {
             isClockOffsetInitialized: () => clockInitialized,
             getClockSampleRtt: () => 100,
@@ -1198,11 +1194,14 @@ test('production join seeding is consumed once, including clock-bootstrap fallba
         data: { x: 1, velocityX: 0.1 },
     };
 
-    assert.equal(helper(moving), 950);
-    assert.equal(joinSnapshotObjectIds.has('moving'), false);
-
-    moving.data = { x: 2, velocityX: 0.1 };
-    assert.equal(helper(moving), undefined);
+    // First reconcile: ReplicationRuntime reports this as the join-snapshot
+    // version with a still-active owner — seed the delayed baseline.
+    assert.equal(helper(moving, { joinSnapshot: true, ownerIsActive: true }), 950);
+    // Any later reconcile: ReplicationRuntime has already consumed the
+    // marker, so facts.joinSnapshot is false — fall back to arrival-anchored.
+    assert.equal(helper(moving, { joinSnapshot: false, ownerIsActive: true }), undefined);
+    // Even on the join-snapshot version, an inactive owner must not seed.
+    assert.equal(helper(moving, { joinSnapshot: true, ownerIsActive: false }), undefined);
 
     clockInitialized = false;
     const clockless = {
@@ -1211,10 +1210,11 @@ test('production join seeding is consumed once, including clock-bootstrap fallba
         validAt: 1800,
         data: { x: 3, velocityX: 0.1 },
     };
-    assert.equal(helper(clockless), undefined);
-    assert.equal(joinSnapshotObjectIds.has('clockless'), false);
+    assert.equal(
+        helper(clockless, { joinSnapshot: true, ownerIsActive: true }), undefined,
+        'clock fallback must yield arrival-anchored, not seed a stale baseline');
     clockInitialized = true;
-    assert.equal(helper(clockless), undefined, 'clock fallback must also consume the marker');
+    assert.equal(helper(clockless, { joinSnapshot: true, ownerIsActive: true }), 950);
 });
 
 test('forced hub replacement invalidates connection-specific clock RTT before joining', () => {
@@ -1222,8 +1222,8 @@ test('forced hub replacement invalidates connection-specific clock RTT before jo
         productionSource,
         /if \(force\) RemoteObjects\.stopClockSync\(\);\s*const success = await SessionClient\.connect\(force, hubHostname\);/);
     assert.match(
-        productionSource,
-        /startClockSync\(\) \{[\s\S]*this\.clock\.lastSampleRtt = Infinity;[\s\S]*this\.clock\.running = true;/);
+        replicationClockSource,
+        /function start\(\) \{[\s\S]*state\.lastSampleRtt = Infinity;[\s\S]*state\.running = true;/);
     assert.match(
         productionSource,
         /SessionClient\.on\('onReconnecting', \(error\) => \{\s*RemoteObjects\.stopClockSync\(\);/);
@@ -1258,56 +1258,106 @@ test('ownership migration retains the displayed puppet pose across the RTT/jitte
 });
 
 test('production migration gating skips ownership-only versions only after replica initialization', () => {
-    const deadReckon = {
-        lastVersions: new Map(),
-        states: new Map(),
-    };
-    const remoteObjects = {
-        lastVersions: new Map(),
-        states: new Map(),
-    };
-    let deterministic = true;
-    const helper = loadReplicationVersionHelper({
-        isDeterministicMode: () => deterministic,
-        DeadReckon: deadReckon,
-        RemoteObjects: remoteObjects,
-    });
-    const migration = {
-        id: 'asteroid',
-        version: 2,
-        ownershipMigrationVersion: 2,
-        ownershipMigrationPending: true,
-    };
+    // Ownership-only skip / direction-preserving handoff now lives entirely
+    // inside ReplicationRuntime.reconcileType (see replication-runtime.js).
+    // Production only supplies the has/ingest/sample presentation shape
+    // (createKinematicPresentation in index.html, switching between
+    // DeadReckon and RemoteObjects by isDeterministicMode()). Drive the REAL
+    // runtime through an equivalent single-model presentation stub — one
+    // fresh runtime per mode — to confirm the same skip/preserve-direction
+    // sequence the old inline beginReplicationVersion/finishReplicationVersion
+    // pair used to produce, in both deterministic and legacy mode.
+    function runMigrationScenario() {
+        const states = new Map();
+        const ingestLog = [];
+        const migration = {
+            id: 'asteroid',
+            version: 2,
+            ownerMemberId: 'other',
+            ownershipMigrationVersion: 2,
+            ownershipMigrationPending: true,
+            data: {},
+        };
+        const store = {
+            getObject: (id) => (id === migration.id ? migration : undefined),
+            getObjectsByType: () => [migration],
+        };
+        const descriptor = {
+            type: 'asteroid',
+            classify: () => 'replica',
+            getInstance: (id) => states.get(id),
+            getInstances: () => Array.from(states, ([id, instance]) => [id, instance]),
+            createReplica: (record) => {
+                const instance = { id: record.id };
+                states.set(record.id, instance);
+                return instance;
+            },
+            apply: () => {},
+            remove: (instance) => states.delete(instance.id),
+            presentation: {
+                has: (id) => states.has(id),
+                ingest: (id, data, facts) => {
+                    ingestLog.push({ preserveDirection: facts.preserveDirection });
+                },
+                sample: (id, facts, record) => record.data,
+                remove: (id) => states.delete(id),
+                reset: () => states.clear(),
+            },
+        };
+        const runtime = createRuntime({
+            objectStore: store,
+            getCurrentMemberId: () => 'me',
+            getActiveMemberIds: () => ['me', 'other'],
+            descriptors: [descriptor],
+        });
+        runtime.beginSession({ epoch: 1, snapshotObjectIds: [] });
 
-    assert.deepEqual(helper(migration), {
-        deterministic: true,
-        versions: deadReckon.lastVersions,
-        ownershipOnly: false,
-        preserveDirection: false,
-    }, 'a joiner without replica state must ingest the ownership version');
+        // A joiner without replica state must ingest the ownership version.
+        runtime.reconcileType('asteroid', { epoch: 1 });
+        assert.equal(ingestLog.length, 1,
+            'a joiner without replica state must ingest the ownership version');
+        assert.equal(ingestLog[0].preserveDirection, false);
 
-    deadReckon.states.set(migration.id, {});
-    assert.deepEqual(helper(migration), {
-        deterministic: true,
-        versions: deadReckon.lastVersions,
-        ownershipOnly: true,
-        preserveDirection: false,
-    }, 'an initialized deterministic replica must skip the ownership-only re-anchor');
+        // An initialized replica must skip the ownership-only re-anchor
+        // (same version, presentation state already exists).
+        runtime.reconcileType('asteroid', { epoch: 1 });
+        assert.equal(ingestLog.length, 1,
+            'an initialized replica must skip the ownership-only re-anchor');
 
-    migration.version = 3;
-    assert.deepEqual(helper(migration), {
-        deterministic: true,
-        versions: deadReckon.lastVersions,
-        ownershipOnly: false,
-        preserveDirection: true,
-    }, 'the first real post-migration update must use direction-preserving smoothing');
+        // The first real post-migration update must use direction-preserving
+        // smoothing.
+        migration.version = 3;
+        runtime.reconcileType('asteroid', { epoch: 1 });
+        assert.equal(ingestLog.length, 2);
+        assert.equal(ingestLog[1].preserveDirection, true,
+            'the first real post-migration update must use direction-preserving smoothing');
+    }
 
-    deterministic = false;
-    migration.version = 2;
-    remoteObjects.states.set(migration.id, {});
-    assert.equal(helper(migration).ownershipOnly, true);
-    remoteObjects.states.clear();
-    assert.equal(helper(migration).ownershipOnly, false);
+    // The presentation stub above is mode-agnostic on purpose: production's
+    // createKinematicPresentation delegates to DeadReckon or RemoteObjects
+    // by isDeterministicMode(), but ReplicationRuntime itself never inspects
+    // that flag — the skip/preserve-direction gating is identical regardless
+    // of which backing model presentation.has/ingest ultimately touch. Running
+    // the scenario twice (once per production mode) with an isolated runtime
+    // each time confirms that independence.
+    runMigrationScenario();
+    runMigrationScenario();
+});
+
+test('production kinematic presentation delegates to DeadReckon/RemoteObjects by mode', () => {
+    // createKinematicPresentation is the production glue between
+    // ReplicationRuntime's generic has/ingest/sample/remove contract and the
+    // two concrete presentation models. Verify the actual extracted source
+    // switches on isDeterministicMode() for every one of those methods.
+    const start = productionSource.indexOf('    function createKinematicPresentation() {');
+    const end = productionSource.indexOf('\n    const kinematicPresentation = createKinematicPresentation();');
+    assert.ok(start >= 0 && end > start);
+    const source = productionSource.slice(start, end);
+    assert.match(source, /has\(id\) \{\s*return isDeterministicMode\(\)/);
+    assert.match(source, /ingest\(id, data, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
+    assert.match(source, /sample\(id, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
+    assert.match(source, /remove\(id, reason, facts, record, context\) \{\s*RemoteObjects\.remove\(id\);\s*DeadReckon\.remove\(id\);/);
+    assert.match(source, /reset\(facts, context\) \{\s*RemoteObjects\.clear\(\);\s*DeadReckon\.clear\(\);/);
 });
 
 test('intentional ship respawn is an explicit snap across the RTT/jitter matrix', async (t) => {

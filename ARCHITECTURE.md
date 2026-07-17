@@ -6,9 +6,10 @@
 graph TB
     subgraph "Browser (HTML5 Canvas)"
         UI["index.html<br/>Single-file frontend<br/>Game loop · Rendering · Input"]
+        RR["ReplicationRuntime<br/>Replica lifecycle · Versions · Ownership"]
+        RP["Replication policies<br/>Clock · Presentation · Send decisions"]
         OS["ObjectSync<br/>object-sync.js"]
         SC["SessionClient<br/>session-client.js"]
-        RO["RemoteObjects<br/>Interpolation · BUF · RTT · JIT"]
     end
 
     subgraph "ASP.NET Core Server"
@@ -17,32 +18,43 @@ graph TB
         OBS["ObjectService<br/>Object CRUD · Versioning"]
     end
 
-    UI -->|"tick(dt) each frame"| OS
+    UI -->|"reconcileType at game-owned pivots"| RR
+    RR -->|"pull canonical records"| OS
+    RR -->|"ingest / sample / reset"| RP
+    RP -->|"sampled state"| UI
+    UI -->|"send decision + tick(dt)"| OS
     OS -->|"updateObjects / createObject / deleteObject"| SC
     SC <-->|"WebSocket (SignalR)"| HUB
     HUB --> SS
     HUB --> OBS
     SC -->|"onBatchReceived · onObjectCreated · onObjectDeleted"| OS
-    OS -->|"updateState(id, data, ownerMemberId)"| RO
-    RO -->|"getInterpolated(id, renderTime)"| UI
 ```
 
 ---
 
 ## Client Architecture
 
-The browser client is split into four cooperative modules loaded before `index.html`'s inline script runs. Each module exposes only an explicit `return { ... }` object; all internal state is closure-private. Dependency direction is strictly top-down — no code above a given layer ever calls into a layer below it directly.
+The browser client uses classic-script modules loaded before `index.html`'s
+inline composition root. There is no bundler or transpilation step. Each module
+exposes an explicit public object while retaining internal state in closures.
+The game composes the layers and supplies Astervoids-specific adapters.
 
 ### Layer Boundaries
 
 ```mermaid
 graph TB
     GAME["index.html<br/>Game loop · Rendering · Input · Gameplay rules"]
+    RR["ReplicationRuntime  (replication-runtime.js)<br/>Replica lifecycle · Version consumption<br/>Join markers · Ownership transitions"]
+    POL["Replication policies<br/>replication-clock.js · replication-presentation.js<br/>replication-send-policy.js"]
     OS["ObjectSync  (object-sync.js)<br/>Object registry · Delta encoding · Batched flush<br/>Per-member sequencing · Reconciliation · Field-name compression"]
     SC["SessionClient  (session-client.js)<br/>SignalR lifecycle · Hub RPC wrappers<br/>Stale-connection guard() · GUID normalization"]
     GU["GuidUtils  (guid-utils.js)<br/>bytesToGuid · transformBinaryGuids"]
     HUB["/sessionHub<br/>ASP.NET Core SignalR — MessagePack"]
 
+    GAME -->|"register adapters · reconcileType at existing pivots"| RR
+    RR -->|"getObjectsByType · getObject"| OS
+    RR -->|"ingest · sample · remove · reset"| POL
+    GAME -->|"send-policy decisions"| POL
     GAME -->|"tick(dt) · create/update/delete/replaceObject · on(event)"| OS
     GAME -->|"connect · createSession · joinSession · leaveSession · on(event)"| SC
     OS -->|"createObject · updateObjects · deleteObject<br/>replaceObject · getSessionState"| SC
@@ -59,8 +71,107 @@ These rules are enforced purely by module structure and must not be violated whe
 - **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
 - **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
 - **Send rate is decoupled from frame rate.** The game calls only `ObjectSync.tick(frameTimeSec)` once per frame; `ObjectSync` internally computes `sendThreshold` from `nominalFrameTime` and flushes batched mutations independently.
+- **`ReplicationRuntime` is pull-driven.** It never owns a frame loop, calls
+  `ObjectSync.tick`, sends a mutation, or subscribes to SignalR. The game invokes
+  one type reconciliation at each existing collision-visible simulation pivot.
+- **`ReplicationRuntime` never interprets game data.** Record classification
+  and entity create/apply/adopt/remove behavior are adapter callbacks.
+  Reusable kinematic/control policies define explicit input state contracts and
+  receive geometry, prediction, replay, wrapping, and clock behavior through
+  injection.
+- **Serialization has one seam.** Entity `toSyncData`, `toUpdateData`, and
+  `fromSyncData` methods plus the schema selector remain authoritative; runtime
+  descriptors do not duplicate wire mappings.
 
 > These are the client-side analogues of the server-side lock ordering described in the [Thread Safety](#sessionservice-thread-safety) section.
+
+### Replication Responsibilities and State Ownership
+
+| Layer | Owns | Does not own |
+|---|---|---|
+| `SessionClient` | SignalR connection, session identity/epoch, RPC lifecycle | Replicated entities or presentation |
+| `ObjectSync` | Canonical records, versions, deltas, batching, sequencing, reconciliation | Game fields, physics, concrete entities |
+| Replication policies | Clock estimates, interpolation/dead-reckoning state, send eligibility | Transport, collections, frame scheduling |
+| `ReplicationRuntime` | Consumed versions, one-shot join markers, role bindings, migration-pending state | Serialization, simulation, collisions, audio |
+| Astervoids adapters | Record-to-entity mapping and game-specific transition effects | SignalR and wire mechanics |
+| Astervoids game | Local authority, rules, physics, collisions, rendering, UX | Generic record ordering and migration gates |
+
+The canonical record in `ObjectSync`, a locally authoritative entity, a remote
+game instance, and transient presentation state are deliberately separate
+objects with one owner each. `ReplicationRuntime` coordinates them without
+copying canonical data into a second generic store.
+
+### Pull-Driven Frame Contract
+
+The extraction preserves the existing order rather than introducing one global
+replication update:
+
+1. `ObjectSync.tick` pumps the outbound scheduler once per frame.
+2. Local authoritative entities simulate and enqueue their latest state.
+3. `updateRemoteShips`, `updateAstervoidsFromSync`,
+   `updateBulletsFromSync`, and `updateGameStateFromSync` reconcile their type
+   at their original game-owned pivots.
+4. Collision detection observes the same local and sampled remote state as
+   before extraction.
+5. Rendering remains outside the runtime.
+
+The hidden-tab fallback keeps its own established order: outbound tick, local
+ownership simulation, asteroid and bullet reconciliation, collision handling,
+then ship reconciliation. Consolidating these calls into a single automatic
+runtime tick is prohibited because it would change collision-visible state.
+
+Outbound authority remains game-owned. `replication-send-policy.js` returns
+explicit `{ send, immediate, reason }` decisions, but the game still invokes
+entity serializers and `ObjectSync.updateObject`; `ObjectSync` still owns
+coalescing, immediate edge flushes, cadence, and backpressure. An
+`AuthorityPublisher` was intentionally not introduced because it would combine
+independently tested scheduling layers without adding receive-side reuse.
+
+### Replica Lifecycle Contract
+
+`ReplicationRuntime` consumes plain records with `id`, `type`, `data`,
+`creatorMemberId`, `ownerMemberId`, `scope`, `version`, `validAt`, and optional
+ownership-migration metadata. A registered type adapter classifies each record
+as `owned`, `replica`, or `ignore` and supplies collection and lifecycle hooks.
+
+- `beginSession({ epoch, snapshotObjectIds })` scopes all work to a
+  `SessionClient` epoch and installs one-shot join markers.
+- A join marker is consumed only by the first applicable replica ingest or
+  owned adoption.
+- Equal consumed versions continue to sample existing presentation state but
+  do not ingest another anchor.
+- A metadata-only ownership version advances consumption without re-anchoring
+  an existing replica. The first later data-bearing version receives a
+  `preserveDirection` transition fact.
+- Delete, ownership gain, ignored role, missing type, and session reset use
+  explicit removal reasons so game adapters can suppress inappropriate
+  cosmetic effects.
+- Stale-epoch reconciliation, deletion, migration, and reset work is rejected.
+
+This remains a client-side boundary for one joined session. Server authority is
+still the in-memory, per-session state protected by `Session.SyncRoot` inside
+one application instance; the runtime does not add cross-process or
+cross-region session replication.
+
+### Future Native Client Contract
+
+The JavaScript callbacks and `Map` usage are implementation details, not the
+cross-language API. A native client should reproduce these protocol-neutral
+contracts:
+
+- plain record fields, session epochs, role transitions, version acceptance,
+  and removal reasons;
+- explicit wall, server-UTC, and monotonic clock domains in milliseconds;
+- primitive-input prediction/interpolation kernels and documented clamp rules;
+- explicit send decisions, while retaining a separate transport scheduler;
+- golden codec, timing, join, migration, and cadence fixtures.
+
+Normative behavior must not depend on DOM APIs, JavaScript object identity, or
+hidden calls to `performance.now()`. The existing JS/C# cross-wire fixtures and
+policy/runtime vectors are the starting point for a future C/C++ implementation.
+Packaging, code generation, a full ECS, distributed authority, and a separate
+session/reconnect coordinator remain deferred until a second client proves
+those seams.
 
 ### SessionClient Public API
 
@@ -97,6 +208,7 @@ These methods have no corresponding hub RPC.
 | `on(eventName, callback)` | Registers a named callback from the fixed `callbacks` set |
 | `getCurrentSession()` | Returns the current session object (`id, name, members[], objects[], metadata`) or `null` |
 | `getCurrentMember()` | Returns the current member object (`id, role`) or `null` |
+| `getSessionEpoch()` | Returns the monotonically changing local lifecycle epoch used to reject stale async work |
 | `isConnected()` | `true` when the connection is `HubConnectionState.Connected` |
 | `isInSession()` | `true` when `currentSession !== null` |
 | `getLastSessionId()` | Returns the session id from the most recent join; preserved across unexpected disconnects for auto-rejoin |
@@ -914,7 +1026,10 @@ per object. This bandwidth tradeoff relies on the following:
 
 * **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries begin with the same operation timestamp. It does not retain each pose's original simulation time.
 * **Server-side caps can still differ.** `ObjectService.ValidateValidAt` clamps a regressing value to each object's previous `ValidAt`. If objects had different prior values, their validated values can diverge even though the wire broadcast selects the first entry's value.
-* **Receiver insertion is monotonic.** `RemoteObjects.updateState` prevents regressing keys, and its near-coincident-key cushion avoids an immediate Hermite jump. This protects bracket ordering; it does not restore discarded per-object timestamps.
+* **Receiver insertion is monotonic.** The snapshot presentation policy
+  prevents regressing keys, and its near-coincident-key cushion avoids an
+  immediate Hermite jump. This protects bracket ordering; it does not restore
+  discarded per-object timestamps.
 
 Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
 `SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
@@ -1315,6 +1430,11 @@ SignalR connection to the correct region's hub.
   every region in parallel and merges the results. No central registry,
   no cross-region writes — keeps the existing per-process state model
   unchanged.
+- **One process owns a joined session.** The replication runtime consumes
+  canonical records without assuming where they are stored, but current server
+  ordering and authority remain process-local. Future distributed sessions
+  require a shared ordered session/object store and fan-out below this client
+  boundary; client extraction alone does not provide them.
 - **Apex entrypoint via Static Web App.** First-time visitors land on the
   static shell via apex CNAME → Static Web App. After the client downloads
   `region-service.js` it takes over: pings every region and pins to its
@@ -1645,6 +1765,8 @@ astervoids/
 │
 ├── AstervoidsWeb/              # Main web application
 │   ├── AstervoidsWeb.csproj    # .NET 10.0 Web SDK project
+│   ├── *.test.mjs              # Node behavior, policy, runtime, cadence, continuity,
+│   │                           # codec, and source-order contract tests
 │   ├── Program.cs              # App startup, DI, middleware, SignalR mapping,
 │   │                           # MessagePack protocol, /api/srvmon endpoint
 │   ├── Dockerfile              # Multi-stage Docker build (SDK → aspnet runtime)
@@ -1707,6 +1829,10 @@ astervoids/
 │           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,
 │           │                                      # per-member sequencing, reconciliation, field-name compression.
 │           │                                      # See: Client Architecture.
+│           ├── replication-clock.js               # Injected server-clock estimator and validAt conversion
+│           ├── replication-presentation.js        # Adaptive delay, interpolation, and dead-reckoning policies
+│           ├── replication-send-policy.js         # Ballistic/ship send eligibility and immediate-edge decisions
+│           ├── replication-runtime.js             # Pull-driven replica lifecycle, versions, joins, and ownership
 │           ├── guid-utils.js                      # bytesToGuid · transformBinaryGuids (binary GUID → string)
 │           ├── signalr.min.js                     # SignalR client library (local copy)
 │           └── signalr-protocol-msgpack.min.js    # MessagePack protocol for SignalR client

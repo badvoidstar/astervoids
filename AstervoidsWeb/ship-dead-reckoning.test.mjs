@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
-// Mirrors the inline ship dead-reckoning improvements in wwwroot/index.html
-// (the game layer). Per repo convention (see send-on-change.test.mjs /
-// deterministic-sim.test.mjs) pure inline logic is re-implemented here and
-// asserted, since index.html is not importable. Three features are covered:
+const require = createRequire(import.meta.url);
+const { createControlEdgeGate } = require('./wwwroot/js/replication-send-policy.js');
+const { createDeadReckoningPolicy } = require(
+    './wwwroot/js/replication-presentation.js');
+
+// Exercises extracted policies where available and mirrors the game-layer Ship
+// replay callback where Ship itself remains inline. The covered features are:
 //
 //   P1  ShipControlGate.isEdge — scheme-agnostic detection of overshoot-critical
 //       control edges (rotation start/stop/reversal, thrust on/off, brake
@@ -29,28 +33,10 @@ import assert from 'node:assert/strict';
 const ROT_EPS = 1e-4;
 
 function makeShipControlGate() {
-    return {
-        last: null,
-        EPS: 1e-4,
-        isEdge(ship) {
-            const rotEps = ROT_EPS;
-            const eps = this.EPS;
-            const rs = ship.rotationSpeed || 0;
-            const th = ship.thrustInput || 0;
-            const br = ship.brakeInput || 0;
-            const thrusting = !!ship.thrusting;
-            const p = this.last;
-            this.last = { rs, th, br, thrusting };
-            if (!p) return false;
-            if ((Math.abs(rs) > rotEps) !== (Math.abs(p.rs) > rotEps)) return true;
-            if (rs * p.rs < 0) return true;
-            if (thrusting !== p.thrusting) return true;
-            if ((th > eps) !== (p.th > eps)) return true;
-            if ((br > eps) !== (p.br > eps)) return true;
-            return false;
-        },
-        reset() { this.last = null; },
-    };
+    return createControlEdgeGate({
+        getRotationEpsilon: () => ROT_EPS,
+        epsilon: 1e-4
+    });
 }
 
 test('P1: first sample only seeds the baseline (no edge)', () => {
@@ -120,14 +106,27 @@ test('P1: reset clears the baseline so the next sample re-seeds', () => {
 });
 
 // ----------------------------------------------------------------------------
-// P2: DeadReckon angular-projection clamp mirror
+// P2: production DeadReckon angular-projection clamp
 // ----------------------------------------------------------------------------
 
 function reckonAngle(state, frames, cfg) {
-    let angFrames = frames;
-    const cap = cfg.DEADRECKON_ANGULAR_MAX_FRAMES;
-    if (state.clampAngular && cap >= 0 && angFrames > cap) angFrames = cap;
-    return state.angle + state.rotationSpeed * angFrames;
+    const targetFps = 60;
+    const policy = createDeadReckoningPolicy({
+        config: {
+            ...cfg,
+            TARGET_FPS: targetFps,
+            DEADRECKON_MAX_FRAMES: frames,
+            DEADRECKON_SMOOTH_MS: 0,
+            DEADRECKON_SNAP_DIST: Infinity
+        },
+        nowMs: () => frames * 1000 / targetFps,
+        velocityToDeltaX: () => 0,
+        velocityToDeltaY: () => 0,
+        shortestAngleDelta,
+        createState: data => data
+    });
+    policy.states.set('ship', { ...state, recvPerf: 0 });
+    return policy._reckonRaw('ship', frames * 1000 / targetFps).angle;
 }
 
 test('P2: ship angle is clamped to DEADRECKON_ANGULAR_MAX_FRAMES', () => {

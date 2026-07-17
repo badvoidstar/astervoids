@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { createShipGate } = require('./wwwroot/js/replication-send-policy.js');
 
 // Mirrors the inline owner-side `ShipSendGate` send-on-change suppression in
 // wwwroot/index.html (the game layer). Per repo convention (see
@@ -39,53 +43,11 @@ function makeClock() {
 // Mirror of the inline ShipSendGate. `deterministic` and `config` are injectable
 // to exercise the always-send fall-throughs.
 function makeGate(clock, deterministic = true, config = CONFIG) {
-    return {
-        baselines: new Map(),
-        shouldSend(id, ship, force) {
-            if (!config.SHIP_SEND_ON_CHANGE_ENABLED ||
-                !config.SHIP_INPUT_REPLAY_ENABLED ||
-                !deterministic) {
-                return true;
-            }
-            const now = clock.now();
-            const b = this.baselines.get(id);
-            if (force || !b) { this._set(id, ship, now); return true; }
-            const eps = config.SEND_ON_CHANGE_VEL_EPS;
-            const rotEps = config.SEND_ON_CHANGE_ROT_EPS;
-            let send = false;
-            if (Math.abs((ship.thrustInput || 0) - b.thrustInput) > eps ||
-                Math.abs((ship.brakeInput || 0) - b.brakeInput) > eps ||
-                Math.abs((ship.turnTarget || 0) - b.turnTarget) > eps ||
-                Math.abs((ship.turnMagnitude || 0) - b.turnMagnitude) > eps ||
-                Math.abs((ship.turnBias || 0) - b.turnBias) > eps ||
-                Math.abs((ship.turnTargetAngle || 0) - b.turnTargetAngle) > rotEps ||
-                (ship.turnControlMode || 0) !== b.turnControlMode ||
-                !!ship.thrusting !== b.thrusting ||
-                (ship.invulnerable || 0) !== b.invulnerable) {
-                send = true;
-            } else if ((now - b.lastSentMs) >= config.SEND_ON_CHANGE_HEARTBEAT_MS) {
-                send = true;
-            }
-            if (send) this._set(id, ship, now);
-            return send;
-        },
-        _set(id, ship, now) {
-            this.baselines.set(id, {
-                thrustInput: ship.thrustInput || 0,
-                brakeInput: ship.brakeInput || 0,
-                turnControlMode: ship.turnControlMode || 0,
-                turnTarget: ship.turnTarget || 0,
-                turnTargetAngle: ship.turnTargetAngle || 0,
-                turnMagnitude: ship.turnMagnitude || 0,
-                turnBias: ship.turnBias || 0,
-                thrusting: !!ship.thrusting,
-                invulnerable: ship.invulnerable || 0,
-                lastSentMs: now,
-            });
-        },
-        remove(id) { this.baselines.delete(id); },
-        clear() { this.baselines.clear(); },
-    };
+    return createShipGate({
+        config,
+        isDeterministic: () => deterministic,
+        nowMs: clock.now
+    });
 }
 
 // A coasting ship: position/velocity drift every frame (friction decay + wrap)

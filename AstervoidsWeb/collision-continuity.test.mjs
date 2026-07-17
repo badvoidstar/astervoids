@@ -6,6 +6,12 @@ import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
+const presentationSource = readFileSync(
+    resolve(here, 'wwwroot/js/replication-presentation.js'),
+    'utf8');
+const runtimeSource = readFileSync(
+    resolve(here, 'wwwroot/js/replication-runtime.js'),
+    'utf8');
 
 const CUE_MIN_MS = 120;
 const CUE_FADE_MS = 180;
@@ -174,9 +180,9 @@ test('pending bullets and monotonic ship hits are cued exactly once', () => {
 });
 
 test('production applies non-kinematic pending-hit fields outside DeadReckon', () => {
-    assert.match(productionSource, /bullet\.pendingHit = !!obj\.data\.pendingHit;/);
-    assert.match(productionSource, /bullet\.hitTargetId = obj\.data\.hitTargetId \|\| null;/);
-    assert.match(productionSource, /CollisionEffects\.startAsteroidHit\(\{\s*\.\.\.obj\.data,/);
+    assert.match(productionSource, /instance\.pendingHit = !!raw\.pendingHit;/);
+    assert.match(productionSource, /instance\.hitTargetId = raw\.hitTargetId \|\| null;/);
+    assert.match(productionSource, /CollisionEffects\.startAsteroidHit\(\{\s*\.\.\.raw,/);
 });
 
 test('production ship-hit event carries the pre-reset pose and deduplicates by hitCount', () => {
@@ -225,25 +231,24 @@ test('same-owner asteroid impacts broadcast a target-relative cue before replace
 });
 
 test('production join seeding targets the delayed presentation timeline only for active owners', () => {
-    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.has\(obj\.id\)/);
-    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.delete\(obj\.id\)/);
-    assert.match(productionSource, /session\?\.members\?\.some\(member => member\.id === obj\.ownerMemberId\)/);
+    assert.match(productionSource, /!isDeterministicMode\(\) \|\| !record \|\| !facts\.joinSnapshot/);
+    assert.match(productionSource, /!facts\.ownerIsActive \|\| !Number\.isFinite\(clockRtt\)/);
     assert.match(
         productionSource,
         /presentationNow = RemoteObjects\.serverNowMs\(\) - Math\.max\(0, clockRtt\) \/ 2/);
-    assert.match(productionSource, /getDeterministicJoinBaselinePerf\(obj\)/);
+    assert.match(productionSource, /getDeterministicJoinBaselinePerf\(record, facts\)/);
 });
 
 test('production migration handoff skips ownership-only anchors and preserves direction', () => {
-    assert.match(productionSource, /obj\.ownershipMigrationVersion === obj\.version/);
-    assert.match(productionSource, /!replicationChange\.ownershipOnly && replicationChange\.deterministic/);
-    assert.match(productionSource, /replicationChange\.preserveDirection/);
-    assert.match(productionSource, /correctionAlong \* stepMs \/ motion/);
-    assert.match(productionSource, /tauMs: tau/);
+    assert.match(runtimeSource, /record\.ownershipMigrationVersion === record\.version/);
+    assert.match(runtimeSource, /preserveDirection = !!transition\?\.pending && !ownershipVersion;/);
+    assert.match(productionSource, /isTeleport,\s*facts\.preserveDirection\);/);
+    assert.match(presentationSource, /correctionAlong \* stepMs \/ motion/);
+    assert.match(presentationSource, /tauMs: tau/);
 });
 
 test('session reset clears all transient collision state', () => {
-    assert.match(productionSource, /game\.multiplayer\.joinSnapshotObjectIds\.clear\(\);[\s\S]*CollisionEffects\.clear\(\);/);
+    assert.match(productionSource, /CollisionEffects\.clear\(\);[\s\S]*replicationRuntime\.resetSession\(\);/);
     assert.match(productionSource, /game\.multiplayer\.seenPendingBulletIds\.clear\(\);/);
     assert.match(productionSource, /game\.multiplayer\.seenShipHitCounts\.clear\(\);/);
 });
