@@ -76,56 +76,52 @@ public record MemberLeftInfo(
 // parallel ValidAts array (GuidLongPair[]) so each pre-existing object keeps its
 // own age. SessionObject.ValidAt remains the server-side storage.
 //
-// Phase 3 (wireopt envelope): the per-object Data slot is now a SyncPayload —
-// a (byte SchemaId, byte[] Data) pair. SchemaId=0 means "Data bytes are a
-// MessagePack-serialized Dictionary<string, object?>" (the legacy form, lossless
-// round-trip with both the C# server-internal Dictionary and the JS game
-// dict). Phase 4+ will assign nonzero schemaIds to positional, type-tagged
-// records for individual game object types. The server treats the bytes as
-// opaque; only sync-layer code (ToObjectInfo / inbound decode) ever inspects
-// them. See SyncPayloadCodec for encode/decode.
+// The per-object Data slot is a SyncPayload (byte SchemaId, byte[] Data).
+// SchemaId=0 carries a generic MessagePack map; nonzero IDs select registered
+// positional schemas. The server treats the encoded bytes as opaque outside
+// the sync-layer encode/decode boundary.
 [MessagePackObject]
 public record ObjectInfo(
-    [property: Key("id")] Guid Id,
-    [property: Key("creatorMemberId")] Guid CreatorMemberId,
-    [property: Key("ownerMemberId")] Guid OwnerMemberId,
-    [property: Key("scope")] ObjectScope Scope,
-    [property: Key("data")] SyncPayload Data,
-    [property: Key("version")] long Version);
+    [property: Key(0)] Guid Id,
+    [property: Key(1)] Guid CreatorMemberId,
+    [property: Key(2)] Guid OwnerMemberId,
+    [property: Key(3)] ObjectScope Scope,
+    [property: Key(4)] SyncPayload Data,
+    [property: Key(5)] long Version);
 
 [MessagePackObject]
 public record ObjectUpdateInfo(
-    [property: Key("id")] Guid Id,
-    [property: Key("data")] SyncPayload Data,
-    [property: Key("version")] long Version);
+    [property: Key(0)] Guid Id,
+    [property: Key(1)] SyncPayload Data,
+    [property: Key(2)] long Version);
 
 [MessagePackObject]
 public record ObjectUpdateRequest(
-    [property: Key("objectId")] Guid ObjectId,
-    [property: Key("data")] SyncPayload Data);
+    [property: Key(0)] Guid ObjectId,
+    [property: Key(1)] SyncPayload Data);
 
 [MessagePackObject]
 public record ObjectReplacedEvent(
-    [property: Key("deletedObjectId")] Guid DeletedObjectId,
-    [property: Key("createdObjects")] List<ObjectInfo> CreatedObjects);
+    [property: Key(0)] Guid DeletedObjectId,
+    [property: Key(1)] List<ObjectInfo> CreatedObjects);
 
 // Operation responses
 [MessagePackObject]
 public record CreateObjectResponse(
-    [property: Key("objectInfo")] ObjectInfo ObjectInfo,
-    [property: Key("memberSequence")] long MemberSequence,
-    [property: Key("validAt")] long ValidAt);
+    [property: Key(0)] ObjectInfo ObjectInfo,
+    [property: Key(1)] long MemberSequence,
+    [property: Key(2)] long ValidAt);
 
 [MessagePackObject]
 public record UpdateObjectsResponse(
-    [property: Key("versions")] GuidLongPair[] Versions,
-    [property: Key("memberSequence")] long MemberSequence,
-    [property: Key("serverTimestamp")] long ServerTimestamp);
+    [property: Key(0)] GuidLongPair[] Versions,
+    [property: Key(1)] long MemberSequence,
+    [property: Key(2)] long ServerTimestamp);
 
 [MessagePackObject]
 public record DeleteObjectResponse(
-    [property: Key("success")] bool Success,
-    [property: Key("memberSequence")] long MemberSequence);
+    [property: Key(0)] bool Success,
+    [property: Key(1)] long MemberSequence);
 
 /// <summary>
 /// Wire-level (Guid, long) pair encoded as a 2-element MessagePack fixarray
@@ -143,15 +139,15 @@ public record DeleteObjectResponse(
 /// an object/Map for ergonomic game-side access.
 /// </summary>
 // Generic per-object event channel. Server is a relay — payload is opaque
-// to the server (game-defined dictionary). EventKind is a small byte-id
+// to the server (game-encoded MessagePack bytes). EventKind is a small byte-id
 // agreed between game peers (registered via ObjectSync.registerEventKind).
 // Use for low-frequency state transitions that don't belong on the per-frame
 // update path (score changes, one-shot impact reports, etc.).
 [MessagePackObject]
 public record ObjectEventInfo(
-    [property: Key("objectId")] Guid ObjectId,
-    [property: Key("eventKind")] byte EventKind,
-    [property: Key("payload")] Dictionary<string, object?>? Payload);
+    [property: Key(0)] Guid ObjectId,
+    [property: Key(1)] byte EventKind,
+    [property: Key(2)] byte[]? Payload);
 
 [MessagePackObject]
 public record GuidLongPair(
@@ -159,15 +155,15 @@ public record GuidLongPair(
     [property: Key(1)] long Value);
 
 /// <summary>
-/// Phase 3 wire envelope for per-object game data. The server is opaque
+/// Wire envelope for per-object game data. The server is opaque
 /// w.r.t. <c>Data</c>; <see cref="SchemaId"/> selects how clients (and the
 /// hub-layer encoders/decoders) interpret the bytes:
 ///
 /// <list type="bullet">
-///   <item><b>0</b> = legacy form. Bytes are <c>MessagePackSerializer.Serialize&lt;Dictionary&lt;string, object?&gt;&gt;(...)</c>
+///   <item><b>0</b> = generic map form. Bytes are <c>MessagePackSerializer.Serialize&lt;Dictionary&lt;string, object?&gt;&gt;(...)</c>
 ///         using the standard contractless resolver. Lossless round-trip with
 ///         the JS msgpack codec at <c>wwwroot/js/msgpack-codec.js</c>.</item>
-///   <item><b>1..N</b> = Phase 4+ positional schemas (registered per session
+///   <item><b>1..N</b> = positional schemas (registered per session
 ///         in <c>metadata.schemas</c>). Bytes are a packed positional
 ///         representation; the server still treats them as opaque.</item>
 /// </list>
@@ -175,7 +171,7 @@ public record GuidLongPair(
 /// Wire cost vs the prior shape (raw <c>Dictionary&lt;string, object?&gt;</c>):
 /// <list type="bullet">
 ///   <item>+2 B per object (1 B SchemaId + 1 B bin8 length header on the byte[]).</item>
-///   <item>Recouped many times over by Phase 4 typed schemas + Phase 5 quantization.</item>
+///   <item>Recouped many times over by typed positional schemas and quantization.</item>
 /// </list>
 ///
 /// Positional <c>[Key(int)]</c> attributes serialize this as a 2-element

@@ -30,18 +30,23 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 
-// Mirror of the production WIREOPT_SCHEMAS id=3 entry (asteroid update).
+// Mirror of the production WIREOPT_SCHEMAS id=2 asteroid superset.
 // Keep this in lock-step with index.html — if the wire shape changes here
 // without the production schema also changing, that's the bug being repinned.
 const ASTEROID_UPDATE_SCHEMA_FIELDS = [
+    ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+    ['radius', 'q16'],
     ['velocityX', 'q16s'], ['velocityY', 'q16s'],
     ['rotationSpeed', 'q16s'],
+    ['seed', 'f64'], ['vertices', 'bytes'],
+    ['terminalEpoch', 'f64'],
+    ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
 ];
 
 function freshSchema() {
     SchemaCodec.clear();
-    return SchemaCodec.register(3, ASTEROID_UPDATE_SCHEMA_FIELDS);
+    return SchemaCodec.register(2, ASTEROID_UPDATE_SCHEMA_FIELDS);
 }
 
 // Mirror of the production updateState snapshot construction (index.html
@@ -76,8 +81,8 @@ test('asteroid update schema carries velocity through encode/decode round trip',
     const bytes = SchemaCodec.encode(schema, sent);
     const decoded = SchemaCodec.decode(schema, bytes);
 
-    // The ship-update schema id=1 already had these fields; the regression
-    // was that schema id=3 was minimised to {x, y, angle}. Pin that the
+    // The ship schema already had these fields; the regression was that the
+    // asteroid schema was minimised to {x, y, angle}. Pin that the
     // current schema preserves velocity — both the keys and the values
     // (within q16s ~3e-5 quantization).
     assert.ok('velocityX' in decoded, 'velocityX must survive decode (Phase 4D regression)');

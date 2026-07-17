@@ -15,20 +15,36 @@ const TWO_PI = Math.PI * 2;
 
 // Mirror the live game schemas registered in index.html WIREOPT_SCHEMAS.
 const SHIP_UPDATE_FIELDS = [
-    ['x', 'q16'], ['y', 'q16'], ['angle', 'q16_2pi'],
+    ['type', 'str'],
+    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
     ['velocityX', 'q16s'], ['velocityY', 'q16s'],
     ['rotationSpeed', 'q16s'],
-    ['thrusting', 'bool'], ['invulnerable', 'bool'],
+    ['thrusting', 'bool'], ['invulnerable', 'u16'],
+    ['colorIndex', 'u8'], ['memberId', 'guid'],
+    ['score', 'u32'], ['hitCount', 'u16'],
+    ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+    ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
+    ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
+    ['turnBias', 'q16s'],
+    ['terminalEpoch', 'f64'],
+    ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
 ];
 const ASTEROID_UPDATE_FIELDS = [
-    ['x', 'q16'], ['y', 'q16'], ['angle', 'q16_2pi'],
+    ['type', 'str'],
+    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+    ['radius', 'q16'],
+    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+    ['rotationSpeed', 'q16s'],
+    ['seed', 'f64'], ['vertices', 'bytes'],
+    ['terminalEpoch', 'f64'],
+    ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
 ];
 
 function fresh() { SchemaCodec.clear(); }
 
 test('asteroid x/y position error within 1 normalized pixel @ 65535 canvas', () => {
     fresh();
-    const s = SchemaCodec.register(3, ASTEROID_UPDATE_FIELDS);
+    const s = SchemaCodec.register(2, ASTEROID_UPDATE_FIELDS);
     const QUANTUM = 1 / 65535;
     let maxErr = 0;
     // Sample 1000 random positions in [0, 1).
@@ -43,7 +59,7 @@ test('asteroid x/y position error within 1 normalized pixel @ 65535 canvas', () 
 
 test('asteroid angle error within 0.01° (much finer than human perception)', () => {
     fresh();
-    const s = SchemaCodec.register(3, ASTEROID_UPDATE_FIELDS);
+    const s = SchemaCodec.register(2, ASTEROID_UPDATE_FIELDS);
     const TOLERANCE_RAD = 0.0001; // ~0.0057°
     let maxErr = 0;
     for (let i = 0; i < 1000; i++) {
@@ -124,7 +140,7 @@ test('q16_2pi roundtrip: angle near 0 vs near 2π wrap correctly', () => {
     // Hazard L10: ensure encoder normalizes negative angles before quantizing,
     // so -0.0001 doesn't decode to opposite end of the range from +0.0001.
     fresh();
-    const s = SchemaCodec.register(3, ASTEROID_UPDATE_FIELDS);
+    const s = SchemaCodec.register(2, ASTEROID_UPDATE_FIELDS);
 
     const aPositive = SchemaCodec.decode(s, SchemaCodec.encode(s,
         { x: 0, y: 0, angle: 0.0001 })).angle;
@@ -147,7 +163,7 @@ test('q16_2pi roundtrip: angle near 0 vs near 2π wrap correctly', () => {
 test('one full game-second of asteroid updates: cumulative position error stays bounded', () => {
     // Same idea as Hazard L11 but a full game's worth of asteroid samples.
     fresh();
-    const s = SchemaCodec.register(3, ASTEROID_UPDATE_FIELDS);
+    const s = SchemaCodec.register(2, ASTEROID_UPDATE_FIELDS);
     const QUANTUM = 1 / 65535;
 
     let truePos = 0.42;

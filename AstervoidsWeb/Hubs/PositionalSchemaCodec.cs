@@ -19,7 +19,7 @@ namespace AstervoidsWeb.Hubs;
 ///   &lt;bitmask: ceil(N/8) bytes, bit i = field i present&gt;
 ///   &lt;slot_i ...&gt; (only for fields whose bit is set, in declaration order)
 ///
-/// Type tags supported in Phase 4:
+/// Fixed-width and variable-width type tags:
 /// <list type="bullet">
 ///   <item><c>f64/f32</c> — IEEE-754 little-endian (8 / 4 bytes)</item>
 ///   <item><c>u32/i32 u16/i16 u8/i8</c> — little-endian fixed</item>
@@ -30,12 +30,13 @@ namespace AstervoidsWeb.Hubs;
 ///   <item><c>nullable-str</c>, <c>nullable-guid</c> — 1-byte presence flag + (if set) the value</item>
 /// </list>
 ///
-/// Phase 5 quantized type tags (lossy fixed-point):
+/// Quantized type tags (lossy fixed-point):
 /// <list type="bullet">
-///   <item><c>q16</c>     — uint16 over [0, 1)   (2 B; resolution ≈ 1.5e-5)</item>
+///   <item><c>q16</c>     — uint16 over [0, 1]   (2 B; resolution ≈ 1.5e-5)</item>
+///   <item><c>q16w</c>    — uint16 over [-0.5, 1.5] (2 B; resolution ≈ 3.05e-5)</item>
 ///   <item><c>q16s</c>    — int16  over [-1, 1]  (2 B; resolution ≈ 3.0e-5)</item>
 ///   <item><c>q16_2pi</c> — uint16 over [0, 2π)  (2 B; resolution ≈ 9.6e-5 rad)</item>
-///   <item><c>q8</c>      — uint8  over [0, 1)   (1 B; resolution ≈ 4e-3)</item>
+///   <item><c>q8</c>      — uint8  over [0, 1]   (1 B; resolution ≈ 4e-3)</item>
 /// </list>
 /// </summary>
 public static class PositionalSchemaCodec

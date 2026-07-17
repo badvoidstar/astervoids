@@ -1005,8 +1005,8 @@ public class SessionHub : Hub
 
     /// <summary>
     /// Broadcasts a small per-object event to all other members of the session.
-    /// Server is a relay — <paramref name="payload"/> is opaque (game-defined
-    /// dictionary). Used for low-frequency state transitions that don't belong
+    /// Server is a relay — <paramref name="payload"/> is opaque game-encoded
+    /// bytes. Used for low-frequency state transitions that don't belong
     /// on the per-frame update path (score changes, one-shot impact reports,
     /// etc.). Owner-only: caller must own <paramref name="objectId"/>.
     ///
@@ -1023,7 +1023,7 @@ public class SessionHub : Hub
     /// the owner's clock isn't yet initialized; server falls back to its
     /// hub-entry timestamp.
     /// </param>
-    public async Task<bool> BroadcastObjectEvent(Guid objectId, byte eventKind, Dictionary<string, object?>? payload, long? clientValidAt = null)
+    public async Task<bool> BroadcastObjectEvent(Guid objectId, byte eventKind, byte[]? payload, long? clientValidAt = null)
     {
         var serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -1060,7 +1060,7 @@ public class SessionHub : Hub
         var eventInfo = new ObjectEventInfo(
             objectId,
             eventKind,
-            payload == null ? null : new Dictionary<string, object?>(payload));
+            payload?.ToArray());
         await BroadcastToOthersAsync(session, member.Id, "OnObjectEvent",
             eventInfo, member.Id, memberSequence, serverTimestamp, validAt);
 

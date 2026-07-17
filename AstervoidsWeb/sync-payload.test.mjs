@@ -67,6 +67,48 @@ test('round-trip preserves common game-dict value shapes', () => {
     assert.deepEqual(decoded, original);
 });
 
+test('schema zero preserves generic nested maps, arrays, nulls, and binary data', () => {
+    const original = {
+        type: 'generic-widget',
+        nested: {
+            enabled: true,
+            values: [1, -2, 3.5, null],
+        },
+        bytes: new Uint8Array([0, 127, 128, 255]),
+    };
+    const wrapped = SyncPayload.wrap(original, 0);
+    const decoded = SyncPayload.unwrap(wrapped);
+
+    assert.equal(wrapped[0], 0);
+    assert.deepEqual(decoded, original);
+});
+
+test('schema zero and positional payloads coexist in one heterogeneous batch', () => {
+    SchemaCodec.clear();
+    SchemaCodec.register(1, [['x', 'q16w']]);
+    const payloads = [
+        SyncPayload.wrap({ type: 'generic-widget', value: 7 }, 0),
+        SyncPayload.wrap({ x: 0.5 }, 1),
+    ];
+    const decoded = payloads.map(payload => SyncPayload.unwrap(payload));
+
+    assert.deepEqual(decoded[0], { type: 'generic-widget', value: 7 });
+    assert.ok(Math.abs(decoded[1].x - 0.5) <= 1 / 65535);
+});
+
+test('replaceSchemas installs the join contract before snapshot decoding', () => {
+    SchemaCodec.clear();
+    SyncPayload.replaceSchemas([{
+        id: 7,
+        fields: [['type', 'str'], ['x', 'q16w']]
+    }]);
+
+    const decoded = SyncPayload.unwrap(
+        SyncPayload.wrap({ type: 'widget', x: 0.25 }, 7));
+    assert.equal(decoded.type, 'widget');
+    assert.ok(Math.abs(decoded.x - 0.25) <= 1 / 65535);
+});
+
 test('unwrap throws on an unknown schema id', () => {
     // Phase 4: schemaId=5 dispatches to SchemaCodec; with no schema registered
     // the error mentions the registry/metadata path so debugging stays obvious.

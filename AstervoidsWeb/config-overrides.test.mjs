@@ -113,6 +113,25 @@ test('session metadata: creator config is serializable and joiner adopts it', ()
     assert.equal(joinerCfg.FRACTURE_ENABLED, true);
 });
 
+test('session metadata locks seeded asteroid shape parameters', () => {
+    const keys = ['ASTEROID_VERTICES', 'ASTEROID_JAGGEDNESS'];
+    const creatorCfg = {
+        ASTEROID_VERTICES: 11,
+        ASTEROID_JAGGEDNESS: 0.42
+    };
+    const joinerCfg = {
+        ASTEROID_VERTICES: 7,
+        ASTEROID_JAGGEDNESS: 0.1
+    };
+
+    applySessionConfigMetadata(
+        { config: buildSessionConfigMetadata(creatorCfg, keys) },
+        joinerCfg,
+        keys);
+
+    assert.deepEqual(joinerCfg, creatorCfg);
+});
+
 test('session metadata precedence: session config wins over local URL-derived value', () => {
     const keys = ['FRACTURE_ENABLED'];
     const cfg = { FRACTURE_ENABLED: false };

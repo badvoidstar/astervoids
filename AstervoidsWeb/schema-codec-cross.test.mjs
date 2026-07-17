@@ -19,25 +19,52 @@ function freshRegistry() {
     SchemaCodec.clear();
 }
 
+const SHIP_SCHEMA_FIELDS = [
+    ['type', 'str'],
+    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+    ['velocityX', 'q16s'], ['velocityY', 'q16s'], ['rotationSpeed', 'q16s'],
+    ['thrusting', 'bool'], ['invulnerable', 'u16'],
+    ['colorIndex', 'u8'], ['memberId', 'guid'],
+    ['score', 'u32'], ['hitCount', 'u16'],
+    ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+    ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
+    ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'], ['turnBias', 'q16s'],
+    ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
+    ['terminalY', 'f64'], ['terminalAngle', 'f64'],
+];
+const ASTEROID_SCHEMA_FIELDS = [
+    ['type', 'str'],
+    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'], ['radius', 'q16'],
+    ['velocityX', 'q16s'], ['velocityY', 'q16s'], ['rotationSpeed', 'q16s'],
+    ['seed', 'f64'], ['vertices', 'bytes'],
+    ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
+    ['terminalY', 'f64'], ['terminalAngle', 'f64'],
+];
+const BULLET_SCHEMA_FIELDS = [
+    ['type', 'str'],
+    ['x', 'q16w'], ['y', 'q16w'],
+    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+    ['lifetime', 'u16'], ['colorIndex', 'u8'], ['ownerMemberId', 'guid'],
+    ['pendingHit', 'bool'], ['hitTargetId', 'nullable-guid'],
+    ['hitImpactTorque', 'q16s'], ['hitBulletAngle', 'q16_2pi'],
+    ['hitOffsetN', 'q16s'], ['terminalEpoch', 'f64'],
+    ['terminalX', 'f64'], ['terminalY', 'f64'],
+];
+
 test('cross-wire: asteroid update — all fields', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(3, [['x', 'f64'], ['y', 'f64'], ['angle', 'f64']]);
-    const bytes = hexToBytes(
-        '07' +
-        '000000000000e03f' +
-        '000000000000d03f' +
-        '182d4454fb21f93f'
-    );
+    const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
+    const bytes = hexToBytes('0e00' + '0080' + '0060' + '0040');
     const decoded = SchemaCodec.decode(schema, bytes);
-    assert.equal(decoded.x, 0.5);
-    assert.equal(decoded.y, 0.25);
-    assert.ok(Math.abs(decoded.angle - Math.PI / 2) < 1e-12);
+    assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
+    assert.ok(Math.abs(decoded.y - 0.25) < 0.00002);
+    assert.equal(decoded.angle, Math.PI / 2);
 });
 
 test('cross-wire: asteroid update — only angle bit set', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(3, [['x', 'f64'], ['y', 'f64'], ['angle', 'f64']]);
-    const bytes = hexToBytes('04' + '0000000000000000');
+    const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
+    const bytes = hexToBytes('0800' + '0000');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.equal('x' in decoded, false);
     assert.equal('y' in decoded, false);
@@ -46,50 +73,41 @@ test('cross-wire: asteroid update — only angle bit set', () => {
 
 test('cross-wire: ship update — mixed types', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(1, [
-        ['x', 'f64'], ['y', 'f64'], ['angle', 'f64'],
-        ['velocityX', 'f64'], ['velocityY', 'f64'],
-        ['rotationSpeed', 'f64'],
-        ['thrusting', 'bool'],
-        ['invulnerable', 'bool'],
-    ]);
+    const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
     const bytes = hexToBytes(
-        'ff' +
-        '000000000000e03f' +
-        '000000000000e03f' +
-        '0000000000000000' +
-        '0000000000000000' +
-        '0000000000000000' +
-        '0000000000000000' +
+        'fe0100' +
+        '0080' +
+        '0080' +
+        '0000' +
+        '0000' +
+        '0000' +
+        '0000' +
         '00' +
-        '01'
+        '7800'
     );
     const decoded = SchemaCodec.decode(schema, bytes);
-    assert.equal(decoded.x, 0.5);
-    assert.equal(decoded.y, 0.5);
+    assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
+    assert.ok(Math.abs(decoded.y - 0.5) < 0.00002);
     assert.equal(decoded.angle, 0);
     assert.equal(decoded.velocityX, 0);
     assert.equal(decoded.velocityY, 0);
     assert.equal(decoded.rotationSpeed, 0);
     assert.equal(decoded.thrusting, false);
-    assert.equal(decoded.invulnerable, true);
+    assert.equal(decoded.invulnerable, 120);
 });
 
 test('cross-wire: bullet update — guid field', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(5, [
-        ['x', 'f64'], ['y', 'f64'],
-        ['ownerMemberId', 'guid'],
-    ]);
+    const schema = SchemaCodec.register(3, BULLET_SCHEMA_FIELDS);
     const bytes = hexToBytes(
-        '07' +
-        '9a9999999999b93f' +
-        '9a9999999999c93f' +
+        '8600' +
+        '0080' +
+        '0080' +
         '443322116655887799aabbccddeeff00'
     );
     const decoded = SchemaCodec.decode(schema, bytes);
-    assert.ok(Math.abs(decoded.x - 0.1) < 1e-12);
-    assert.ok(Math.abs(decoded.y - 0.2) < 1e-12);
+    assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
+    assert.ok(Math.abs(decoded.y - 0.5) < 0.00002);
     assert.equal(decoded.ownerMemberId.toLowerCase(), '11223344-5566-7788-99aa-bbccddeeff00');
 });
 
@@ -123,26 +141,23 @@ test('cross-wire: bytes field length is u32 little-endian', () => {
 
 test('cross-wire: JS encode → C# hex round-trip (asteroid update)', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(3, [['x', 'f64'], ['y', 'f64'], ['angle', 'f64']]);
+    const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, { x: 0.5, y: 0.25, angle: Math.PI / 2 });
     const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     assert.equal(hex,
-        '07' +
-        '000000000000e03f' +
-        '000000000000d03f' +
-        '182d4454fb21f93f'
+        '0e00' +
+        '0080' +
+        '0060' +
+        '0040'
     );
 });
 
 test('cross-wire (Phase 5): quantized asteroid update produces canonical hex', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(3, [['x', 'q16'], ['y', 'q16'], ['angle', 'q16_2pi']]);
+    const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, { x: 0.5, y: 0.25, angle: Math.PI });
     const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-    // bitmask=0x07 + x=Math.round(0.5*65535)=32768→0x8000 (LE 0080)
-    //              + y=Math.round(0.25*65535)=16384→0x4000 (LE 0040)
-    //              + angle=π→65536/2=32768→0x8000 (LE 0080)
-    assert.equal(hex, '07008000400080');
+    assert.equal(hex, '0E00008000600080');
 });
 
 // PR #96 review fix #4 cross-wire parity.
@@ -159,43 +174,32 @@ test('cross-wire: null on non-nullable f64 slot is absent (matches C# bytes)', (
     assert.equal(hex, '01' + '000000000000f03f');
 });
 
-// Phase 4E cross-wire parity for the ship-create schema. The matching C#
+// Cross-wire parity for the unified production ship schema. The matching C#
 // test is SyncPayloadCodecRegistryTests.EncodeDict_RegisteredPositionalSchema_
 // EmitsPositionalBytes (which compares to a direct PositionalSchemaCodec.Encode
 // call). Pinning the JS-side byte length here ensures the two implementations
 // stay aligned at every byte even when a future field-set tweak lands. If
 // either side drifts, both this test and its C# counterpart fire.
-test('cross-wire (Phase 4E): ship-create positional encoding length is byte-stable', () => {
+test('cross-wire: unified ship create encoding length is byte-stable', () => {
     freshRegistry();
-    // Minimal subset mirroring the production ship-create schema id 2.
-    const schema = SchemaCodec.register(2, [
-        ['type', 'str'],
-        ['x', 'f64'], ['y', 'f64'],
-    ]);
+    const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, { type: 'ship', x: 0.5, y: 0.25 });
-    // bitmask=0x07 (3 fields) + str len=2 + 4-byte "ship" + 8B x + 8B y
-    assert.equal(bytes.length, 1 + 2 + 4 + 8 + 8);
-    // The first three bytes are deterministic regardless of float values.
+    assert.equal(bytes.length, 3 + 2 + 4 + 2 + 2);
     assert.equal(bytes[0], 0x07);
-    assert.equal(bytes[1], 0x04);
+    assert.equal(bytes[1], 0x00);
     assert.equal(bytes[2], 0x00);
-    // Bytes 3-6 spell out "ship" in UTF-8.
-    assert.equal(String.fromCharCode(bytes[3], bytes[4], bytes[5], bytes[6]), 'ship');
-    // Round-trip must reproduce the dict exactly (no quantization on f64).
+    assert.equal(bytes[3], 0x04);
+    assert.equal(bytes[4], 0x00);
+    assert.equal(String.fromCharCode(bytes[5], bytes[6], bytes[7], bytes[8]), 'ship');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.equal(decoded.type, 'ship');
-    assert.equal(decoded.x, 0.5);
-    assert.equal(decoded.y, 0.25);
+    assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
+    assert.ok(Math.abs(decoded.y - 0.25) < 0.00002);
 });
 
 test('cross-wire: persisted ship terminal target uses exact f64 fields', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(12, [
-        ['terminalEpoch', 'f64'],
-        ['terminalX', 'f64'],
-        ['terminalY', 'f64'],
-        ['terminalAngle', 'f64'],
-    ]);
+    const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, {
         terminalEpoch: 1000,
         terminalX: 0.25,
@@ -206,7 +210,7 @@ test('cross-wire: persisted ship terminal target uses exact f64 fields', () => {
         .map(b => b.toString(16).padStart(2, '0')).join('');
     assert.equal(
         hex,
-        '0f'
+        '0000f0'
         + '0000000000408f40'
         + '000000000000d03f'
         + '000000000000e83f'

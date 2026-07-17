@@ -502,10 +502,8 @@ const ObjectSync = (function() {
      * legitimately mixes objects of different ages.
      */
     function handleSessionJoined(session, member) {
-        // Phase 4 wireopt: register positional schemas published by the
-        // session creator via metadata.schemas BEFORE processing any objects,
-        // so SyncPayload.unwrap can dispatch positional payloads. Failures are
-        // logged but non-fatal — the legacy SchemaId=0 path still works.
+        // SessionClient installs these before snapshot decoding. Reapply here
+        // defensively for direct integrations that inject joined sessions.
         try {
             const schemas = session && session.metadata && session.metadata.schemas;
             if (schemas && typeof window !== 'undefined' && window.SchemaCodec) {
@@ -1247,7 +1245,7 @@ const ObjectSync = (function() {
         const delta = {};
         let hasChanges = false;
         for (const key in data) {
-            if (data[key] !== prev[key]) {
+            if (!dataValueEquals(data[key], prev[key])) {
                 delta[key] = data[key];
                 hasChanges = true;
             }
@@ -1256,6 +1254,28 @@ const ObjectSync = (function() {
         if (!hasChanges) return null;
 
         return delta;
+    }
+
+    function dataValueEquals(left, right) {
+        if (Object.is(left, right)) return true;
+        if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)
+            || left.length !== right.length) {
+            return false;
+        }
+        for (let i = 0; i < left.length; i++) {
+            if (left[i] !== right[i]) return false;
+        }
+        return true;
+    }
+
+    function snapshotDataValues(data) {
+        const snapshot = { ...data };
+        for (const key in snapshot) {
+            if (snapshot[key] instanceof Uint8Array) {
+                snapshot[key] = new Uint8Array(snapshot[key]);
+            }
+        }
+        return snapshot;
     }
 
     /**
@@ -1279,14 +1299,14 @@ const ObjectSync = (function() {
 
     /**
      * Return whether every supplied field matches the most recently observed
-     * server-confirmed value for the object. The comparison is shallow, matching
-     * update coalescing and delta encoding semantics.
+     * server-confirmed value for the object. Byte arrays compare by content;
+     * other values retain the normal shallow comparison semantics.
      */
     function isDataConfirmed(objectId, data) {
         const confirmed = lastSentData.get(objectId);
         if (!confirmed || !data || typeof data !== 'object') return false;
         return Object.entries(data).every(
-            ([key, value]) => Object.is(confirmed[key], value));
+            ([key, value]) => dataValueEquals(confirmed[key], value));
     }
 
     /**
@@ -1321,14 +1341,14 @@ const ObjectSync = (function() {
                         objectId: objectId,
                         data: delta
                     });
-                    sentData.set(objectId, delta);
+                    sentData.set(objectId, snapshotDataValues(delta));
                 }
             }
         } else {
             updates = [];
             for (const [objectId, data] of pendingUpdates) {
                 updates.push({ objectId: objectId, data: data });
-                sentData.set(objectId, data);
+                sentData.set(objectId, snapshotDataValues(data));
             }
         }
         pendingUpdates.clear();
@@ -1616,7 +1636,9 @@ const ObjectSync = (function() {
         const validAt = clockSource && typeof clockSource.nowMs === 'function'
             ? Math.round(clockSource.nowMs())
             : null;
-        return SessionClient.broadcastObjectEvent(objectId, kindByte, payload, validAt);
+        const wirePayload = MsgpackCodec.encode(compressData(payload || {}));
+        return SessionClient.broadcastObjectEvent(
+            objectId, kindByte, wirePayload, validAt);
     }
 
     /**
@@ -1633,14 +1655,21 @@ const ObjectSync = (function() {
         const handler = eventHandlers.get(kindName);
         if (!handler) return; // silently ignore — game may not subscribe to all kinds
         try {
-            handler(eventInfo.objectId, eventInfo.payload, {
+            let payload = eventInfo.payload;
+            if (payload instanceof Uint8Array) {
+                payload = expandData(MsgpackCodec.decode(payload));
+            } else {
+                // Keep direct test/game injections ergonomic.
+                payload = expandData(payload || {});
+            }
+            handler(eventInfo.objectId, payload, {
                 local: false,
                 senderMemberId,
                 memberSequence,
                 validAt
             });
         } catch (e) {
-            _warn('[ObjectSync] OnObjectEvent handler threw:', e);
+            _warn('[ObjectSync] OnObjectEvent payload/handler failed:', e);
         }
     }
 

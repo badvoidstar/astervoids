@@ -11,6 +11,7 @@ const productionSource = readFileSync(
     resolve(here, 'wwwroot', 'index.html'), 'utf8');
 const {
     createMinimumJerkTransition,
+    createWrappedConvergenceTransition,
     sampleMinimumJerkTransition,
     unwrapConvergenceTarget,
 } = require('./wwwroot/js/replication-presentation.js');
@@ -155,6 +156,163 @@ test('stationary target unwrapping chooses the shortest equivalent', () => {
     approx(target, 1.1);
 });
 
+test('late positional convergence relaxes derivatives instead of adding a full lap', () => {
+    const axis = createWrappedConvergenceTransition({
+        start: 1.04,
+        target: 1.04,
+        span: 1.1,
+        startVelocity: 0.00025,
+        startTime: 0,
+        endTime: 300,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, true);
+    approx(axis.target, 1.04);
+    for (let now = 0; now <= 300; now += 5) {
+        approx(sampleMinimumJerkTransition(axis.transition, now).value, 1.04);
+    }
+});
+
+test('late angular convergence relaxes derivatives instead of adding a full turn', () => {
+    const angle = 1.25;
+    const axis = createWrappedConvergenceTransition({
+        start: angle,
+        target: angle,
+        span: Math.PI * 2,
+        startVelocity: 0.002,
+        startAcceleration: 0.00001,
+        startTime: 0,
+        endTime: 300,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, true);
+    approx(axis.target, angle);
+    const start = sampleMinimumJerkTransition(axis.transition, 0);
+    assert.equal(start.velocity, 0);
+    assert.equal(start.acceleration, 0);
+    approx(sampleMinimumJerkTransition(axis.transition, 300).value, angle);
+});
+
+test('on-time convergence retains direction-preserving winding', () => {
+    const axis = createWrappedConvergenceTransition({
+        start: 1.04,
+        target: 1.04,
+        span: 1.1,
+        startVelocity: 0.00025,
+        startTime: 0,
+        endTime: 300,
+        relaxExtraWinding: false
+    });
+
+    assert.equal(axis.relaxed, false);
+    approx(axis.target, 2.14);
+    approx(sampleMinimumJerkTransition(axis.transition, 0).velocity, 0.00025);
+});
+
+test('late convergence preserves derivatives when no extra winding is selected', () => {
+    const axis = createWrappedConvergenceTransition({
+        start: 0.2,
+        target: 0.5,
+        span: 1.1,
+        startVelocity: 0.00025,
+        startAcceleration: 0.000001,
+        startTime: 0,
+        endTime: 300,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, false);
+    approx(axis.target, 0.5);
+    const start = sampleMinimumJerkTransition(axis.transition, 0);
+    approx(start.velocity, 0.00025);
+    approx(start.acceleration, 0.000001);
+});
+
+test('production relaxes only winding axes and only below the late threshold', () => {
+    const source = extractProductionFunction(
+        'createCanonicalTerminalTransition',
+        'function terminalTargetMatches');
+    const current = {
+        x: 1.04,
+        y: 0.2,
+        angle: 1.25,
+        velocityX: 0.00025,
+        velocityY: 0.0001,
+        angularVelocity: 0.002,
+        accelerationX: 0.000002,
+        accelerationY: 0.000001,
+        angularAcceleration: 0.00001
+    };
+    const factory = new Function(
+        'deterministicTerminalState',
+        'sampleTerminalTransition',
+        'lastRenderedPose',
+        'velocityToNormalizedDeltaX',
+        'velocityToNormalizedDeltaY',
+        'CONFIG',
+        'wrapRadiusFor',
+        'wrapMarginX',
+        'wrapMarginY',
+        'ReplicationPresentation',
+        `${source}\nreturn createCanonicalTerminalTransition;`);
+    const create = factory(
+        {
+            directTargetIds: new Set()
+        },
+        () => current,
+        () => current,
+        value => value,
+        value => value,
+        {
+            TARGET_FPS: 1000,
+            DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+            DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+        },
+        () => 0.05,
+        () => 0.05,
+        () => 0.05,
+        {
+            createWrappedConvergenceTransition
+        });
+    const record = {
+        id: 'asteroid',
+        data: {
+            terminalX: 1.04,
+            terminalY: 0.5,
+            terminalAngle: 1.25
+        }
+    };
+    const now = 1000;
+
+    const late = create(
+        {}, record, { epoch: 1, terminalAt: now + 179 }, now, {});
+    const onTime = create(
+        {}, record, { epoch: 1, terminalAt: now + 180 }, now, {});
+
+    const lateX = sampleMinimumJerkTransition(late.xTransition, now);
+    const lateY = sampleMinimumJerkTransition(late.yTransition, now);
+    const lateAngle = sampleMinimumJerkTransition(late.angleTransition, now);
+    assert.equal(late.xTransition.target, 1.04);
+    assert.equal(lateX.velocity, 0);
+    assert.equal(lateX.acceleration, 0);
+    approx(lateY.velocity, current.velocityY);
+    approx(lateY.acceleration, current.accelerationY);
+    assert.equal(late.angleTransition.target, 1.25);
+    assert.equal(lateAngle.velocity, 0);
+    assert.equal(lateAngle.acceleration, 0);
+
+    approx(onTime.xTransition.target, 2.14);
+    approx(
+        sampleMinimumJerkTransition(onTime.xTransition, now).velocity,
+        current.velocityX);
+    approx(onTime.angleTransition.target, 1.25 + Math.PI * 2);
+    approx(
+        sampleMinimumJerkTransition(onTime.angleTransition, now).velocity,
+        current.angularVelocity);
+});
+
 test('different displayed poses converge continuously to one exact terminal pose', () => {
     const make = (start, velocity) => createMinimumJerkTransition({
         start,
@@ -245,11 +403,19 @@ test('terminal bootstrap deferral is deterministic-only and includes late record
 });
 
 test('production canonical retargeting carries sampled acceleration', () => {
-    assert.match(productionSource, /startAcceleration: current\.accelerationX/);
-    assert.match(productionSource, /startAcceleration: current\.accelerationY/);
+    assert.match(
+        productionSource,
+        /createWrappedConvergenceTransition\(\{[\s\S]*startAcceleration: current\.accelerationX/);
+    assert.match(
+        productionSource,
+        /createWrappedConvergenceTransition\(\{[\s\S]*startAcceleration: current\.accelerationY/);
     assert.match(
         productionSource,
         /startAcceleration: current\.angularAcceleration/);
+    assert.equal(
+        (productionSource.match(/relaxExtraWinding: lateSettle/g) || []).length,
+        3,
+        'late winding relaxation must cover x, y, and angle');
 });
 
 test('record-derived terminal fallback is tied to terminalAt, not join time', () => {
@@ -404,19 +570,22 @@ test('terminal publisher retries owned targets and retires ownership races', () 
     assert.equal(updates.at(-1).id, 'migrated');
 });
 
-test('ship snapshot schema persists every terminal field written by updates', () => {
-    const schemaStart = productionSource.indexOf('{ id: 2, fields: [');
+test('unified ship schema persists every terminal field written by updates', () => {
+    const schemaStart = productionSource.indexOf('{ id: 1, fields: [');
     const schemaEnd = productionSource.indexOf(']},', schemaStart);
-    const shipCreateSchema = productionSource.slice(schemaStart, schemaEnd);
+    const shipSchema = productionSource.slice(schemaStart, schemaEnd);
     for (const field of [
         'terminalEpoch',
         'terminalX',
         'terminalY',
         'terminalAngle'
     ]) {
-        assert.match(shipCreateSchema, new RegExp(`\\['${field}', 'f64'\\]`));
+        assert.match(shipSchema, new RegExp(`\\['${field}', 'f64'\\]`));
     }
     assert.match(
         productionSource,
-        /if \(data && data\.terminalEpoch !== undefined\) return 0;/);
+        /\[OBJECT_TYPES\.SHIP\]: 1/);
+    assert.doesNotMatch(
+        productionSource,
+        /terminalEpoch !== undefined\) return 0/);
 });

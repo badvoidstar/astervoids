@@ -505,6 +505,61 @@ const ReplicationPresentation = (function () {
         return start + delta;
     }
 
+    /**
+     * Build a wrapped terminal transition. In a degraded late-settle path,
+     * discard incoming derivatives only when preserving their direction would
+     * select an additional full winding over the nearest equivalent target.
+     */
+    function createWrappedConvergenceTransition({
+        start,
+        target,
+        span,
+        startVelocity = 0,
+        startAcceleration = 0,
+        startTime,
+        endTime,
+        relaxExtraWinding = false
+    }) {
+        const duration = endTime - startTime;
+        let selectedTarget = unwrapConvergenceTarget({
+            start,
+            target,
+            span,
+            velocity: startVelocity,
+            duration
+        });
+        let effectiveVelocity = startVelocity;
+        let effectiveAcceleration = startAcceleration;
+        let relaxed = false;
+
+        if (relaxExtraWinding) {
+            const nearestTarget = unwrapConvergenceTarget({
+                start,
+                target,
+                span
+            });
+            if (Math.abs(selectedTarget - nearestTarget) > span / 2) {
+                selectedTarget = nearestTarget;
+                effectiveVelocity = 0;
+                effectiveAcceleration = 0;
+                relaxed = true;
+            }
+        }
+
+        return Object.freeze({
+            target: selectedTarget,
+            relaxed,
+            transition: createMinimumJerkTransition({
+                start,
+                target: selectedTarget,
+                startVelocity: effectiveVelocity,
+                startAcceleration: effectiveAcceleration,
+                startTime,
+                endTime
+            })
+        });
+    }
+
     function interpolateHermiteAngle(options) {
         const previousAngle = options.previousAngle;
         const currentAngle = options.currentAngle;
@@ -767,6 +822,7 @@ const ReplicationPresentation = (function () {
         findSnapshotBracket,
         hermiteBasis,
         createMinimumJerkTransition,
+        createWrappedConvergenceTransition,
         sampleMinimumJerkTransition,
         unwrapConvergenceTarget,
         interpolateHermiteAngle,

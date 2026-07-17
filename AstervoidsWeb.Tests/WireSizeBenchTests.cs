@@ -115,46 +115,12 @@ public class WireSizeBenchTests
         }),
         Version: 17L);
 
-    // ── Phase 4 positional-encoded variants ────────────────────────────────────
-    // These mirror the schemas registered by the game in index.html (WIREOPT_SCHEMAS).
-    // Used by the Phase4_* bench tests to lock the wire savings into CI.
+    // ── Production positional schemas ──────────────────────────────────────────
+    // These mirror index.html WIREOPT_SCHEMAS exactly.
 
-    private static readonly PositionalSchemaCodec.Schema AsteroidUpdateSchema =
-        new(3, new[] {
-            new PositionalSchemaCodec.FieldSpec("x", "f64"),
-            new PositionalSchemaCodec.FieldSpec("y", "f64"),
-            new PositionalSchemaCodec.FieldSpec("angle", "f64"),
-            new PositionalSchemaCodec.FieldSpec("velocityX", "f64"),
-            new PositionalSchemaCodec.FieldSpec("velocityY", "f64"),
-            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "f64"),
-        });
-
-    private static readonly PositionalSchemaCodec.Schema ShipUpdateSchema =
+    private static readonly PositionalSchemaCodec.Schema ShipSchema =
         new(1, new[] {
-            new PositionalSchemaCodec.FieldSpec("x", "f64"),
-            new PositionalSchemaCodec.FieldSpec("y", "f64"),
-            new PositionalSchemaCodec.FieldSpec("angle", "f64"),
-            new PositionalSchemaCodec.FieldSpec("velocityX", "f64"),
-            new PositionalSchemaCodec.FieldSpec("velocityY", "f64"),
-            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "f64"),
-            new PositionalSchemaCodec.FieldSpec("thrusting", "bool"),
-            new PositionalSchemaCodec.FieldSpec("invulnerable", "u16"),
-        });
-
-    // ── Phase 5 quantized variants ─────────────────────────────────────────
-    // Mirror the live game schemas registered in index.html WIREOPT_SCHEMAS.
-    private static readonly PositionalSchemaCodec.Schema AsteroidUpdateSchemaQ =
-        new(3, new[] {
-            new PositionalSchemaCodec.FieldSpec("x", "q16w"),
-            new PositionalSchemaCodec.FieldSpec("y", "q16w"),
-            new PositionalSchemaCodec.FieldSpec("angle", "q16_2pi"),
-            new PositionalSchemaCodec.FieldSpec("velocityX", "q16s"),
-            new PositionalSchemaCodec.FieldSpec("velocityY", "q16s"),
-            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "q16s"),
-        });
-
-    private static readonly PositionalSchemaCodec.Schema ShipUpdateSchemaQ =
-        new(1, new[] {
+            new PositionalSchemaCodec.FieldSpec("type", "str"),
             new PositionalSchemaCodec.FieldSpec("x", "q16w"),
             new PositionalSchemaCodec.FieldSpec("y", "q16w"),
             new PositionalSchemaCodec.FieldSpec("angle", "q16_2pi"),
@@ -163,36 +129,77 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("rotationSpeed", "q16s"),
             new PositionalSchemaCodec.FieldSpec("thrusting", "bool"),
             new PositionalSchemaCodec.FieldSpec("invulnerable", "u16"),
+            new PositionalSchemaCodec.FieldSpec("colorIndex", "u8"),
+            new PositionalSchemaCodec.FieldSpec("memberId", "guid"),
+            new PositionalSchemaCodec.FieldSpec("score", "u32"),
+            new PositionalSchemaCodec.FieldSpec("hitCount", "u16"),
+            new PositionalSchemaCodec.FieldSpec("thrustInput", "q8"),
+            new PositionalSchemaCodec.FieldSpec("brakeInput", "q8"),
+            new PositionalSchemaCodec.FieldSpec("turnControlMode", "u8"),
+            new PositionalSchemaCodec.FieldSpec("turnTarget", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("turnTargetAngle", "q16_2pi"),
+            new PositionalSchemaCodec.FieldSpec("turnMagnitude", "q8"),
+            new PositionalSchemaCodec.FieldSpec("turnBias", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("terminalEpoch", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
         });
 
-    private static ObjectUpdateInfo SampleAsteroidUpdatePositional() => new(
-        Id: Guid.NewGuid(),
-        Data: new SyncPayload(3, PositionalSchemaCodec.Encode(AsteroidUpdateSchema, new Dictionary<string, object?>
-        {
-            ["x"] = 0.523,
-            ["y"] = 0.412,
-            ["angle"] = 1.234,
-            ["velocityX"] = 0.05,
-            ["velocityY"] = -0.03,
-            ["rotationSpeed"] = 0.01,
-        })),
-        Version: 42L);
+    private static readonly PositionalSchemaCodec.Schema AsteroidSchema =
+        new(2, new[] {
+            new PositionalSchemaCodec.FieldSpec("type", "str"),
+            new PositionalSchemaCodec.FieldSpec("x", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("y", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("angle", "q16_2pi"),
+            new PositionalSchemaCodec.FieldSpec("radius", "q16"),
+            new PositionalSchemaCodec.FieldSpec("velocityX", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("velocityY", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("seed", "f64"),
+            new PositionalSchemaCodec.FieldSpec("vertices", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("terminalEpoch", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
+        });
 
-    private static ObjectUpdateInfo SampleShipUpdatePositional() => new(
-        Id: Guid.NewGuid(),
-        Data: new SyncPayload(1, PositionalSchemaCodec.Encode(ShipUpdateSchema, new Dictionary<string, object?>
-        {
-            ["x"] = 0.523,
-            ["y"] = 0.412,
-            ["angle"] = 1.234,
-            ["velocityX"] = 0.05,
-            ["velocityY"] = -0.03,
-            ["rotationSpeed"] = 0.01,
-            ["thrusting"] = true,
-            // Realistic mid-invuln value (frame counter 0..180); u16 encodes as 2 B.
-            ["invulnerable"] = 120,
-        })),
-        Version: 42L);
+    private static readonly PositionalSchemaCodec.Schema BulletSchema =
+        new(3, new[] {
+            new PositionalSchemaCodec.FieldSpec("type", "str"),
+            new PositionalSchemaCodec.FieldSpec("x", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("y", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("velocityX", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("velocityY", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("lifetime", "u16"),
+            new PositionalSchemaCodec.FieldSpec("colorIndex", "u8"),
+            new PositionalSchemaCodec.FieldSpec("ownerMemberId", "guid"),
+            new PositionalSchemaCodec.FieldSpec("pendingHit", "bool"),
+            new PositionalSchemaCodec.FieldSpec("hitTargetId", "nullable-guid"),
+            new PositionalSchemaCodec.FieldSpec("hitImpactTorque", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("hitBulletAngle", "q16_2pi"),
+            new PositionalSchemaCodec.FieldSpec("hitOffsetN", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("terminalEpoch", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
+        });
+
+    private static readonly PositionalSchemaCodec.Schema GameStateSchema =
+        new(4, new[] {
+            new PositionalSchemaCodec.FieldSpec("type", "str"),
+            new PositionalSchemaCodec.FieldSpec("gameStarted", "bool"),
+            new PositionalSchemaCodec.FieldSpec("wave", "u16"),
+            new PositionalSchemaCodec.FieldSpec("state", "str"),
+            new PositionalSchemaCodec.FieldSpec("lives", "u16"),
+            new PositionalSchemaCodec.FieldSpec("groupScore", "u32"),
+            new PositionalSchemaCodec.FieldSpec("speedMultiplier", "f32"),
+            new PositionalSchemaCodec.FieldSpec("waveDelayTimer", "f32"),
+            new PositionalSchemaCodec.FieldSpec("processedHits", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("processedScores", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("peakShipCount", "u8"),
+            new PositionalSchemaCodec.FieldSpec("gameOverAt", "f64"),
+            new PositionalSchemaCodec.FieldSpec("terminalAt", "f64"),
+        });
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────
 
@@ -202,45 +209,37 @@ public class WireSizeBenchTests
         // 9 data fields including string GUIDs for member ids embedded as keys/values.
         // Expected ranges accommodate slight variation per Guid (binary GUIDs are fixed 18 B).
         var size = Size(SampleAsteroidInfo());
-        // Phase 3 envelope (measured: 252 B). Wire shape now includes
-        // SyncPayload(fixarray2 + schemaId byte + bin8 length header) ≈ +4 B vs
-        // the pre-envelope dict-in-place encoding.
-        size.Should().BeInRange(240, 270, "asteroid full-create payload (Phase 3 envelope)");
+        // Legacy schema-0 data retained as a comparison baseline; ObjectInfo
+        // itself is now a compact six-slot array.
+        size.Should().BeInRange(195, 205, "schema-0 asteroid create comparison");
     }
 
     [Fact]
     public void Baseline_ShipInfo_FullCreate()
     {
         var size = Size(SampleShipInfo());
-        // Phase 3 envelope (measured: 335 B). +~4 B envelope absorbed in range.
-        size.Should().BeInRange(320, 355, "ship full-create payload (Phase 3 envelope)");
+        size.Should().BeInRange(278, 288, "schema-0 ship create comparison");
     }
 
     [Fact]
     public void Baseline_AsteroidUpdate_PerFrame()
     {
         var size = Size(SampleAsteroidUpdate());
-        // Phase 3 envelope (measured: 78 B). Pre-Phase-3 baseline was ~75 B.
-        // Goal in Phase 4 (typed schema): ~22 B. Goal in Phase 5 (quantized): ~10 B.
-        size.Should().BeInRange(65, 85, "asteroid per-frame update (Phase 3 envelope)");
+        size.Should().BeInRange(58, 66, "schema-0 asteroid update comparison");
     }
 
     [Fact]
     public void Baseline_ShipUpdate_PerFrame()
     {
         var size = Size(SampleShipUpdate());
-        // Phase 3 envelope (measured: 164 B). Pre-Phase-3 baseline post-Phase-2.3 was ~165 B.
-        // Phase 4 typed schema reduces further; Phase 5 quantization further still.
-        size.Should().BeInRange(150, 180, "ship per-frame update (Phase 3 envelope, post-Phase-2.3)");
+        size.Should().BeInRange(142, 152, "schema-0 ship update comparison");
     }
 
     [Fact]
     public void Baseline_BulletUpdate_PerFrame_WithPendingHit()
     {
         var size = Size(SampleBulletUpdate());
-        // Phase 3 envelope (measured: 212 B). Pre-Phase-3 baseline was ~208 B.
-        // Phase 2 (A5) deferred: still carries all 5 hit-related fields per frame.
-        size.Should().BeInRange(195, 225, "bullet per-frame update (Phase 3 envelope, A5 deferred)");
+        size.Should().BeInRange(195, 225, "schema-0 pending-hit comparison");
     }
 
     // ── Batch-level baselines (one OnObjectsUpdated broadcast) ────────────────
@@ -257,8 +256,7 @@ public class WireSizeBenchTests
             SampleAsteroidUpdate()
         };
         var size = Size(batch);
-        // Phase 3 envelope (measured: 235 B). Pre-Phase-3 baseline was ~225 B (+~3 B/object).
-        size.Should().BeInRange(200, 250, "OnObjectsUpdated with 3 asteroids (Phase 3 envelope)");
+        size.Should().BeInRange(180, 195, "three schema-0 asteroid updates");
     }
 
     [Fact]
@@ -273,9 +271,7 @@ public class WireSizeBenchTests
             SampleBulletUpdate(), SampleBulletUpdate()
         };
         var size = Size(batch);
-        // Phase 3 envelope (measured: 901 B). Pre-Phase-3 baseline post-Phase-2.3
-        // was ~878 B; +23 B = ~+3 B per object × 7 objects.
-        size.Should().BeInRange(850, 910, "mixed steady-state OnObjectsUpdated (Phase 3 envelope)");
+        size.Should().BeInRange(775, 800, "mixed schema-0 comparison batch");
     }
 
     // ── Snapshot baselines (rare path; one-shot per join) ─────────────────────
@@ -314,11 +310,8 @@ public class WireSizeBenchTests
             Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
 
         var size = Size(dto);
-        // Phase 3 envelope: ObjectInfo×6 each gains ~+4 B (fixarray2 + schemaId
-        // + bin8 length header). Roughly +24 B vs the post-Phase-1 baseline of
-        // 2056 B (range had ~24 B headroom). Phase 4 typed schemas will then
-        // shrink each ObjectInfo's data slot considerably.
-        size.Should().BeInRange(2110, 2180, "JoinSessionResponse with reconnect credential, 4 asteroids + 2 ships");
+        size.Should().BeInRange(1830, 1870,
+            "schema-0 comparison snapshot with compact ObjectInfo arrays");
     }
 
     [Fact]
@@ -332,9 +325,9 @@ public class WireSizeBenchTests
         };
         var dto = new UpdateObjectsResponse(versions, 42L, 1_700_000_000_000L);
         var size = Size(dto);
-        // Phase 1 measured (was 184 B baseline, now 112 B): -72 B / -39%.
-        // B3: versions Dict<string,long>(N=3) → GuidLongPair[N=3]. ~24 B per entry vs ~47 B per entry.
-        size.Should().BeInRange(95, 130, "UpdateObjectsResponse 3-versions post-Phase-1");
+        // Binary GuidLongPair entries plus a three-slot response array reduce the
+        // original 184-byte contract to 72 bytes.
+        size.Should().Be(72, "compact UpdateObjectsResponse with three versions");
     }
 
     // ── Phase 2.1 — generic OnObjectEvent broadcast ────────────────────────────
@@ -348,98 +341,31 @@ public class WireSizeBenchTests
         var dto = new ObjectEventInfo(
             ObjectId: Guid.NewGuid(),
             EventKind: 1, // SHIP_STATE_CHANGED
-            Payload: new Dictionary<string, object?>
+            Payload: SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>
             {
-                ["score"] = 100,
-                ["hitCount"] = 2
-            });
+                ["sc"] = 100,
+                ["hc"] = 2
+            }).Data);
         var size = Size(dto);
-        // Measured: 73 B. Composition: ObjectId binary GUID (~18 B) + EventKind
-        // (1 B) + payload dict (~50 B for 2 keys + 2 small ints) + envelope.
-        // The break-even vs leaving fields in per-frame updates depends on
-        // event-rate vs send-rate. At 10 Hz send-rate and ~1 score change per
-        // second per ship, A4 saves ~150 B/s/ship.
-        size.Should().BeInRange(60, 90, "ObjectEvent ship-state-changed payload");
+        size.Should().BeInRange(35, 45,
+            "compact positional event envelope with aliased MessagePack bytes");
     }
 
-    // ── Phase 4 positional schema baselines ────────────────────────────────────
-
-    [Fact]
-    public void Phase4_AsteroidUpdate_PerFrame_Positional()
-    {
-        var size = Size(SampleAsteroidUpdatePositional());
-        // Measured: 89 B (Phase 4 f64 with 6 fields including velocity +
-        // rotationSpeed, which the receiver's interpolator extrapolation
-        // arm requires; see schema-codec-cross.test.mjs Phase 4D regression
-        // notes). Composition: id GUID(18) + version(varint) +
-        // SyncPayload.SchemaId(1) + bin8 length header(2) + bitmask(1) +
-        // 6×f64(48) + array/wrap overhead. Phase 5 quantization shrinks the
-        // body 6×f64 → 6×u/i16 (48 B → 12 B), reducing total to ~53 B.
-        size.Should().BeInRange(80, 100, "asteroid per-frame update (Phase 4 positional, 6 fields)");
-    }
-
-    [Fact]
-    public void Phase4_ShipUpdate_PerFrame_Positional()
-    {
-        var size = Size(SampleShipUpdatePositional());
-        // Measured: 91 B (down from 164 B Phase 3 dict path; ~45% reduction).
-        // Body: bitmask(1) + 6×f64(48) + 2×bool(2) = 51 B. Wins are bigger here
-        // because dict keys ("velocityX", "rotationSpeed", etc.) were costly.
-        size.Should().BeInRange(80, 105, "ship per-frame update (Phase 4 positional)");
-    }
-
-    [Fact]
-    public void Phase4_OnObjectsUpdated_3Asteroids_Positional()
-    {
-        var batch = new List<ObjectUpdateInfo>
-        {
-            SampleAsteroidUpdatePositional(),
-            SampleAsteroidUpdatePositional(),
-            SampleAsteroidUpdatePositional()
-        };
-        var size = Size(batch);
-        // Measured: 268 B (3 × ~89 B + array header). Phase 4 f64 baseline
-        // includes velocity + rotationSpeed (required for receiver-side
-        // interpolation extrapolation). Phase 5 quantized batch is ~160 B.
-        size.Should().BeInRange(245, 295, "OnObjectsUpdated 3 asteroids (Phase 4 positional, 6 fields)");
-    }
-
-    [Fact]
-    public void Phase4_AsteroidUpdate_DeltaOnly_Positional()
-    {
-        // Delta-encoder sends only changed slots — say only x changed this frame.
-        // Bitmask = 0b001 (1 B) + 1×f64(8) = 9 B body.
-        var data = PositionalSchemaCodec.Encode(AsteroidUpdateSchema, new Dictionary<string, object?>
-        {
-            ["x"] = 0.523
-        });
-        var update = new ObjectUpdateInfo(
-            Id: Guid.NewGuid(),
-            Data: new SyncPayload(3, data),
-            Version: 42L);
-        var size = Size(update);
-        // Measured: 49 B (down from 78 B full Phase 3 dict path).
-        size.Should().BeInRange(40, 60, "asteroid delta update with only x present (Phase 4 positional)");
-    }
-
-    // ── Phase 5 quantized schema baselines ─────────────────────────────────────
+    // ── Production quantized schema baselines ──────────────────────────────────
 
     private static ObjectUpdateInfo SampleAsteroidUpdateQuantized() => new(
         Id: Guid.NewGuid(),
-        Data: new SyncPayload(3, PositionalSchemaCodec.Encode(AsteroidUpdateSchemaQ, new Dictionary<string, object?>
+        Data: new SyncPayload(2, PositionalSchemaCodec.Encode(AsteroidSchema, new Dictionary<string, object?>
         {
             ["x"] = 0.523,
             ["y"] = 0.412,
             ["angle"] = 1.234,
-            ["velocityX"] = 0.05,
-            ["velocityY"] = -0.03,
-            ["rotationSpeed"] = 0.01,
         })),
         Version: 42L);
 
     private static ObjectUpdateInfo SampleShipUpdateQuantized() => new(
         Id: Guid.NewGuid(),
-        Data: new SyncPayload(1, PositionalSchemaCodec.Encode(ShipUpdateSchemaQ, new Dictionary<string, object?>
+        Data: new SyncPayload(1, PositionalSchemaCodec.Encode(ShipSchema, new Dictionary<string, object?>
         {
             ["x"] = 0.523,
             ["y"] = 0.412,
@@ -448,35 +374,61 @@ public class WireSizeBenchTests
             ["velocityY"] = -0.03,
             ["rotationSpeed"] = 0.01,
             ["thrusting"] = true,
-            // Realistic mid-invuln value (frame counter 0..180); u16 encodes as 2 B.
             ["invulnerable"] = 120,
+            ["thrustInput"] = 1d,
+            ["brakeInput"] = 0d,
+            ["turnControlMode"] = 1,
+            ["turnTarget"] = 0.5,
+            ["turnTargetAngle"] = 1.5,
+            ["turnMagnitude"] = 1d,
+            ["turnBias"] = 0d,
         })),
         Version: 42L);
 
+    private static ObjectUpdateInfo SampleBulletUpdateQuantized(bool pendingHit = false) => new(
+        Id: Guid.NewGuid(),
+        Data: new SyncPayload(3, PositionalSchemaCodec.Encode(BulletSchema, pendingHit
+            ? new Dictionary<string, object?>
+            {
+                ["pendingHit"] = true,
+                ["hitTargetId"] = Guid.NewGuid().ToString(),
+                ["hitImpactTorque"] = 0.05,
+                ["hitBulletAngle"] = 1.57,
+                ["hitOffsetN"] = 0.3
+            }
+            : new Dictionary<string, object?>
+            {
+                ["x"] = 0.523,
+                ["y"] = 0.412,
+                ["lifetime"] = 42
+            })),
+        Version: 17L);
+
     [Fact]
-    public void Phase5_AsteroidUpdate_PerFrame_Quantized()
+    public void Production_AsteroidUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleAsteroidUpdateQuantized());
-        // Measured: 47 B (down from 65 B Phase 4 f64 = -18 B; -28% just from Phase 5).
-        // Body: bitmask(1) + 3×u16(6) = 7 B (vs 25 B for Phase 4 f64).
-        // Wrapper dominates: id GUID(18) + version(varint) + SyncPayload header(3) ≈ 22 B.
-        size.Should().BeInRange(40, 55, "asteroid per-frame update (Phase 5 quantized)");
+        size.Should().BeInRange(29, 35, "asteroid positional x/y/angle delta");
     }
 
     [Fact]
-    public void Phase5_ShipUpdate_PerFrame_Quantized()
+    public void Production_ShipUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleShipUpdateQuantized());
-        // Body: bitmask(1) + 6×i/u16(12) + 1×bool(1) + 1×u16(2) = 16 B (vs 51 B
-        // Phase 4 f64 = -35 B). `invulnerable` is u16 (frame counter), not bool —
-        // bool would freeze remote ships in the blink-off half of the invuln
-        // animation. Wrapped ObjectUpdateInfo: ~50-60 B (vs 91 B Phase 4 f64;
-        // ~38% reduction).
-        size.Should().BeInRange(40, 65, "ship per-frame update (Phase 5 quantized)");
+        size.Should().BeInRange(52, 62, "full replay-capable ship update");
     }
 
     [Fact]
-    public void Phase5_OnObjectsUpdated_3Asteroids_Quantized()
+    public void Production_BulletUpdates_ArePositional()
+    {
+        Size(SampleBulletUpdateQuantized()).Should().BeInRange(
+            29, 35, "ballistic bullet delta");
+        Size(SampleBulletUpdateQuantized(pendingHit: true)).Should().BeInRange(
+            50, 60, "pending-hit bullet delta");
+    }
+
+    [Fact]
+    public void Production_OnObjectsUpdated_3Asteroids_Quantized()
     {
         var batch = new List<ObjectUpdateInfo>
         {
@@ -485,26 +437,72 @@ public class WireSizeBenchTests
             SampleAsteroidUpdateQuantized()
         };
         var size = Size(batch);
-        // Measured: 142 B (3 × ~47 B + array header). Vs 196 B Phase 4 (-28%); vs 235 B Phase 3 (-40%).
-        size.Should().BeInRange(125, 165, "OnObjectsUpdated 3 asteroids (Phase 5 quantized)");
+        size.Should().BeInRange(90, 105, "three compact asteroid deltas");
     }
 
     [Fact]
-    public void Phase5_OnObjectsUpdated_MixedSession_Quantized()
+    public void Production_OnObjectsUpdated_MixedSession_Quantized()
     {
-        // Realistic steady-state with quantized schemas in flight.
-        // 4 quantized asteroids + 1 quantized ship + 2 legacy bullet updates.
         var batch = new List<ObjectUpdateInfo>
         {
             SampleAsteroidUpdateQuantized(), SampleAsteroidUpdateQuantized(),
             SampleAsteroidUpdateQuantized(), SampleAsteroidUpdateQuantized(),
             SampleShipUpdateQuantized(),
-            SampleBulletUpdate(), SampleBulletUpdate()
+            SampleBulletUpdateQuantized(), SampleBulletUpdateQuantized()
         };
         var size = Size(batch);
-        // Ships and asteroids dominate the savings; bullets stay on the legacy
-        // dict path until the pendingHit handshake (Phase 2.2) is converted.
-        // Phase 3 baseline: 901 B. Expected Phase 5: ~600-650 B (~30% further reduction).
-        size.Should().BeInRange(550, 700, "mixed steady-state OnObjectsUpdated (Phase 5 quantized)");
+        size.Should().BeInRange(235, 255, "mixed steady-state positional batch");
+    }
+
+    [Fact]
+    public void Production_InnerPayloadBodies_AreByteStable()
+    {
+        var shipCreate = PositionalSchemaCodec.Encode(ShipSchema, new Dictionary<string, object?>
+        {
+            ["type"] = "ship",
+            ["x"] = 0.5, ["y"] = 0.5, ["angle"] = 1d,
+            ["velocityX"] = 0.1, ["velocityY"] = -0.05,
+            ["rotationSpeed"] = 0.01,
+            ["thrusting"] = true, ["invulnerable"] = 120,
+            ["colorIndex"] = 1,
+            ["memberId"] = "00112233-4455-6677-8899-aabbccddeeff",
+            ["score"] = 0, ["hitCount"] = 0
+        });
+        var asteroidCreate = PositionalSchemaCodec.Encode(AsteroidSchema, new Dictionary<string, object?>
+        {
+            ["type"] = "asteroid",
+            ["x"] = 0.5, ["y"] = 0.5, ["angle"] = 1d,
+            ["radius"] = 0.083,
+            ["velocityX"] = 0.1, ["velocityY"] = -0.05,
+            ["rotationSpeed"] = 0.01,
+            ["seed"] = 0.123456789
+        });
+        var bulletCreate = PositionalSchemaCodec.Encode(BulletSchema, new Dictionary<string, object?>
+        {
+            ["type"] = "bullet",
+            ["x"] = 0.5, ["y"] = 0.5,
+            ["velocityX"] = 1d, ["velocityY"] = 0d,
+            ["lifetime"] = 60, ["colorIndex"] = 1,
+            ["ownerMemberId"] = "00112233-4455-6677-8899-aabbccddeeff"
+        });
+        var gameStateCreate = PositionalSchemaCodec.Encode(GameStateSchema, new Dictionary<string, object?>
+        {
+            ["type"] = "gameState",
+            ["gameStarted"] = true,
+            ["wave"] = 1,
+            ["state"] = "playing",
+            ["lives"] = 3,
+            ["groupScore"] = 0,
+            ["speedMultiplier"] = 1d,
+            ["waveDelayTimer"] = 0d,
+            ["processedHits"] = Array.Empty<byte>(),
+            ["processedScores"] = Array.Empty<byte>(),
+            ["peakShipCount"] = 2
+        });
+
+        shipCreate.Length.Should().Be(47);
+        asteroidCreate.Length.Should().Be(34);
+        bulletCreate.Length.Should().Be(37);
+        gameStateCreate.Length.Should().Be(48);
     }
 }

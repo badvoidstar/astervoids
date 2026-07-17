@@ -237,7 +237,7 @@ test('baselines are per-ship; one ship changing does not flush another', () => {
 });
 
 // ── q8 wire round-trip for the unsigned inputs ──────────────────────────────
-// thrustInput / brakeInput / turnMagnitude moved from q16s to q8 in schema id 5.
+// The unified ship schema stores thrustInput / brakeInput / turnMagnitude as q8.
 // q8 maps [0,1] -> round(v*255) -> /255. Confirm the endpoints and that the
 // 1/255 resolution comfortably covers control-input fidelity needs.
 function q8RoundTrip(v) {

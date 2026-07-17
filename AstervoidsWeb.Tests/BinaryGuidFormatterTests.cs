@@ -174,6 +174,7 @@ public class BinaryGuidFormatterTests
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<ObjectInfo>(bytes, Options);
 
+        bytes[0].Should().Be(0x96, "ObjectInfo must remain a six-slot fixarray");
         result.Id.Should().Be(dto.Id);
         result.CreatorMemberId.Should().Be(dto.CreatorMemberId);
         result.OwnerMemberId.Should().Be(dto.OwnerMemberId);
@@ -212,6 +213,44 @@ public class BinaryGuidFormatterTests
         result.DeletedObjectId.Should().Be(dto.DeletedObjectId);
         result.CreatedObjects.Should().HaveCount(1);
         result.CreatedObjects[0].Id.Should().Be(created.Id);
+    }
+
+    [Fact]
+    public void RecurringObjectDtos_UseCompactPositionalArrays()
+    {
+        var id = Guid.NewGuid();
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>
+        {
+            ["x"] = 0.5
+        });
+        var updateInfo = MessagePackSerializer.Serialize(
+            new ObjectUpdateInfo(id, payload, 2), Options);
+        var updateRequest = MessagePackSerializer.Serialize(
+            new ObjectUpdateRequest(id, payload), Options);
+        var eventInfo = MessagePackSerializer.Serialize(
+            new ObjectEventInfo(id, 1, new byte[] { 0x80 }), Options);
+        var createResponse = MessagePackSerializer.Serialize(
+            new CreateObjectResponse(
+                new ObjectInfo(id, id, id, ObjectScope.Member, payload, 1),
+                2,
+                3),
+            Options);
+        var updateResponse = MessagePackSerializer.Serialize(
+            new UpdateObjectsResponse(
+                new[] { new GuidLongPair(id, 2) },
+                3,
+                4),
+            Options);
+        var deleteResponse = MessagePackSerializer.Serialize(
+            new DeleteObjectResponse(true, 5),
+            Options);
+
+        updateInfo[0].Should().Be(0x93);
+        updateRequest[0].Should().Be(0x92);
+        eventInfo[0].Should().Be(0x93);
+        createResponse[0].Should().Be(0x93);
+        updateResponse[0].Should().Be(0x93);
+        deleteResponse[0].Should().Be(0x92);
     }
 
     [Fact]

@@ -773,6 +773,7 @@
     <script src="/js/msgpack-codec.js"></script>
     <!-- Phase 4 positional schema codec — must load BEFORE sync-payload.js so wrap/unwrap can dispatch -->
     <script src="/js/schema-codec.js"></script>
+    <script src="/js/astervoids-wire-codec.js"></script>
     <!-- SyncPayload envelope adapter (mirror of AstervoidsWeb/Hubs/SyncPayloadCodec.cs) -->
     <script src="/js/sync-payload.js"></script>
     <!-- Debug toggle — set to true in browser console: window.ASTERVOIDS_DEBUG = true -->
@@ -1274,25 +1275,18 @@
         // rotating-heading thrust, speed clamp, brake) forward from each
         // authoritative packet, instead of first-order linear dead reckoning.
         // This is exact (modulo cross-engine float drift, bounded by the
-        // heartbeat re-anchor) and wraps natively. It requires the owner to also
-        // send thrustInput / brakeInput and turn-control intent, so replay-
-        // enabled sessions put ships on ship-update schema id 5 when available
-        // (falling back to legacy replay schema id 4 for older sessions). When
-        // disabled, ships stay on schema id 1 and the linear reckoner, so the
-        // wire and all existing size locks are byte-for-byte unchanged. Schema
-        // id 5 lets polar target-heading controls replay toward the owner's
-        // intended heading instead of projecting a stale rotationSpeed across
-        // latency. On by default now that target-heading replay is paired with
-        // rotation-target convergence for non-replay and legacy replay paths.
+        // heartbeat re-anchor) and wraps natively. The unified ship schema
+        // carries thrust/brake/turn intent only when replay is enabled; its
+        // presence mask omits those fields entirely in adaptive-delay mode.
+        // Target-heading intent lets replay follow the owner's intended heading
+        // instead of projecting a stale rotationSpeed across latency.
         SHIP_INPUT_REPLAY_ENABLED: true,
         // Deterministic mode only, ships only: display remote ship rotation by
         // targeting authoritative heading rather than forward-projecting stale
         // angular velocity. With replay disabled, this renders the latest
         // authoritative angle and lets DeadReckon's correction offset ease to it
-        // (no overshoot, small heading lag). With replay enabled and schema id 5
-        // target-heading metadata available, target-mode controls still replay
-        // forward toward the owner's intended heading; older schema-id-4 replay
-        // sessions gracefully fall back to authoritative-angle convergence.
+        // (no overshoot, small heading lag). With replay enabled, target-mode
+        // controls replay forward toward the owner's intended heading.
         SHIP_ROTATION_TARGET_ENABLED: true,
         // Deterministic + input-replay mode only: suppress redundant per-frame
         // ship sends the same way SendGate does for ballistic objects. Under
@@ -1668,6 +1662,9 @@
 
     const SESSION_CONFIG_KEYS = [
         'FRACTURE_ENABLED',
+        // Seeded asteroid vertices are reconstructed instead of transmitted.
+        'ASTEROID_VERTICES',
+        'ASTEROID_JAGGEDNESS',
         'SIM_MODE',
     ];
 
@@ -2099,59 +2096,26 @@
         ASTEROID_IMPACT_CUE: 2
     };
 
-    // ── Phase 4 wireopt: positional schemas ─────────────────────────────────
-    // Each (type, kind) gets a stable schema id. Servers register schemas via
-    // session metadata.schemas at create time; joiners apply the same set on
-    // join. The selector below routes outbound payloads to the right id.
+    // ── Compact positional schemas ───────────────────────────────────────────
+    // Each known type has one stable superset schema for create, update,
+    // replace, terminal writes, and snapshot re-encoding. Servers register the
+    // schemas from session metadata; joiners install them before decoding the
+    // snapshot. Optional mask bits keep each payload sparse. Schema 0 remains
+    // reserved for explicit generic MessagePack-map objects.
     //
-    // Update schemas omit `type` because the receiver already knows the type
-    // from the existing local object (looked up via objectId in fromSyncData
-    // dispatch). Create schemas keep `type` for the registerObject path.
-    //
-    // Bullet payloads (create + update) intentionally remain on the legacy
-    // SchemaId=0 path because the pendingHit handshake still rides on the
-    // per-frame data (Phase 2.2 deferred); converting it now would require an
-    // integration test harness we don't have yet.
-    //
-    // ── Phase 5 quantization (lossy) ─────────────────────────────────────
-    // Position fields use q16w (2 B, ~3.05e-5 resolution over [-0.5, 1.5] —
-    // sub-pixel on a 4K canvas AND large enough to carry the off-screen
-    // wrap-margin positions used by wrapNormalized without clamping at the
-    // edge. The plain q16 [0,1] tag clamped owner positions in the extended
-    // off-screen region to 0 or 1, freezing remote asteroids at the edge
-    // for the entire wrap excursion). Angle uses q16_2pi (2 B, ~0.0055°
+    // Position fields use wrap-extended q16w (2 B, ~3.05e-5 resolution over
+    // [-0.5, 1.5]), which preserves off-screen toroidal wrap excursions instead
+    // of clamping them at an edge. Angle uses q16_2pi (2 B, ~0.0055°
     // resolution). Velocity uses q16s (2 B, signed [-1,1] — game velocities
-    // saturate well below ±1). `invulnerable` is a frame counter
+    // saturate well below ±1).
+    // `invulnerable` is a frame counter
     // (0..INVULNERABILITY_TIME, decremented by dt each frame; receivers use
     // its integer value to drive the blink phase via Math.floor(v/BLINK_RATE)
     // % 2), so it MUST be encoded as an integer — `bool` would collapse all
     // nonzero values to 1, fixing the receiver in the "blink off" half and
     // making the ship invisible for the entire invuln period.
-    // Phase 4E adds an additional create-time schema (id 2 for ship) to
-    // capture the join/respawn payload positionally; the server's
-    // ToObjectInfo replays the same SchemaId on every broadcast and on
-    // JoinSession snapshots so late joiners see the compact positional form
-    // instead of legacy MessagePack. Asteroid create (and split-children) is
-    // intentionally NOT positional in this phase: those payloads carry a
-    // per-instance `vertices` polygon list that would need a dedicated
-    // game-layer packer (a follow-on PR). Including them without packing
-    // would either silently drop vertices (wrong silhouette for fracture
-    // shards) or pay full MessagePack overhead inside a positional `bytes`
-    // slot (no savings).
     const WIREOPT_SCHEMAS = [
         { id: 1, fields: [
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-            ['thrusting', 'bool'], ['invulnerable', 'u16'],
-        ]},
-        // Ship create schema (Phase 4E): full ship-toSyncData() shape.
-        // Includes static identity fields (type, colorIndex, memberId) so
-        // late joiners can reconstruct the player ship from the snapshot
-        // without a separate metadata round-trip. score/hitCount ride along
-        // for snapshot correctness even though steady-state updates use the
-        // SHIP_STATE_CHANGED per-object event channel instead.
-        { id: 2, fields: [
             ['type', 'str'],
             ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
             ['velocityX', 'q16s'], ['velocityY', 'q16s'],
@@ -2160,101 +2124,71 @@
             ['colorIndex', 'u8'],
             ['memberId', 'guid'],
             ['score', 'u32'], ['hitCount', 'u16'],
-            // Persistence-only terminal fields. Terminal updates intentionally
-            // use the legacy dict path, but JoinSession snapshots re-encode a
-            // ship with its creation schema (id 2), so these fields must live
-            // here as well or late joiners silently lose the canonical target.
-            ['terminalEpoch', 'f64'],
-            ['terminalX', 'f64'], ['terminalY', 'f64'],
-            ['terminalAngle', 'f64'],
-        ]},
-        // Asteroid update schema. velocityX/Y and rotationSpeed are NOT
-        // optional even though asteroid kinematics are constant in steady
-        // state — RemoteObjects.updateState reads them off every snapshot
-        // and feeds them to _baseInterpolated as Hermite tangents AND as
-        // the slope used to extrapolate forward when targetTime advances
-        // past the latest snapshot. Dropping them silently zeroes both,
-        // which freezes the rendered asteroid whenever targetTime passes the
-        // newest sample, followed by a jump at the next transport flush. The
-        // resulting stutter follows the current adaptive send cadence; it is
-        // unrelated to the deterministic 30-frame extrapolation cap.
-        // Cost: +6 B per update.
-        { id: 3, fields: [
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-        ]},
-        // Ship update schema for INPUT-REPLAY mode (P3, schema id 4). Kept for
-        // compatibility with sessions created before target-heading replay fields
-        // existed; it replays thrust/brake but recovers turn input from
-        // rotationSpeed.
-        { id: 4, fields: [
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-            ['thrusting', 'bool'], ['invulnerable', 'u16'],
-            ['thrustInput', 'q16s'], ['brakeInput', 'q16s'],
-        ]},
-        // Ship update schema for target-heading replay (P3b, schema id 5).
-        // Extends id 4 with turn-control intent: rate-mode uses turnTarget;
-        // polar target-mode recomputes turnTarget from turnTargetAngle and
-        // turnMagnitude each replay substep, plus turnBias for the optional
-        // right-anchor steering contribution. thrustInput / brakeInput /
-        // turnMagnitude are unsigned [0,1] (turnMagnitude is clamped in
-        // DeadReckon.updateState), so they ride q8 (1 B, 1/255 resolution) rather
-        // than q16s; turnTarget / turnBias stay q16s (signed [-1,1]). q8 is
-        // already supported by both codecs and the server registers schemas from
-        // session metadata, so this needs no server change.
-        { id: 5, fields: [
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-            ['thrusting', 'bool'], ['invulnerable', 'u16'],
             ['thrustInput', 'q8'], ['brakeInput', 'q8'],
             ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
             ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
             ['turnBias', 'q16s'],
+            ['terminalEpoch', 'f64'],
+            ['terminalX', 'f64'], ['terminalY', 'f64'],
+            ['terminalAngle', 'f64'],
+        ]},
+        { id: 2, fields: [
+            ['type', 'str'],
+            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+            ['radius', 'q16'],
+            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+            ['rotationSpeed', 'q16s'],
+            ['seed', 'f64'],
+            ['vertices', 'bytes'],
+            ['terminalEpoch', 'f64'],
+            ['terminalX', 'f64'], ['terminalY', 'f64'],
+            ['terminalAngle', 'f64'],
+        ]},
+        { id: 3, fields: [
+            ['type', 'str'],
+            ['x', 'q16w'], ['y', 'q16w'],
+            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+            ['lifetime', 'u16'],
+            ['colorIndex', 'u8'],
+            ['ownerMemberId', 'guid'],
+            ['pendingHit', 'bool'],
+            ['hitTargetId', 'nullable-guid'],
+            ['hitImpactTorque', 'q16s'],
+            ['hitBulletAngle', 'q16_2pi'],
+            ['hitOffsetN', 'q16s'],
+            ['terminalEpoch', 'f64'],
+            ['terminalX', 'f64'], ['terminalY', 'f64'],
+        ]},
+        { id: 4, fields: [
+            ['type', 'str'],
+            ['gameStarted', 'bool'],
+            ['wave', 'u16'],
+            ['state', 'str'],
+            ['lives', 'u16'],
+            ['groupScore', 'u32'],
+            ['speedMultiplier', 'f32'],
+            ['waveDelayTimer', 'f32'],
+            ['processedHits', 'bytes'],
+            ['processedScores', 'bytes'],
+            ['peakShipCount', 'u8'],
+            ['gameOverAt', 'f64'],
+            ['terminalAt', 'f64'],
         ]},
     ];
-    const SCHEMA_ID_UPDATE = {
+    const WIREOPT_SCHEMA_BY_TYPE = Object.freeze({
         [OBJECT_TYPES.SHIP]: 1,
-        [OBJECT_TYPES.ASTEROID]: 3,
-    };
-    // Phase 4E: create/replace paths. Asteroid creates (including split
-    // children) stay on SchemaId=0 until the vertex-packing follow-on lands.
-    const SCHEMA_ID_CREATE = {
-        [OBJECT_TYPES.SHIP]: 2,
-    };
+        [OBJECT_TYPES.ASTEROID]: 2,
+        [OBJECT_TYPES.BULLET]: 3,
+        [OBJECT_TYPES.GAME_STATE]: 4,
+    });
     function selectWireoptSchemaId(data, kind, ctx) {
+        let type = data?.type;
         if (kind === 'update') {
-            // A terminal write is one-shot and persistence-sensitive. Use the
-            // legacy dictionary so every target field reaches the server even
-            // though normal ship/asteroid update schemas stay compact.
-            if (data && data.terminalEpoch !== undefined) return 0;
-            const obj = ctx && ctx.object;
-            const type = obj && obj.data && obj.data.type;
-            // P3/P3b: replay-enabled sessions carry control intent on ship
-            // updates. Prefer schema id 5 when the session registered it; fall
-            // back to id 4 for older session metadata.
-            if (type === OBJECT_TYPES.SHIP && CONFIG.SHIP_INPUT_REPLAY_ENABLED) {
-                if (typeof window !== 'undefined' && window.SchemaCodec
-                    && typeof window.SchemaCodec.get === 'function'
-                    && window.SchemaCodec.get(5)) {
-                    return 5;
-                }
-                return 4;
-            }
-            return SCHEMA_ID_UPDATE[type] || 0;
+            type = ctx?.object?.data?.type || type;
+        } else if (kind !== 'create' && kind !== 'replace') {
+            return 0;
         }
-        if (kind === 'create' || kind === 'replace') {
-            // Replace-children and creates both carry the full create-time
-            // dict shape with `type` set, so the selector keys off data.type
-            // directly rather than walking ctx.object (which doesn't exist
-            // yet for a fresh create).
-            const type = data && data.type;
-            return SCHEMA_ID_CREATE[type] || 0;
-        }
-        return 0;
+        return WIREOPT_SCHEMA_BY_TYPE[type] || 0;
     }
 
     // Ship colors for up to 4 players (distinct, high-contrast)
@@ -2284,13 +2218,8 @@
         if (!data || !data.type) return 0;
         if (data.type === OBJECT_TYPES.ASTEROID) {
             const vertices = data.vertices;
-            if (Array.isArray(vertices) && vertices.length > 0) {
-                let maximum = 0;
-                for (const vertex of vertices) {
-                    const distance = vertex ? vertex.distance || 0 : 0;
-                    if (distance > maximum) maximum = distance;
-                }
-                if (maximum > 0) return maximum;
+            if (AstervoidsWireCodec.hasAsteroidVertices(vertices)) {
+                return AstervoidsWireCodec.maxAsteroidVertexDistance(vertices);
             }
             return (data.radius || 0) * (1 + CONFIG.ASTEROID_JAGGEDNESS);
         }
@@ -3871,9 +3800,10 @@
          * channel ('ship-state-changed' / EVENT_KIND.SHIP_STATE_CHANGED) so they
          * don't pay per-frame wire cost. Snapshot reconciliation still carries
          * them via toSyncData() so late joiners see correct values.
+         * Replay controls are emitted only in deterministic sessions.
          */
         toUpdateData() {
-            return {
+            const data = {
                 x: this.x,
                 y: this.y,
                 angle: this.angle,
@@ -3881,18 +3811,20 @@
                 velocityY: this.velocityY,
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
-                invulnerable: this.invulnerable,
-                // P3/P3b input-replay: control intent. Only encoded when the
-                // session uses ship-update schema id 4/5 (SHIP_INPUT_REPLAY_
-                // ENABLED); harmless extra dict keys under schema id 1.
-                thrustInput: this.thrustInput,
-                brakeInput: this.brakeInput,
-                turnControlMode: this.turnControlMode,
-                turnTarget: this.turnTarget,
-                turnTargetAngle: this.turnTargetAngle,
-                turnMagnitude: this.turnMagnitude,
-                turnBias: this.turnBias
+                invulnerable: this.invulnerable
             };
+            if (isDeterministicMode()) {
+                Object.assign(data, {
+                    thrustInput: this.thrustInput,
+                    brakeInput: this.brakeInput,
+                    turnControlMode: this.turnControlMode,
+                    turnTarget: this.turnTarget,
+                    turnTargetAngle: this.turnTargetAngle,
+                    turnMagnitude: this.turnMagnitude,
+                    turnBias: this.turnBias
+                });
+            }
+            return data;
         }
 
         /**
@@ -4163,11 +4095,13 @@
             this.velocityY = velocityY;    // Velocity in reference-dimension per second
             this.angle = Math.random() * Math.PI * 2;  // Random rotation
             this.rotationSpeed = randomRange(-0.02, 0.02);  // Spin rate
-            this.seed = seed || Math.random();  // Seed for deterministic shape generation
+            this.seed = seed ?? Math.random();  // Seed for deterministic shape generation
             // If explicit vertices are supplied (e.g. from a fracture split), keep
             // them verbatim; otherwise generate the classic seeded jagged polygon.
-            this.vertices = vertices ? vertices.map(v => ({ angle: v.angle, distance: v.distance }))
-                                     : this.generateShape();
+            this.hasExplicitVertices = Array.isArray(vertices);
+            this.vertices = this.hasExplicitVertices
+                ? vertices.map(v => ({ angle: v.angle, distance: v.distance }))
+                : this.generateShape();
             // True bounding radius for broad-phase collision: max distance from
             // the asteroid's center to any vertex. For seeded jagged spawns
             // this is roughly radius × (1 + ASTEROID_JAGGEDNESS); for fracture
@@ -4183,7 +4117,7 @@
          * @returns {object} Asteroid data for syncing
          */
         toSyncData() {
-            return {
+            const data = {
                 type: OBJECT_TYPES.ASTEROID,
                 x: this.x,
                 y: this.y,
@@ -4193,13 +4127,13 @@
                 angle: this.angle,
                 rotationSpeed: this.rotationSpeed,
                 seed: this.seed,
-                // Both spawn (seed-generated) and fracture (explicit vertex
-                // list) asteroids ride their full vertex list across the wire
-                // so receivers see the same silhouette without re-running the
-                // seeded RNG. Used by RemoteObjects.getBoundingRadius to derive
-                // the wrap margin from the actual visible polygon extent.
-                vertices: this.vertices,
             };
+            // Seed-generated shapes are reproducible from radius+seed. Fracture
+            // children carry q16 angle/distance pairs (4 bytes per vertex).
+            if (this.hasExplicitVertices) {
+                data.vertices = AstervoidsWireCodec.packAsteroidVertices(this.vertices);
+            }
+            return data;
         }
 
         /**
@@ -4234,6 +4168,14 @@
          * @returns {Asteroid} New asteroid instance
          */
         static fromSyncData(data) {
+            let vertices = null;
+            if (data.vertices !== undefined) {
+                try {
+                    vertices = AstervoidsWireCodec.unpackAsteroidVertices(data.vertices);
+                } catch (error) {
+                    _error('[Multiplayer] Ignoring malformed asteroid vertices:', error);
+                }
+            }
             const asteroid = new Asteroid(
                 data.x,
                 data.y,
@@ -4241,7 +4183,7 @@
                 data.velocityX,
                 data.velocityY,
                 data.seed,
-                Array.isArray(data.vertices) ? data.vertices : null
+                vertices
             );
             asteroid.angle = data.angle || 0;
             asteroid.rotationSpeed = data.rotationSpeed || 0;
@@ -4413,7 +4355,7 @@
          * @returns {object} Bullet data for syncing
          */
         toSyncData() {
-            return {
+            const data = {
                 type: OBJECT_TYPES.BULLET,
                 x: this.x,
                 y: this.y,
@@ -4422,12 +4364,9 @@
                 lifetime: this.lifetime,
                 colorIndex: this.colorIndex,
                 ownerMemberId: this.ownerMemberId,
-                pendingHit: this.pendingHit,
-                hitTargetId: this.hitTargetId || null,
-                hitImpactTorque: this.hitImpactTorque || 0,
-                hitBulletAngle: this.hitBulletAngle || 0,
-                hitOffsetN: this.hitOffsetN || 0
             };
+            if (this.pendingHit) Object.assign(data, this.toHitData());
+            return data;
         }
 
         /**
@@ -4436,11 +4375,18 @@
          * 'type' is omitted for the same reason as Ship.toUpdateData.
          */
         toUpdateData() {
-            return {
+            const data = {
                 x: this.x,
                 y: this.y,
                 lifetime: this.lifetime,
-                pendingHit: this.pendingHit,
+            };
+            if (this.pendingHit) Object.assign(data, this.toHitData());
+            return data;
+        }
+
+        toHitData() {
+            return {
+                pendingHit: true,
                 hitTargetId: this.hitTargetId || null,
                 hitImpactTorque: this.hitImpactTorque || 0,
                 hitBulletAngle: this.hitBulletAngle || 0,
@@ -5562,7 +5508,8 @@
         if (data.wave !== undefined) game.wave = data.wave;
         const oldLives = game.lives;
         if (data.lives !== undefined) game.lives = data.lives;
-        if (data.score !== undefined) game.score = data.score;
+        if (data.groupScore !== undefined) game.score = data.groupScore;
+        else if (data.score !== undefined) game.score = data.score;
         if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
         if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
 
@@ -5971,10 +5918,11 @@
                 wave: game.wave,
                 state: game.state,
                 lives: game.lives,
-                score: game.score,
+                groupScore: game.score,
                 speedMultiplier: game.speedMultiplier,
                 waveDelayTimer: game.waveDelayTimer,
-                processedHits: {},
+                processedHits: AstervoidsWireCodec.packCounterMap({}),
+                processedScores: AstervoidsWireCodec.packCounterMap({}),
                 peakShipCount: shipObjects.length,
                 // Authoritative server-time (ms) at which the shared lives reached
                 // 0. Null until game over; stamped once by the GameState owner.
@@ -5998,14 +5946,27 @@
      * Sync GameState to ObjectSync (GameState owner only)
      * Aggregates score from all ships and processes hitCounts for lives
      */
+    let malformedGameStateLedgerKey = null;
     function syncGameState(immediate = false) {
         if (!isSessionMode() || !isGameStateOwner() || !game.multiplayer.gameStateObjectId) return;
         
         const gsObj = ObjectSync.getObject(game.multiplayer.gameStateObjectId);
-        // Spread into new objects so delta encoding detects in-place mutations
-        // (computeDelta uses shallow reference comparison — same ref ≠ change detected)
-        const processedHits = { ...(gsObj?.data?.processedHits || {}) };
-        const processedScores = { ...(gsObj?.data?.processedScores || {}) };
+        let processedHits;
+        let processedScores;
+        try {
+            processedHits = AstervoidsWireCodec.unpackCounterMap(
+                gsObj?.data?.processedHits);
+            processedScores = AstervoidsWireCodec.unpackCounterMap(
+                gsObj?.data?.processedScores);
+            malformedGameStateLedgerKey = null;
+        } catch (error) {
+            const ledgerKey = `${game.multiplayer.gameStateObjectId}:${gsObj?.version ?? 0}`;
+            if (malformedGameStateLedgerKey !== ledgerKey) {
+                malformedGameStateLedgerKey = ledgerKey;
+                _error('[Multiplayer] Refusing malformed GameState ledgers:', error);
+            }
+            return;
+        }
         let groupScore = gsObj?.data?.groupScore || 0;
         
         // Read lives from gsObj.data (same source as processedHits/peakShipCount)
@@ -6017,7 +5978,7 @@
         // Accumulate score deltas from all ships (survives member departure)
         const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
         for (const ship of shipObjects) {
-            const shipId = ship.id;
+            const shipId = ship.id.toLowerCase();
             const shipScore = ship.data?.score || 0;
             const lastProcessed = processedScores[shipId] || 0;
             const delta = shipScore - lastProcessed;
@@ -6030,7 +5991,7 @@
         
         // Process hitCounts from all ships (idempotent via processedHits tracking)
         for (const ship of shipObjects) {
-            const shipId = ship.id;
+            const shipId = ship.id.toLowerCase();
             const hitCount = ship.data?.hitCount || 0;
             const lastProcessed = processedHits[shipId] || 0;
             const newHits = hitCount - lastProcessed;
@@ -6086,19 +6047,17 @@
             wave: game.wave,
             state: game.state,
             lives: lives,
-            score: groupScore,
             groupScore: groupScore,
             speedMultiplier: game.speedMultiplier,
             waveDelayTimer: game.waveDelayTimer,
-            processedHits: processedHits,
-            processedScores: processedScores,
+            processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
+            processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
             peakShipCount: peakShipCount,
             gameOverAt: gameOverAt,
             terminalAt: terminalAt
         };
         
-        // Note: this queues into pendingUpdates (same batch as ship/asteroid/bullet updates).
-        // Delta encoding skips GameState when nothing changed, so no further rate reduction needed.
+        // This queues into pendingUpdates with the other object updates.
         ObjectSync.updateObject(game.multiplayer.gameStateObjectId, gameStateData, immediate);
     }
 
@@ -6228,7 +6187,9 @@
                 freshGameStart = false;
                 game.lives = existingGsObj?.data?.lives ?? CONFIG.MULTIPLAYER_LIVES;
                 game.wave = existingGsObj?.data?.wave ?? 0;
-                game.score = existingGsObj?.data?.score ?? 0;
+                game.score = existingGsObj?.data?.groupScore
+                    ?? existingGsObj?.data?.score
+                    ?? 0;
                 game.speedMultiplier = existingGsObj?.data?.speedMultiplier ?? 1;
                 game.state = existingGsObj?.data?.state ?? 'playing';
                 if (existingGsObj?.data?.waveDelayTimer !== undefined) {
@@ -7885,45 +7846,50 @@
                 angularAcceleration: 0
             };
         const remaining = terminal.terminalAt - nowServer;
-        const endTime = remaining >= CONFIG.DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS
+        // A late target gets a local grace interval. If preserving an axis's
+        // incoming derivative would force a whole extra position/angle winding,
+        // the wrapped-transition helper relaxes only that degraded axis.
+        const lateSettle =
+            remaining < CONFIG.DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS;
+        const endTime = !lateSettle
             ? terminal.terminalAt
             : nowServer + CONFIG.DEADRECKON_GAMEOVER_LATE_SETTLE_MS;
-        const duration = endTime - nowServer;
         const radius = wrapRadiusFor(obj);
         const marginX = wrapMarginX(radius);
         const marginY = wrapMarginY(radius);
-        const targetX = ReplicationPresentation.unwrapConvergenceTarget({
+        const xAxis = ReplicationPresentation.createWrappedConvergenceTransition({
             start: current.x,
             target: data.terminalX,
             span: 1 + 2 * marginX,
-            velocity: current.velocityX,
-            duration
+            startVelocity: current.velocityX,
+            startAcceleration: current.accelerationX,
+            startTime: nowServer,
+            endTime,
+            relaxExtraWinding: lateSettle
         });
-        const targetY = ReplicationPresentation.unwrapConvergenceTarget({
+        const yAxis = ReplicationPresentation.createWrappedConvergenceTransition({
             start: current.y,
             target: data.terminalY,
             span: 1 + 2 * marginY,
-            velocity: current.velocityY,
-            duration
+            startVelocity: current.velocityY,
+            startAcceleration: current.accelerationY,
+            startTime: nowServer,
+            endTime,
+            relaxExtraWinding: lateSettle
         });
-        let targetAngle = null;
         let angleTransition = null;
         if (current.angle != null && Number.isFinite(data.terminalAngle)) {
-            targetAngle = ReplicationPresentation.unwrapConvergenceTarget({
-                start: current.angle,
-                target: data.terminalAngle,
-                span: Math.PI * 2,
-                velocity: current.angularVelocity,
-                duration
-            });
-            angleTransition = ReplicationPresentation.createMinimumJerkTransition({
-                start: current.angle,
-                target: targetAngle,
-                startVelocity: current.angularVelocity,
-                startAcceleration: current.angularAcceleration,
-                startTime: nowServer,
-                endTime
-            });
+            angleTransition =
+                ReplicationPresentation.createWrappedConvergenceTransition({
+                    start: current.angle,
+                    target: data.terminalAngle,
+                    span: Math.PI * 2,
+                    startVelocity: current.angularVelocity,
+                    startAcceleration: current.angularAcceleration,
+                    startTime: nowServer,
+                    endTime,
+                    relaxExtraWinding: lateSettle
+                }).transition;
         }
 
         return {
@@ -7937,22 +7903,8 @@
                 : null,
             marginX,
             marginY,
-            xTransition: ReplicationPresentation.createMinimumJerkTransition({
-                start: current.x,
-                target: targetX,
-                startVelocity: current.velocityX,
-                startAcceleration: current.accelerationX,
-                startTime: nowServer,
-                endTime
-            }),
-            yTransition: ReplicationPresentation.createMinimumJerkTransition({
-                start: current.y,
-                target: targetY,
-                startVelocity: current.velocityY,
-                startAcceleration: current.accelerationY,
-                startTime: nowServer,
-                endTime
-            }),
+            xTransition: xAxis.transition,
+            yTransition: yAxis.transition,
             angleTransition
         };
     }
@@ -9616,9 +9568,8 @@
             if (success) {
                 // Initialize ObjectSync after connection
                 ObjectSync.init();
-                // Phase 4 wireopt: register positional schemas before any
-                // SyncPayload.wrap/unwrap can fire. SchemaCodec is loaded by
-                // schema-codec.js (browser) ahead of sync-payload.js.
+                // Register positional schemas before any SyncPayload
+                // wrap/unwrap can fire. schema-codec.js loads first.
                 if (window.SchemaCodec) {
                     window.SchemaCodec.replaceAll(WIREOPT_SCHEMAS);
                 }
@@ -9765,8 +9716,8 @@
                         // seed) carry angle = parent's angle at collision and DO
                         // benefit from a parentInterp.angle bridge for smooth
                         // angular continuity.
-                        const isFractureChild = Array.isArray(child.data.vertices)
-                            && child.data.vertices.length > 0;
+                        const isFractureChild =
+                            AstervoidsWireCodec.hasAsteroidVertices(child.data.vertices);
                         const bridgeData = {
                             ...child.data,
                             x: bridgeX,
@@ -9866,7 +9817,9 @@
                         groupScore: 'gr', peakShipCount: 'pk',
                         gameOverAt: 'go', terminalAt: 'ta',
                         terminalEpoch: 'te', terminalX: 'tx',
-                        terminalY: 'ty', terminalAngle: 'tg'
+                        terminalY: 'ty', terminalAngle: 'tg',
+                        hitX: 'hx', hitY: 'hy', hitAngle: 'hg',
+                        cueId: 'cu', bulletAngle: 'ba', offsetN: 'on'
                     }
                 });
                 

@@ -301,6 +301,43 @@ public class SessionHubTests
         result.Should().BeGreaterThan(0);
     }
 
+    [Fact]
+    public async Task BroadcastObjectEvent_RelaysOpaqueBytesFromCurrentOwner()
+    {
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        var owned = _objectService.CreateObject(
+            session.Id,
+            creator.Id,
+            ObjectScope.Member,
+            new Dictionary<string, object?> { ["type"] = "ship" })!;
+        object?[]? capturedArgs = null;
+        var proxy = new Mock<IClientProxy>();
+        proxy
+            .Setup(p => p.SendCoreAsync(
+                "OnObjectEvent",
+                It.IsAny<object?[]>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((_, args, _) =>
+                capturedArgs = args)
+            .Returns(Task.CompletedTask);
+        var hub = CreateHubWithProxy("connection-1", proxy);
+        var payload = new byte[] { 0x82, 0xa2, 0x73, 0x63, 0x64, 0xa2, 0x68, 0x63, 0x02 };
+
+        var result = await hub.BroadcastObjectEvent(
+            owned.Id, 1, payload, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        result.Should().BeTrue();
+        capturedArgs.Should().NotBeNull();
+        capturedArgs!.Length.Should().Be(5);
+        var eventInfo = capturedArgs[0].Should().BeOfType<ObjectEventInfo>().Subject;
+        eventInfo.ObjectId.Should().Be(owned.Id);
+        eventInfo.EventKind.Should().Be(1);
+        eventInfo.Payload.Should().Equal(payload);
+        eventInfo.Payload.Should().NotBeSameAs(payload);
+    }
+
     private SessionHub CreateHub(string connectionId, Mock<IGroupManager>? groupsMock = null)
     {
         var hub = new SessionHub(

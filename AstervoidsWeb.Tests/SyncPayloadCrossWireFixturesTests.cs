@@ -174,4 +174,27 @@ public class SyncPayloadCrossWireFixturesTests
         decoded["memberId"].Should().Be("abc-def");
         decoded["hitTargetId"].Should().BeNull();
     }
+
+    [Fact]
+    public void SchemaZero_RoundTripsNestedCollectionsAndBinaryData()
+    {
+        var original = new Dictionary<string, object?>
+        {
+            ["type"] = "generic-widget",
+            ["nested"] = new Dictionary<string, object?>
+            {
+                ["enabled"] = true,
+                ["values"] = new object?[] { 1, -2, 3.5, null }
+            },
+            ["bytes"] = new byte[] { 0, 127, 128, 255 }
+        };
+
+        var payload = SyncPayloadCodec.EncodeDict(original);
+        var decoded = SyncPayloadCodec.DecodeDict(payload);
+
+        payload.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
+        decoded["type"].Should().Be("generic-widget");
+        decoded["bytes"].Should().BeEquivalentTo(new byte[] { 0, 127, 128, 255 });
+        decoded["nested"].Should().NotBeNull();
+    }
 }

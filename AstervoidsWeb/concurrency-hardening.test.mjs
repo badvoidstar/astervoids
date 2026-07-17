@@ -140,16 +140,20 @@ function evaluateModule(relativePath, exportName, globals) {
     return moduleHost.exports;
 }
 
-function loadSessionClient(connections, objectSyncBridge = { triggerReconciliation() {} }) {
+function loadSessionClient(
+    connections,
+    objectSyncBridge = { triggerReconciliation() {} },
+    guidUtils = { transformBinaryGuids: value => value },
+    syncPayload = SyncPayload) {
     const window = { ASTERVOIDS_DEBUG: false };
     const signalR = makeSignalR(connections);
     const client = evaluateModule('wwwroot/js/session-client.js', 'SessionClient', {
         window,
         console,
         signalR,
-        GuidUtils: { transformBinaryGuids: value => value },
+        GuidUtils: guidUtils,
         WireEnum,
-        SyncPayload,
+        SyncPayload: syncPayload,
         ObjectSync: objectSyncBridge,
         setTimeout: (callback, delay) => {
             const timer = setTimeout(callback, delay);
@@ -444,6 +448,149 @@ test('SessionClient rejects session responses without reconnect credentials', as
     assert.equal(client.getCurrentSession(), null);
 });
 
+test('SessionClient adapts compact object DTO arrays at every wire boundary', async () => {
+    const connection = new FakeConnection();
+    const compact = (id, version, data, owner = 'owner') =>
+        [id, owner, owner, 'Session', data, version];
+    connection.invokers.set('JoinSession', sessionId =>
+        Promise.resolve(joinResponse(sessionId, [
+            compact('snapshot', 1, { type: 'ship', x: 1 })
+        ])));
+    connection.invokers.set('UpdateObjects', updates => {
+        assert.deepEqual(updates, [['snapshot', { x: 2 }]]);
+        return Promise.resolve([[['snapshot', 2]], 17, 123]);
+    });
+    connection.invokers.set('CreateObject', () =>
+        Promise.resolve([compact('owned-create', 1, { type: 'bullet' }), 18, 124]));
+    connection.invokers.set('DeleteObject', () => Promise.resolve([true, 19]));
+    connection.invokers.set('ReplaceObject', () =>
+        Promise.resolve([compact('owned-child', 1, { type: 'asteroid' })]));
+    connection.invokers.set('GetSessionState', () => Promise.resolve({
+        members: [],
+        objects: [compact('reconciled', 4, { type: 'gameState' })],
+        validAts: [],
+        memberSequences: []
+    }));
+    const { client } = loadSessionClient([connection]);
+    const created = [];
+    const updated = [];
+    const replaced = [];
+    const events = [];
+    client.on('onObjectCreated', value => created.push(value));
+    client.on('onObjectsUpdated', value => updated.push(value));
+    client.on('onObjectReplaced', value => replaced.push(value));
+    client.on('onObjectEvent', value => events.push(value));
+
+    await connectImmediately(client, connection);
+    const joined = await client.joinSession('session');
+    assert.equal(joined.session.objects[0].id, 'snapshot');
+    assert.equal(joined.session.objects[0].data.x, 1);
+
+    connection.emit('OnObjectCreated',
+        compact('created', 1, { type: 'asteroid' }), 'sender', 1, 10, 10);
+    connection.emit('OnObjectsUpdated',
+        [['created', { x: 2 }, 2]], 'sender', 1, 2, 10, 16, 10);
+    connection.emit('OnObjectReplaced',
+        ['created', [compact('child', 1, { type: 'asteroid' })]],
+        'sender', 3, 10, 10);
+    connection.emit('OnObjectEvent',
+        ['snapshot', 1, new Uint8Array([0x80])], 'sender', 4, 10, 10);
+
+    assert.equal(created[0].id, 'created');
+    assert.equal(updated[0][0].id, 'created');
+    assert.equal(replaced[0].deletedObjectId, 'created');
+    assert.equal(replaced[0].createdObjects[0].id, 'child');
+    assert.equal(events[0].objectId, 'snapshot');
+
+    const updateResponse = await client.updateObjects([
+        { objectId: 'snapshot', data: { x: 2 } }
+    ]);
+    const createResponse = await client.createObject({ type: 'bullet' }, 'Member');
+    const replacement = await client.replaceObject('snapshot', [{ type: 'asteroid' }]);
+    const deleteResponse = await client.deleteObject('snapshot');
+    const reconciliation = await client.getSessionState();
+    assert.deepEqual(updateResponse.versions, { snapshot: 2 });
+    assert.equal(updateResponse.memberSequence, 17);
+    assert.equal(createResponse.objectInfo.id, 'owned-create');
+    assert.equal(createResponse.memberSequence, 18);
+    assert.equal(replacement[0].id, 'owned-child');
+    assert.equal(deleteResponse.success, true);
+    assert.equal(deleteResponse.memberSequence, 19);
+    assert.equal(reconciliation.objects[0].id, 'reconciled');
+});
+
+test('SessionClient installs session schemas before decoding a join snapshot', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('JoinSession', sessionId => Promise.resolve({
+        ...joinResponse(sessionId, [
+            ['snapshot', 'owner', 'owner', 'Session', [7, new Uint8Array([0])], 1]
+        ]),
+        metadata: {
+            schemas: [{ id: 7, fields: [['type', 'str']] }]
+        }
+    }));
+    let schemasInstalled = false;
+    const syncPayload = {
+        wrap: value => value,
+        replaceSchemas(schemas) {
+            assert.equal(schemas[0].id, 7);
+            schemasInstalled = true;
+        },
+        unwrapObjectData(objectInfo) {
+            assert.equal(schemasInstalled, true);
+            objectInfo.data = { type: 'widget' };
+        }
+    };
+    const { client } = loadSessionClient(
+        [connection],
+        { triggerReconciliation() {} },
+        { transformBinaryGuids: value => value },
+        syncPayload);
+
+    await connectImmediately(client, connection);
+    const joined = await client.joinSession('session');
+
+    assert.equal(joined.session.objects[0].data.type, 'widget');
+});
+
+test('SessionClient preserves 16-byte opaque event payloads during GUID normalization', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('JoinSession', sessionId =>
+        Promise.resolve(joinResponse(sessionId, [])));
+    const transformBinaryGuids = value => {
+        if (value instanceof Uint8Array && value.length === 16) return 'converted-guid';
+        if (Array.isArray(value)) return value.map(transformBinaryGuids);
+        if (value && typeof value === 'object') {
+            return Object.fromEntries(
+                Object.entries(value).map(([key, item]) =>
+                    [key, transformBinaryGuids(item)]));
+        }
+        return value;
+    };
+    const { client } = loadSessionClient(
+        [connection],
+        { triggerReconciliation() {} },
+        { transformBinaryGuids });
+    let received;
+    client.on('onObjectEvent', eventInfo => { received = eventInfo; });
+    await connectImmediately(client, connection);
+    await client.joinSession('session');
+
+    const payload = new Uint8Array(16);
+    payload.fill(0x2a);
+    connection.emit(
+        'OnObjectEvent',
+        [new Uint8Array(16), 1, payload],
+        new Uint8Array(16),
+        1,
+        10,
+        10);
+
+    assert.equal(received.objectId, 'converted-guid');
+    assert.ok(received.payload instanceof Uint8Array);
+    assert.deepEqual(received.payload, payload);
+});
+
 test('join snapshot preserves object events delivered before JoinSession returns', async () => {
     const connection = new FakeConnection();
     const joinGate = deferred();
@@ -666,6 +813,92 @@ test('outbound confirmation is tracked with delta encoding disabled', async () =
     assert.equal(objectSync.isDataConfirmed(
         'accepted',
         { ...terminal, terminalX: 0.5 }), false);
+});
+
+test('byte-array deltas and confirmations compare by content', async () => {
+    const client = makeObjectSyncClient();
+    let updateCalls = 0;
+    client.updateObjects = async updates => {
+        updateCalls++;
+        return {
+            versions: Object.fromEntries(updates.map(update => [update.objectId, 2])),
+            memberSequence: 1
+        };
+    };
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: true });
+
+    client.transition();
+    client.join({
+        objects: [objectInfo('state', 1, {
+            processedHits: new Uint8Array([1, 2])
+        })],
+        validAts: {},
+        metadata: {}
+    });
+
+    objectSync.updateObject('state', {
+        processedHits: new Uint8Array([1, 2])
+    });
+    await objectSync.flushUpdates();
+    assert.equal(updateCalls, 0, 'equal byte content must not produce a delta');
+
+    objectSync.updateObject('state', {
+        processedHits: new Uint8Array([1, 3])
+    });
+    await objectSync.flushUpdates();
+    assert.equal(updateCalls, 1);
+    assert.equal(objectSync.isDataConfirmed('state', {
+        processedHits: new Uint8Array([1, 3])
+    }), true);
+});
+
+test('byte-array confirmation snapshots cannot drift while a flush is in flight', async () => {
+    const client = makeObjectSyncClient();
+    const firstResponse = deferred();
+    let updateCalls = 0;
+    let sentBytes;
+    client.updateObjects = updates => {
+        updateCalls++;
+        sentBytes = updates[0].data.processedHits.slice();
+        if (updateCalls === 1) return firstResponse.promise;
+        return Promise.resolve({
+            versions: { state: 3 },
+            memberSequence: updateCalls
+        });
+    };
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: true });
+    client.transition();
+    client.join({
+        objects: [objectInfo('state', 1, {
+            processedHits: new Uint8Array([1, 2])
+        })],
+        validAts: {},
+        metadata: {}
+    });
+
+    const mutable = new Uint8Array([1, 3]);
+    objectSync.updateObject('state', { processedHits: mutable });
+    const flush = objectSync.flushUpdates();
+    await drainMicrotasks();
+    mutable[1] = 4;
+    firstResponse.resolve({ versions: { state: 2 }, memberSequence: 1 });
+    await flush;
+
+    assert.deepEqual(Array.from(sentBytes), [1, 3]);
+    assert.equal(objectSync.isDataConfirmed('state', {
+        processedHits: new Uint8Array([1, 3])
+    }), true);
+    assert.equal(objectSync.isDataConfirmed('state', {
+        processedHits: mutable
+    }), false);
+
+    objectSync.updateObject('state', { processedHits: mutable });
+    await objectSync.flushUpdates();
+    assert.equal(updateCalls, 2, 'the post-send mutation must remain eligible');
 });
 
 test('authoritative reconciliation confirms a write whose response was lost', async () => {
