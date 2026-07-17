@@ -44,19 +44,30 @@ function loadStatusUpdater({ sessionPicker, clientSession, game, status }) {
     );
 }
 
-function loadConnectionStatusUpdater({ sessionPicker, clientSession, game, status }) {
+function loadConnectionStatusUpdater({
+    sessionPicker,
+    clientSession,
+    game,
+    status,
+    regionalReadiness = () => ({ assessmentsComplete: true, hasAvailableRegion: true }),
+    browserNavigator = { onLine: true },
+}) {
     const factory = new Function(
         'sessionPicker',
         'SessionClient',
         'game',
         'setPickerStatus',
+        'getRegionalCreateReadiness',
+        'navigator',
         `${statusFunction[0]}; ${connectionStatusFunction}; return updatePickerConnectionStatus;`
     );
     return factory(
         sessionPicker,
         { getCurrentSession: () => clientSession },
         game,
-        (message, type = '') => Object.assign(status, { message, type })
+        (message, type = '') => Object.assign(status, { message, type }),
+        regionalReadiness,
+        browserNavigator,
     );
 }
 
@@ -129,11 +140,13 @@ test('transport status distinguishes connecting, connected, reconnecting, and of
         isServer: false,
     };
     const status = {};
+    const browserNavigator = { onLine: true };
     const updateStatus = loadConnectionStatusUpdater({
         sessionPicker,
         clientSession: null,
         game: {},
         status,
+        browserNavigator,
     });
 
     updateStatus();
@@ -148,6 +161,10 @@ test('transport status distinguishes connecting, connected, reconnecting, and of
     assert.deepEqual(status, { message: 'Reconnecting...', type: 'connecting' });
 
     sessionPicker.connectionState = 'offline';
+    updateStatus();
+    assert.deepEqual(status, { message: 'Connection unavailable', type: 'error' });
+
+    browserNavigator.onLine = false;
     updateStatus();
     assert.deepEqual(status, { message: 'Offline - Solo play only', type: 'error' });
 });
@@ -166,11 +183,13 @@ test('transport status overrides stale in-session text until the connection is r
         members: [{ id: 'member-1' }],
     };
     const status = {};
+    const browserNavigator = { onLine: true };
     const updateStatus = loadConnectionStatusUpdater({
         sessionPicker,
         clientSession,
         game: { sessionInfo: { id: 'session-1', name: 'Swift Mango' } },
         status,
+        browserNavigator,
     });
 
     updateStatus();
@@ -182,7 +201,91 @@ test('transport status overrides stale in-session text until the connection is r
 
     sessionPicker.connectionState = 'offline';
     updateStatus();
+    assert.deepEqual(status, { message: 'Connection unavailable', type: 'error' });
+
+    browserNavigator.onLine = false;
+    updateStatus();
     assert.deepEqual(status, { message: 'Offline - Solo play only', type: 'error' });
+});
+
+test('online regional startup stays connecting through assessment and reports connected afterward', () => {
+    const sessionPicker = {
+        currentSessionId: null,
+        sessions: [],
+        maxSessions: 6,
+        connectionState: 'connecting',
+        regionDiscoveryState: 'loading',
+        regions: [],
+        isServer: false,
+    };
+    const status = {};
+    const browserNavigator = { onLine: true };
+    let readiness = { assessmentsComplete: false, hasAvailableRegion: false };
+    const updateStatus = loadConnectionStatusUpdater({
+        sessionPicker,
+        clientSession: null,
+        game: {},
+        status,
+        browserNavigator,
+        regionalReadiness: () => readiness,
+    });
+
+    updateStatus();
+    assert.deepEqual(status, { message: 'Connecting...', type: 'connecting' });
+
+    sessionPicker.regionDiscoveryState = 'loaded';
+    sessionPicker.regions = [{ id: 'westus2' }, { id: 'eastus' }];
+    readiness = { assessmentsComplete: true, hasAvailableRegion: true };
+    sessionPicker.connectionState = 'offline'; // Static apex has no same-origin hub.
+    updateStatus();
+    assert.deepEqual(status, { message: 'Connected - 0/6 sessions', type: 'connected' });
+
+    readiness = { assessmentsComplete: true, hasAvailableRegion: false };
+    updateStatus();
+    assert.deepEqual(status, { message: 'Regional servers unavailable', type: 'error' });
+
+    browserNavigator.onLine = false;
+    updateStatus();
+    assert.deepEqual(status, { message: 'Offline - Solo play only', type: 'error' });
+});
+
+test('single-region hub failure does not claim regional connectivity', () => {
+    const sessionPicker = {
+        currentSessionId: null,
+        sessions: [],
+        maxSessions: 6,
+        connectionState: 'offline',
+        regionDiscoveryState: 'loaded',
+        regions: [{ id: 'westus2' }],
+        isServer: false,
+    };
+    const status = {};
+    const updateStatus = loadConnectionStatusUpdater({
+        sessionPicker,
+        clientSession: null,
+        game: {},
+        status,
+        regionalReadiness: () => ({ assessmentsComplete: true, hasAvailableRegion: true }),
+    });
+
+    updateStatus();
+    assert.deepEqual(status, { message: 'Connection unavailable', type: 'error' });
+});
+
+test('region assessment updates refresh the picker status line', () => {
+    const initStart = html.indexOf('async function initRegionService()');
+    const multiRegionStart = html.indexOf('let multiRegionActive = false;', initStart);
+    assert.ok(initStart >= 0 && multiRegionStart > initStart);
+
+    const initSource = html.slice(initStart, multiRegionStart);
+    assert.match(
+        initSource,
+        /on\('rttUpdated',[\s\S]*?updatePickerConnectionStatus\(\);/,
+        'the final RTT/unavailable assessment must replace Connecting with the current regional status');
+    assert.match(
+        initSource,
+        /on\('regionsLoaded',[\s\S]*?updatePickerConnectionStatus\(\);/,
+        'loading a multi-region manifest must immediately enter the assessment status flow');
 });
 
 test('regional create readiness waits for every assessment but accepts concluded outages', () => {
