@@ -24,13 +24,16 @@
  *      (1500 ms), emit `coldStart(regionId)`, leave the region in `'warming'`
  *      state, and DO NOT feed the sample into the smoothing window — it is a
  *      cold-start measurement, not RTT.
- *   3. Subsequent **rolling bursts** fire every `BURST_INTERVAL_MS` (5000 ms),
+ *   3. If a warming region cannot produce a sample for a complete burst, mark
+ *      it `'unavailable'`. This concludes its assessment so the picker can
+ *      stop waiting for a region that cannot currently be reached.
+ *   4. Subsequent **rolling bursts** fire every `BURST_INTERVAL_MS` (5000 ms),
  *      staggered per region by a random initial offset to avoid synchronised
  *      bursts hammering the network.
- *   4. Each burst's minimum sample (jitter rejection) is fed into an
+ *   5. Each burst's minimum sample (jitter rejection) is fed into an
  *      exponential moving average with smoothing factor `EMA_ALPHA` (0.3).
  *      The displayed value is the EMA — stable across single-burst outliers.
- *   5. `confidence` ramps from 0 to 1 as more bursts land
+ *   6. `confidence` ramps from 0 to 1 as more bursts land
  *      (`min(1, sampleCount / CONFIDENCE_FULL_AFTER_SAMPLES)`), so the picker
  *      can show a "settling" indicator that visibly converges.
  *
@@ -116,6 +119,32 @@ const RegionService = (function () {
         };
     }
 
+    function unavailableRttState(prev, nowMs) {
+        return {
+            ...prev,
+            valueMs: null,
+            confidence: 0,
+            sampleCount: 0,
+            lastSampleAt: nowMs,
+            state: 'unavailable',
+        };
+    }
+
+    function isAssessmentComplete(state) {
+        return state != null && state.state !== 'warming';
+    }
+
+    function areRegionsAssessed(rttMap, regionIds) {
+        return regionIds.length > 0
+            && regionIds.every(id => isAssessmentComplete(rttMap.get(id)));
+    }
+
+    function isRttStateAvailable(state) {
+        return isAssessmentComplete(state)
+            && state.state !== 'unavailable'
+            && Number.isFinite(state.valueMs);
+    }
+
     /**
      * Fold a fresh burst-minimum into a region's measurement state.
      *
@@ -177,7 +206,7 @@ const RegionService = (function () {
     function pickBestRegion(rttMap, previousBest, cfg = CONFIG) {
         const candidates = [];
         for (const [id, s] of rttMap.entries()) {
-            if (s.state === 'warming' || s.valueMs == null) continue;
+            if (s.state === 'warming' || s.state === 'unavailable' || s.valueMs == null) continue;
             candidates.push({ id, value: s.valueMs, confidence: s.confidence });
         }
         if (candidates.length === 0) return null;
@@ -219,25 +248,31 @@ const RegionService = (function () {
     }
 
     /**
-     * Fire a burst of N pings to a region, return the minimum elapsed time
+     * Fire a burst of N pings to a region, returning the minimum retained time
+     * plus whether any ping reached the region at all.
      * (jitter rejection — matches clock-offset.test.mjs philosophy). When
      * `discardFirst` is true, the first sample is treated as warm-up and
      * excluded from the min. Failed pings reduce the burst size; if all fail,
-     * returns null.
+     * returns `minMs: null`.
      */
     async function measureBurst(hostname, samples, timeoutMs, discardFirst) {
         const times = [];
+        let successfulPingCount = 0;
         for (let i = 0; i < samples; i++) {
             try {
                 const ms = await pingOnce(hostname, timeoutMs);
+                successfulPingCount++;
                 if (i === 0 && discardFirst) continue;
                 times.push(ms);
             } catch (_) {
-                // Individual ping failure ignored — only an all-failed burst returns null.
+                // Individual ping failure is tolerated; the caller decides whether
+                // a burst with no successful requests means the region is unavailable.
             }
         }
-        if (times.length === 0) return null;
-        return Math.min(...times);
+        return {
+            minMs: times.length === 0 ? null : Math.min(...times),
+            successfulPingCount,
+        };
     }
 
     // ── Per-region burst loop ─────────────────────────────────────────────────
@@ -262,6 +297,11 @@ const RegionService = (function () {
         for (const id of Array.from(burstTimers.keys())) clearBurstTimer(id);
     }
 
+    function refreshBestRegion() {
+        const newBest = pickBestRegion(rtt, currentBestRegion);
+        if (newBest !== currentBestRegion) currentBestRegion = newBest;
+    }
+
     async function runBurst(regionId, isBootstrap, generation) {
         if (!started || generation !== runGeneration) return;
         const burstSequence = (burstSequences.get(regionId) ?? 0) + 1;
@@ -269,30 +309,43 @@ const RegionService = (function () {
         const region = regions.find(r => r.id === regionId);
         if (!region) return;
         const prev = rtt.get(regionId) ?? initialRttState();
-        const isFirstSample = prev.sampleCount === 0;
-        // Cold-start budget only for the very first attempt against this region.
-        const timeoutMs = isFirstSample ? CONFIG.COLD_PING_TIMEOUT_MS : CONFIG.WARM_PING_TIMEOUT_MS;
+        const needsWarmup = prev.state === 'warming'
+            && prev.sampleCount === 0
+            && prev.lastSampleAt == null;
+        // Cold-start budget only for the first unattempted burst against a region.
+        const timeoutMs = needsWarmup ? CONFIG.COLD_PING_TIMEOUT_MS : CONFIG.WARM_PING_TIMEOUT_MS;
         const samples = isBootstrap ? CONFIG.BOOTSTRAP_SAMPLES : CONFIG.ROLLING_SAMPLES;
-        const min = await measureBurst(region.hostname, samples, timeoutMs, /*discardFirst=*/isFirstSample);
+        const { minMs, successfulPingCount } = await measureBurst(
+            region.hostname, samples, timeoutMs, /*discardFirst=*/needsWarmup);
         if (!started
             || generation !== runGeneration
             || burstSequences.get(regionId) !== burstSequence) return;
 
-        if (min == null) {
-            // All pings in the burst failed — surface as a measurement attempt without state change,
-            // then reschedule.
+        if (minMs == null) {
+            // A full failed burst concludes a still-pending assessment. Keep a
+            // previously measured RTT intact during transient later failures.
+            // A successful discarded warm-up request means the region is
+            // reachable, so leave it warming until a later burst yields an RTT.
+            if (prev.state === 'warming' && successfulPingCount === 0) {
+                rtt.set(regionId, unavailableRttState(prev, Date.now()));
+                refreshBestRegion();
+                emit('rttUpdated', regionId);
+            } else if (prev.state === 'warming' && prev.lastSampleAt == null) {
+                // The warm-up request itself reached the region. Do not discard
+                // another first response on the next burst.
+                rtt.set(regionId, { ...prev, lastSampleAt: Date.now() });
+            }
             scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
             return;
         }
 
-        const { next, coldStart } = applyBurstSample(prev, min, Date.now());
+        const { next, coldStart } = applyBurstSample(prev, minMs, Date.now());
         rtt.set(regionId, next);
+        // Publish the new recommendation with the same rttUpdated event that
+        // drives the picker, so Create can use it immediately.
+        refreshBestRegion();
         if (coldStart) emit('coldStart', regionId);
         emit('rttUpdated', regionId);
-
-        // bestRegion memo refresh — recompute whenever any region's EMA moves.
-        const newBest = pickBestRegion(rtt, currentBestRegion);
-        if (newBest !== currentBestRegion) currentBestRegion = newBest;
 
         scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
     }
@@ -451,6 +504,16 @@ const RegionService = (function () {
         return currentBestRegion;
     }
 
+    /** True once every loaded region has either an RTT or an unavailable result. */
+    function areAllRegionsAssessed() {
+        return areRegionsAssessed(rtt, regions.map(region => region.id));
+    }
+
+    /** True when a region completed measurement and can currently accept routing. */
+    function isRegionAvailable(regionId) {
+        return isRttStateAvailable(rtt.get(regionId));
+    }
+
     /** Returns the canonical region manifest as loaded from /api/regions. */
     function getRegions() {
         return [...regions];
@@ -469,8 +532,12 @@ const RegionService = (function () {
     // Test hook — pure functions exported for unit testing without network I/O.
     const _internals = {
         initialRttState,
+        unavailableRttState,
         applyBurstSample,
         pickBestRegion,
+        isAssessmentComplete,
+        areRegionsAssessed,
+        isRttStateAvailable,
         measureBurst,
         pingOnce,
         CONFIG,
@@ -483,6 +550,8 @@ const RegionService = (function () {
         on,
         getRtt,
         bestRegion,
+        areAllRegionsAssessed,
+        isRegionAvailable,
         getRegions,
         getLocalRegionId,
         _configure,
