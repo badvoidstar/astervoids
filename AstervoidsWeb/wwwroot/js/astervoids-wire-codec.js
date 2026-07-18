@@ -2,6 +2,9 @@
  * Astervoids-specific packing at the game/replication boundary.
  */
 const AstervoidsWireCodec = (function () {
+    const guidUtils = typeof GuidUtils !== 'undefined'
+        ? GuidUtils
+        : require('./guid-utils.js');
     const TWO_PI = Math.PI * 2;
     const ASTEROID_VERTEX_BYTES = 4;
     const COUNTER_ENTRY_BYTES = 20;
@@ -103,35 +106,18 @@ const AstervoidsWireCodec = (function () {
     }
 
     function guidStringToBytes(value) {
-        if (typeof value !== 'string') {
-            throw new TypeError('counter-map keys must be GUID strings');
-        }
-        const hex = value.replace(/-/g, '');
-        if (!/^[0-9a-fA-F]{32}$/.test(hex)) {
+        try {
+            return guidUtils.guidToBytes(value);
+        } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
             throw new TypeError(`invalid counter-map GUID: ${value}`);
         }
-        const bytes = new Uint8Array(16);
-        const order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
-        for (let i = 0; i < order.length; i++) {
-            bytes[i] = parseInt(hex.slice(order[i] * 2, order[i] * 2 + 2), 16);
-        }
-        return bytes;
     }
 
     function guidBytesToString(bytes, offset) {
-        const order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
-        const hex = new Array(32);
-        for (let i = 0; i < order.length; i++) {
-            const byte = bytes[offset + i];
-            const target = order[i] * 2;
-            hex[target] = (byte >>> 4).toString(16);
-            hex[target + 1] = (byte & 0x0f).toString(16);
-        }
-        return hex.slice(0, 8).join('')
-            + '-' + hex.slice(8, 12).join('')
-            + '-' + hex.slice(12, 16).join('')
-            + '-' + hex.slice(16, 20).join('')
-            + '-' + hex.slice(20).join('');
+        const value = guidUtils.bytesToGuid(bytes, offset);
+        if (value === null) throw new Error('counter-map GUID payload is truncated');
+        return value;
     }
 
     function packCounterMap(counters) {

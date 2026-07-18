@@ -16,12 +16,14 @@ import { createRequire } from 'node:module';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
+const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 
 function loadObjectSync(stubs) {
     // Stubs we feed into the global before evaluating object-sync.js.
     const globals = {
         SessionClient: stubs.SessionClient,
         MsgpackCodec,
+        AuthoritativeObject,
         signalR: { HubConnectionState: { Connected: 'Connected', Reconnecting: 'Reconnecting' } },
         window: { ASTERVOIDS_DEBUG: false },
         console
@@ -36,14 +38,35 @@ function loadObjectSync(stubs) {
 function makeSessionClientStub() {
     const handlers = {};
     const sent = [];
+    const replacements = [];
     return {
         sentEvents: sent,
+        replacementRequests: replacements,
         handlers,
         on: (event, cb) => { handlers[event] = cb; },
         broadcastObjectEvent: async (objectId, eventKind, payload, validAt) => {
             sent.push({ objectId, eventKind, payload, validAt });
             return true;
         },
+        replaceObject: async (
+            deleteObjectId,
+            replacementData,
+            scope,
+            ownerMemberId,
+            clientValidAt,
+            schemaIds
+        ) => {
+            replacements.push({
+                deleteObjectId,
+                replacementData,
+                scope,
+                ownerMemberId,
+                clientValidAt,
+                schemaIds
+            });
+            return [];
+        },
+        getCurrentMember: () => ({ id: 'member-1' }),
         isInSession: () => true
     };
 }
@@ -99,6 +122,52 @@ test('emitEvent: invokes local handler synchronously then sends', async () => {
     assert.equal(stub.sentEvents[0].eventKind, 1);
     assert.ok(stub.sentEvents[0].payload instanceof Uint8Array);
     assert.deepEqual(MsgpackCodec.decode(stub.sentEvents[0].payload), { score: 100 });
+});
+
+test('emitEvent: validAt requires an initialized finite clock and is rounded', async () => {
+    const uninitializedStub = makeSessionClientStub();
+    const uninitialized = loadObjectSync({ SessionClient: uninitializedStub });
+    let reads = 0;
+    uninitialized.configure({
+        clockSource: {
+            initialized: () => false,
+            nowMs: () => { reads++; return 1234.6; }
+        }
+    });
+    uninitialized.registerEventKind('event', 1);
+    await uninitialized.emitEvent('obj-1', 'event', {});
+    assert.equal(uninitializedStub.sentEvents[0].validAt, null);
+    assert.equal(reads, 0);
+
+    const initializedStub = makeSessionClientStub();
+    const initialized = loadObjectSync({ SessionClient: initializedStub });
+    initialized.configure({
+        clockSource: {
+            initialized: () => true,
+            nowMs: () => 1234.6
+        }
+    });
+    initialized.registerEventKind('event', 1);
+    await initialized.emitEvent('obj-1', 'event', {});
+    assert.equal(initializedStub.sentEvents[0].validAt, 1235);
+});
+
+test('replaceObject selects each schema once and keeps payload paired with its id', async () => {
+    const stub = makeSessionClientStub();
+    const ObjectSync = loadObjectSync({ SessionClient: stub });
+    ObjectSync.configure({ fieldMap: { angle: 'a' } });
+    let selections = 0;
+    ObjectSync.setSchemaIdSelector(() => ++selections === 1 ? 7 : 0);
+
+    await ObjectSync.replaceObject('parent', [{ angle: 1 }, { angle: 2 }]);
+
+    assert.equal(selections, 2);
+    assert.equal(stub.replacementRequests.length, 1);
+    assert.deepEqual(stub.replacementRequests[0].schemaIds, [7, 0]);
+    assert.deepEqual(stub.replacementRequests[0].replacementData, [
+        { angle: 1 },
+        { a: 2 }
+    ]);
 });
 
 test('emitEvent: silent no-op when kind unregistered', async () => {

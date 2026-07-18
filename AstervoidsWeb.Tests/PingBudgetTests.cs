@@ -1,7 +1,5 @@
 using System.Diagnostics;
 using FluentAssertions;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 
 namespace AstervoidsWeb.Tests;
 
@@ -25,24 +23,8 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class PingBudgetTests : IClassFixture<PingBudgetTests.Factory>
 {
-    public sealed class Factory : WebApplicationFactory<Program>
+    public sealed class Factory : AstervoidsWebFactory
     {
-        protected override void ConfigureWebHost(IWebHostBuilder builder)
-            => builder.UseContentRoot(FindContentRoot());
-
-        private static string FindContentRoot()
-        {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null)
-            {
-                var candidate = Path.Combine(dir.FullName, "AstervoidsWeb");
-                if (Directory.Exists(Path.Combine(candidate, "wwwroot")))
-                    return candidate;
-                dir = dir.Parent;
-            }
-            throw new DirectoryNotFoundException(
-                $"Could not find AstervoidsWeb project directory. Searched from: {AppContext.BaseDirectory}");
-        }
     }
 
     private readonly Factory _factory;

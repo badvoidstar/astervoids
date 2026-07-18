@@ -47,6 +47,9 @@
  * 4.2 / `object-sync.js` registration flow.
  */
 const SchemaCodec = (function () {
+    const guidUtils = typeof GuidUtils !== 'undefined'
+        ? GuidUtils
+        : require('./guid-utils.js');
     const MAX_FIELDS = 32;
     const TYPE_TAGS = new Set([
         'f64', 'f32',
@@ -121,35 +124,16 @@ const SchemaCodec = (function () {
      * for the first 3 fields, network order for the remaining 8 bytes).
      */
     function guidStringToBytes(s) {
-        if (typeof s !== 'string' || s.length !== 36) {
-            throw new Error(`GUID must be a 36-char string; got ${typeof s} length ${s && s.length}`);
-        }
-        const hex = s.replace(/-/g, '');
-        if (hex.length !== 32) throw new Error(`Malformed GUID string: ${s}`);
-        const bytes = new Uint8Array(16);
-        // LE for first 4 bytes, then 2, then 2, then 8 in network order.
-        const order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
-        for (let i = 0; i < 16; i++) {
-            const hi = parseInt(hex.charAt(order[i] * 2), 16);
-            const lo = parseInt(hex.charAt(order[i] * 2 + 1), 16);
-            bytes[i] = (hi << 4) | lo;
-        }
-        return bytes;
+        return guidUtils.guidToBytes(s);
     }
 
     /**
      * 16-byte GUID buffer → "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
      */
     function bytesToGuidString(bytes, offset) {
-        const order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
-        const hex = new Array(32);
-        for (let i = 0; i < 16; i++) {
-            const b = bytes[offset + order[i]];
-            hex[i * 2] = (b >>> 4).toString(16);
-            hex[i * 2 + 1] = (b & 0x0f).toString(16);
-        }
-        const h = hex.join('');
-        return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+        const value = guidUtils.bytesToGuid(bytes, offset);
+        if (value === null) throw new Error('GUID payload is truncated');
+        return value;
     }
 
     /**

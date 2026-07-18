@@ -3,8 +3,6 @@ using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Services;
-using MessagePack;
-using MessagePack.Resolvers;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -126,13 +124,7 @@ builder.Services.AddSignalR(options =>
     // primitives, collections, Dictionary<K,V>. Collection formatters (e.g. IEnumerable<Guid>)
     // resolve element formatters through the composite root, so Guid elements also get
     // binary encoding. UntrustedData rejects malformed msgpack.
-    var compositeResolver = CompositeResolver.Create(
-        BinaryGuidResolver.Instance,
-        ContractlessStandardResolver.Instance
-    );
-    options.SerializerOptions = MessagePackSerializerOptions.Standard
-        .WithResolver(compositeResolver)
-        .WithSecurity(MessagePackSecurity.UntrustedData);
+    options.SerializerOptions = AstervoidsMessagePack.Options;
 });
 
 var app = builder.Build();

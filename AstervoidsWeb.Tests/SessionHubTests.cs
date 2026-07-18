@@ -324,9 +324,10 @@ public class SessionHubTests
             .Returns(Task.CompletedTask);
         var hub = CreateHubWithProxy("connection-1", proxy);
         var payload = new byte[] { 0x82, 0xa2, 0x73, 0x63, 0x64, 0xa2, 0x68, 0x63, 0x02 };
+        var clientValidAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         var result = await hub.BroadcastObjectEvent(
-            owned.Id, 1, payload, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            owned.Id, 1, payload, clientValidAt);
 
         result.Should().BeTrue();
         capturedArgs.Should().NotBeNull();
@@ -336,25 +337,37 @@ public class SessionHubTests
         eventInfo.EventKind.Should().Be(1);
         eventInfo.Payload.Should().Equal(payload);
         eventInfo.Payload.Should().NotBeSameAs(payload);
+        capturedArgs[4].Should().Be(clientValidAt);
     }
 
-    private SessionHub CreateHub(string connectionId, Mock<IGroupManager>? groupsMock = null)
+    private SessionHub CreateHub(
+        string connectionId,
+        Mock<IGroupManager>? groupsMock = null,
+        Mock<IClientProxy>? clientProxyMock = null,
+        ISessionOperationCoordinator? coordinator = null)
     {
         var hub = new SessionHub(
             _sessionService,
             _objectService,
             Mock.Of<ILogger<SessionHub>>(),
             new ServerMetricsService(),
-            new SyncSchemaRegistry());
+            new SyncSchemaRegistry(),
+            coordinator);
 
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns(connectionId);
         hub.Context = context.Object;
 
-        var clientProxy = new Mock<IClientProxy>();
-        clientProxy
-            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+        var clientProxy = clientProxyMock ?? new Mock<IClientProxy>();
+        if (clientProxyMock == null)
+        {
+            clientProxy
+                .Setup(p => p.SendCoreAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<object?[]>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+        }
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.OthersInGroup(It.IsAny<string>())).Returns(clientProxy.Object);
@@ -367,10 +380,13 @@ public class SessionHubTests
             groups
                 .Setup(g => g.AddToGroupAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
+            groups
+                .Setup(g => g.RemoveFromGroupAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
         }
-        groups
-            .Setup(g => g.RemoveFromGroupAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
         hub.Groups = groups.Object;
 
         return hub;
@@ -411,15 +427,7 @@ public class SessionHubTests
             .Callback<string, object?[], CancellationToken>((method, _, _) => callOrder.Add($"send:{method}"))
             .Returns(Task.CompletedTask);
 
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
-        var context = new Mock<HubCallerContext>();
-        context.SetupGet(c => c.ConnectionId).Returns("connection-new");
-        hub.Context = context.Object;
-        var clients = new Mock<IHubCallerClients>();
-        clients.Setup(c => c.OthersInGroup(It.IsAny<string>())).Returns(clientProxy.Object);
-        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(clientProxy.Object);
-        hub.Clients = clients.Object;
-        hub.Groups = groups.Object;
+        var hub = CreateHub("connection-new", groups, clientProxy);
 
         // Act: join with eviction
         var response = await hub.RejoinSession(
@@ -516,18 +524,7 @@ public class SessionHubTests
             })
             .Returns(Task.CompletedTask);
 
-        var hub = new SessionHub(_sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(), new ServerMetricsService(), new SyncSchemaRegistry());
-        var context = new Mock<HubCallerContext>();
-        context.SetupGet(c => c.ConnectionId).Returns("connection-1");
-        hub.Context = context.Object;
-        var clients = new Mock<IHubCallerClients>();
-        clients.Setup(c => c.OthersInGroup(It.IsAny<string>())).Returns(clientProxy.Object);
-        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(clientProxy.Object);
-        hub.Clients = clients.Object;
-        var groups = new Mock<IGroupManager>();
-        groups.Setup(g => g.AddToGroupAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        hub.Groups = groups.Object;
+        var hub = CreateHub("connection-1", clientProxyMock: clientProxy);
 
         // Act
         var response = await hub.CreateObject(
@@ -680,7 +677,7 @@ public class SessionHubTests
     // ─────────────────────────────────────────────────────────────────────
     // CreateObject / UpdateObjects — clientValidAt clamp + fallback coverage
     //
-    // These mirror the ReplaceObject tests above. The shared ValidateValidAt
+    // These mirror the ReplaceObject tests above. The shared ValidAtPolicy
     // helper (in ObjectService) applies a ±2s sanity bound vs. the hub-entry
     // serverTimestamp. Within bounds: client value wins (eliminates upload-time
     // bias from the unified server-time interpolation axis). Out-of-bounds or
@@ -973,25 +970,8 @@ public class SessionHubTests
         string connectionId,
         Mock<IClientProxy> proxy,
         ISessionOperationCoordinator? coordinator = null)
-    {
-        var hub = new SessionHub(
-            _sessionService,
-            _objectService,
-            Mock.Of<ILogger<SessionHub>>(),
-            new ServerMetricsService(),
-            new SyncSchemaRegistry(),
-            coordinator);
-        var context = new Mock<HubCallerContext>();
-        context.SetupGet(c => c.ConnectionId).Returns(connectionId);
-        hub.Context = context.Object;
-        var clients = new Mock<IHubCallerClients>();
-        clients.Setup(c => c.OthersInGroup(It.IsAny<string>())).Returns(proxy.Object);
-        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(proxy.Object);
-        hub.Clients = clients.Object;
-        var groups = new Mock<IGroupManager>();
-        groups.Setup(g => g.AddToGroupAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        hub.Groups = groups.Object;
-        return hub;
-    }
+        => CreateHub(
+            connectionId,
+            clientProxyMock: proxy,
+            coordinator: coordinator);
 }

@@ -3,10 +3,7 @@
  *
  * Run with:  node --test AstervoidsWeb/fracture.test.mjs
  *
- * The polygon helpers and the polygon-fracture portion of splitAsteroid()
- * live inline in AstervoidsWeb/wwwroot/index.html (no module export). To keep
- * tests independent of the browser bundle the math is mirrored here, exactly
- * matching the wwwroot/index.html implementation. Keep the two in sync.
+ * The tests execute the same pure fracture module used by the browser runtime.
  *
  * Verified properties:
  *   • polygonArea / polygonCentroid against known shapes.
@@ -24,130 +21,34 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
-// ─── Mirror of polygon helpers (kept in sync with wwwroot/index.html) ───────
+const require = createRequire(import.meta.url);
+const AstervoidsConfig = require('./wwwroot/js/game-config.js');
+const AstervoidsFracture = require('./wwwroot/js/asteroid-fracture.js');
+const runtimeSource = readFileSync(
+    new URL('./wwwroot/index.html', import.meta.url),
+    'utf8');
 
-function polygonArea(verts) {
-    let a = 0;
-    const N = verts.length;
-    for (let i = 0; i < N; i++) {
-        const j = (i + 1) % N;
-        a += verts[i].x * verts[j].y - verts[j].x * verts[i].y;
-    }
-    return a * 0.5;
-}
+const {
+    polygonArea,
+    polygonCentroid,
+    fractureSplitPolygon,
+    buildFracturePolyline,
+    makeSeededRandom,
+    verticesFromXY,
+    calculateAsteroidFragments,
+} = AstervoidsFracture;
 
-function polygonCentroid(verts) {
-    let cx = 0, cy = 0, a = 0;
-    const N = verts.length;
-    for (let i = 0; i < N; i++) {
-        const j = (i + 1) % N;
-        const cross = verts[i].x * verts[j].y - verts[j].x * verts[i].y;
-        cx += (verts[i].x + verts[j].x) * cross;
-        cy += (verts[i].y + verts[j].y) * cross;
-        a += cross;
-    }
-    a *= 0.5;
-    if (Math.abs(a) < 1e-18) {
-        let sx = 0, sy = 0;
-        for (const v of verts) { sx += v.x; sy += v.y; }
-        return { x: sx / N, y: sy / N, area: 0 };
-    }
-    return { x: cx / (6 * a), y: cy / (6 * a), area: a };
-}
-
-function fractureSplitPolygon(verts, n, d, jagPath) {
-    const N = verts.length;
-    if (N < 3) return null;
-    const sides = new Array(N);
-    for (let i = 0; i < N; i++) sides[i] = verts[i].x * n.x + verts[i].y * n.y - d;
-
-    const crossEdges = [];
-    for (let i = 0; i < N; i++) {
-        const j = (i + 1) % N;
-        const sa = sides[i], sb = sides[j];
-        if ((sa > 0 && sb < 0) || (sa < 0 && sb > 0)) {
-            const t = sa / (sa - sb);
-            crossEdges.push({
-                edgeStart: i,
-                point: {
-                    x: verts[i].x + (verts[j].x - verts[i].x) * t,
-                    y: verts[i].y + (verts[j].y - verts[i].y) * t,
-                },
-                fromPos: sa > 0,
-            });
-        }
-    }
-    if (crossEdges.length !== 2) return null;
-
-    let entryIdx, exitIdx;
-    if (crossEdges[0].fromPos) { entryIdx = 0; exitIdx = 1; }
-    else                       { entryIdx = 1; exitIdx = 0; }
-
-    const buildHalf = (startCross, endCross, sideTest, jagDir) => {
-        const out = [{ x: startCross.point.x, y: startCross.point.y }];
-        const stop = (endCross.edgeStart + 1) % N;
-        let i = (startCross.edgeStart + 1) % N;
-        let safety = N + 2;
-        while (i !== stop && safety-- > 0) {
-            if (sideTest(sides[i])) out.push({ x: verts[i].x, y: verts[i].y });
-            i = (i + 1) % N;
-        }
-        out.push({ x: endCross.point.x, y: endCross.point.y });
-        if (jagDir > 0) {
-            for (const p of jagPath) out.push({ x: p.x, y: p.y });
-        } else {
-            for (let k = jagPath.length - 1; k >= 0; k--) {
-                out.push({ x: jagPath[k].x, y: jagPath[k].y });
-            }
-        }
-        return out;
-    };
-
-    const positive = buildHalf(crossEdges[exitIdx], crossEdges[entryIdx], s => s > 0, +1);
-    const negative = buildHalf(crossEdges[entryIdx], crossEdges[exitIdx], s => s < 0, -1);
-
-    if (positive.length < 3 || negative.length < 3) return null;
-    return {
-        positive, negative,
-        entry: crossEdges[entryIdx].point,
-        exit:  crossEdges[exitIdx].point,
-    };
-}
-
-function buildFracturePolyline(entry, exit, count, jagAmplitude, randomFn) {
-    const out = [];
-    if (count <= 0) return out;
-    const dx = exit.x - entry.x, dy = exit.y - entry.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 1e-12) return out;
-    const px = -dy / len, py = dx / len;
-    for (let k = 1; k <= count; k++) {
-        const t = k / (count + 1);
-        const cx = entry.x + dx * t;
-        const cy = entry.y + dy * t;
-        const taper = 2 * Math.min(t, 1 - t);
-        const amp = jagAmplitude > 0 ? jagAmplitude : 0;
-        const offset = (randomFn() * 2 - 1) * amp * taper;
-        out.push({ x: cx + px * offset, y: cy + py * offset });
-    }
-    return out;
-}
-
-function makeSeededRandom(seed) {
-    let s = (seed >>> 0) || 1;
-    return () => {
-        s = (s + 0x6D2B79F5) >>> 0;
-        let t = s;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-}
-
-function verticesFromXY(xy) {
-    return xy.map(p => ({ angle: Math.atan2(p.y, p.x), distance: Math.hypot(p.x, p.y) }));
-}
+test('runtime seeds simulation RNG without an order-sensitive alias', () => {
+    assert.match(
+        runtimeSource,
+        /_next:\s*AstervoidsFracture\.makeSeededRandom\(1\)/);
+    assert.doesNotMatch(
+        runtimeSource,
+        /const\s*\{\s*makeSeededRandom\s*\}\s*=\s*AstervoidsFracture/);
+});
 
 // ─── Helpers: build a parent polygon shaped like the game's asteroids ───────
 
@@ -277,128 +178,31 @@ test('buildFracturePolyline: deterministic for same seed', () => {
 
 // ─── End-to-end: regular 10-gon parent, full fracture split ─────────────────
 
-const CONFIG = {
-    DEFLECTION_KICK: 1e-3,
-    SEPARATION_ENERGY: 1e-4,
-    MIN_ASTEROID_RADIUS: 0.025,
-    INITIAL_ASTEROID_RADIUS: 0.083,
-    ASTEROID_DENSITY: 5.0,
-    SEPARATION_ENERGY_SIZE_BLEND: 1.0,
-    FRACTURE_ENABLED: true,
-    FRACTURE_VERTEX_DENSITY: 1.0,
-    FRACTURE_JAGGEDNESS: 0.35,
-    MIN_SPLIT_RATIO: 0.1,
-    MASS_SPLIT_BIAS: 1.0,
-};
+const CONFIG = AstervoidsConfig.SHARED_DEFAULTS;
 
 function fragmentPolygon(parentVerts, R, vx, vy, omega, offsetN, bulletAngle, cfg = CONFIG) {
-    const dx = Math.cos(bulletAngle), dy = Math.sin(bulletAngle);
-    const nx = -dy, ny = dx;
-    const density = cfg.ASTEROID_DENSITY;
-    const M = density * R * R;
-    const I = 0.5 * M * R * R;
-    const b   = offsetN * R;
-    const rxN = b;
-    const rxD = -Math.sqrt(Math.max(0, R * R - b * b));
-    const rx  = rxD * dx + rxN * nx;
-    const ry  = rxD * dy + rxN * ny;
-    const vKick = Math.max(0, cfg.DEFLECTION_KICK);
-    const blend = Math.max(0, Math.min(1, cfg.SEPARATION_ENERGY_SIZE_BLEND));
-    const sizeMul = (1 - blend) + blend * (R / cfg.INITIAL_ASTEROID_RADIUS) ** 2;
-    const E_sep = Math.max(0, cfg.SEPARATION_ENERGY) * sizeMul;
-    const Jmag = M * vKick;
-    const Jx = Jmag * dx, Jy = Jmag * dy;
-    const vxP = vx + Jx / M, vyP = vy + Jy / M;
-    const torque = rx * Jy - ry * Jx;
-    const omegaP = omega + torque / I;
-    const sideSign = offsetN >= 0 ? 1 : -1;
-    const sx = sideSign * nx, sy = sideSign * ny;
-
-    const out = {
-        M, I, J: { x: Jx, y: Jy }, vxP, vyP, omegaP,
-        A_parent: null, A_pos: null, A_neg: null, pi_eff: null,
-        children: []
+    const result = calculateAsteroidFragments({
+        radius: R,
+        velocityX: vx,
+        velocityY: vy,
+        rotationSpeed: omega,
+        angle: 0,
+        seed: 0,
+        vertices: verticesFromXY(parentVerts),
+    }, { offsetN, bulletAngle }, cfg);
+    return {
+        M: result.mass,
+        I: result.inertia,
+        J: result.impulse,
+        vxP: result.postImpulse.velocityX,
+        vyP: result.postImpulse.velocityY,
+        omegaP: result.postImpulse.angularVelocity,
+        A_parent: result.fracture?.parentArea ?? null,
+        A_pos: result.fracture?.positiveArea ?? null,
+        A_neg: result.fracture?.negativeArea ?? null,
+        pi_eff: result.fracture?.effectivePi ?? null,
+        children: result.children,
     };
-    if (cfg.FRACTURE_ENABLED) {
-        const A_parent = Math.abs(polygonArea(parentVerts));
-        const pi_eff = A_parent / (R * R);
-        const probe = fractureSplitPolygon(parentVerts, { x: nx, y: ny }, b, []);
-        if (!probe) return null;
-        const chordLen = Math.hypot(probe.exit.x - probe.entry.x,
-                                    probe.exit.y - probe.entry.y);
-        const parentSpacing = (2 * Math.PI * R) / Math.max(1, parentVerts.length);
-        const fracDensity = Math.max(0, cfg.FRACTURE_VERTEX_DENSITY);
-        const jagCount = parentSpacing > 0
-            ? Math.max(0, Math.floor((chordLen / parentSpacing) * fracDensity))
-            : 0;
-        const jag = buildFracturePolyline(probe.entry, probe.exit,
-            jagCount, cfg.FRACTURE_JAGGEDNESS * R, makeSeededRandom(1));
-        const split = fractureSplitPolygon(parentVerts, { x: nx, y: ny }, b, jag);
-        if (!split) return null;
-        const A_pos = Math.abs(polygonArea(split.positive));
-        const A_neg = Math.abs(polygonArea(split.negative));
-        if (!(A_pos > 0 && A_neg > 0 && A_parent > 0)) return null;
-        out.A_parent = A_parent;
-        out.A_pos = A_pos;
-        out.A_neg = A_neg;
-        out.pi_eff = pi_eff;
-        const smallSide = A_pos <= A_neg ? { poly: split.positive, area: A_pos } : { poly: split.negative, area: A_neg };
-        const largeSide = A_pos <= A_neg ? { poly: split.negative, area: A_neg } : { poly: split.positive, area: A_pos };
-        const cSmall = polygonCentroid(smallSide.poly);
-        const cLarge = polygonCentroid(largeSide.poly);
-        const rSmall = Math.sqrt(smallSide.area / pi_eff);
-        const rLarge = Math.sqrt(largeSide.area / pi_eff);
-        const mSmall = (smallSide.area / A_parent) * M;
-        const mLarge = (largeSide.area / A_parent) * M;
-        if (rSmall < cfg.MIN_ASTEROID_RADIUS) {
-            out.children.push({ r: rLarge, m: mLarge, cx: cLarge.x, cy: cLarge.y,
-                vx: vxP + (-omegaP) * cLarge.y, vy: vyP + (omegaP) * cLarge.x, omega: omegaP, vertices: [] });
-            return out;
-        }
-        const v_rs = { vx: vxP + (-omegaP) * cSmall.y, vy: vyP + (omegaP) * cSmall.x };
-        const v_rl = { vx: vxP + (-omegaP) * cLarge.y, vy: vyP + (omegaP) * cLarge.x };
-        const s = E_sep > 0 ? Math.sqrt(2 * E_sep * mLarge / (mSmall * M)) : 0;
-        const proj = cSmall.x * sx + cSmall.y * sy;
-        const sepDir = proj >= 0 ? 1 : -1;
-        const sepX = sepDir * sx, sepY = sepDir * sy;
-        out.children.push({ r: rSmall, m: mSmall, cx: cSmall.x, cy: cSmall.y,
-            vx: v_rs.vx + sepX * s, vy: v_rs.vy + sepY * s, omega: omegaP, vertices: [] });
-        out.children.push({ r: rLarge, m: mLarge, cx: cLarge.x, cy: cLarge.y,
-            vx: v_rl.vx - sepX * s * (mSmall / mLarge),
-            vy: v_rl.vy - sepY * s * (mSmall / mLarge), omega: omegaP, vertices: [] });
-        return out;
-    }
-
-    const minRatio = Math.max(0.01, Math.min(0.5, cfg.MIN_SPLIT_RATIO));
-    const massBias = Math.max(0, Math.min(1, cfg.MASS_SPLIT_BIAS));
-    const fSmall = Math.max(minRatio, 0.5 * (1 - massBias * Math.abs(offsetN)));
-    const fLarge = 1 - fSmall;
-    const rSmall = R * Math.sqrt(fSmall);
-    const rLarge = R * Math.sqrt(fLarge);
-    const mSmall = fSmall * M;
-    const mLarge = fLarge * M;
-    if (rSmall < cfg.MIN_ASTEROID_RADIUS) {
-        out.children.push({ r: rLarge, m: mLarge, cx: 0, cy: 0, vx: vxP, vy: vyP, omega: omegaP, vertices: null });
-        return out;
-    }
-    const dSmall = R * fLarge;
-    const dLarge = -R * fSmall;
-    const rigidVelocityAt = (d) => ({
-        vx: vxP + (-omegaP) * (d * sy),
-        vy: vyP + ( omegaP) * (d * sx),
-    });
-    const vS = rigidVelocityAt(dSmall), vL = rigidVelocityAt(dLarge);
-    const s = E_sep > 0 ? Math.sqrt(2 * E_sep * mLarge / (mSmall * M)) : 0;
-    out.children.push({
-        r: rSmall, m: mSmall, cx: dSmall * sx, cy: dSmall * sy,
-        vx: vS.vx + s * sx, vy: vS.vy + s * sy, omega: omegaP, vertices: null,
-    });
-    out.children.push({
-        r: rLarge, m: mLarge, cx: dLarge * sx, cy: dLarge * sy,
-        vx: vL.vx - s * sx * (mSmall / mLarge),
-        vy: vL.vy - s * sy * (mSmall / mLarge), omega: omegaP, vertices: null,
-    });
-    return out;
 }
 
 const FRACTURE_ON_CONFIG = { ...CONFIG, FRACTURE_ENABLED: true };

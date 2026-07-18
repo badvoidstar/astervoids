@@ -35,6 +35,31 @@ test('bytesToGuid converts a 16-byte .NET binary guid to a string', () => {
     assert.equal(guid, '76543210-ba98-fedc-0123-456789abcdef');
 });
 
+test('guidToBytes and bytesToGuid share the .NET mixed-endian layout', () => {
+    const guid = '76543210-ba98-fedc-0123-456789abcdef';
+    const bytes = GuidUtils.guidToBytes(guid);
+
+    assert.deepEqual(Array.from(bytes), [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef
+    ]);
+    assert.equal(GuidUtils.bytesToGuid(bytes), guid);
+});
+
+test('bytesToGuid supports an offset within a larger payload', () => {
+    const guid = '00112233-4455-6677-8899-aabbccddeeff';
+    const bytes = new Uint8Array(20);
+    bytes.set(GuidUtils.guidToBytes(guid), 2);
+
+    assert.equal(GuidUtils.bytesToGuid(bytes, 2), guid);
+    assert.equal(GuidUtils.bytesToGuid(bytes, 5), null);
+});
+
+test('guidToBytes rejects non-canonical GUID strings', () => {
+    assert.throws(() => GuidUtils.guidToBytes('00112233445566778899aabbccddeeff'), /Invalid GUID/);
+    assert.throws(() => GuidUtils.guidToBytes('not-a-guid'), /Invalid GUID/);
+});
+
 test('a delta of { y, lifetime } encodes to exactly 16 bytes (collision shape)', () => {
     // This is the exact shape that triggered the original bug: a straight-up
     // bullet's per-frame delta omits x (unchanged) and carries only y + lifetime.

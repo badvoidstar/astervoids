@@ -166,6 +166,8 @@ jobs:
 
       - name: Cleanup orphaned DNS records and certificates
         run: |
+          source .github/scripts/orphan-safety.sh
+
           # Check if custom domain is configured
           if [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] || [ -z "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
             echo "Custom domain not configured, skipping DNS/cert cleanup"
@@ -216,28 +218,17 @@ jobs:
           for CNAME in $CNAME_RECORDS; do
             # Extract suffix (e.g., "astervoids-feature-test" -> "feature-test")
             SUFFIX="${CNAME#${SUBDOMAIN_PREFIX}-}"
-            if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
-              echo "  Protected CNAME: $CNAME (production)"
+            if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
+              echo "  Protected CNAME: $CNAME (production or active deployment)"
               continue
             fi
-            
-            # Check if this suffix matches an active container app
-            IS_ACTIVE=false
-            for ACTIVE in $ACTIVE_SUFFIXES; do
-              if [ "$SUFFIX" = "$ACTIVE" ]; then
-                IS_ACTIVE=true
-                break
-              fi
-            done
-            
-            if [ "$IS_ACTIVE" = "false" ]; then
-              echo "  Orphan CNAME: $CNAME"
-              az network dns record-set cname delete \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --zone-name "$DOMAIN_NAME" \
-                --name "$CNAME" \
-                --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
-            fi
+
+            echo "  Orphan CNAME: $CNAME"
+            az network dns record-set cname delete \
+              --resource-group "${{ env.PRODUCTION_RG }}" \
+              --zone-name "$DOMAIN_NAME" \
+              --name "$CNAME" \
+              --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
           done
           
           # Scan TXT records for orphans
@@ -252,27 +243,17 @@ jobs:
           for TXT in $TXT_RECORDS; do
             # Extract suffix (e.g., "asuid.astervoids-feature-test" -> "feature-test")
             SUFFIX="${TXT#asuid.${SUBDOMAIN_PREFIX}-}"
-            if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
-              echo "  Protected TXT: $TXT (production)"
+            if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
+              echo "  Protected TXT: $TXT (production or active deployment)"
               continue
             fi
-            
-            IS_ACTIVE=false
-            for ACTIVE in $ACTIVE_SUFFIXES; do
-              if [ "$SUFFIX" = "$ACTIVE" ]; then
-                IS_ACTIVE=true
-                break
-              fi
-            done
-            
-            if [ "$IS_ACTIVE" = "false" ]; then
-              echo "  Orphan TXT: $TXT"
-              az network dns record-set txt delete \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --zone-name "$DOMAIN_NAME" \
-                --name "$TXT" \
-                --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
-            fi
+
+            echo "  Orphan TXT: $TXT"
+            az network dns record-set txt delete \
+              --resource-group "${{ env.PRODUCTION_RG }}" \
+              --zone-name "$DOMAIN_NAME" \
+              --name "$TXT" \
+              --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
           done
           
           # Scan certificates for orphans
@@ -293,28 +274,20 @@ jobs:
               DOMAIN_SUFFIX="${DOMAIN_NAME//./-}"
               TEMP="${CERT#cert-${SUBDOMAIN_PREFIX}-}"
               SUFFIX="${TEMP%-${DOMAIN_SUFFIX}}"
-              if [ "$SUFFIX" = "production" ] || [[ "$SUFFIX" == production-* ]]; then
-                echo "  Protected cert on $CAE: $CERT (production)"
+              if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
+                echo "  Protected cert on $CAE: $CERT (production or active deployment)"
                 continue
               fi
-              IS_ACTIVE=false
-              for ACTIVE in $ACTIVE_SUFFIXES; do
-                if [ "$SUFFIX" = "$ACTIVE" ]; then
-                  IS_ACTIVE=true
-                  break
-                fi
-              done
-              if [ "$IS_ACTIVE" = "false" ]; then
-                echo "  Orphan certificate on $CAE: $CERT"
-                if az containerapp env certificate delete \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --name "$CAE" \
-                  --certificate "$CERT" \
-                  --yes 2>&1; then
-                  echo "  -> Deleted"
-                else
-                  echo "  -> Failed to delete (may still be bound to a domain)"
-                fi
+
+              echo "  Orphan certificate on $CAE: $CERT"
+              if az containerapp env certificate delete \
+                --resource-group "${{ env.PRODUCTION_RG }}" \
+                --name "$CAE" \
+                --certificate "$CERT" \
+                --yes 2>&1; then
+                echo "  -> Deleted"
+              else
+                echo "  -> Failed to delete (may still be bound to a domain)"
               fi
             done
           done

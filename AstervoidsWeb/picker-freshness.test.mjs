@@ -4,13 +4,8 @@
  * Targets the multi-region session merge + dedup invariants that drive the
  * picker's latency budget (plan.md → "Picker freshness — latency budget").
  *
- * The actual `MultiRegionSessions` module lives inline in index.html (where
- * it has access to other picker functions via closure). Rather than
- * extracting it into a separate file (which would entangle the picker DOM),
- * we reimplement the SAME shape here and assert the contract via injected
- * `fetch` and `setTimeout` stubs. Any future refactor of the inline module
- * MUST keep this contract or these tests fail and we revisit the freshness
- * budget intentionally.
+ * The tests execute the same dependency-injected aggregation module used by
+ * the browser picker.
  *
  * Contract under test:
  *   - Bootstrap: parallel /api/sessions fetch per region; merged result
@@ -24,121 +19,14 @@
  *   - Explicit refresh after stop(): remains available for Join/Create
  *     transitions while stale pre-stop requests are still rejected.
  *
- * The reimplementation below mirrors the inline module byte-for-byte
- * (modulo `updateSessionList` callback wiring which is what we observe).
  */
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
-const here = dirname(fileURLToPath(import.meta.url));
-const indexHtml = readFileSync(join(here, 'wwwroot/index.html'), 'utf8');
-const productionModuleStart = indexHtml.indexOf('const MultiRegionSessions = (function () {');
-const productionModuleEnd = indexHtml.indexOf(
-    '\n    // Refresh session list from server',
-    productionModuleStart
-);
-assert.ok(productionModuleStart >= 0 && productionModuleEnd > productionModuleStart);
-const productionModuleSource = indexHtml.slice(productionModuleStart, productionModuleEnd);
-
-function loadProductionMultiRegionSessions(updateSessionList, fetch) {
-    const factory = new Function(
-        'updateSessionList',
-        'fetch',
-        `${productionModuleSource}; return MultiRegionSessions;`
-    );
-    return factory(updateSessionList, fetch);
-}
-
-function makeMultiRegionSessions({ updateSessionList, fetch, now = () => Date.now() }) {
-    const COALESCE_MS = 250;
-    const REST_TIMEOUT_MS = 5000;
-    const POLL_INTERVAL_MS = 30000;
-    const perRegion = new Map();
-    const pendingRefetch = new Map();
-    const requestSequences = new Map();
-    let backgroundPollHandle = null;
-    let runGeneration = 0;
-
-    async function fetchOneRegion(region) {
-        const url = `${region.hostname.replace(/\/$/, '')}/api/sessions`;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-    }
-    async function refreshRegion(region, generation = runGeneration) {
-        const requestSequence = (requestSequences.get(region.id) ?? 0) + 1;
-        requestSequences.set(region.id, requestSequence);
-        try {
-            const body = await fetchOneRegion(region);
-            if (generation !== runGeneration
-                || requestSequences.get(region.id) !== requestSequence) return;
-            perRegion.set(region.id, {
-                sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
-                maxSessions: body.maxSessions ?? 6,
-                canCreate: body.canCreateSession ?? true,
-                state: 'fresh',
-                lastFetchAt: now(),
-                lastError: null,
-            });
-        } catch (err) {
-            if (generation !== runGeneration
-                || requestSequences.get(region.id) !== requestSequence) return;
-            const prev = perRegion.get(region.id) ?? {};
-            perRegion.set(region.id, {
-                ...prev,
-                sessions: [],
-                state: 'stale',
-                lastError: err && err.message,
-            });
-        }
-        if (generation === runGeneration
-            && requestSequences.get(region.id) === requestSequence) {
-            applyMerged();
-        }
-    }
-    function requestRefresh(region, immediate = false) {
-        if (immediate) return refreshRegion(region, runGeneration);
-        const existing = pendingRefetch.get(region.id);
-        if (existing) clearTimeout(existing);
-        const handle = setTimeout(() => {
-            pendingRefetch.delete(region.id);
-            refreshRegion(region, runGeneration);
-        }, COALESCE_MS);
-        pendingRefetch.set(region.id, handle);
-        return Promise.resolve();
-    }
-    function applyMerged() {
-        const sessions = [];
-        let maxSessions = 6;
-        let canCreate = true;
-        for (const [, slice] of perRegion) {
-            if (slice.state !== 'fresh') continue;
-            sessions.push(...slice.sessions);
-            maxSessions = Math.max(maxSessions, slice.maxSessions);
-            canCreate = canCreate && slice.canCreate;
-        }
-        updateSessionList({ sessions, maxSessions, canCreateSession: canCreate });
-    }
-    async function start(regions) {
-        stop();
-        const generation = ++runGeneration;
-        await Promise.all(regions.map(r => refreshRegion(r, generation)));
-        if (generation !== runGeneration) return;
-        backgroundPollHandle = setInterval(() => {
-            regions.forEach(r => requestRefresh(r));
-        }, POLL_INTERVAL_MS);
-    }
-    function stop() {
-        runGeneration++;
-        if (backgroundPollHandle) { clearInterval(backgroundPollHandle); backgroundPollHandle = null; }
-        for (const t of pendingRefetch.values()) clearTimeout(t);
-        pendingRefetch.clear();
-    }
-    return { start, stop, requestRefresh, _perRegion: perRegion, COALESCE_MS };
-}
+const require = createRequire(import.meta.url);
+const makeMultiRegionSessions =
+    require('./wwwroot/js/multi-region-sessions.js').create;
 
 // ─── helpers ───
 function fakeOk(body) { return { ok: true, status: 200, json: async () => body }; }
@@ -285,7 +173,7 @@ describe('MultiRegionSessions stop()', () => {
         mrs.stop();
     });
 
-    test('production module applies an explicit refresh started after stop()', async () => {
+    test('explicit refresh started after stop() still applies', async () => {
         let sessions = [session('before-stop', 'r1')];
         const updates = [];
         const fetch = async () => fakeOk({
@@ -293,10 +181,10 @@ describe('MultiRegionSessions stop()', () => {
             maxSessions: 6,
             canCreateSession: true
         });
-        const mrs = loadProductionMultiRegionSessions(
-            result => updates.push(result),
-            fetch
-        );
+        const mrs = makeMultiRegionSessions({
+            updateSessionList: result => updates.push(result),
+            fetch,
+        });
         const region = { id: 'r1', hostname: 'https://r1.example.com' };
 
         await mrs.start([region]);

@@ -97,6 +97,9 @@ jobs:
       - name: Run JavaScript tests
         run: node --test AstervoidsWeb/*.test.mjs
 
+      - name: Validate workflow helpers
+        run: bash .github/scripts/workflow-helpers.test.sh
+
       # Bicep smoke check — fail fast on template syntax errors before any
       # Azure deploy is attempted. Runs in the build job so a malformed
       # bicep change blocks the deploy job from even running.
@@ -173,6 +176,7 @@ jobs:
 
       - name: Set up azd environment
         run: |
+          source .github/scripts/deployment-helpers.sh
           ENV_NAME="${{ steps.vars.outputs.env_name }}"
           
           # Create or select azd environment
@@ -213,36 +217,17 @@ jobs:
           # ownership during app create; missing asuid causes
           # InvalidCustomHostNameValidation failures.
           if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
-            DOMAIN_VERIFICATION_ID=""
             PRIMARY_REGION_NAME=$(echo "$REGIONS_JSON" | jq -r '.[0].name' 2>/dev/null || true)
-            for CANDIDATE in "ca-web-production-${PRIMARY_REGION_NAME}" "ca-web-production" "${{ env.CONTAINER_APP_PREFIX }}-${{ steps.vars.outputs.sanitized_branch }}"; do
-              [ -n "$CANDIDATE" ] || continue
-              DOMAIN_VERIFICATION_ID=$(az containerapp show \
-                --name "$CANDIDATE" \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --query 'properties.customDomainVerificationId' \
-                -o tsv 2>/dev/null || echo "")
-              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
-                echo "Using customDomainVerificationId from $CANDIDATE (length: ${#DOMAIN_VERIFICATION_ID})"
-                break
-              fi
-            done
-            # Fallback: the value is subscription-scoped and available on the
-            # shared CAE even when no container apps exist yet.
-            if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
-              SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
-              if [ -n "$PRIMARY_REGION_NAME" ]; then
-                SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}-${PRIMARY_REGION_NAME}"
-              fi
-              DOMAIN_VERIFICATION_ID=$(az containerapp env show \
-                --name "$SHARED_CAE_NAME" \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --query 'properties.customDomainConfiguration.customDomainVerificationId' \
-                -o tsv 2>/dev/null || echo "")
-              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
-                echo "Using customDomainVerificationId from $SHARED_CAE_NAME (length: ${#DOMAIN_VERIFICATION_ID})"
-              fi
+            SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}"
+            if [ -n "$PRIMARY_REGION_NAME" ]; then
+              SHARED_CAE_NAME="${{ env.CONTAINER_ENV_NAME }}-${PRIMARY_REGION_NAME}"
             fi
+            DOMAIN_VERIFICATION_ID=$(resolve_domain_verification_id \
+              "${{ env.PRODUCTION_RG }}" \
+              "ca-web-production-${PRIMARY_REGION_NAME}" \
+              "ca-web-production" \
+              "${{ env.CONTAINER_APP_PREFIX }}-${{ steps.vars.outputs.sanitized_branch }}" \
+              -- "$SHARED_CAE_NAME")
             if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
               azd env set DOMAIN_VERIFICATION_ID "$DOMAIN_VERIFICATION_ID"
             else
@@ -365,6 +350,7 @@ jobs:
       - name: Provision and Deploy to Azure
         id: deploy
         run: |
+          source .github/scripts/deployment-helpers.sh
           IS_PRODUCTION="${{ steps.vars.outputs.is_production }}"
           SANITIZED_BRANCH="${{ steps.vars.outputs.sanitized_branch }}"
           # ── Multi-region detection ────────────────────────────────────────
@@ -400,8 +386,9 @@ jobs:
             # Each region's container app already has Region__Id env var
             # baked in by the bicep template; only the image tag changes
             # on subsequent deploys.
-            CD_NAME=$(azd env get-values | grep '^CUSTOM_DOMAIN_NAME=' | cut -d'=' -f2 | tr -d '"' || echo "")
-            CD_SUB=$(azd env get-values | grep '^CUSTOM_SUBDOMAIN=' | cut -d'=' -f2 | tr -d '"' || echo "")
+            AZD_ENV_VALUES=$(azd env get-values)
+            CD_NAME=$(azd_env_value CUSTOM_DOMAIN_NAME "$AZD_ENV_VALUES")
+            CD_SUB=$(azd_env_value CUSTOM_SUBDOMAIN "$AZD_ENV_VALUES")
             PRIMARY_LOCATION=$(echo "$REGIONS_JSON" | jq -r '.[0].location')
 
             # ── Fail-fast: multi-region + custom domain REQUIRES BYO cert ──
@@ -426,84 +413,51 @@ jobs:
             # and CNAME-only validation is used (which may need a 2nd
             # bicep pass for hostname binding to succeed on first deploy).
             PRIMARY_REGION_NAME=$(echo "$REGIONS_JSON" | jq -r '.[0].name')
-            DOMAIN_VERIFICATION_ID=""
-            # Try container apps first (fastest path on subsequent deploys).
-            for CANDIDATE in "ca-web-production-${PRIMARY_REGION_NAME}" "ca-web-production"; do
-              DOMAIN_VERIFICATION_ID=$(az containerapp show \
-                --name "$CANDIDATE" \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --query 'properties.customDomainVerificationId' \
-                -o tsv 2>/dev/null || echo "")
-              if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
-                echo "Pulled customDomainVerificationId from container app $CANDIDATE (length: ${#DOMAIN_VERIFICATION_ID})"
-                break
-              fi
-            done
-            # Fallback: query the CAE — same ID, available even on first deploy
-            # when no container apps exist yet (greenfield / post-cleanup scenario).
-            if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
-              for CAE_CANDIDATE in "cae-production-${PRIMARY_REGION_NAME}" "cae-production"; do
-                DOMAIN_VERIFICATION_ID=$(az containerapp env show \
-                  --name "$CAE_CANDIDATE" \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --query 'properties.customDomainConfiguration.customDomainVerificationId' \
-                  -o tsv 2>/dev/null || echo "")
-                if [ -n "$DOMAIN_VERIFICATION_ID" ]; then
-                  echo "Pulled customDomainVerificationId from CAE $CAE_CANDIDATE (length: ${#DOMAIN_VERIFICATION_ID})"
-                  break
-                fi
-              done
-            fi
+            DOMAIN_VERIFICATION_ID=$(resolve_domain_verification_id \
+              "${{ env.PRODUCTION_RG }}" \
+              "ca-web-production-${PRIMARY_REGION_NAME}" \
+              "ca-web-production" \
+              -- \
+              "cae-production-${PRIMARY_REGION_NAME}" \
+              "cae-production")
             if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
               echo "::warning::No existing app or CAE found to extract customDomainVerificationId. asuid TXT records will be skipped (CNAME-only). A second deploy may be needed to bind hostnames."
             fi
 
             echo "Provisioning multi-region production via bicep (primary: $PRIMARY_LOCATION)"
             set +e
-            az deployment sub create \
-              --name "production-multi-${{ github.run_id }}" \
-              --location "$PRIMARY_LOCATION" \
-              --template-file infra/main.bicep \
-              --parameters \
-                environmentName=production \
-                location="$PRIMARY_LOCATION" \
-                customDomainName="$CD_NAME" \
-                customSubdomain="$CD_SUB" \
-                regions="$REGIONS_JSON" \
-                certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
-                certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
-                certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
-                domainVerificationId="$DOMAIN_VERIFICATION_ID" \
-              --output none
+            deploy_multi_region_bicep \
+              "production-multi-${{ github.run_id }}" \
+              "$PRIMARY_LOCATION" \
+              "$CD_NAME" \
+              "$CD_SUB" \
+              "$REGIONS_JSON" \
+              "$CERT_KEY_VAULT_SECRET_URL" \
+              "$CERT_KEY_VAULT_CERT_NAME" \
+              "$CERT_READER_IDENTITY_ID" \
+              "$DOMAIN_VERIFICATION_ID"
             DEPLOY_RC=$?
             set -e
             if [ "$DEPLOY_RC" -ne 0 ]; then
               if [ -n "$CD_NAME" ] && [ -z "$DOMAIN_VERIFICATION_ID" ]; then
                 echo "::warning::First multi-region deploy pass failed without domainVerificationId. Retrying once after reading it from the new shared CAE."
-                DOMAIN_VERIFICATION_ID=$(az containerapp env show \
-                  --name "cae-production-${PRIMARY_REGION_NAME}" \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --query 'properties.customDomainConfiguration.customDomainVerificationId' \
-                  -o tsv 2>/dev/null || echo "")
+                DOMAIN_VERIFICATION_ID=$(resolve_domain_verification_id \
+                  "${{ env.PRODUCTION_RG }}" \
+                  -- "cae-production-${PRIMARY_REGION_NAME}")
                 if [ -z "$DOMAIN_VERIFICATION_ID" ]; then
                   echo "::error::Retry aborted: could not resolve customDomainVerificationId from cae-production-${PRIMARY_REGION_NAME}."
                   exit "$DEPLOY_RC"
                 fi
-                az deployment sub create \
-                  --name "production-multi-${{ github.run_id }}" \
-                  --location "$PRIMARY_LOCATION" \
-                  --template-file infra/main.bicep \
-                  --parameters \
-                    environmentName=production \
-                    location="$PRIMARY_LOCATION" \
-                    customDomainName="$CD_NAME" \
-                    customSubdomain="$CD_SUB" \
-                    regions="$REGIONS_JSON" \
-                    certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
-                    certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
-                    certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
-                    domainVerificationId="$DOMAIN_VERIFICATION_ID" \
-                  --output none
+                deploy_multi_region_bicep \
+                  "production-multi-${{ github.run_id }}" \
+                  "$PRIMARY_LOCATION" \
+                  "$CD_NAME" \
+                  "$CD_SUB" \
+                  "$REGIONS_JSON" \
+                  "$CERT_KEY_VAULT_SECRET_URL" \
+                  "$CERT_KEY_VAULT_CERT_NAME" \
+                  "$CERT_READER_IDENTITY_ID" \
+                  "$DOMAIN_VERIFICATION_ID"
               else
                 exit "$DEPLOY_RC"
               fi
@@ -520,36 +474,12 @@ jobs:
             OUTPUTS_JSON=$(az deployment sub show \
               --name "production-multi-${{ github.run_id }}" \
               --query 'properties.outputs' -o json)
-            get_out() {
-              # $1 = output name (case-insensitive); $2 = jq value selector
-              # (default '.value.value' for scalars; pass '.value.value | tostring'
-              # or similar for arrays). Returns first match or empty string.
-              local key_lc; key_lc=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-              local selector="${2:-.value.value}"
-              echo "$OUTPUTS_JSON" \
-                | jq -r --arg k "$key_lc" \
-                  "to_entries[] | select((.key | ascii_downcase) == \$k) | $selector" \
-                | head -1
-            }
-            get_out_json() {
-              # Same but returns the raw JSON value (for arrays/objects).
-              local key_lc; key_lc=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-              echo "$OUTPUTS_JSON" \
-                | jq -c --arg k "$key_lc" \
-                  'to_entries[] | select((.key | ascii_downcase) == $k) | .value.value'
-            }
-
-            ACR_NAME=$(get_out AZURE_CONTAINER_REGISTRY_NAME)
-            ACR_LOGIN_SERVER=$(get_out AZURE_CONTAINER_REGISTRY_ENDPOINT)
+            ACR_NAME=$(deployment_output "$OUTPUTS_JSON" AZURE_CONTAINER_REGISTRY_NAME)
+            ACR_LOGIN_SERVER=$(deployment_output "$OUTPUTS_JSON" AZURE_CONTAINER_REGISTRY_ENDPOINT)
 
             IMAGE_TAG="${{ github.sha }}"
-            IMAGE_NAME="astervoids-web:${IMAGE_TAG}"
-            FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}"
-
-            echo "Building and pushing image: $FULL_IMAGE"
-            az acr login --name "$ACR_NAME"
-            docker build -t "$FULL_IMAGE" ./AstervoidsWeb
-            docker push "$FULL_IMAGE"
+            publish_astervoids_image "$ACR_NAME" "$ACR_LOGIN_SERVER" "$IMAGE_TAG"
+            FULL_IMAGE="$PUBLISHED_IMAGE"
 
             # Update every region's container app with the new image.
             echo "$REGIONS_JSON" | jq -r '.[].name' | while read -r REGION_NAME; do
@@ -564,21 +494,21 @@ jobs:
             done
 
             # Surface static apex + per-region details in the run log.
-            STATIC_WEB_APP_NAME=$(get_out STATIC_WEB_APP_NAME)
-            STATIC_WEB_APP_DEFAULT_HOSTNAME=$(get_out STATIC_WEB_APP_DEFAULT_HOSTNAME)
+            STATIC_WEB_APP_NAME=$(deployment_output "$OUTPUTS_JSON" STATIC_WEB_APP_NAME)
+            STATIC_WEB_APP_DEFAULT_HOSTNAME=$(deployment_output "$OUTPUTS_JSON" STATIC_WEB_APP_DEFAULT_HOSTNAME)
             echo "Static Web App: ${STATIC_WEB_APP_NAME:-<none>}"
             echo "Static apex default hostname: ${STATIC_WEB_APP_DEFAULT_HOSTNAME:-<none>}"
             echo "Per-region endpoints:"
-            get_out_json REGION_ENDPOINTS | jq .
+            deployment_output_json "$OUTPUTS_JSON" REGION_ENDPOINTS | jq .
 
             # Use the primary region's URI as the canonical deploy URL.
-            azd env set WEB_URI "$(get_out WEB_URI)"
+            azd env set WEB_URI "$(deployment_output "$OUTPUTS_JSON" WEB_URI)"
             azd env set CONTAINER_APP_NAME "${{ env.CONTAINER_APP_PREFIX }}-production-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set CONTAINER_APPS_ENVIRONMENT "${{ env.CONTAINER_ENV_NAME }}-$(echo "$REGIONS_JSON" | jq -r '.[0].name')"
             azd env set RESOURCE_GROUP "${{ env.PRODUCTION_RG }}"
 
             # Build the static apex payload from wwwroot + generated region bootstrap.
-            STATIC_REGION_MANIFEST=$(get_out_json STATIC_APEX_REGION_MANIFEST)
+            STATIC_REGION_MANIFEST=$(deployment_output_json "$OUTPUTS_JSON" STATIC_APEX_REGION_MANIFEST)
             if [ -z "$STATIC_REGION_MANIFEST" ]; then
               STATIC_REGION_MANIFEST='[]'
             fi
@@ -597,6 +527,7 @@ jobs:
             # Branch: provision with azd, then deploy with az cli to specific container app
             # First, provision the infrastructure
             azd provision --no-prompt
+            AZD_ENV_VALUES=$(azd env get-values)
 
             # Defensive check: `azd provision --no-prompt` can falsely report
             # "no changes" for branch deploys when a prior branch's truncated
@@ -614,8 +545,9 @@ jobs:
                   &>/dev/null; then
               echo "::warning::Container app '$EXPECTED_APP' missing after azd provision (likely the env-name truncation collision in azd's deployment state). Forcing a direct bicep deployment to create it."
 
-              CD_NAME=$(azd env get-values | grep '^CUSTOM_DOMAIN_NAME=' | cut -d'=' -f2 | tr -d '"' || echo "")
-              CD_SUB=$(azd env get-values | grep '^CUSTOM_SUBDOMAIN=' | cut -d'=' -f2 | tr -d '"' || echo "")
+              CD_NAME=$(azd_env_value CUSTOM_DOMAIN_NAME "$AZD_ENV_VALUES")
+              CD_SUB=$(azd_env_value CUSTOM_SUBDOMAIN "$AZD_ENV_VALUES")
+              DOMAIN_VERIFICATION_ID=$(azd_env_value DOMAIN_VERIFICATION_ID "$AZD_ENV_VALUES")
 
               az deployment sub create \
                 --name "fallback-${SANITIZED_BRANCH}-${{ github.run_id }}" \
@@ -631,7 +563,7 @@ jobs:
                   certKeyVaultSecretUrl="$CERT_KEY_VAULT_SECRET_URL" \
                   certKeyVaultCertName="$CERT_KEY_VAULT_CERT_NAME" \
                   certReaderIdentityId="$CERT_READER_IDENTITY_ID" \
-                  domainVerificationId="$(azd env get-values | grep '^DOMAIN_VERIFICATION_ID=' | cut -d'=' -f2 | tr -d '\"')"
+                  domainVerificationId="$DOMAIN_VERIFICATION_ID"
 
               # Re-verify after the fallback deployment.
               if ! az containerapp show \
@@ -644,22 +576,13 @@ jobs:
             fi
 
             # Get the container registry name from azd outputs
-            ACR_NAME=$(azd env get-values | grep '^AZURE_CONTAINER_REGISTRY_NAME=' | cut -d'=' -f2 | tr -d '"')
-            ACR_LOGIN_SERVER=$(azd env get-values | grep '^AZURE_CONTAINER_REGISTRY_ENDPOINT=' | cut -d'=' -f2 | tr -d '"')
+            ACR_NAME=$(azd_env_value AZURE_CONTAINER_REGISTRY_NAME "$AZD_ENV_VALUES")
+            ACR_LOGIN_SERVER=$(azd_env_value AZURE_CONTAINER_REGISTRY_ENDPOINT "$AZD_ENV_VALUES")
             
             # Build and push image using Docker
             IMAGE_TAG="${{ github.sha }}"
-            IMAGE_NAME="astervoids-web:${IMAGE_TAG}"
-            FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}"
-            
-            echo "Building and pushing image: $FULL_IMAGE"
-            
-            # Login to ACR
-            az acr login --name "$ACR_NAME"
-            
-            # Build and push
-            docker build -t "$FULL_IMAGE" ./AstervoidsWeb
-            docker push "$FULL_IMAGE"
+            publish_astervoids_image "$ACR_NAME" "$ACR_LOGIN_SERVER" "$IMAGE_TAG"
+            FULL_IMAGE="$PUBLISHED_IMAGE"
             
             # Update the specific branch container app with the new image
             CONTAINER_APP_NAME="${{ env.CONTAINER_APP_PREFIX }}-${SANITIZED_BRANCH}"
@@ -672,13 +595,17 @@ jobs:
           fi
           
           # Get outputs from azd
-          DEPLOY_URL=$(azd env get-values | grep '^WEB_URI=' | cut -d'=' -f2 | tr -d '"')
+          AZD_ENV_VALUES=$(azd env get-values)
+          if ! DEPLOY_URL=$(require_azd_env_value WEB_URI "$AZD_ENV_VALUES"); then
+            echo "::error::Deployment did not produce a WEB_URI."
+            exit 1
+          fi
           echo "url=$DEPLOY_URL" >> $GITHUB_OUTPUT
           
           # Export values for custom domain step
-          echo "CONTAINER_APP_NAME=$(azd env get-values | grep '^CONTAINER_APP_NAME=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
-          echo "CONTAINER_APPS_ENVIRONMENT=$(azd env get-values | grep '^CONTAINER_APPS_ENVIRONMENT=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=$(azd env get-values | grep '^RESOURCE_GROUP=' | cut -d'=' -f2 | tr -d '\"')" >> $GITHUB_ENV
+          echo "CONTAINER_APP_NAME=$(azd_env_value CONTAINER_APP_NAME "$AZD_ENV_VALUES")" >> $GITHUB_ENV
+          echo "CONTAINER_APPS_ENVIRONMENT=$(azd_env_value CONTAINER_APPS_ENVIRONMENT "$AZD_ENV_VALUES")" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=$(azd_env_value RESOURCE_GROUP "$AZD_ENV_VALUES")" >> $GITHUB_ENV
           echo "IS_MULTI_REGION=${IS_MULTI_REGION}" >> $GITHUB_ENV
 
           # Resolve custom domain explicitly for multi-region (azd env outputs
@@ -688,7 +615,7 @@ jobs:
             CUSTOM_DOMAIN="${CD_SUB}.${CD_NAME}"
             azd env set CUSTOM_DOMAIN "$CUSTOM_DOMAIN"
           else
-            CUSTOM_DOMAIN=$(azd env get-values | grep '^CUSTOM_DOMAIN=' | cut -d'=' -f2 | tr -d '"')
+            CUSTOM_DOMAIN=$(azd_env_value CUSTOM_DOMAIN "$AZD_ENV_VALUES")
           fi
           if [ -n "$CUSTOM_DOMAIN" ]; then
             echo "CUSTOM_DOMAIN=$CUSTOM_DOMAIN" >> $GITHUB_ENV
@@ -774,158 +701,13 @@ jobs:
         #                                            cert per branch.
         if: env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && env.CERT_KEY_VAULT_SECRET_URL == ''
         continue-on-error: true
-        run: |
-          echo "Configuring custom domain: $CUSTOM_DOMAIN (single-region managed-cert flow)"
-
-          # ── DNS propagation probe ─────────────────────────────────────
-          check_dns() {
-            echo "Checking DNS propagation for $CUSTOM_DOMAIN..."
-            CNAME_RESULT=$(nslookup "$CUSTOM_DOMAIN" 2>/dev/null | grep -i "canonical name" || echo "")
-            TXT_RESULT=$(nslookup -type=TXT "asuid.$CUSTOM_DOMAIN" 2>/dev/null | grep -i "text" || echo "")
-            if [ -n "$CNAME_RESULT" ] && [ -n "$TXT_RESULT" ]; then
-              echo "✅ DNS records found"
-              return 0
-            else
-              echo "⏳ DNS not yet propagated (CNAME: ${CNAME_RESULT:-not found}, TXT: ${TXT_RESULT:-not found})"
-              return 1
-            fi
-          }
-
-          # ── Bind hostname + provision managed cert (idempotent) ───────
-          # Returns 0 on success (hostname bound with HTTPS) or 1 on
-          # transient failure (outer attempt loop retries).
-          bind_single_region() {
-            local rg="${PRODUCTION_RG}"
-            local env_name="$CONTAINER_APPS_ENVIRONMENT"
-            local app_name="$CONTAINER_APP_NAME"
-
-            echo "::group::Binding $CUSTOM_DOMAIN on $app_name"
-
-            # Fast path: already SniEnabled means the cert is bound and
-            # serving HTTPS — no work to do.
-            local existing_binding
-            existing_binding=$(az containerapp hostname list \
-              --resource-group "$rg" --name "$app_name" \
-              --query "[?name=='$CUSTOM_DOMAIN'].bindingType" -o tsv 2>/dev/null || echo "")
-            if [ "$existing_binding" = "SniEnabled" ]; then
-              echo "✅ Already SniEnabled — skipping"
-              echo "::endgroup::"
-              return 0
-            fi
-
-            # Add custom hostname (unbound first; validation happens during cert create).
-            local hostname_exists
-            hostname_exists=$(az containerapp hostname list \
-              --resource-group "$rg" --name "$app_name" \
-              --query "[?name=='$CUSTOM_DOMAIN'].name" -o tsv 2>/dev/null || echo "")
-            if [ -z "$hostname_exists" ]; then
-              echo "Adding custom hostname..."
-              if ! az containerapp hostname add \
-                --resource-group "$rg" --name "$app_name" \
-                --hostname "$CUSTOM_DOMAIN" 2>&1; then
-                echo "::warning::Failed to add hostname on $app_name"
-                echo "::endgroup::"
-                return 1
-              fi
-            else
-              echo "Hostname already exists, skipping add..."
-            fi
-
-            # Create managed cert with CNAME validation.
-            local cert_name="cert-${CUSTOM_DOMAIN//./-}"
-            local cert_exists
-            cert_exists=$(az containerapp env certificate list \
-              --resource-group "$rg" --name "$env_name" \
-              --query "[?name=='$cert_name'].name" -o tsv 2>/dev/null || echo "")
-            if [ -z "$cert_exists" ]; then
-              echo "Creating managed certificate (CNAME validation)..."
-              if ! az containerapp env certificate create \
-                --resource-group "$rg" --name "$env_name" \
-                --certificate-name "$cert_name" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --validation-method CNAME 2>&1; then
-                echo "::warning::Failed to create certificate on $env_name"
-                echo "::endgroup::"
-                return 1
-              fi
-            fi
-
-            # Wait for cert provisioning (up to 5 minutes).
-            local cert_id="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$rg/providers/Microsoft.App/managedEnvironments/$env_name/managedCertificates/$cert_name"
-            local cert_ready=false
-            for i in $(seq 1 30); do
-              local state
-              state=$(az resource show --ids "$cert_id" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
-              echo "Cert state: $state (check $i/30)"
-              if [ "$state" = "Succeeded" ]; then
-                cert_ready=true
-                break
-              elif [ "$state" = "Failed" ]; then
-                echo "::warning::Cert provisioning Failed on $env_name"
-                break
-              fi
-              sleep 10
-            done
-
-            if [ "$cert_ready" = "true" ]; then
-              echo "Binding certificate..."
-              if az containerapp hostname bind \
-                --resource-group "$rg" --name "$app_name" \
-                --hostname "$CUSTOM_DOMAIN" \
-                --environment "$env_name" \
-                --validation-method CNAME 2>&1; then
-                echo "✅ HTTPS enabled for $CUSTOM_DOMAIN on $app_name"
-                echo "::endgroup::"
-                return 0
-              fi
-            fi
-
-            echo "::warning::Cert not ready / bind failed for $app_name"
-            echo "::endgroup::"
-            return 1
-          }
-
-          # ── Outer attempt loop ─────────────────────────────────────────
-          MAX_RETRIES=3
-          RETRY_DELAY=120
-
-          for attempt in $(seq 1 $MAX_RETRIES); do
-            echo ""
-            echo "=========================================="
-            echo "Custom domain setup attempt $attempt of $MAX_RETRIES"
-            echo "=========================================="
-
-            # Wait for DNS propagation before attempting (skip wait on
-            # first attempt if DNS is already propagated).
-            if [ $attempt -gt 1 ] || ! check_dns; then
-              if [ $attempt -gt 1 ]; then
-                WAIT_TIME=$((RETRY_DELAY * (attempt - 1)))
-                echo "Waiting ${WAIT_TIME}s before retry..."
-                sleep $WAIT_TIME
-              fi
-              if ! check_dns; then
-                echo "DNS not propagated yet, will retry..."
-                if [ $attempt -eq $MAX_RETRIES ]; then
-                  echo "::warning::DNS not propagated after $MAX_RETRIES attempts. Custom domain setup incomplete."
-                  exit 0
-                fi
-                continue
-              fi
-            fi
-
-            if bind_single_region; then
-              echo "✅ Single-region custom domain bound on attempt $attempt"
-              exit 0
-            fi
-            echo "Bind attempt $attempt failed; will retry..."
-          done
-
-          echo "::warning::Custom domain setup incomplete after $MAX_RETRIES attempts."
-          echo "The deployment succeeded but HTTPS is not yet configured."
-          echo "Usually resolves on the next deployment after DNS propagates."
+        run: bash .github/scripts/configure-managed-domain.sh
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Deployment Summary
         run: |
+          source .github/scripts/deployment-helpers.sh
           echo "### 🚀 Deployment Successful!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
@@ -952,18 +734,14 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "| Region | Container App | FQDN |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|---------------|------|" >> $GITHUB_STEP_SUMMARY
-            # Re-fetch outputs JSON; same case-insensitive lookup pattern as
-            # the multi-region provision step above (Azure ARM lowerCamelCase
-            # mangles output names, JMESPath is case-sensitive).
+            # Re-fetch outputs JSON for the multi-region deployment.
             SUMMARY_OUTPUTS=$(az deployment sub show \
               --name "production-multi-${{ github.run_id }}" \
               --query 'properties.outputs' -o json)
-            echo "$SUMMARY_OUTPUTS" \
-              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "region_endpoints") | .value.value[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
+            deployment_output_json "$SUMMARY_OUTPUTS" REGION_ENDPOINTS \
+              | jq -r '.[] | "| \(.displayName) (\(.id)) | \(.containerAppName) | https://\(.fqdn) |"' \
               >> $GITHUB_STEP_SUMMARY
-            SWA_FQDN=$(echo "$SUMMARY_OUTPUTS" \
-              | jq -r 'to_entries[] | select((.key | ascii_downcase) == "static_web_app_default_hostname") | .value.value' \
-              | head -1)
+            SWA_FQDN=$(deployment_output "$SUMMARY_OUTPUTS" STATIC_WEB_APP_DEFAULT_HOSTNAME)
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Static apex default host:** \`$SWA_FQDN\` (apex CNAME target)" >> $GITHUB_STEP_SUMMARY
           fi

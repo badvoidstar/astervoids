@@ -1,6 +1,5 @@
 using AstervoidsWeb.Formatters;
 using MessagePack;
-using MessagePack.Resolvers;
 
 namespace AstervoidsWeb.Hubs;
 
@@ -29,11 +28,7 @@ public static class SyncPayloadCodec
     /// the wire carries are exactly the same as those JS encodes/decodes.
     /// </summary>
     public static readonly MessagePackSerializerOptions DictOptions =
-        MessagePackSerializerOptions.Standard
-            .WithResolver(CompositeResolver.Create(
-                BinaryGuidResolver.Instance,
-                ContractlessStandardResolver.Instance))
-            .WithSecurity(MessagePackSecurity.UntrustedData);
+        AstervoidsMessagePack.Options;
 
     /// <summary>
     /// Sentinel: identifies the "legacy MessagePack-encoded dict" payload format.
