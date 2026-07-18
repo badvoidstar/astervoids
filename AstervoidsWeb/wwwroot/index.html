@@ -772,6 +772,12 @@
     <script src="/js/signalr-protocol-msgpack.min.js"></script>
     <!-- Binary GUID conversion (server sends 16-byte binary GUIDs; this converts to strings) -->
     <script src="/js/guid-utils.js"></script>
+    <!-- Shared runtime/debug/test gameplay defaults and override policy -->
+    <script src="/js/game-config.js"></script>
+    <!-- Pure asteroid fracture geometry and kinematics -->
+    <script src="/js/asteroid-fracture.js"></script>
+    <!-- Canonical Astervoids positional schemas and selector -->
+    <script src="/js/game-wire-schemas.js"></script>
     <!-- Wire enum translation (server sends MemberRole/ObjectScope as bytes; this converts to strings) -->
     <script src="/js/wire-enum.js"></script>
     <!-- MessagePack codec for the Phase 3 SyncPayload envelope (per-object data wrap/unwrap) -->
@@ -789,9 +795,11 @@
     <script src="/js/region-service.js"></script>
     <!-- Spectator client — multi-region SignalR for cross-region session-list updates -->
     <script src="/js/spectator-client.js"></script>
+    <script src="/js/multi-region-sessions.js"></script>
     <!-- Session client module -->
     <script src="/js/session-client.js"></script>
     <!-- Object sync module -->
+    <script src="/js/authoritative-object.js"></script>
     <script src="/js/object-sync.js"></script>
     <!-- Replication clock and presentation policies -->
     <script src="/js/replication-clock.js"></script>
@@ -1159,9 +1167,10 @@
     // All tunable game parameters in one place
     // All positions are normalized (0-1), sizes relative to shorter dimension
     // ============================================
+    const SHARED_CONFIG_DEFAULTS = AstervoidsConfig.SHARED_DEFAULTS;
     const CONFIG = {
         // Timing settings
-        TARGET_FPS: 60,             // Target frame rate for physics
+        TARGET_FPS: SHARED_CONFIG_DEFAULTS.TARGET_FPS,
 
         // Simulation mode:
         //   legacy        - variable-dt owner simulation with buffered,
@@ -1318,8 +1327,8 @@
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
         SHIP_THRUST: 0.009,         // Acceleration per frame (normalized, ~0.15/600*60)
         SHIP_FRICTION: 0.99,        // Velocity decay (1 = no friction)
-        SHIP_TURN_SPEED: 0.12,      // Rotation speed in radians per frame
-        SHIP_MAX_SPEED: 0.8,        // Maximum velocity per second (normalized)
+        SHIP_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_TURN_SPEED,
+        SHIP_MAX_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_MAX_SPEED,
         // Turning input ramping: time in seconds for the ship's angular speed to
         // ramp up from 0 to ±SHIP_TURN_SPEED (accel) or back down to 0 (decel).
         // 0 = instantaneous (legacy behavior).
@@ -1364,8 +1373,8 @@
         // ignored for turning, and vertical displacements with |dy| <=
         // THRUST_DEADZONE_PX are ignored for thrust/brake. Independent knobs
         // let turning be more responsive (smaller deadzone) than thrust/brake.
-        TOUCH_STICK_TURN_DEADZONE_PX: 6,
-        TOUCH_STICK_THRUST_DEADZONE_PX: 24,
+        TOUCH_STICK_TURN_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_STICK_TURN_DEADZONE_PX,
+        TOUCH_STICK_THRUST_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_STICK_THRUST_DEADZONE_PX,
         // Polar scheme radii (left anchor only). The polar control's response
         // is determined by the length of the finger displacement vector:
         //   • r ≤ TOUCH_POLAR_DEADZONE_PX   → no turn / thrust, but BRAKE
@@ -1381,23 +1390,23 @@
         // raw radius: brake = clamp01(1 − r / THRESHOLD), so r=0 is full
         // brake and r=THRESHOLD is no brake. This lets the dead-zone double
         // as the "high brake" region of the control.
-        TOUCH_POLAR_DEADZONE_PX: 16,
-        TOUCH_POLAR_THRESHOLD_PX: 64,
+        TOUCH_POLAR_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_POLAR_DEADZONE_PX,
+        TOUCH_POLAR_THRESHOLD_PX: SHARED_CONFIG_DEFAULTS.TOUCH_POLAR_THRESHOLD_PX,
         // Linear gain applied to normalized lateral displacement → turnTarget.
         // turnTarget = clamp(xNorm * GAIN, -MAX, +MAX). Peak rotation rate is
         // SHIP_TURN_SPEED * TOUCH_TURN_MAX (so MAX=1 reuses the existing cap).
-        TOUCH_TURN_GAIN: 1.0,
+        TOUCH_TURN_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_TURN_GAIN,
         TOUCH_TURN_MAX: 1.0,
         // Forward-thrust mapping from upward displacement (finger above anchor).
         // thrustInput = clamp(|yNorm| * GAIN, 0, MAX). Peak forward accel is
         // SHIP_THRUST * TOUCH_THRUST_MAX. Downward displacement does NOT drive
         // thrust here — it goes to brake below, with independent scaling/clamp.
-        TOUCH_THRUST_GAIN: 1.0,
+        TOUCH_THRUST_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_THRUST_GAIN,
         TOUCH_THRUST_MAX: 1.0,
         // Brake mapping from downward displacement (finger below anchor).
         // brakeInput = clamp(|yNorm| * GAIN, 0, MAX). Peak braking deceleration
         // is SHIP_BRAKE_STRENGTH * TOUCH_BRAKE_MAX. Set MAX=0 to disable braking.
-        TOUCH_BRAKE_GAIN: 1.0,
+        TOUCH_BRAKE_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_BRAKE_GAIN,
         TOUCH_BRAKE_MAX: 1.0,
         // When true: if the right (fire) anchor is held, it has
         // exclusive control over thrust/brake — the left-anchor thrust/brake
@@ -1407,7 +1416,7 @@
         // When false (default): both anchors contribute, combined via Math.max
         // (winner-takes-all per axis; each side already clamped individually).
         // Turning is always driven by the left anchor regardless of this flag.
-        TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST: false,
+        TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST: SHARED_CONFIG_DEFAULTS.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST,
         // Anchor overlay: an 8-vertex polygon centered on each active anchor
         // whose basis form is a rectangle matching the dead-zone exactly
         // (2·TOUCH_STICK_TURN_DEADZONE_PX wide × 2·TOUCH_STICK_THRUST_DEADZONE_PX
@@ -1443,16 +1452,16 @@
         // to 5 full rotations per second (5 · 2π rad/s ÷ 60 frames/s = π/6).
         // Caps apply after split impulses, so chains of close-range hits can no
         // longer compound velocity/spin past these limits.
-        ASTEROID_MAX_SPEED: 0.4,
-        ASTEROID_MAX_SPIN: Math.PI / 6,
+        ASTEROID_MAX_SPEED: SHARED_CONFIG_DEFAULTS.ASTEROID_MAX_SPEED,
+        ASTEROID_MAX_SPIN: SHARED_CONFIG_DEFAULTS.ASTEROID_MAX_SPIN,
         ASTEROID_VERTICES: 10,      // Number of vertices per asteroid
         ASTEROID_JAGGEDNESS: 0.4,   // Shape irregularity (0-1)
-        MIN_ASTEROID_RADIUS: 0.025, // Min radius before no split (normalized)
-        INITIAL_ASTEROID_RADIUS: 0.083, // Starting asteroid size (normalized)
+        MIN_ASTEROID_RADIUS: SHARED_CONFIG_DEFAULTS.MIN_ASTEROID_RADIUS,
+        INITIAL_ASTEROID_RADIUS: SHARED_CONFIG_DEFAULTS.INITIAL_ASTEROID_RADIUS,
         
         // Asteroid splitting
         SPLIT_COUNT: 2,             // Always split into 2 pieces
-        MIN_SPLIT_RATIO: 0.1,       // Smallest piece is at least 10% of original (area fraction)
+        MIN_SPLIT_RATIO: SHARED_CONFIG_DEFAULTS.MIN_SPLIT_RATIO,
         // Parent COM deflection-velocity kick imparted by a bullet hit, in normalized
         // reference-dim per second. The bullet impulse is J = M · DEFLECTION_KICK along
         // the bullet direction, so a head-on hit changes the parent's COM velocity by
@@ -1463,14 +1472,14 @@
         // matches the previous κ=1e-4 / E_b=6e-5 / ρ=5 / R=R_ref combination (~6e-4).
         // Independent of SEPARATION_ENERGY: tuning this knob changes only how much the
         // parent's trajectory bends, never how far the children fly apart.
-        DEFLECTION_KICK: 2.00e-3,
+        DEFLECTION_KICK: SHARED_CONFIG_DEFAULTS.DEFLECTION_KICK,
         // Asteroid disk density. Mass is M = ASTEROID_DENSITY · R². With the
         // independent-knob model, density still scales separation speed by 1/√density
         // (since separation derives from a fixed energy released into a mass-dependent
         // formula), but DEFLECTION_KICK is a velocity kick so deflection and induced
         // spin are now density-INDEPENDENT. Useful for damping compounding separation
         // speeds across successive splits without affecting deflection feel.
-        ASTEROID_DENSITY: 5.0,
+        ASTEROID_DENSITY: SHARED_CONFIG_DEFAULTS.ASTEROID_DENSITY,
         // Blend [0..1] between fixed and size-proportional separation-energy injection.
         // Effective E_sep = SEPARATION_ENERGY · ((1 − blend) + blend · (R/R_ref)²)
         // where R_ref = INITIAL_ASTEROID_RADIUS. blend=0 reproduces the legacy
@@ -1479,7 +1488,7 @@
         // cross-section (≈ mass), which yields generation-independent separation speed.
         // Applies only to SEPARATION_ENERGY; DEFLECTION_KICK is a velocity scalar and
         // is already invariant under R changes.
-        SEPARATION_ENERGY_SIZE_BLEND: 1.0,
+        SEPARATION_ENERGY_SIZE_BLEND: SHARED_CONFIG_DEFAULTS.SEPARATION_ENERGY_SIZE_BLEND,
         // Fragment separation energy released per bullet hit, in (normalized
         // reference-dim per second)². The two children fly apart along the impact-side
         // normal with relative speed determined by s = √(2·E_sep·m_l/(m_s·M)).
@@ -1487,7 +1496,7 @@
         // enforces "total injected KE = bullet KE"; it instead lets you tune deflection
         // and separation independently. Default chosen so per-hit separation matches
         // the previous κ=1e-4 / (1−κ)·E_b ≈ 6e-5 budget.
-        SEPARATION_ENERGY: 2.00e-4,
+        SEPARATION_ENERGY: SHARED_CONFIG_DEFAULTS.SEPARATION_ENERGY,
         // Weighting factor [0..1] applied to |offsetN| when computing the mass-split
         // ratio. With bias=1 the mass split follows the geometric formula
         //   fSmall = max(MIN_SPLIT_RATIO, 0.5·(1 − |offsetN|))
@@ -1495,14 +1504,14 @@
         // always 50/50 regardless of offset (modulo the MIN_SPLIT_RATIO floor, which
         // is moot at 0.5). Intermediate values smoothly interpolate. Independent of
         // impulse/torque physics — only the mass partition is affected.
-        MASS_SPLIT_BIAS: 0.6,
+        MASS_SPLIT_BIAS: SHARED_CONFIG_DEFAULTS.MASS_SPLIT_BIAS,
 
         // ─── Fracture geometry (visual + clip) ──────────────────────────────
         // Master switch for fracture split logic. ON by default so children of
         // a split inherit the parent silhouette closed by a jagged fracture
         // polyline. Set to false (or via URL/session override) to fall back to
         // the legacy disk split path.
-        FRACTURE_ENABLED: true,
+        FRACTURE_ENABLED: SHARED_CONFIG_DEFAULTS.FRACTURE_ENABLED,
         // Children of a split inherit their parent's outer silhouette on their
         // side of the impact, and a jagged FRACTURE polyline closes the cut.
         // The number of intermediate jag-points along the fracture chord is
@@ -1512,8 +1521,8 @@
         // higher = more jag points, 0 = straight chord).
         // FRACTURE_JAGGEDNESS is the maximum perpendicular displacement of each
         // intermediate point, expressed as a fraction of the parent's radius.
-        FRACTURE_VERTEX_DENSITY: 1.0,
-        FRACTURE_JAGGEDNESS: 0.35,
+        FRACTURE_VERTEX_DENSITY: SHARED_CONFIG_DEFAULTS.FRACTURE_VERTEX_DENSITY,
+        FRACTURE_JAGGEDNESS: SHARED_CONFIG_DEFAULTS.FRACTURE_JAGGEDNESS,
 
         // ─── Post-split shooter-deflection ──────────────────────────────────
         // After splitAsteroid computes child velocities, any child that is on a
@@ -1538,8 +1547,8 @@
         // the shooter ship; world wrap is accounted for by shortest-path
         // wrapping. Solo mode uses game.ship; multiplayer resolves the shooter
         // by memberId across the local ship and remoteShips.
-        DEFLECTION_TIME_LIMIT: 0.5,
-        DEFLECTION_SCALE: 1.2,
+        DEFLECTION_TIME_LIMIT: SHARED_CONFIG_DEFAULTS.DEFLECTION_TIME_LIMIT,
+        DEFLECTION_SCALE: SHARED_CONFIG_DEFAULTS.DEFLECTION_SCALE,
 
         // Scoring (points awarded based on asteroid size - thresholds normalized)
         POINTS_LARGE: 20,           // Points for large astervoids
@@ -1593,7 +1602,7 @@
         ADAPTIVE_DELAY_SAMPLES: 30,    // Lag and packet-interval samples retained per owner
         ADAPTIVE_DELAY_MIN_SAMPLES: 5, // Samples required before each estimate is trusted
         SNAP_THRESHOLD: 0.25,          // Legacy hard-snap distance in isotropic reference units
-        MAX_EXTRAPOLATION: 2.0,        // Legacy cap beyond the newest snapshot (seconds)
+        MAX_EXTRAPOLATION: SHARED_CONFIG_DEFAULTS.MAX_EXTRAPOLATION,
         SNAPSHOT_BUFFER_SIZE: 6,       // Six snapshots retain five inter-snapshot intervals
         // Legacy-only spawn bridge: after asteroid replacement, add a synthetic
         // child snapshot on the parent's current display timeline. This softens
@@ -1603,102 +1612,18 @@
         SPAWN_BRIDGE_ENABLED: 1,
     };
 
-    function parseBooleanLike(value) {
-        if (typeof value === 'boolean') return value;
-        if (typeof value === 'number') {
-            if (value === 1) return true;
-            if (value === 0) return false;
-            return undefined;
-        }
-        if (typeof value !== 'string') return undefined;
-        const normalized = value.trim().toLowerCase();
-        if (normalized === 'true' || normalized === '1' || normalized === 'on') return true;
-        if (normalized === 'false' || normalized === '0' || normalized === 'off') return false;
-        return undefined;
-    }
-
-    function coerceConfigOverrideValue(rawValue, currentValue) {
-        if (typeof currentValue === 'boolean') {
-            return parseBooleanLike(rawValue);
-        }
-        if (typeof currentValue === 'number') {
-            const numeric = typeof rawValue === 'number' ? rawValue : Number(rawValue);
-            return Number.isFinite(numeric) ? numeric : undefined;
-        }
-        if (typeof currentValue === 'string') {
-            // String-typed CONFIG values (e.g. TOUCH_CONTROL_SCHEME) accept
-            // strings directly; numbers and booleans are stringified so the
-            // same wire path (URL params, debug BroadcastChannel) Just Works.
-            // Empty strings are rejected so an accidental ?cfg.KEY= clears
-            // nothing; the override is simply ignored.
-            if (typeof rawValue === 'string') {
-                return rawValue.length > 0 ? rawValue : undefined;
-            }
-            if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
-                return String(rawValue);
-            }
-            if (typeof rawValue === 'boolean') {
-                return rawValue ? 'true' : 'false';
-            }
-            return undefined;
-        }
-        const booleanLike = parseBooleanLike(rawValue);
-        if (booleanLike !== undefined) return booleanLike;
-        if (typeof rawValue === 'number' && Number.isFinite(rawValue)) return rawValue;
-        return undefined;
-    }
-
-    function applyConfigOverride(config, key, rawValue) {
-        if (!Object.prototype.hasOwnProperty.call(config, key)) return false;
-        const value = coerceConfigOverrideValue(rawValue, config[key]);
-        if (value === undefined) return false;
-        config[key] = value;
-        return true;
-    }
-
-    function applyUrlConfigOverrides(config, search = window.location.search) {
-        const params = new URLSearchParams(search);
-        for (const [paramKey, rawValue] of params.entries()) {
-            if (!paramKey.startsWith('cfg.')) continue;
-            const configKey = paramKey.slice(4);
-            applyConfigOverride(config, configKey, rawValue);
-        }
-    }
-
-    const SESSION_CONFIG_KEYS = [
-        'FRACTURE_ENABLED',
-        // Seeded asteroid vertices are reconstructed instead of transmitted.
-        'ASTEROID_VERTICES',
-        'ASTEROID_JAGGEDNESS',
-        'SIM_MODE',
-    ];
-
-    function snapshotConfigValues(config, keys) {
-        const out = {};
-        for (const key of keys) {
-            out[key] = config[key];
-        }
-        return out;
-    }
-
-    function buildSessionConfigMetadata(config = CONFIG) {
-        return snapshotConfigValues(config, SESSION_CONFIG_KEYS);
-    }
-
-    function applySessionConfigMetadata(metadata, config = CONFIG) {
-        if (!metadata || typeof metadata !== 'object') return;
-        const overrides = metadata.config;
-        if (!overrides || typeof overrides !== 'object') return;
-        for (const key of SESSION_CONFIG_KEYS) {
-            if (Object.prototype.hasOwnProperty.call(overrides, key)) {
-                applyConfigOverride(config, key, overrides[key]);
-            }
-        }
-    }
+    const {
+        SESSION_CONFIG_KEYS,
+        applyConfigOverride,
+        applyUrlConfigOverrides,
+        snapshotConfigValues,
+        buildSessionConfigMetadata,
+        applySessionConfigMetadata,
+    } = AstervoidsConfig;
 
     // Baseline config is defaults + URL overrides. Session metadata may override
     // this while in a session; leaving session restores this local baseline.
-    applyUrlConfigOverrides(CONFIG);
+    applyUrlConfigOverrides(CONFIG, window.location.search);
     const LOCAL_CONFIG_BASELINE = snapshotConfigValues(CONFIG, SESSION_CONFIG_KEYS);
 
     // Touch control scheme registry. Keep the constants in lock-step with the
@@ -1825,8 +1750,11 @@
     // re-derive them — do not draw from and thus desynchronize this stream.
     // In legacy mode the simRandom* helpers fall through to Math.random.
     const simRng = {
-        _next: makeSeededRandom(1),
-        reseed(seed) { this._next = makeSeededRandom((seed >>> 0) || 1); },
+        _next: AstervoidsFracture.makeSeededRandom(1),
+        reseed(seed) {
+            this._next = AstervoidsFracture.makeSeededRandom(
+                (seed >>> 0) || 1);
+        },
         next() { return this._next(); },
         range(min, max) { return this._next() * (max - min) + min; },
         nextSeed() { return (this._next() * 0x100000000) >>> 0; },
@@ -2119,82 +2047,8 @@
     // % 2), so it MUST be encoded as an integer — `bool` would collapse all
     // nonzero values to 1, fixing the receiver in the "blink off" half and
     // making the ship invisible for the entire invuln period.
-    const WIREOPT_SCHEMAS = [
-        { id: 1, fields: [
-            ['type', 'str'],
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-            ['thrusting', 'bool'], ['invulnerable', 'u16'],
-            ['colorIndex', 'u8'],
-            ['memberId', 'guid'],
-            ['score', 'u32'], ['hitCount', 'u16'],
-            ['thrustInput', 'q8'], ['brakeInput', 'q8'],
-            ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
-            ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
-            ['turnBias', 'q16s'],
-            ['terminalEpoch', 'f64'],
-            ['terminalX', 'f64'], ['terminalY', 'f64'],
-            ['terminalAngle', 'f64'],
-        ]},
-        { id: 2, fields: [
-            ['type', 'str'],
-            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-            ['radius', 'q16'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['rotationSpeed', 'q16s'],
-            ['seed', 'f64'],
-            ['vertices', 'bytes'],
-            ['terminalEpoch', 'f64'],
-            ['terminalX', 'f64'], ['terminalY', 'f64'],
-            ['terminalAngle', 'f64'],
-        ]},
-        { id: 3, fields: [
-            ['type', 'str'],
-            ['x', 'q16w'], ['y', 'q16w'],
-            ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-            ['lifetime', 'u16'],
-            ['colorIndex', 'u8'],
-            ['ownerMemberId', 'guid'],
-            ['pendingHit', 'bool'],
-            ['hitTargetId', 'nullable-guid'],
-            ['hitImpactTorque', 'q16s'],
-            ['hitBulletAngle', 'q16_2pi'],
-            ['hitOffsetN', 'q16s'],
-            ['terminalEpoch', 'f64'],
-            ['terminalX', 'f64'], ['terminalY', 'f64'],
-        ]},
-        { id: 4, fields: [
-            ['type', 'str'],
-            ['gameStarted', 'bool'],
-            ['wave', 'u16'],
-            ['state', 'str'],
-            ['lives', 'u16'],
-            ['groupScore', 'u32'],
-            ['speedMultiplier', 'f32'],
-            ['waveDelayTimer', 'f32'],
-            ['processedHits', 'bytes'],
-            ['processedScores', 'bytes'],
-            ['peakShipCount', 'u8'],
-            ['gameOverAt', 'f64'],
-            ['terminalAt', 'f64'],
-        ]},
-    ];
-    const WIREOPT_SCHEMA_BY_TYPE = Object.freeze({
-        [OBJECT_TYPES.SHIP]: 1,
-        [OBJECT_TYPES.ASTEROID]: 2,
-        [OBJECT_TYPES.BULLET]: 3,
-        [OBJECT_TYPES.GAME_STATE]: 4,
-    });
-    function selectWireoptSchemaId(data, kind, ctx) {
-        let type = data?.type;
-        if (kind === 'update') {
-            type = ctx?.object?.data?.type || type;
-        } else if (kind !== 'create' && kind !== 'replace') {
-            return 0;
-        }
-        return WIREOPT_SCHEMA_BY_TYPE[type] || 0;
-    }
+    const WIREOPT_SCHEMAS = AstervoidsWireSchemas.SCHEMAS;
+    const selectWireoptSchemaId = AstervoidsWireSchemas.selectSchemaId;
 
     // Ship colors for up to 4 players (distinct, high-contrast)
     const SHIP_COLORS = [
@@ -3162,168 +3016,6 @@
         return false;
     }
 
-    /**
-     * Polygon helpers for fracture-based asteroid splits.
-     * All polygons are arrays of {x, y} vertices in CCW order (positive signed area).
-     * Units are caller's choice — used here in the parent-asteroid local frame
-     * with normalized reference-dim distances.
-     */
-    function polygonArea(verts) {
-        let a = 0;
-        const N = verts.length;
-        for (let i = 0; i < N; i++) {
-            const j = (i + 1) % N;
-            a += verts[i].x * verts[j].y - verts[j].x * verts[i].y;
-        }
-        return a * 0.5;
-    }
-
-    function polygonCentroid(verts) {
-        let cx = 0, cy = 0, a = 0;
-        const N = verts.length;
-        for (let i = 0; i < N; i++) {
-            const j = (i + 1) % N;
-            const cross = verts[i].x * verts[j].y - verts[j].x * verts[i].y;
-            cx += (verts[i].x + verts[j].x) * cross;
-            cy += (verts[i].y + verts[j].y) * cross;
-            a += cross;
-        }
-        a *= 0.5;
-        if (Math.abs(a) < 1e-18) {
-            let sx = 0, sy = 0;
-            for (const v of verts) { sx += v.x; sy += v.y; }
-            return { x: sx / N, y: sy / N, area: 0 };
-        }
-        return { x: cx / (6 * a), y: cy / (6 * a), area: a };
-    }
-
-    /**
-     * Split a CCW polygon by the line { p : n·p = d } (n unit normal, d scalar)
-     * and replace the chord with the supplied jagged polyline.
-     *
-     * jagPath: ordered list of intermediate {x,y} points strictly between the
-     * entry crossing (the +→- transition along the polygon walk) and the exit
-     * crossing (the -→+ transition). The same jagPath is reused on both sides
-     * — reversed on the negative half — so the two children share the exact
-     * same fracture boundary.
-     *
-     * Returns { positive, negative, entry, exit } or null on degenerate input
-     * (chord crosses ≠ 2 times, child polygon has < 3 vertices, etc.).
-     */
-    function fractureSplitPolygon(verts, n, d, jagPath) {
-        const N = verts.length;
-        if (N < 3) return null;
-        const sides = new Array(N);
-        for (let i = 0; i < N; i++) {
-            sides[i] = verts[i].x * n.x + verts[i].y * n.y - d;
-        }
-
-        const crossEdges = [];
-        for (let i = 0; i < N; i++) {
-            const j = (i + 1) % N;
-            const sa = sides[i], sb = sides[j];
-            if ((sa > 0 && sb < 0) || (sa < 0 && sb > 0)) {
-                const t = sa / (sa - sb);
-                crossEdges.push({
-                    edgeStart: i,
-                    point: {
-                        x: verts[i].x + (verts[j].x - verts[i].x) * t,
-                        y: verts[i].y + (verts[j].y - verts[i].y) * t,
-                    },
-                    fromPos: sa > 0,
-                });
-            }
-        }
-        if (crossEdges.length !== 2) return null;
-
-        let entryIdx, exitIdx;
-        if (crossEdges[0].fromPos) { entryIdx = 0; exitIdx = 1; }
-        else                       { entryIdx = 1; exitIdx = 0; }
-
-        const buildHalf = (startCross, endCross, sideTest, jagDir) => {
-            const out = [{ x: startCross.point.x, y: startCross.point.y }];
-            const stop = (endCross.edgeStart + 1) % N;
-            let i = (startCross.edgeStart + 1) % N;
-            let safety = N + 2;
-            while (i !== stop && safety-- > 0) {
-                if (sideTest(sides[i])) out.push({ x: verts[i].x, y: verts[i].y });
-                i = (i + 1) % N;
-            }
-            out.push({ x: endCross.point.x, y: endCross.point.y });
-            if (jagDir > 0) {
-                for (const p of jagPath) out.push({ x: p.x, y: p.y });
-            } else {
-                for (let k = jagPath.length - 1; k >= 0; k--) {
-                    out.push({ x: jagPath[k].x, y: jagPath[k].y });
-                }
-            }
-            return out;
-        };
-
-        const positive = buildHalf(crossEdges[exitIdx], crossEdges[entryIdx], s => s > 0, +1);
-        const negative = buildHalf(crossEdges[entryIdx], crossEdges[exitIdx], s => s < 0, -1);
-
-        if (positive.length < 3 || negative.length < 3) return null;
-        return {
-            positive, negative,
-            entry: crossEdges[entryIdx].point,
-            exit:  crossEdges[exitIdx].point,
-        };
-    }
-
-    /**
-     * Build the jagged fracture polyline (intermediate points only) between
-     * `entry` and `exit`. Each of the `count` intermediate points sits at an
-     * even fraction along the chord, displaced perpendicular by up to
-     * `jagAmplitude` (in the same units as entry/exit). A triangular taper
-     * keeps the displacement near 0 at the endpoints so the fracture meets the
-     * silhouette without a kink.
-     */
-    function buildFracturePolyline(entry, exit, count, jagAmplitude, randomFn) {
-        const out = [];
-        if (count <= 0) return out;
-        const dx = exit.x - entry.x, dy = exit.y - entry.y;
-        const len = Math.hypot(dx, dy);
-        if (len < 1e-12) return out;
-        const px = -dy / len, py = dx / len;
-        for (let k = 1; k <= count; k++) {
-            const t = k / (count + 1);
-            const cx = entry.x + dx * t;
-            const cy = entry.y + dy * t;
-            const taper = 2 * Math.min(t, 1 - t);
-            const amp = jagAmplitude > 0 ? jagAmplitude : 0;
-            const offset = (randomFn() * 2 - 1) * amp * taper;
-            out.push({ x: cx + px * offset, y: cy + py * offset });
-        }
-        return out;
-    }
-
-    /**
-     * Build a deterministic [0,1) RNG from a numeric seed (mulberry32-ish).
-     * Used so the two children of a fracture see the same jag points if they
-     * are independently regenerated from a parent seed (belt-and-braces; the
-     * authoritative path sends the explicit child vertex list over sync).
-     */
-    function makeSeededRandom(seed) {
-        let s = (seed >>> 0) || 1;
-        return () => {
-            s = (s + 0x6D2B79F5) >>> 0;
-            let t = s;
-            t = Math.imul(t ^ (t >>> 15), t | 1);
-            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-        };
-    }
-
-    /** Convert centered (x, y) pairs into the {angle, distance} polar format
-     *  used by Asteroid.vertices. */
-    function verticesFromXY(xyArray) {
-        return xyArray.map(p => ({
-            angle: Math.atan2(p.y, p.x),
-            distance: Math.hypot(p.x, p.y),
-        }));
-    }
-
     // ============================================
     // SECTION 3: GAME ENTITY CLASSES
     // Ship, Asteroid, and Bullet definitions
@@ -4263,25 +3955,15 @@
          * @param {number} dt - Delta time multiplier (1.0 = 60fps)
          */
         update(dt = 1) {
-            // Cap linear speed (same units as SHIP_MAX_SPEED). Compare squared
-            // magnitudes to skip the sqrt when under the cap.
-            const maxSpeed = CONFIG.ASTEROID_MAX_SPEED;
-            if (maxSpeed > 0) {
-                const speedSq = this.velocityX * this.velocityX + this.velocityY * this.velocityY;
-                const maxSpeedSq = maxSpeed * maxSpeed;
-                if (speedSq > maxSpeedSq) {
-                    const speed = Math.sqrt(speedSq);
-                    const k = maxSpeed / speed;
-                    this.velocityX *= k;
-                    this.velocityY *= k;
-                }
-            }
-
-            // Cap angular speed (same units as SHIP_TURN_SPEED — radians per frame).
-            const maxSpin = CONFIG.ASTEROID_MAX_SPIN;
-            if (maxSpin > 0 && Math.abs(this.rotationSpeed) > maxSpin) {
-                this.rotationSpeed = this.rotationSpeed > 0 ? maxSpin : -maxSpin;
-            }
+            const cappedMotion = AstervoidsFracture.clampAsteroidMotion(
+                this.velocityX,
+                this.velocityY,
+                this.rotationSpeed,
+                CONFIG.ASTEROID_MAX_SPEED,
+                CONFIG.ASTEROID_MAX_SPIN);
+            this.velocityX = cappedMotion.velocityX;
+            this.velocityY = cappedMotion.velocityY;
+            this.rotationSpeed = cappedMotion.rotationSpeed;
 
             // Move asteroid using aspect-ratio-aware conversion
             this.x += velocityToNormalizedDeltaX(this.velocityX) * dt;
@@ -4539,32 +4221,8 @@
     const DEBUG_HEARTBEAT_TIMEOUT = 2000; // ms before we consider the listener gone
     // Allow-list of CONFIG keys the debug UI may override. Restricting to known-safe
     // numeric tunables prevents stray messages from mutating arbitrary CONFIG fields.
-    const DEBUG_OVERRIDABLE_KEYS = new Set([
-        'ASTEROID_DENSITY',
-        'ASTEROID_MAX_SPEED',
-        'ASTEROID_MAX_SPIN',
-        'DEFLECTION_KICK',
-        'SEPARATION_ENERGY',
-        'SEPARATION_ENERGY_SIZE_BLEND',
-        'MASS_SPLIT_BIAS',
-        'FRACTURE_ENABLED',
-        'FRACTURE_VERTEX_DENSITY',
-        'FRACTURE_JAGGEDNESS',
-        'DEFLECTION_TIME_LIMIT',
-        'DEFLECTION_SCALE',
-        'MAX_EXTRAPOLATION',
-        'SPAWN_BRIDGE_ENABLED',
-        'SHIP_TURN_SPEED',
-        'SHIP_MAX_SPEED',
-        'TOUCH_TURN_GAIN',
-        'TOUCH_THRUST_GAIN',
-        'TOUCH_BRAKE_GAIN',
-        'TOUCH_STICK_TURN_DEADZONE_PX',
-        'TOUCH_STICK_THRUST_DEADZONE_PX',
-        'TOUCH_POLAR_DEADZONE_PX',
-        'TOUCH_POLAR_THRESHOLD_PX',
-        'TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST',
-    ]);
+    const DEBUG_OVERRIDABLE_KEYS = new Set(
+        AstervoidsConfig.DEBUG_OVERRIDABLE_KEYS);
     debugChannel.onmessage = (event) => {
         const data = event.data;
         if (data === 'ping') {
@@ -6538,212 +6196,8 @@
             return;
         }
 
-        // Unpack impact (safe defaults: head-on along parent velocity).
-        const offsetN = Math.max(-1, Math.min(1, impact?.offsetN ?? 0));
-        let bulletAngle = impact?.bulletAngle;
-        if (!Number.isFinite(bulletAngle)) {
-            const m = Math.hypot(asteroid.velocityX, asteroid.velocityY);
-            bulletAngle = m > 1e-9 ? Math.atan2(asteroid.velocityY, asteroid.velocityX) : 0;
-        }
-
-        // Bullet direction d̂ and separation normal n̂ = d̂ rotated +90°.
-        const dx = Math.cos(bulletAngle), dy = Math.sin(bulletAngle);
-        const nx = -dy, ny = dx;
-
-        // Disk physics: M = ρ·R², I = ½MR². Both fragmentation paths use the
-        // same M/I; per-child mass is allocated either by polygon area
-        // (fracture path) or by the closed-form ratio (disk fallback).
-        const R = asteroid.radius;
-        const density = Math.max(1e-6, CONFIG.ASTEROID_DENSITY);
-        const M = density * R * R;
-        const I = 0.5 * M * R * R;
-
-        // Impact point r relative to parent COM (on disk surface).
-        const b   = offsetN * R;
-        const rxN = b;
-        const rxD = -Math.sqrt(Math.max(0, R * R - b * b));
-        const rx  = rxD * dx + rxN * nx;
-        const ry  = rxD * dy + rxN * ny;
-
-        const vKick = Math.max(0, CONFIG.DEFLECTION_KICK);
-        const blend = Math.max(0, Math.min(1, CONFIG.SEPARATION_ENERGY_SIZE_BLEND));
-        const Rref  = CONFIG.INITIAL_ASTEROID_RADIUS;
-        const sizeMul = (1 - blend) + blend * (R / Rref) * (R / Rref);
-        const E_sep   = Math.max(0, CONFIG.SEPARATION_ENERGY) * sizeMul;
-        const Jmag    = M * vKick;
-        const Jx      = Jmag * dx, Jy = Jmag * dy;
-
-        // Post-impulse parent state.
-        const vxP    = asteroid.velocityX + Jx / M;
-        const vyP    = asteroid.velocityY + Jy / M;
-        const torque = rx * Jy - ry * Jx;                // r × J  (scalar in 2D)
-        const omegaP = (asteroid.rotationSpeed || 0) + torque / I;
-
-        // Default separation axis n̂_sep — toward impact side (used by disk fallback
-        // and as the fixed axis along which polygon-path separation impulses act).
-        const sideSign = offsetN >= 0 ? 1 : -1;
-        const sx = sideSign * nx, sy = sideSign * ny;
-
-        // ─── Polygon-fracture path ─────────────────────────────────────────
-        // Build the parent silhouette in the parent-COM-relative world frame
-        // (pre-rotation angles already folded in). All distances in normalized
-        // ref-dim units, same as asteroid.radius.
-        let children = null;
-        if (CONFIG.FRACTURE_ENABLED) {
-            const parentPoly = asteroid.vertices.map(v => ({
-                x: Math.cos(v.angle + asteroid.angle) * v.distance,
-                y: Math.sin(v.angle + asteroid.angle) * v.distance,
-            }));
-            const A_parent = Math.abs(polygonArea(parentPoly));
-            const pi_eff = A_parent > 0 ? A_parent / (R * R) : Math.PI;
-
-            // Probe-clip with an empty jag to discover entry/exit and validate that
-            // the chord cleanly cuts the polygon.
-            const probe = fractureSplitPolygon(parentPoly, { x: nx, y: ny }, b, []);
-            if (probe) {
-                // Match the parent's perimeter vertex spacing (~ 2πR / N) along
-                // the chord, scaled by FRACTURE_VERTEX_DENSITY.
-                const chordLen = Math.hypot(probe.exit.x - probe.entry.x,
-                                            probe.exit.y - probe.entry.y);
-                const parentSpacing = (2 * Math.PI * R) / Math.max(1, parentPoly.length);
-                const density = Math.max(0, CONFIG.FRACTURE_VERTEX_DENSITY);
-                const jagCount = parentSpacing > 0
-                    ? Math.max(0, Math.floor((chordLen / parentSpacing) * density))
-                    : 0;
-                const jagAmplitude = Math.max(0, CONFIG.FRACTURE_JAGGEDNESS) * R;
-                // Deterministic seed so independent regenerations agree.
-                const seedFrac = ((asteroid.seed || 0) * 0x100000000) >>> 0;
-                const jagSeed = (seedFrac
-                    ^ (Math.floor((bulletAngle + 10) * 1e6) >>> 0)
-                    ^ (Math.floor((offsetN + 10) * 1e6) >>> 0)) >>> 0;
-                const jagRng = makeSeededRandom(jagSeed);
-                const jagPath = buildFracturePolyline(probe.entry, probe.exit,
-                                                    jagCount, jagAmplitude, jagRng);
-                const split = fractureSplitPolygon(parentPoly, { x: nx, y: ny }, b, jagPath);
-                if (split) {
-                    const A_pos = Math.abs(polygonArea(split.positive));
-                    const A_neg = Math.abs(polygonArea(split.negative));
-                    if (A_pos > 0 && A_neg > 0 && A_parent > 0) {
-                        const smallSide = A_pos <= A_neg
-                            ? { poly: split.positive, area: A_pos }
-                            : { poly: split.negative, area: A_neg };
-                        const largeSide = A_pos <= A_neg
-                            ? { poly: split.negative, area: A_neg }
-                            : { poly: split.positive, area: A_pos };
-
-                        const cSmall = polygonCentroid(smallSide.poly);
-                        const cLarge = polygonCentroid(largeSide.poly);
-                        const rSmall = Math.sqrt(smallSide.area / pi_eff);
-                        const rLarge = Math.sqrt(largeSide.area / pi_eff);
-                        const mSmall = (smallSide.area / A_parent) * M;
-                        const mLarge = (largeSide.area / A_parent) * M;
-
-                        const recenter = (poly, c) => verticesFromXY(
-                            poly.map(p => ({ x: p.x - c.x, y: p.y - c.y }))
-                        );
-                        const vertsSmall = recenter(smallSide.poly, cSmall);
-                        const vertsLarge = recenter(largeSide.poly, cLarge);
-
-                        if (rSmall < CONFIG.MIN_ASTEROID_RADIUS) {
-                            // 1-child case: chip is debris, surviving large piece
-                            // keeps the new fractured silhouette and inherits all
-                            // post-impulse parent momentum. (The chip's tiny share
-                            // is dropped — same accounting as the disk fallback.)
-                            const v_rigid = {
-                                vx: vxP + (-omegaP) * cLarge.y,
-                                vy: vyP + ( omegaP) * cLarge.x,
-                            };
-                            children = [{
-                                r: rLarge, m: mLarge,
-                                cx: cLarge.x, cy: cLarge.y,
-                                vx: v_rigid.vx, vy: v_rigid.vy,
-                                omega: omegaP,
-                                vertices: vertsLarge,
-                            }];
-                        } else {
-                            // 2-child case. Inherited rigid velocities at each
-                            // centroid; equal-and-opposite separation impulse along
-                            // n̂_sep balanced by mass ratio so total Δp = 0.
-                            const v_rigid_small = {
-                                vx: vxP + (-omegaP) * cSmall.y,
-                                vy: vyP + ( omegaP) * cSmall.x,
-                            };
-                            const v_rigid_large = {
-                                vx: vxP + (-omegaP) * cLarge.y,
-                                vy: vyP + ( omegaP) * cLarge.x,
-                            };
-                            const s = E_sep > 0
-                                ? Math.sqrt(2 * E_sep * mLarge / (mSmall * M))
-                                : 0;
-                            // Pick the separation direction so the small child flies
-                            // outward from the parent COM (its centroid sits on its
-                            // own side of the chord; we just project onto n̂_sep).
-                            const proj = cSmall.x * sx + cSmall.y * sy;
-                            const sepDir = proj >= 0 ? 1 : -1;
-                            const sepX = sepDir * sx, sepY = sepDir * sy;
-
-                            children = [
-                                {
-                                    r: rSmall, m: mSmall,
-                                    cx: cSmall.x, cy: cSmall.y,
-                                    vx: v_rigid_small.vx + sepX * s,
-                                    vy: v_rigid_small.vy + sepY * s,
-                                    omega: omegaP,
-                                    vertices: vertsSmall,
-                                },
-                                {
-                                    r: rLarge, m: mLarge,
-                                    cx: cLarge.x, cy: cLarge.y,
-                                    vx: v_rigid_large.vx - sepX * s * (mSmall / mLarge),
-                                    vy: v_rigid_large.vy - sepY * s * (mSmall / mLarge),
-                                    omega: omegaP,
-                                    vertices: vertsLarge,
-                                },
-                            ];
-                        }
-                    }
-                }
-            }
-        }
-
-        // ─── Disk-fallback path ────────────────────────────────────────────
-        if (!children) {
-            const minRatio = Math.max(0.01, Math.min(0.5, CONFIG.MIN_SPLIT_RATIO));
-            const massBias = Math.max(0, Math.min(1, CONFIG.MASS_SPLIT_BIAS));
-            const fSmall   = Math.max(minRatio, 0.5 * (1 - massBias * Math.abs(offsetN)));
-            const fLarge   = 1 - fSmall;
-
-            const rSmall = R * Math.sqrt(fSmall);
-            const rLarge = R * Math.sqrt(fLarge);
-            const mSmall = fSmall * M;
-            const mLarge = fLarge * M;
-
-            children = [];
-            if (rSmall < CONFIG.MIN_ASTEROID_RADIUS) {
-                children.push({ r: rLarge, m: mLarge, cx: 0, cy: 0,
-                                vx: vxP, vy: vyP, omega: omegaP, vertices: null });
-            } else {
-                const dSmall = +R * fLarge;
-                const dLarge = -R * fSmall;
-                const rigidVelocityAt = (d) => ({
-                    vx: vxP + (-omegaP) * (d * sy),
-                    vy: vyP + ( omegaP) * (d * sx),
-                });
-                const vS = rigidVelocityAt(dSmall), vL = rigidVelocityAt(dLarge);
-                const s = E_sep > 0 ? Math.sqrt(2 * E_sep * mLarge / (mSmall * M)) : 0;
-                children.push({
-                    r: rSmall, m: mSmall, cx: dSmall * sx, cy: dSmall * sy,
-                    vx: vS.vx + s * sx, vy: vS.vy + s * sy,
-                    omega: omegaP, vertices: null,
-                });
-                children.push({
-                    r: rLarge, m: mLarge, cx: dLarge * sx, cy: dLarge * sy,
-                    vx: vL.vx - s * sx * (mSmall / mLarge),
-                    vy: vL.vy - s * sy * (mSmall / mLarge),
-                    omega: omegaP, vertices: null,
-                });
-            }
-        }
+        const { children } = AstervoidsFracture.calculateAsteroidFragments(
+            asteroid, impact, CONFIG);
 
         // ─── Shooter-deflection (linear-only) ──────────────────────────────
         // After fragment kinematics are settled, nudge any surviving child off a
@@ -8924,26 +8378,28 @@
         });
     }
 
-    // Initial canvas sizing before game starts
-    resizeCanvas();
-
-    // Initialize game objects for start screen display (but don't start playing)
-    // Use normalized coordinates (0.5, 0.5 = center)
-    game.ship = null;  // No ship on start screen
-    game.astervoids = [];
-    game.bullets = [];
-    // Spawn some cosmetic astervoids for visual effect on start screen (normalized coords)
-    for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
-        const angle = Math.random() * Math.PI * 2;
-        const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
-        game.cosmeticAstervoids.push(new Asteroid(
-            Math.random(),  // 0-1 normalized X
-            Math.random(),  // 0-1 normalized Y
-            CONFIG.INITIAL_ASTEROID_RADIUS,
-            Math.cos(angle) * speed,
-            Math.sin(angle) * speed
-        ));
+    function resetStartScreenVisuals() {
+        game.ship = null;
+        game.astervoids = [];
+        game.bullets = [];
+        game.cosmeticAstervoids = [];
+        for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = CONFIG.ASTEROID_BASE_SPEED
+                + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
+            game.cosmeticAstervoids.push(new Asteroid(
+                Math.random(),
+                Math.random(),
+                CONFIG.INITIAL_ASTEROID_RADIUS,
+                Math.cos(angle) * speed,
+                Math.sin(angle) * speed
+            ));
+        }
     }
+
+    // Initial canvas sizing and cosmetic objects before game starts.
+    resizeCanvas();
+    resetStartScreenVisuals();
     
     // Mobile UI update loop (only runs after touch controls are enabled)
     function startMobileUILoop() {
@@ -9457,173 +8913,9 @@
     // Push coalescing: if multiple OnSessionsChanged arrive from the same
     // region within COALESCE_MS, only one refetch fires. Stops a member-leave
     // (which triggers promotion + broadcast + cleanup) from triple-fetching.
-    const MultiRegionSessions = (function () {
-        const COALESCE_MS = 250;       // dedup window for repeated pushes
-        const REST_TIMEOUT_MS = 5000;  // per-region REST fetch timeout
-        const POLL_INTERVAL_MS = 30000; // belt-and-suspenders background poll
-
-        const perRegion = new Map();   // regionId -> { sessions, maxSessions, canCreate, state, lastFetchAt, lastError }
-        const pendingRefetch = new Map(); // regionId -> setTimeout handle (debounce)
-        const inFlight = new Map();    // regionId -> AbortController
-        const requestSequences = new Map();
-        let backgroundPollHandle = null;
-        let runGeneration = 0;
-        let running = false;
-
-        function emptyResult() {
-            return { sessions: [], maxSessions: 6, canCreateSession: true };
-        }
-
-        function regionState(regionId) {
-            const r = perRegion.get(regionId);
-            return r ? r.state : 'cold';
-        }
-
-        async function fetchOneRegion(region, controller) {
-            const url = `${region.hostname.replace(/\/$/, '')}/api/sessions`;
-            const timer = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
-            try {
-                const res = await fetch(url, {
-                    method: 'GET',
-                    cache: 'no-store',
-                    mode: 'cors',
-                    credentials: 'omit',  // intentionally NOT credentialed — public read
-                    signal: controller.signal,
-                });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                return await res.json();
-            } finally {
-                clearTimeout(timer);
-            }
-        }
-
-        // Update one region's slice and trigger a picker render. Per-region
-        // failure marks the region 'stale' and drops its sessions from the
-        // merge until the next successful fetch.
-        async function refreshRegion(region, generation = runGeneration) {
-            const requestSequence = (requestSequences.get(region.id) ?? 0) + 1;
-            requestSequences.set(region.id, requestSequence);
-            inFlight.get(region.id)?.abort();
-            const controller = new AbortController();
-            inFlight.set(region.id, controller);
-            try {
-                const body = await fetchOneRegion(region, controller);
-                if (generation !== runGeneration
-                    || requestSequences.get(region.id) !== requestSequence) return;
-                perRegion.set(region.id, {
-                    sessions: (body.sessions || []).map(s => ({ ...s, regionId: s.regionId || region.id })),
-                    maxSessions: body.maxSessions ?? 6,
-                    canCreate: body.canCreateSession ?? true,
-                    state: 'fresh',
-                    lastFetchAt: Date.now(),
-                    lastError: null,
-                });
-            } catch (err) {
-                if (generation !== runGeneration
-                    || requestSequences.get(region.id) !== requestSequence) return;
-                const prev = perRegion.get(region.id) ?? {};
-                perRegion.set(region.id, {
-                    ...prev,
-                    sessions: [],  // drop stale rows so users don't try to join a session whose host is offline
-                    state: 'stale',
-                    lastError: err && err.message,
-                });
-            } finally {
-                if (inFlight.get(region.id) === controller) {
-                    inFlight.delete(region.id);
-                }
-            }
-            if (generation !== runGeneration
-                || requestSequences.get(region.id) !== requestSequence) return;
-            // Render with the merged state — every region's fresh slice
-            // contributes its sessions; stale regions contribute nothing.
-            applyMerged();
-        }
-
-        // Coalesce N pushes within COALESCE_MS into one refetch per region.
-        // Without this, a single member leave triggers promotion +
-        // cleanup + broadcast and the receiver would fetch 2-3 times.
-        // `running` controls background polling only. An immediate request made
-        // after stop() is an intentional one-shot refresh; runGeneration still
-        // prevents any request started before stop() from applying stale data.
-        function requestRefresh(region, immediate = false) {
-            if (immediate) {
-                return refreshRegion(region, runGeneration);
-            }
-            const existing = pendingRefetch.get(region.id);
-            if (existing) clearTimeout(existing);
-            const handle = setTimeout(() => {
-                pendingRefetch.delete(region.id);
-                refreshRegion(region, runGeneration);
-            }, COALESCE_MS);
-            pendingRefetch.set(region.id, handle);
-            return Promise.resolve();
-        }
-
-        // Apply the merged view to the picker. Sessions are keyed by
-        // sessionId — within a region they're unique, and across regions
-        // they're globally unique (server-side UUIDs). Sort order is by RTT
-        // ascending; rendering preserves it.
-        function applyMerged() {
-            const sessions = [];
-            let maxSessions = 6;
-            let canCreate = true;
-            for (const [, slice] of perRegion) {
-                if (slice.state !== 'fresh') continue;
-                sessions.push(...slice.sessions);
-                maxSessions = Math.max(maxSessions, slice.maxSessions);
-                canCreate = canCreate && slice.canCreate;
-            }
-            updateSessionList({
-                sessions,
-                maxSessions,
-                canCreateSession: canCreate,
-            });
-        }
-
-        // Start the multi-region session-list machine. Idempotent.
-        async function start(regions) {
-            stop();
-            running = true;
-            const generation = ++runGeneration;
-            // Bootstrap REST fetch in parallel across every region.
-            await Promise.all(regions.map(r => refreshRegion(r, generation)));
-            if (!running || generation !== runGeneration) return;
-            // Background belt-and-suspenders poll catches missed pushes.
-            backgroundPollHandle = setInterval(() => {
-                if (typeof document !== 'undefined' && document.hidden) return;
-                regions.forEach(r => requestRefresh(r));
-            }, POLL_INTERVAL_MS);
-        }
-
-        function stop() {
-            running = false;
-            runGeneration++;
-            if (backgroundPollHandle) {
-                clearInterval(backgroundPollHandle);
-                backgroundPollHandle = null;
-            }
-            for (const t of pendingRefetch.values()) clearTimeout(t);
-            pendingRefetch.clear();
-            for (const controller of inFlight.values()) controller.abort();
-            inFlight.clear();
-        }
-
-        function reset() {
-            perRegion.clear();
-        }
-
-        return {
-            start,
-            stop,
-            reset,
-            requestRefresh,
-            regionState,
-            applyMerged,
-            // Test/debug hooks
-            _perRegion: perRegion,
-        };
-    })();
+    const MultiRegionSessions = MultiRegionSessionsFactory.create({
+        updateSessionList,
+    });
 
     // Refresh session list from server (or from pushed data).
     // Single-region (regions array empty): falls back to the legacy
@@ -10065,7 +9357,7 @@
             const currentAspectRatio = canvas.width / canvas.height;
             const result = await SessionClient.createSession({
                 aspectRatio: currentAspectRatio,
-                config: buildSessionConfigMetadata(),
+                config: buildSessionConfigMetadata(CONFIG),
                 schemas: WIREOPT_SCHEMAS,
                 seed: generateSessionSeed(),
             });
@@ -10327,23 +9619,7 @@
         // Recalculate viewport now that we're back in solo mode (force recalc even if window size unchanged)
         resizeCanvas(true);
 
-        // Reinitialize start screen visuals (normalized coordinates)
-        game.ship = null;  // No ship on start screen
-        game.astervoids = [];
-        game.bullets = [];
-        // Respawn cosmetic astervoids
-        game.cosmeticAstervoids = [];
-        for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
-            const angle = Math.random() * Math.PI * 2;
-            const speed = CONFIG.ASTEROID_BASE_SPEED + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
-            game.cosmeticAstervoids.push(new Asteroid(
-                Math.random(),  // 0-1 normalized X
-                Math.random(),  // 0-1 normalized Y
-                CONFIG.INITIAL_ASTEROID_RADIUS,
-                Math.cos(angle) * speed,
-                Math.sin(angle) * speed
-            ));
-        }
+        resetStartScreenVisuals();
 
         if (errorMessage) {
             setPickerStatus(errorMessage, 'error');

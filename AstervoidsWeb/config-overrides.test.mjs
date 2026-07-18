@@ -1,79 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
-function parseBooleanLike(value) {
-    if (typeof value === 'boolean') return value;
-    if (typeof value === 'number') {
-        if (value === 1) return true;
-        if (value === 0) return false;
-        return undefined;
-    }
-    if (typeof value !== 'string') return undefined;
-    const normalized = value.trim().toLowerCase();
-    if (normalized === 'true' || normalized === '1' || normalized === 'on') return true;
-    if (normalized === 'false' || normalized === '0' || normalized === 'off') return false;
-    return undefined;
-}
+const require = createRequire(import.meta.url);
+const {
+    SHARED_DEFAULTS,
+    CONFIG_CONTROLS,
+    coerceConfigOverrideValue,
+    applyUrlConfigOverrides,
+    applySessionConfigMetadata,
+    buildSessionConfigMetadata,
+} = require('./wwwroot/js/game-config.js');
 
-function coerceConfigOverrideValue(rawValue, currentValue) {
-    if (typeof currentValue === 'boolean') {
-        return parseBooleanLike(rawValue);
+test('debug controls derive defaults from the shared runtime values', () => {
+    for (const control of CONFIG_CONTROLS) {
+        const expected = typeof SHARED_DEFAULTS[control.key] === 'boolean'
+            ? Number(SHARED_DEFAULTS[control.key])
+            : SHARED_DEFAULTS[control.key];
+        assert.equal(control.default, expected, control.key);
     }
-    if (typeof currentValue === 'number') {
-        const numeric = typeof rawValue === 'number' ? rawValue : Number(rawValue);
-        return Number.isFinite(numeric) ? numeric : undefined;
-    }
-    if (typeof currentValue === 'string') {
-        if (typeof rawValue === 'string') {
-            return rawValue.length > 0 ? rawValue : undefined;
-        }
-        if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
-            return String(rawValue);
-        }
-        if (typeof rawValue === 'boolean') {
-            return rawValue ? 'true' : 'false';
-        }
-        return undefined;
-    }
-    const booleanLike = parseBooleanLike(rawValue);
-    if (booleanLike !== undefined) return booleanLike;
-    if (typeof rawValue === 'number' && Number.isFinite(rawValue)) return rawValue;
-    return undefined;
-}
-
-function applyConfigOverride(config, key, rawValue) {
-    if (!Object.prototype.hasOwnProperty.call(config, key)) return false;
-    const value = coerceConfigOverrideValue(rawValue, config[key]);
-    if (value === undefined) return false;
-    config[key] = value;
-    return true;
-}
-
-function applyUrlConfigOverrides(config, search) {
-    const params = new URLSearchParams(search);
-    for (const [paramKey, rawValue] of params.entries()) {
-        if (!paramKey.startsWith('cfg.')) continue;
-        const configKey = paramKey.slice(4);
-        applyConfigOverride(config, configKey, rawValue);
-    }
-}
-
-function applySessionConfigMetadata(metadata, config, keys) {
-    if (!metadata || typeof metadata !== 'object') return;
-    const overrides = metadata.config;
-    if (!overrides || typeof overrides !== 'object') return;
-    for (const key of keys) {
-        if (Object.prototype.hasOwnProperty.call(overrides, key)) {
-            applyConfigOverride(config, key, overrides[key]);
-        }
-    }
-}
-
-function buildSessionConfigMetadata(config, keys) {
-    const out = {};
-    for (const key of keys) out[key] = config[key];
-    return out;
-}
+});
 
 test('URL overrides: no params preserves defaults', () => {
     const cfg = { FRACTURE_ENABLED: false, FRACTURE_JAGGEDNESS: 0.35 };

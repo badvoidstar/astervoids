@@ -15,26 +15,52 @@
  */
 
 const GuidUtils = (function() {
+    const mixedEndianOrder = Object.freeze([
+        3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15
+    ]);
     const hex = new Array(256);
     for (let i = 0; i < 256; i++) {
         hex[i] = i.toString(16).padStart(2, '0');
     }
 
     /**
-     * Convert a 16-byte Uint8Array (.NET binary Guid) to a lowercase GUID string.
-     * Returns null if the input is not a 16-byte Uint8Array.
+     * Convert a canonical GUID string to the 16-byte .NET mixed-endian layout.
+     * Throws when the value is not a canonical 8-4-4-4-12 hexadecimal GUID.
      */
-    function bytesToGuid(bytes) {
-        if (!(bytes instanceof Uint8Array) || bytes.length !== 16) return null;
+    function guidToBytes(value) {
+        if (typeof value !== 'string'
+            || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value)) {
+            throw new TypeError(`Invalid GUID: ${value}`);
+        }
+        const canonicalHex = value.replace(/-/g, '');
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < mixedEndianOrder.length; i++) {
+            const source = mixedEndianOrder[i] * 2;
+            bytes[i] = parseInt(canonicalHex.slice(source, source + 2), 16);
+        }
+        return bytes;
+    }
+
+    /**
+     * Convert a 16-byte Uint8Array (.NET binary Guid) to a lowercase GUID string.
+     * An offset may select a GUID within a larger byte buffer.
+     */
+    function bytesToGuid(bytes, offset = 0) {
+        if (!(bytes instanceof Uint8Array)
+            || !Number.isInteger(offset)
+            || offset < 0
+            || offset + 16 > bytes.length) {
+            return null;
+        }
 
         // .NET mixed-endian: reverse first 3 groups, big-endian for last 2
         return (
-            hex[bytes[3]] + hex[bytes[2]] + hex[bytes[1]] + hex[bytes[0]] + '-' +
-            hex[bytes[5]] + hex[bytes[4]] + '-' +
-            hex[bytes[7]] + hex[bytes[6]] + '-' +
-            hex[bytes[8]] + hex[bytes[9]] + '-' +
-            hex[bytes[10]] + hex[bytes[11]] + hex[bytes[12]] + hex[bytes[13]] +
-            hex[bytes[14]] + hex[bytes[15]]
+            hex[bytes[offset + 3]] + hex[bytes[offset + 2]] + hex[bytes[offset + 1]] + hex[bytes[offset]] + '-' +
+            hex[bytes[offset + 5]] + hex[bytes[offset + 4]] + '-' +
+            hex[bytes[offset + 7]] + hex[bytes[offset + 6]] + '-' +
+            hex[bytes[offset + 8]] + hex[bytes[offset + 9]] + '-' +
+            hex[bytes[offset + 10]] + hex[bytes[offset + 11]] + hex[bytes[offset + 12]] + hex[bytes[offset + 13]] +
+            hex[bytes[offset + 14]] + hex[bytes[offset + 15]]
         );
     }
 
@@ -81,7 +107,7 @@ const GuidUtils = (function() {
         return value;
     }
 
-    return { bytesToGuid, transformBinaryGuids };
+    return { guidToBytes, bytesToGuid, transformBinaryGuids };
 })();
 
 // Export for module systems if available

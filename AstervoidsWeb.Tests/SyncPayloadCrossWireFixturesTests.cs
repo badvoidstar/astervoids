@@ -3,7 +3,6 @@ using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Hubs;
 using FluentAssertions;
 using MessagePack;
-using MessagePack.Resolvers;
 using Xunit.Abstractions;
 
 namespace AstervoidsWeb.Tests;
@@ -38,11 +37,7 @@ public class SyncPayloadCrossWireFixturesTests
     }
 
     private static readonly MessagePackSerializerOptions Options =
-        MessagePackSerializerOptions.Standard
-            .WithResolver(CompositeResolver.Create(
-                BinaryGuidResolver.Instance,
-                ContractlessStandardResolver.Instance))
-            .WithSecurity(MessagePackSecurity.UntrustedData);
+        AstervoidsMessagePack.Options;
 
     private static string HexOf<T>(T v)
     {

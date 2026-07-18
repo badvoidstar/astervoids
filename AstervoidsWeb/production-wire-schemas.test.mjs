@@ -10,24 +10,16 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, 'wwwroot', 'index.html'), 'utf8');
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 const WireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
-
-function productionSchemas() {
-    const marker = 'const WIREOPT_SCHEMAS = ';
-    const start = source.indexOf(marker);
-    const end = source.indexOf('\n    const WIREOPT_SCHEMA_BY_TYPE', start);
-    assert.ok(start >= 0 && end > start, 'production schema literal not found');
-    return Function(`"use strict"; return (${
-        source.slice(start + marker.length, end).trim().replace(/;$/, '')
-    });`)();
-}
+const WireSchemas = require('./wwwroot/js/game-wire-schemas.js');
+const { SESSION_CONFIG_KEYS } = require('./wwwroot/js/game-config.js');
 
 function registerProductionSchemas() {
     SchemaCodec.clear();
-    SchemaCodec.replaceAll(productionSchemas());
+    SchemaCodec.replaceAll(WireSchemas.SCHEMAS);
 }
 
 test('known gameplay objects each have one positional schema', () => {
-    const schemas = productionSchemas();
+    const schemas = WireSchemas.SCHEMAS;
     assert.deepEqual(schemas.map(schema => schema.id), [1, 2, 3, 4]);
     for (const schema of schemas) {
         assert.ok(schema.fields.length <= 32);
@@ -36,14 +28,12 @@ test('known gameplay objects each have one positional schema', () => {
             schema.fields.length,
             `schema ${schema.id} field names must be unique`);
     }
-    for (const mapping of [
-        '[OBJECT_TYPES.SHIP]: 1',
-        '[OBJECT_TYPES.ASTEROID]: 2',
-        '[OBJECT_TYPES.BULLET]: 3',
-        '[OBJECT_TYPES.GAME_STATE]: 4',
-    ]) {
-        assert.ok(source.includes(mapping), `missing production mapping ${mapping}`);
-    }
+    assert.deepEqual(WireSchemas.SCHEMA_BY_OBJECT_TYPE, {
+        ship: 1,
+        asteroid: 2,
+        bullet: 3,
+        gameState: 4,
+    });
 });
 
 test('unified ship schema carries adaptive, replay, identity, and terminal subsets', () => {
@@ -97,11 +87,8 @@ test('asteroid schema omits reproducible vertices and packs fracture vertices', 
     const decodedFracture = SchemaCodec.decode(schema, fractureBytes);
     assert.equal(WireCodec.bytesEqual(decodedFracture.vertices, vertices), true);
     assert.ok(fractureBytes.length > seededBytes.length);
-    const sessionConfig = source.slice(
-        source.indexOf('const SESSION_CONFIG_KEYS = ['),
-        source.indexOf('];', source.indexOf('const SESSION_CONFIG_KEYS = [')));
-    assert.match(sessionConfig, /'ASTEROID_VERTICES'/);
-    assert.match(sessionConfig, /'ASTEROID_JAGGEDNESS'/);
+    assert.ok(SESSION_CONFIG_KEYS.includes('ASTEROID_VERTICES'));
+    assert.ok(SESSION_CONFIG_KEYS.includes('ASTEROID_JAGGEDNESS'));
 });
 
 test('bullet schema keeps ballistic and hit deltas sparse', () => {
@@ -144,8 +131,15 @@ test('GameState schema stores compact counter-map bytes', () => {
 });
 
 test('known terminal updates do not fall back to schema zero', () => {
-    assert.doesNotMatch(source, /terminalEpoch !== undefined\) return 0/);
-    assert.match(source, /return WIREOPT_SCHEMA_BY_TYPE\[type\] \|\| 0;/);
+    for (const type of Object.keys(WireSchemas.SCHEMA_BY_OBJECT_TYPE)) {
+        assert.notEqual(
+            WireSchemas.selectSchemaId(
+                { terminalEpoch: 1 },
+                'update',
+                { object: { data: { type } } }),
+            0,
+            type);
+    }
 });
 
 test('production serializers keep optional high-cost data sparse', () => {

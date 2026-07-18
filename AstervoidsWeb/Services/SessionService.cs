@@ -576,12 +576,7 @@ public class SessionService : ISessionService
                     newOwnerId = remainingMemberIds[0];
                 }
 
-                obj.OwnerMemberId = newOwnerId;
-                // Replace Data with a new dictionary so snapshot reads outside the lock
-                // see a stable copy (copy-on-write pattern).
-                obj.Data = SyncDataCloner.CloneDictionary(obj.Data);
-                obj.Version++;
-                obj.UpdatedAt = DateTime.UtcNow;
+                TransferObjectOwnership(obj, newOwnerId);
                 // ValidAt is preserved (NOT bumped to "now") so the new owner inherits the
                 // last validated server-time anchor; their first authored snapshot will
                 // carry a fresh validAt and observers will see motion continue smoothly
@@ -614,10 +609,7 @@ public class SessionService : ISessionService
         {
             if (obj.Scope == ObjectScope.Session && !memberIds.Contains(obj.OwnerMemberId))
             {
-                obj.OwnerMemberId = newOwnerId;
-                obj.Data = SyncDataCloner.CloneDictionary(obj.Data);
-                obj.Version++;
-                obj.UpdatedAt = DateTime.UtcNow;
+                TransferObjectOwnership(obj, newOwnerId);
                 adopted++;
             }
         }
@@ -628,6 +620,15 @@ public class SessionService : ISessionService
                 "Adopted {Count} orphaned session-scoped objects for new member {MemberId} in session {SessionName} ({SessionId})",
                 adopted, newOwnerId, session.Name, session.Id);
         }
+    }
+
+    private static void TransferObjectOwnership(SessionObject obj, Guid newOwnerId)
+    {
+        obj.OwnerMemberId = newOwnerId;
+        // Copy-on-write keeps snapshot reads outside the session lock stable.
+        obj.Data = SyncDataCloner.CloneDictionary(obj.Data);
+        obj.Version++;
+        obj.UpdatedAt = DateTime.UtcNow;
     }
 
 }

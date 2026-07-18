@@ -11,14 +11,10 @@ namespace AstervoidsWeb.Tests;
 public class BinaryGuidFormatterTests
 {
     /// <summary>
-    /// Build the same composite resolver used in Program.cs so tests exercise the real wire format.
+    /// Use the production options so tests exercise the real wire format.
     /// </summary>
     private static readonly MessagePackSerializerOptions Options =
-        MessagePackSerializerOptions.Standard
-            .WithResolver(CompositeResolver.Create(
-                BinaryGuidResolver.Instance,
-                ContractlessStandardResolver.Instance))
-            .WithSecurity(MessagePackSecurity.UntrustedData);
+        AstervoidsMessagePack.Options;
 
     // ── Guid round-trip ──────────────────────────────────────────────
 

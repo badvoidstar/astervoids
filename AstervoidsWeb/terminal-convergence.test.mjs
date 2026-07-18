@@ -15,6 +15,10 @@ const {
     sampleMinimumJerkTransition,
     unwrapConvergenceTarget,
 } = require('./wwwroot/js/replication-presentation.js');
+const {
+    SCHEMAS,
+    selectSchemaId,
+} = require('./wwwroot/js/game-wire-schemas.js');
 
 function extractProductionFunction(name, nextMarker) {
     const start = productionSource.indexOf(`function ${name}(`);
@@ -571,21 +575,23 @@ test('terminal publisher retries owned targets and retires ownership races', () 
 });
 
 test('unified ship schema persists every terminal field written by updates', () => {
-    const schemaStart = productionSource.indexOf('{ id: 1, fields: [');
-    const schemaEnd = productionSource.indexOf(']},', schemaStart);
-    const shipSchema = productionSource.slice(schemaStart, schemaEnd);
+    const shipSchema = SCHEMAS.find(schema => schema.id === 1);
+    assert.ok(shipSchema);
     for (const field of [
         'terminalEpoch',
         'terminalX',
         'terminalY',
         'terminalAngle'
     ]) {
-        assert.match(shipSchema, new RegExp(`\\['${field}', 'f64'\\]`));
+        assert.ok(
+            shipSchema.fields.some(([name, type]) =>
+                name === field && type === 'f64'),
+            `${field} must be a ship f64 field`);
     }
-    assert.match(
-        productionSource,
-        /\[OBJECT_TYPES\.SHIP\]: 1/);
-    assert.doesNotMatch(
-        productionSource,
-        /terminalEpoch !== undefined\) return 0/);
+    assert.equal(selectSchemaId(
+        { type: 'ship', terminalEpoch: 1 },
+        'create'), 1);
+    assert.equal(selectSchemaId(
+        { type: 'bullet', terminalEpoch: 1 },
+        'create'), 3);
 });

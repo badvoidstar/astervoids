@@ -3,7 +3,6 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using FluentAssertions;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -18,18 +17,10 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
 {
-    /// <summary>
-    /// Custom factory that mirrors StaticFileCachingTests.Factory — points the
-    /// content root at the AstervoidsWeb project so the wwwroot exists at start.
-    /// Also overrides Region configuration so we test against a known manifest
-    /// rather than whatever appsettings ships.
-    /// </summary>
-    public sealed class Factory : WebApplicationFactory<Program>
+    public sealed class Factory : AstervoidsWebFactory
     {
-        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        protected override void ConfigureAstervoidsWeb(IWebHostBuilder builder)
         {
-            builder.UseContentRoot(FindContentRoot());
-
             // Inject a deterministic Region manifest so assertions don't depend
             // on whatever appsettings.json ships. The test manifest mimics a
             // 3-region deployment (one of which we are).
@@ -52,20 +43,6 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
             });
         }
 
-        private static string FindContentRoot()
-        {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null)
-            {
-                var candidate = Path.Combine(dir.FullName, "AstervoidsWeb");
-                if (Directory.Exists(Path.Combine(candidate, "wwwroot")))
-                    return candidate;
-                dir = dir.Parent;
-            }
-            throw new DirectoryNotFoundException(
-                "Could not find AstervoidsWeb project directory with wwwroot. " +
-                $"Searched upward from: {AppContext.BaseDirectory}");
-        }
     }
 
     private readonly Factory _factory;

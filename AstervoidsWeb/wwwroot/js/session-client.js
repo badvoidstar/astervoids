@@ -840,16 +840,6 @@ const SessionClient = (function() {
     }
 
     /**
-     * Create an object in the current session.
-     * @param {object} data - Object data
-     * @param {string} scope - 'Member' or 'Session'
-     * @param {string|null} [ownerMemberId=null]
-     * @param {number|null} [clientValidAt=null] - Owner's NTP-aligned server-time
-     *   estimate of "now" at creation. Server clamps to ±2s of its own UtcNow
-     *   before forwarding as the broadcast's validAt. Pass null to fall back to
-     *   the server's hub-entry timestamp (slightly upload-biased).
-     */
-    /**
      * Create a new object in the current session.
      * @param {Object} data - The data payload (game-side dict).
      * @param {string} [scope='Member'] - 'Session' or 'Member'.

@@ -140,6 +140,11 @@ function evaluateModule(relativePath, exportName, globals) {
     return moduleHost.exports;
 }
 
+const AuthoritativeObject = evaluateModule(
+    'wwwroot/js/authoritative-object.js',
+    'AuthoritativeObject',
+    {});
+
 function loadSessionClient(
     connections,
     objectSyncBridge = { triggerReconciliation() {} },
@@ -169,6 +174,7 @@ function loadObjectSync(sessionClient, window = { ASTERVOIDS_DEBUG: false }) {
         window,
         console,
         SessionClient: sessionClient,
+        AuthoritativeObject,
         signalR: {
             HubConnectionState: {
                 Connected: 'Connected',

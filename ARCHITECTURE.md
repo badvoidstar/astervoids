@@ -443,7 +443,7 @@ graph TB
     subgraph "SessionCleanupService (BackgroundService)"
         direction TB
         SCS_OPS["Runs every 10 seconds<br/>Empty timeout: destroy sessions with no members<br/>Absolute timeout: destroy sessions exceeding max lifetime<br/>Notifies connected members via SignalR OnSessionExpired<br/>Broadcasts OnSessionsChanged on any cleanup"]
-        SCS_CFG["Config (SessionSettings):<br/>EmptyTimeoutSeconds: 30<br/>AbsoluteTimeoutMinutes: 20<br/>ClientTimeoutSeconds: 20<br/>KeepAliveSeconds: 10"]
+        SCS_CFG["Config source:<br/>appsettings.json Session section<br/>bound to SessionSettings"]
     end
 ```
 
@@ -2022,19 +2022,11 @@ flowchart TB
 
 ## Game Configuration (CONFIG)
 
-The frontend `CONFIG` object in `index.html` defines all game constants (normalized to shorter canvas dimension):
-
-| Category | Key Constants |
-|----------|-------------|
-| **Physics** | `TARGET_FPS: 60`, `SHIP_THRUST: 0.009`, `SHIP_FRICTION: 0.99`, `SHIP_MAX_SPEED: 0.8` |
-| **Weapons** | `BULLET_SPEED: 1.0`, `BULLET_LIFETIME: 60 frames`, `MAX_BULLETS: 10`, `SHOOT_COOLDOWN: 10 frames` |
-| **Asteroids** | `INITIAL_ASTEROID_RADIUS: 0.083`, `MIN_ASTEROID_RADIUS: 0.025`, `SPLIT_COUNT: 2`, `DEFLECTION_KICK: 1e-3`, `SEPARATION_ENERGY: 1e-4` |
-| **Scoring** | `POINTS_LARGE: 20`, `POINTS_MEDIUM: 50`, `POINTS_SMALL: 100` (smaller = more points) |
-| **Game** | `STARTING_LIVES: 3`, `MULTIPLAYER_LIVES: 3`, `INVULNERABILITY_TIME: 180 frames`, `WAVE_DELAY: 120 frames` |
-| **Sync** | Initial `SYNC_NOMINAL_FRAME_TIME: 1/10 (10Hz)`; adaptive flush range `1–20Hz`; `DELTA_ENCODING_ENABLED: true` |
-| **Interpolation** | `INTERPOLATION_DELAY: 33ms`, `ADAPTIVE_DELAY_ENABLED: true`, `SNAPSHOT_BUFFER_SIZE: 6`, `MAX_EXTRAPOLATION: 2.0s` |
-| **Terminal convergence** | `DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750ms`, `DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180ms`, `DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300ms` |
-| **Adaptive Delay** | `ADAPTIVE_DELAY_NET_FLOOR: 0.8`, `ADAPTIVE_DELAY_JITTER_MULT: 2`, `ADAPTIVE_DELAY_SMOOTHING: 0.1`, `ADAPTIVE_DELAY_SAMPLES: 30` |
+Shared gameplay defaults and debug-control metadata are defined in
+[`wwwroot/js/game-config.js`](AstervoidsWeb/wwwroot/js/game-config.js). Runtime-only
+settings stay beside their owning systems in the `CONFIG` object in
+[`index.html`](AstervoidsWeb/wwwroot/index.html). These production sources are
+also imported by the JavaScript tests so physics and UI defaults cannot drift.
 
 Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cyan, Magenta, Yellow (up to 4 players).
 

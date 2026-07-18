@@ -1,7 +1,5 @@
 using System.Net;
 using FluentAssertions;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 
 namespace AstervoidsWeb.Tests;
 
@@ -11,31 +9,8 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class StaticFileCachingTests : IClassFixture<StaticFileCachingTests.Factory>
 {
-    /// <summary>
-    /// Custom factory that sets the content root to the AstervoidsWeb project directory
-    /// so the ETag table at startup can find and hash the actual wwwroot files.
-    /// </summary>
-    public sealed class Factory : WebApplicationFactory<Program>
+    public sealed class Factory : AstervoidsWebFactory
     {
-        protected override void ConfigureWebHost(IWebHostBuilder builder) =>
-            builder.UseContentRoot(FindContentRoot());
-
-        private static string FindContentRoot()
-        {
-            // Walk up from the test output directory until we find a sibling "AstervoidsWeb"
-            // directory that contains wwwroot (i.e. the web project directory).
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null)
-            {
-                var candidate = Path.Combine(dir.FullName, "AstervoidsWeb");
-                if (Directory.Exists(Path.Combine(candidate, "wwwroot")))
-                    return candidate;
-                dir = dir.Parent;
-            }
-            throw new DirectoryNotFoundException(
-                "Could not find AstervoidsWeb project directory with wwwroot. " +
-                $"Searched upward from: {AppContext.BaseDirectory}");
-        }
     }
 
     private readonly Factory _factory;

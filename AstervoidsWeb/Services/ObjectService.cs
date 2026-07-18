@@ -35,36 +35,6 @@ public class ObjectService : IObjectService
     }
 
     /// <summary>
-    /// Sanity bound for owner-stamped <c>clientValidAt</c> values. Mirrors
-    /// <c>SessionHub.ValidAtSanityBoundMs</c>; kept private here so the service
-    /// can be unit-tested without referencing the hub layer.
-    /// </summary>
-    private const long ValidAtSanityBoundMs = 2000;
-
-    /// <summary>
-    /// Validates an owner-stamped <paramref name="clientValidAt"/> against the server's
-    /// <paramref name="serverReceiveTimeMs"/> and (optionally) the object's prior
-    /// <paramref name="previousValidAt"/>:
-    ///   * Out-of-bounds (|client - server| > ±2 s) or null → fall back to <paramref name="serverReceiveTimeMs"/>.
-    ///   * Result is then capped at <paramref name="previousValidAt"/> (if provided)
-    ///     so a single object's ValidAt is monotonically non-decreasing.
-    /// This is the single source of truth for the validAt timeline; both create and
-    /// update paths must call it before storage.
-    /// </summary>
-    private static long ValidateValidAt(long? clientValidAt, long serverReceiveTimeMs, long? previousValidAt = null)
-    {
-        var result = clientValidAt.HasValue
-            && Math.Abs(clientValidAt.Value - serverReceiveTimeMs) <= ValidAtSanityBoundMs
-            ? clientValidAt.Value
-            : serverReceiveTimeMs;
-
-        if (previousValidAt.HasValue && result < previousValidAt.Value)
-            result = previousValidAt.Value;
-
-        return result;
-    }
-
-    /// <summary>
     /// Validates that a session exists. Returns the session if valid, or null if not found.
     /// </summary>
     private Session? GetValidSession(Guid sessionId)
@@ -89,7 +59,7 @@ public class ObjectService : IObjectService
                 return null;
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var validAt = ValidateValidAt(clientValidAt, receive);
+            var validAt = ValidAtPolicy.Resolve(clientValidAt, receive);
             var obj = NewSessionObject(sessionId, creatorMemberId, effectiveOwner, scope, data, validAt, schemaId);
             session.Objects.TryAdd(obj.Id, obj);
             return Snapshot(obj);
@@ -116,7 +86,7 @@ public class ObjectService : IObjectService
                 return null;
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var validAt = ValidateValidAt(clientValidAt, receive, obj.ValidAt);
+            var validAt = ValidAtPolicy.Resolve(clientValidAt, receive, obj.ValidAt);
             ApplyUpdate(obj, data, validAt);
             return Snapshot(obj);
         }
@@ -155,7 +125,7 @@ public class ObjectService : IObjectService
                 if (obj.OwnerMemberId != ownerMemberId)
                     continue;
 
-                var validAt = ValidateValidAt(callLevelClientValidAt, receive, obj.ValidAt);
+                var validAt = ValidAtPolicy.Resolve(callLevelClientValidAt, receive, obj.ValidAt);
                 ApplyUpdate(obj, update.Data, validAt);
                 results.Add(Snapshot(obj));
             }
@@ -224,7 +194,7 @@ public class ObjectService : IObjectService
             // at that moment. Monotonic cap is taken against the deleted parent's
             // ValidAt, not against the (not-yet-existing) children's previous values.
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var validAt = ValidateValidAt(clientValidAt, receive, objToDelete.ValidAt);
+            var validAt = ValidAtPolicy.Resolve(clientValidAt, receive, objToDelete.ValidAt);
 
             // Determine effective owner for replacements (must be a current member)
             var created = new List<SessionObject>(replacements.Count);

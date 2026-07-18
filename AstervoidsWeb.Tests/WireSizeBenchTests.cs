@@ -3,7 +3,6 @@ using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Models;
 using FluentAssertions;
 using MessagePack;
-using MessagePack.Resolvers;
 
 namespace AstervoidsWeb.Tests;
 
@@ -20,11 +19,7 @@ namespace AstervoidsWeb.Tests;
 public class WireSizeBenchTests
 {
     private static readonly MessagePackSerializerOptions Options =
-        MessagePackSerializerOptions.Standard
-            .WithResolver(CompositeResolver.Create(
-                BinaryGuidResolver.Instance,
-                ContractlessStandardResolver.Instance))
-            .WithSecurity(MessagePackSecurity.UntrustedData);
+        AstervoidsMessagePack.Options;
 
     private static int Size<T>(T value) => MessagePackSerializer.Serialize(value, Options).Length;
 

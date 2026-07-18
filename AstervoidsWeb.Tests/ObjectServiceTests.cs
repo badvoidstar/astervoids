@@ -415,7 +415,7 @@ public class ObjectServiceTests : TestBase
     // ── ValidAt validation/storage tests ─────────────────────────────────────────
     //
     // These cover the unified server-time interpolation axis from the service layer.
-    // ObjectService.ValidateValidAt applies a ±2s sanity bound vs the server's
+    // ValidAtPolicy applies a ±2s sanity bound vs the server's
     // hub-entry receive time, then a monotonic cap vs the object's previous ValidAt.
     // The validated value is stored on SessionObject.ValidAt and observable via
     // ObjectInfo.ValidAt / ObjectUpdateInfo.ValidAt on the wire.

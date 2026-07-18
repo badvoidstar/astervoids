@@ -96,6 +96,14 @@
  */
 
 const ObjectSync = (function() {
+    const objectApplication = typeof AuthoritativeObject !== 'undefined'
+        ? AuthoritativeObject
+        : (typeof require === 'function'
+            ? require('./authoritative-object.js')
+            : null);
+    if (!objectApplication) {
+        throw new Error('authoritative-object.js must load before object-sync.js');
+    }
     const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
     const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
     const _error = (...a) => window.ASTERVOIDS_DEBUG && console.error(...a);
@@ -153,6 +161,14 @@ const ObjectSync = (function() {
             _warn('[ObjectSync] schemaIdSelector threw; falling back to schemaId=0', err);
             return 0;
         }
+    }
+
+    function prepareWirePayload(data, kind, ctx) {
+        const schemaId = pickSchemaId(data, kind, ctx);
+        return {
+            data: schemaId === 0 ? compressData(data) : data,
+            schemaId
+        };
     }
 
     // Local object registry
@@ -291,10 +307,18 @@ const ObjectSync = (function() {
      * the age of state while it waited in pendingUpdates.
      */
     function getArrivalServerTimeMs() {
-        if (clockSource && clockSource.initialized && clockSource.initialized()) {
-            return Math.round(clockSource.nowMs());
+        return getClientValidAt();
+    }
+
+    function getClientValidAt() {
+        if (!clockSource
+            || typeof clockSource.initialized !== 'function'
+            || !clockSource.initialized()
+            || typeof clockSource.nowMs !== 'function') {
+            return null;
         }
-        return null;
+        const nowMs = clockSource.nowMs();
+        return Number.isFinite(nowMs) ? Math.round(nowMs) : null;
     }
     
     /**
@@ -523,52 +547,23 @@ const ObjectSync = (function() {
                     // A live broadcast already populated this object at >= this
                     // version. Backfill only metadata/static fields that the live
                     // delta could not carry.
-                    let changed = false;
-                    if (existing.creatorMemberId == null && obj.creatorMemberId != null) {
-                        existing.creatorMemberId = obj.creatorMemberId;
-                        changed = true;
-                    }
-                    if (existing.ownerMemberId == null && obj.ownerMemberId != null) {
-                        existing.ownerMemberId = obj.ownerMemberId;
-                        changed = true;
-                    }
-                    if (existing.scope == null && obj.scope != null) {
-                        existing.scope = obj.scope;
-                        changed = true;
-                    }
-                    const oldType = existing.data?.type;
-                    for (const key in (obj.data || {})) {
-                        if (existing.data[key] === undefined) {
-                            existing.data[key] = obj.data[key];
-                            changed = true;
-                        }
-                    }
-                    if (oldType !== existing.data?.type) {
-                        updateTypeIndex(existing, oldType, existing.data?.type);
-                    }
                     const va = validAts[obj.id];
-                    if (existing.validAt === undefined && va !== undefined && va !== null) {
-                        existing.validAt = va;
-                        changed = true;
-                    }
-                    if (changed) markObjectMutation(existing.id);
+                    const applied = objectApplication.backfill(existing, obj, {
+                        includeData: true,
+                        validAt: va
+                    });
+                    updateTypeIndex(existing, applied.oldType, applied.newType);
+                    if (applied.changed) markObjectMutation(existing.id);
                     lastSentData.set(existing.id, { ...existing.data });
                     continue;
                 }
 
                 if (existing) {
-                    const oldType = existing.data?.type;
-                    existing.creatorMemberId = obj.creatorMemberId;
-                    existing.ownerMemberId = obj.ownerMemberId;
-                    existing.scope = obj.scope;
-                    existing.data = obj.data || {};
-                    existing.version = obj.version;
-                    updateTypeIndex(existing, oldType, existing.data?.type);
+                    const applied = objectApplication.applyFull(existing, obj, {
+                        validAt: validAts[obj.id]
+                    });
+                    updateTypeIndex(existing, applied.oldType, applied.newType);
                     markObjectMutation(existing.id);
-                    const va = validAts[obj.id];
-                    if (va !== undefined && va !== null) {
-                        existing.validAt = va;
-                    }
                     lastSentData.set(existing.id, { ...existing.data });
                     continue;
                 }
@@ -640,26 +635,13 @@ const ObjectSync = (function() {
         if (existing) {
             // Keep existing data/version if already ahead from updates
             if (objectInfo.version > existing.version) {
-                existing.creatorMemberId = objectInfo.creatorMemberId;
-                existing.ownerMemberId = objectInfo.ownerMemberId;
-                existing.scope = objectInfo.scope;
-                existing.data = objectInfo.data || {};
-                existing.version = objectInfo.version;
-                existing.arrivalTime = arrivalTime;
-                existing.arrivalServerTime = arrivalServerTime;
-                if (validAt !== undefined && validAt !== null) {
-                    existing.validAt = validAt;
-                }
-            } else if (objectInfo.data) {
-                if (existing.creatorMemberId == null) {
-                    existing.creatorMemberId = objectInfo.creatorMemberId;
-                }
-                if (existing.ownerMemberId == null) {
-                    existing.ownerMemberId = objectInfo.ownerMemberId;
-                }
-                if (existing.scope == null) {
-                    existing.scope = objectInfo.scope;
-                }
+                const applied = objectApplication.applyFull(existing, objectInfo, {
+                    arrivalTime,
+                    arrivalServerTime,
+                    validAt
+                });
+                updateTypeIndex(existing, applied.oldType, applied.newType);
+            } else {
                 // Even when the existing object's version is ahead (because an
                 // update arrived first via the fallback path), we still need to
                 // backfill any STATIC fields that updates don't carry — most
@@ -668,20 +650,12 @@ const ObjectSync = (function() {
                 // and the asteroid appears frozen between snapshots, then jumps
                 // each time a new update arrives. Only fill missing keys; never
                 // overwrite a value the (newer) update already provided.
-                let typeChanged = false;
-                const oldType = existing.data?.type;
-                for (const key in objectInfo.data) {
-                    if (existing.data[key] === undefined) {
-                        existing.data[key] = objectInfo.data[key];
-                        if (key === 'type') typeChanged = true;
-                    }
-                }
-                if (typeChanged) {
-                    updateTypeIndex(existing, oldType, existing.data.type);
-                }
-            }
-            if (validAt !== undefined && validAt !== null && existing.validAt === undefined) {
-                existing.validAt = validAt;
+                const backfillSource = objectInfo.data ? objectInfo : {};
+                const applied = objectApplication.backfill(existing, backfillSource, {
+                    includeData: Boolean(objectInfo.data),
+                    validAt
+                });
+                updateTypeIndex(existing, applied.oldType, applied.newType);
             }
             markObjectMutation(existing.id);
             return;
@@ -740,19 +714,12 @@ const ObjectSync = (function() {
             if (existing) {
                 // Only apply if version is newer
                 if (update.version > existing.version) {
-                    const oldType = existing.data?.type;
-                    Object.assign(existing.data, update.data);
-                    existing.version = update.version;
-                    existing.arrivalTime = arrivalTime;
-                    existing.arrivalServerTime = arrivalServerTime;
-                    if (validAt !== undefined && validAt !== null) {
-                        existing.validAt = validAt;
-                    }
-
-                    // Update type index if type changed (only when type is present in delta)
-                    if (update.data?.type !== undefined) {
-                        updateTypeIndex(existing, oldType, update.data.type);
-                    }
+                    const applied = objectApplication.applyPatch(existing, update, {
+                        arrivalTime,
+                        arrivalServerTime,
+                        validAt
+                    });
+                    updateTypeIndex(existing, applied.oldType, applied.newType);
 
                     markObjectMutation(existing.id);
                     if (callbacks.onObjectUpdated) {
@@ -918,16 +885,10 @@ const ObjectSync = (function() {
                     // Ownership and state share the object version. Applying either
                     // from an older snapshot could undo a live update/migration.
                     if (obj.version > existing.version) {
-                        const oldType = existing.data?.type;
-                        existing.creatorMemberId = obj.creatorMemberId;
-                        existing.ownerMemberId = obj.ownerMemberId;
-                        existing.scope = obj.scope;
-                        existing.data = obj.data || {};
-                        existing.version = obj.version;
-                        updateTypeIndex(existing, oldType, existing.data?.type);
-                        if (snapValidAt !== undefined && snapValidAt !== null) {
-                            existing.validAt = snapValidAt;
-                        }
+                        const applied = objectApplication.applyFull(existing, obj, {
+                            validAt: snapValidAt
+                        });
+                        updateTypeIndex(existing, applied.oldType, applied.newType);
                         lastSentData.set(existing.id, { ...existing.data });
                         markObjectMutation(existing.id);
                         // Reconciliation snapshots now carry the same validated
@@ -941,26 +902,11 @@ const ObjectSync = (function() {
                     } else if (obj.version === existing.version) {
                         // Update-first fallback objects can lack static metadata.
                         // Filling nulls is monotonic and does not overwrite live data.
-                        let changed = false;
-                        if (existing.creatorMemberId == null && obj.creatorMemberId != null) {
-                            existing.creatorMemberId = obj.creatorMemberId;
-                            changed = true;
-                        }
-                        if (existing.ownerMemberId == null && obj.ownerMemberId != null) {
-                            existing.ownerMemberId = obj.ownerMemberId;
-                            changed = true;
-                        }
-                        if (existing.scope == null && obj.scope != null) {
-                            existing.scope = obj.scope;
-                            changed = true;
-                        }
-                        if (existing.validAt === undefined
-                            && snapValidAt !== undefined
-                            && snapValidAt !== null) {
-                            existing.validAt = snapValidAt;
-                            changed = true;
-                        }
-                        if (changed) markObjectMutation(existing.id);
+                        const applied = objectApplication.backfill(existing, obj, {
+                            includeData: false,
+                            validAt: snapValidAt
+                        });
+                        if (applied.changed) markObjectMutation(existing.id);
                     }
                 } else if (pendingDeletes.has(obj.id)) {
                     // Locally deleted but server hasn't processed yet — do NOT
@@ -1050,18 +996,10 @@ const ObjectSync = (function() {
             // clamps to ±2s of its own UtcNow before forwarding as the
             // unified-axis validAt. Math.round is required (see replaceObject
             // for the float64-vs-int64 MessagePack contract details).
-            const clientValidAt = (clockSource && clockSource.initialized && clockSource.initialized())
-                ? Math.round(clockSource.nowMs())
-                : null;
-            // Positional schemas (schemaId>=1) read field names directly from
-            // the dict and have no name bytes on the wire — compression is
-            // pointless AND silently zeroes fields whose name was remapped
-            // (e.g. fieldMap angle→'a' would make schema lookup of dict.angle
-            // return undefined, clearing its bitmask bit). Apply compression
-            // only on the legacy SchemaId=0 MessagePack-dict path.
-            const createSchemaId = pickSchemaId(data, 'create');
-            const wireData = (createSchemaId === 0) ? compressData(data) : data;
-            const response = await SessionClient.createObject(wireData, scope, ownerMemberId, clientValidAt, createSchemaId);
+            const clientValidAt = getClientValidAt();
+            const wire = prepareWirePayload(data, 'create');
+            const response = await SessionClient.createObject(
+                wire.data, scope, ownerMemberId, clientValidAt, wire.schemaId);
             if (!isAsyncContextCurrent(context)) return null;
             if (!response || !response.objectInfo) return null;
 
@@ -1116,13 +1054,10 @@ const ObjectSync = (function() {
         const context = captureAsyncContext();
 
         try {
-            // Positional schemas have no name bytes on the wire — compression
-            // would silently zero out remapped fields. See createObject.
-            const compressedReplacements = replacements.map((r, i) => {
-                const rid = pickSchemaId(r, 'replace');
-                return (rid === 0) ? compressData(r) : r;
-            });
-            const replacementSchemaIds = replacements.map(r => pickSchemaId(r, 'replace'));
+            const wireReplacements = replacements.map(replacement =>
+                prepareWirePayload(replacement, 'replace'));
+            const replacementData = wireReplacements.map(replacement => replacement.data);
+            const replacementSchemaIds = wireReplacements.map(replacement => replacement.schemaId);
             // Stamp the owner's best server-time estimate at replacement invoke
             // (normally the collision path, after replacement data is built).
             // Server clamps to ±2s of its own UtcNow before forwarding as the
@@ -1137,11 +1072,9 @@ const ObjectSync = (function() {
             // "Type mismatch", causing the entire ReplaceObject invocation to
             // throw — leaving the asteroid undeletable. Rounding to an integer
             // forces MessagePack to encode as int64.
-            const clientValidAt = (clockSource && clockSource.initialized && clockSource.initialized())
-                ? Math.round(clockSource.nowMs())
-                : null;
+            const clientValidAt = getClientValidAt();
             const createdInfos = await SessionClient.replaceObject(
-                deleteObjectId, compressedReplacements, scope, ownerMemberId, clientValidAt, replacementSchemaIds);
+                deleteObjectId, replacementData, scope, ownerMemberId, clientValidAt, replacementSchemaIds);
             if (!isAsyncContextCurrent(context)) return null;
             // Objects will be added/removed via the onObjectReplaced event
             return createdInfos;
@@ -1365,9 +1298,7 @@ const ObjectSync = (function() {
         // anchor rather than an exact timestamp for each simulation pose.
         // Server clamps to ±2s and applies per-object monotonicity.
         // Math.round is required (see replaceObject for MessagePack int64 contract).
-        const clientValidAt = (clockSource && clockSource.initialized && clockSource.initialized())
-            ? Math.round(clockSource.nowMs())
-            : null;
+        const clientValidAt = getClientValidAt();
         // Compress field names for the wire — game logic stays readable.
         // Phase 4: each update carries its own schemaId so heterogeneous
         // batches (mix of asteroid update + ship full-sync, for example)
@@ -1383,12 +1314,11 @@ const ObjectSync = (function() {
         // the legacy SchemaId=0 MessagePack-dict path.
         const wireUpdates = updates.map(u => {
             const ctx = { objectId: u.objectId, object: objects.get(u.objectId) };
-            const schemaId = pickSchemaId(u.data, 'update', ctx);
-            const data = (schemaId === 0) ? compressData(u.data) : u.data;
+            const wire = prepareWirePayload(u.data, 'update', ctx);
             return {
                 objectId: u.objectId,
-                data,
-                schemaId
+                data: wire.data,
+                schemaId: wire.schemaId
             };
         });
         if (!isAsyncContextCurrent(context)) {
@@ -1633,9 +1563,7 @@ const ObjectSync = (function() {
             }
         }
 
-        const validAt = clockSource && typeof clockSource.nowMs === 'function'
-            ? Math.round(clockSource.nowMs())
-            : null;
+        const validAt = getClientValidAt();
         const wirePayload = MsgpackCodec.encode(compressData(payload || {}));
         return SessionClient.broadcastObjectEvent(
             objectId, kindByte, wirePayload, validAt);

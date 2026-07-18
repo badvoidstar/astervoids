@@ -3,7 +3,6 @@ using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Models;
 using AstervoidsWeb.Services;
 using MessagePack;
-using MessagePack.Resolvers;
 using Microsoft.AspNetCore.SignalR;
 
 namespace AstervoidsWeb.Hubs;
@@ -65,11 +64,7 @@ public class SessionHub : Hub
     /// serialized payload sizes for bandwidth tracking.
     /// </summary>
     private static readonly MessagePackSerializerOptions _estimatorOptions =
-        MessagePackSerializerOptions.Standard
-            .WithResolver(CompositeResolver.Create(
-                BinaryGuidResolver.Instance,
-                ContractlessStandardResolver.Instance))
-            .WithSecurity(MessagePackSecurity.UntrustedData);
+        AstervoidsMessagePack.Options;
 
     /// <summary>
     /// Estimates the serialized byte size of hub method arguments using MessagePack.
@@ -201,12 +196,7 @@ public class SessionHub : Hub
 
         if (departure is { RemainingMemberIds.Count: > 0 })
         {
-            var departureInfo = new MemberLeftInfo(
-                departure.MemberId,
-                departure.PromotedMember?.Id,
-                departure.PromotedMember?.Role,
-                departure.DeletedObjectIds,
-                departure.MigratedObjects);
+            var departureInfo = ToMemberLeftInfo(departure);
             try
             {
                 await BroadcastToAllAsync(
@@ -490,13 +480,7 @@ public class SessionHub : Hub
                     session.Id);
             }
 
-            var evictionInfo = new MemberLeftInfo(
-                eviction.EvictedMemberId,
-                eviction.PromotedMember?.Id,
-                eviction.PromotedMember?.Role,
-                eviction.DeletedObjectIds,
-                eviction.MigratedObjects
-            );
+            var evictionInfo = ToMemberLeftInfo(eviction);
             // The new joiner isn't in the SignalR group yet, so excluding member.Id
             // matches the actual delivery set and keeps RX accounting accurate.
             try
@@ -638,13 +622,7 @@ public class SessionHub : Hub
             // Promotion info and object disposal are all in the single LeaveSessionResult,
             // captured atomically by the service. The leaver has already been removed
             // from session.Members, so session.Members.Keys == result.RemainingMemberIds.
-            var departureInfo = new MemberLeftInfo(
-                result.MemberId,
-                result.PromotedMember?.Id,
-                result.PromotedMember?.Role,
-                result.DeletedObjectIds,
-                result.MigratedObjects
-            );
+            var departureInfo = ToMemberLeftInfo(result);
             var session = _sessionService.GetSession(result.SessionId);
             if (session != null)
             {
@@ -844,7 +822,7 @@ public class SessionHub : Hub
             // ValidAt is a single batch-level trailing argument: every object in
             // this batch was sampled at the same owner tick and shares the same
             // server-validated value. Read it from any updated object — they're
-            // all equal after ValidateValidAt collapses to the call-level input.
+            // all equal after ValidAtPolicy collapses to the call-level input.
             var batchValidAt = updatedObjects[0].ValidAt;
 
             await BroadcastToOthersAsync(session, member.Id, "OnObjectsUpdated",
@@ -1049,13 +1027,7 @@ public class SessionHub : Hub
             memberSequence = Interlocked.Increment(ref currentMember.EventSequence);
         }
 
-        // Inline ±2s clamp (events don't go through ObjectService.ValidateValidAt).
-        long validAt = serverTimestamp;
-        if (clientValidAt.HasValue)
-        {
-            var diff = clientValidAt.Value - serverTimestamp;
-            if (diff >= -2000 && diff <= 2000) validAt = clientValidAt.Value;
-        }
+        var validAt = ValidAtPolicy.Resolve(clientValidAt, serverTimestamp);
 
         var eventInfo = new ObjectEventInfo(
             objectId,
@@ -1113,6 +1085,25 @@ public class SessionHub : Hub
 
         await base.OnDisconnectedAsync(exception);
     }
+
+    /// <summary>
+    /// Maps an atomic service departure result to the hub wire contract.
+    /// </summary>
+    private static MemberLeftInfo ToMemberLeftInfo(LeaveSessionResult departure) =>
+        new(
+            departure.MemberId,
+            departure.PromotedMember?.Id,
+            departure.PromotedMember?.Role,
+            departure.DeletedObjectIds,
+            departure.MigratedObjects);
+
+    private static MemberLeftInfo ToMemberLeftInfo(EvictionInfo eviction) =>
+        new(
+            eviction.EvictedMemberId,
+            eviction.PromotedMember?.Id,
+            eviction.PromotedMember?.Role,
+            eviction.DeletedObjectIds,
+            eviction.MigratedObjects);
 
     /// <summary>
     /// Atomically increments and returns the next event sequence number for a member.

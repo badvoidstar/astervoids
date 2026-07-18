@@ -3,9 +3,7 @@
  *
  * Run with:  node --test AstervoidsWeb/split-physics.test.mjs
  *
- * The pure math from splitAsteroid() is mirrored here so the tests are
- * independent of the browser environment. Each test operates on randomized
- * or targeted impact geometries.
+ * The tests execute the same pure split calculation used by the browser.
  *
  * Model: two **independent** knobs (no shared bullet-energy budget).
  *   • DEFLECTION_KICK    — head-on parent COM Δv (refdim/s); J = M·v_kick·d̂
@@ -17,7 +15,7 @@
  *   3. Energy decomposition (rest frame):
  *        Σ ½(m_i|v_i|²+I_i ω_i²) = ½·M·v_kick²·(1+2b²/R²) + E_sep   (~1e-10)
  *   4. Head-on hit  (offsetN = 0)   → f_small = f_large = 0.5
- *   5. Grazing hit  (|offsetN| = 1) → f_small = MIN_SPLIT_RATIO
+ *   5. Grazing hit  (|offsetN| = 1) → f_small follows MASS_SPLIT_BIAS
  *   6. One-child branch: rSmall < MIN_RADIUS → exactly one child, carrying v', ω'
  *   7. Density scaling: deflection & spin are density-INDEPENDENT (velocity kick),
  *      separation alone scales as 1/√density.
@@ -31,114 +29,36 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
-// ─── Mirror of splitAsteroid's pure math ────────────────────────────────────
-// Keep these constants and formulas in sync with AstervoidsWeb/wwwroot/index.html.
+const require = createRequire(import.meta.url);
+const { SHARED_DEFAULTS } = require('./wwwroot/js/game-config.js');
+const {
+    calculateAsteroidFragments,
+    effectiveSeparationEnergy,
+} = require('./wwwroot/js/asteroid-fracture.js');
 
-const CONFIG = {
-    DEFLECTION_KICK: 1e-3,
-    SEPARATION_ENERGY: 1e-4,
-    MIN_SPLIT_RATIO: 0.1,
-    MIN_ASTEROID_RADIUS: 0.025,
-    INITIAL_ASTEROID_RADIUS: 0.083,
-    ASTEROID_DENSITY: 5.0,
-    SEPARATION_ENERGY_SIZE_BLEND: 0.0,
-    MASS_SPLIT_BIAS: 1.0,
-};
+const CONFIG = SHARED_DEFAULTS;
 
-/** Effective separation energy after the size-blend mapping. */
 function effectiveEsep(R, cfg = CONFIG) {
-    const blend = Math.max(0, Math.min(1, cfg.SEPARATION_ENERGY_SIZE_BLEND));
-    const Rref  = cfg.INITIAL_ASTEROID_RADIUS;
-    const sizeMul = (1 - blend) + blend * (R / Rref) * (R / Rref);
-    return Math.max(0, cfg.SEPARATION_ENERGY) * sizeMul;
+    return effectiveSeparationEnergy(R, cfg);
 }
 
-/**
- * Core fragmentation math, extracted from splitAsteroid().
- * Returns an array of child descriptors: { r, m, vx, vy, omega, posX, posY }
- * where posX/posY are offsets from the parent COM along the separation axis.
- */
 function fragment(R, vx, vy, omega, offsetN, bulletAngle, cfg = CONFIG) {
-    // Clamp offsetN.
-    offsetN = Math.max(-1, Math.min(1, offsetN));
-
-    // Bullet direction d̂ and separation normal n̂ = d̂ rotated +90°.
-    const dx = Math.cos(bulletAngle), dy = Math.sin(bulletAngle);
-    const nx = -dy, ny = dx;
-
-    // Disk: M = ρ·R², I = ½MR².
-    const density = cfg.ASTEROID_DENSITY;
-    const M = density * R * R;
-    const I = 0.5 * M * R * R;
-
-    // Impact point r relative to parent COM.
-    const b   = offsetN * R;
-    const rxN = b;
-    const rxD = -Math.sqrt(Math.max(0, R * R - b * b));
-    const rx  = rxD * dx + rxN * nx;
-    const ry  = rxD * dy + rxN * ny;
-
-    // Bullet impulse: J = M · v_kick along d̂. Independent of E_sep.
-    const vKick = Math.max(0, cfg.DEFLECTION_KICK);
-    const Jmag  = M * vKick;
-    const Jx = Jmag * dx, Jy = Jmag * dy;
-
-    // Post-impulse parent state.
-    const vxP    = vx + Jx / M;
-    const vyP    = vy + Jy / M;
-    const torque = rx * Jy - ry * Jx;
-    const omegaP = omega + torque / I;
-
-    // Separation energy (independent knob, with size blend).
-    const E_sep = effectiveEsep(R, cfg);
-
-    // Mass split.
-    const minRatio = Math.max(0.01, Math.min(0.5, cfg.MIN_SPLIT_RATIO));
-    const massBias = Math.max(0, Math.min(1, cfg.MASS_SPLIT_BIAS ?? 1));
-    const fSmall   = Math.max(minRatio, 0.5 * (1 - massBias * Math.abs(offsetN)));
-    const fLarge   = 1 - fSmall;
-
-    const rSmall = R * Math.sqrt(fSmall);
-    const rLarge = R * Math.sqrt(fLarge);
-    const mSmall = fSmall * M;
-    const mLarge = fLarge * M;
-
-    // Separation axis.
-    const sideSign = offsetN >= 0 ? 1 : -1;
-    const sx = sideSign * nx, sy = sideSign * ny;
-
-    if (rSmall < cfg.MIN_ASTEROID_RADIUS) {
-        // Single child: large fragment carries post-impulse motion.
-        return [{ r: rLarge, m: mLarge, vx: vxP, vy: vyP, omega: omegaP, posX: 0, posY: 0 }];
-    }
-
-    // AM-conserving placement: d_s = R·f_l, d_l = -R·f_s.
-    const dSmall = +R * fLarge;
-    const dLarge = -R * fSmall;
-
-    // Inherited rigid velocity at each COM.
-    const rigidVelocityAt = (d) => ({
-        vx: vxP + (-omegaP) * (d * sy),
-        vy: vyP + ( omegaP) * (d * sx),
-    });
-    const vS = rigidVelocityAt(dSmall), vL = rigidVelocityAt(dLarge);
-
-    // Separation impulse.
-    const s = E_sep > 0 ? Math.sqrt(2 * E_sep * mLarge / (mSmall * M)) : 0;
-
-    return [
-        {
-            r: rSmall, m: mSmall,
-            vx: vS.vx + s * sx,                     vy: vS.vy + s * sy,                     omega: omegaP,
-            posX: dSmall * sx, posY: dSmall * sy,
-        },
-        {
-            r: rLarge, m: mLarge,
-            vx: vL.vx - s * sx * (mSmall / mLarge), vy: vL.vy - s * sy * (mSmall / mLarge), omega: omegaP,
-            posX: dLarge * sx, posY: dLarge * sy,
-        },
-    ];
+    const result = calculateAsteroidFragments({
+        radius: R,
+        velocityX: vx,
+        velocityY: vy,
+        rotationSpeed: omega,
+        angle: 0,
+        seed: 0,
+        vertices: [],
+    }, { offsetN, bulletAngle }, { ...cfg, FRACTURE_ENABLED: false });
+    return result.children.map(child => ({
+        ...child,
+        posX: child.cx,
+        posY: child.cy,
+    }));
 }
 
 /** Compute total children quantities for a given scenario. */
@@ -275,14 +195,18 @@ test('head-on hit (offsetN=0) → f_small = f_large = 0.5', () => {
     assert.ok(Math.abs(c1.r - expected) < 1e-12, `c1.r = ${c1.r}, expected ${expected}`);
 });
 
-// ─── Test 5: Grazing → skewed split ─────────────────────────────────────────
-test('grazing hit (|offsetN|=1) → f_small = MIN_SPLIT_RATIO', () => {
-    const minRatio = CONFIG.MIN_SPLIT_RATIO;
-
+// ─── Test 5: Grazing → configured skew ──────────────────────────────────────
+test('grazing hit (|offsetN|=1) applies the configured mass split bias', () => {
+    const R = 0.12;
+    const totalMass = CONFIG.ASTEROID_DENSITY * R * R;
+    const expectedFraction = Math.max(
+        CONFIG.MIN_SPLIT_RATIO,
+        0.5 * (1 - CONFIG.MASS_SPLIT_BIAS));
     for (const sign of [1, -1]) {
-        const fSmall = Math.max(minRatio, 0.5 * (1 - Math.abs(sign)));
-        assert.strictEqual(fSmall, minRatio,
-            `offsetN=${sign}: expected fSmall=${minRatio}, got ${fSmall}`);
+        const children = fragment(R, 0, 0, 0, sign, 0);
+        const observedFraction = Math.min(...children.map(child => child.m)) / totalMass;
+        assert.ok(Math.abs(observedFraction - expectedFraction) < 1e-12,
+            `offsetN=${sign}: expected fSmall=${expectedFraction}, got ${observedFraction}`);
     }
 });
 
@@ -293,7 +217,8 @@ test('one-child branch: when rSmall < MIN_RADIUS, exactly one child with v\', ω
     const offsetN = 1.0;
     const angle   = Math.PI / 4;
 
-    const children = fragment(R, vx, vy, omega0, offsetN, angle);
+    const cfg = { ...CONFIG, MASS_SPLIT_BIAS: 1 };
+    const children = fragment(R, vx, vy, omega0, offsetN, angle, cfg);
     assert.strictEqual(children.length, 1, `expected 1 child, got ${children.length}`);
 
     const M  = CONFIG.ASTEROID_DENSITY * R * R;

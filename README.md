@@ -51,15 +51,15 @@ This will:
 
 ### Iterative Development Workflow
 
-| Action | Command | Time |
-|--------|---------|------|
-| **Deploy code changes** | `azd deploy` | ~24 sec |
-| **Update infrastructure** | `azd provision` | ~1 min |
-| **Full provision + deploy** | `azd up` | ~2 min |
-| **View logs** | `azd monitor --logs` | - |
-| **Open in portal** | `azd monitor` | - |
-| **Show deployment info** | `azd show` | - |
-| **Delete all resources** | `azd down --force --purge` | - |
+| Action | Command |
+|--------|---------|
+| **Deploy code changes** | `azd deploy` |
+| **Update infrastructure** | `azd provision` |
+| **Full provision + deploy** | `azd up` |
+| **View logs** | `azd monitor --logs` |
+| **Open in portal** | `azd monitor` |
+| **Show deployment info** | `azd show` |
+| **Delete all resources** | `azd down --force --purge` |
 
 ### Quick Deploy After Code Changes
 
@@ -67,7 +67,7 @@ This will:
 azd deploy
 ```
 
-That's it! Your changes will be live in about 24 seconds.
+Deployment time varies with image build, registry, and Azure provisioning state.
 
 ## Azure Resources Created
 
@@ -76,7 +76,7 @@ That's it! Your changes will be live in about 24 seconds.
 | Resource Group | `rg-{env}` | Container for all resources |
 | Container Registry | `cr{env}{unique}` | Stores Docker images |
 | Container Apps Environment | `cae-{env}` | Managed environment for containers |
-| Container App | `ca-web-{env}` | Runs the game (scales 0-3 replicas) |
+| Container App | `ca-web-{env}` | Runs the game; scaling limits are defined in [`infra/main.bicep`](infra/main.bicep) |
 | Log Analytics | `log-cae-{env}` | Logging and monitoring |
 
 ## Project Structure

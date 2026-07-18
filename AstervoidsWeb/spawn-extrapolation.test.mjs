@@ -27,12 +27,13 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
+const { SHARED_DEFAULTS } = require('./wwwroot/js/game-config.js');
 const { createSnapshotInterpolationPolicy } = require(
     './wwwroot/js/replication-presentation.js');
 
 const CONFIG = {
-    MAX_EXTRAPOLATION: 1.0,   // seconds
-    TARGET_FPS: 60,           // angle units are per-frame; rotationSpeed × TARGET_FPS = rad/sec
+    MAX_EXTRAPOLATION: SHARED_DEFAULTS.MAX_EXTRAPOLATION,
+    TARGET_FPS: SHARED_DEFAULTS.TARGET_FPS,
 };
 
 // ── Pure-logic mirrors of RemoteObjects helpers ───────────────────────────
@@ -119,18 +120,18 @@ test('computeSpawnStaleness: validAt in future returns negative seconds', () => 
     assert.equal(computeSpawnStaleness(1500, 1700), -0.2);
 });
 
-test('computeSpawnStaleness: clamps at +MAX_EXTRAPOLATION (1.0s)', () => {
-    // 5s of staleness → clamped to 1.0s.
-    assert.equal(computeSpawnStaleness(6000, 1000), 1.0);
+test('computeSpawnStaleness: clamps at +MAX_EXTRAPOLATION', () => {
+    assert.equal(computeSpawnStaleness(6000, 1000), CONFIG.MAX_EXTRAPOLATION);
 });
 
-test('computeSpawnStaleness: clamps at -MAX_EXTRAPOLATION (-1.0s)', () => {
-    assert.equal(computeSpawnStaleness(1000, 6000), -1.0);
+test('computeSpawnStaleness: clamps at -MAX_EXTRAPOLATION', () => {
+    assert.equal(computeSpawnStaleness(1000, 6000), -CONFIG.MAX_EXTRAPOLATION);
 });
 
 test('computeSpawnStaleness: at exactly the cap returns the cap', () => {
-    assert.equal(computeSpawnStaleness(2000, 1000), 1.0);
-    assert.equal(computeSpawnStaleness(1000, 2000), -1.0);
+    const capMs = CONFIG.MAX_EXTRAPOLATION * 1000;
+    assert.equal(computeSpawnStaleness(1000 + capMs, 1000), CONFIG.MAX_EXTRAPOLATION);
+    assert.equal(computeSpawnStaleness(1000, 1000 + capMs), -CONFIG.MAX_EXTRAPOLATION);
 });
 
 // ── projectSpawnData ──────────────────────────────────────────────────────
@@ -193,10 +194,10 @@ test('compose: spawn projection uses clamped staleness', () => {
     const data = { x: 0, y: 0, velocityX: 100, velocityY: 0 };
 
     const staleness = computeSpawnStaleness(serverNow, validAt);
-    assert.equal(staleness, 1.0, 'staleness clamped to 1s');
+    assert.equal(staleness, CONFIG.MAX_EXTRAPOLATION);
 
     const projected = projectSpawnDataNoWrap(data, staleness);
-    assert.equal(projected.x, 100, 'projection capped at 1s of motion (100 units), not 1000');
+    assert.equal(projected.x, 100 * CONFIG.MAX_EXTRAPOLATION);
 });
 
 // ── Single-snapshot velocity extrapolation (production fallback path) ─────
@@ -223,10 +224,10 @@ test('singleSnapExtrapolate: forward extrapolation includes rotation', () => {
     assert.equal(result.angle, 3.5);
 });
 
-test('singleSnapExtrapolate: cap at MAX_EXTRAPOLATION (1.0s) prevents runaway', () => {
+test('singleSnapExtrapolate: cap at MAX_EXTRAPOLATION prevents runaway', () => {
     const snap = makeSnap({ x: 0, y: 0, velocityX: 100, velocityY: 0, angle: 0, rotationSpeed: 0 }, 1000);
-    const result = singleSnapExtrapolate(snap, 6000); // 5s past — should clamp to 1s
-    assert.equal(result.x, 100, 'x capped at 1s of motion (100 units), not 500');
+    const result = singleSnapExtrapolate(snap, 6000);
+    assert.equal(result.x, 100 * CONFIG.MAX_EXTRAPOLATION);
 });
 
 test('singleSnapExtrapolate: returns null for null snap', () => {
@@ -292,10 +293,10 @@ test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected
     const validAt = 1000;
     const serverNow = 9000; // 8s idle
     const staleness = computeSpawnStaleness(serverNow, validAt);
-    assert.equal(staleness, 1.0, 'clamps to MAX_EXTRAPOLATION');
+    assert.equal(staleness, CONFIG.MAX_EXTRAPOLATION);
     const data = { x: 0.5, y: 0, velocityX: 200, velocityY: 0, angle: 0, rotationSpeed: 0 };
     const projected = projectSpawnDataNoWrap(data, staleness);
-    assert.equal(projected.x, 200.5, 'WOULD jump forward by 1s of velocity if projected');
+    assert.equal(projected.x, 0.5 + 200 * CONFIG.MAX_EXTRAPOLATION);
     // The gate prevents this: runtime identifies an initial snapshot record.
     assert.equal(shouldSpawnProject(
         { id: 'orphan-idle', validAt },
