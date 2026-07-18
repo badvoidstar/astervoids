@@ -143,14 +143,14 @@ test('wrap detection compares against the immediately previous frame while suppr
     assert.equal(gate.shouldSend('a', 0.0, 0.5, 0, 0.02, 0, 0), true);
 });
 
-// ── mode gating (legacy unaffected) ─────────────────────────────────────────
-test('legacy mode always sends (suppression is deterministic-only)', () => {
+// ── mode gating (buffered unaffected) ───────────────────────────────────────
+test('buffered mode always sends (suppression is deterministic-only)', () => {
     const clock = makeClock();
     const gate = makeGate(clock, /* deterministic */ false);
     assert.equal(gate.shouldSend('a', 0.0, 0.5, 0, 0.02, 0, 0), true);
     clock.advance(16);
     assert.equal(gate.shouldSend('a', 0.01, 0.5, 0, 0.02, 0, 0), true);
-    assert.equal(gate.baselines.size, 0, 'legacy path never tracks baselines');
+    assert.equal(gate.baselines.size, 0, 'buffered path never tracks baselines');
 });
 
 test('disabling SEND_ON_CHANGE_ENABLED always sends', () => {

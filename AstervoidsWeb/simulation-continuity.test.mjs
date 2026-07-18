@@ -1273,7 +1273,7 @@ test('production migration gating skips ownership-only versions only after repli
     // runtime through an equivalent single-model presentation stub — one
     // fresh runtime per mode — to confirm the same skip/preserve-direction
     // sequence the old inline beginReplicationVersion/finishReplicationVersion
-    // pair used to produce, in both deterministic and legacy mode.
+    // pair used to produce, in both deterministic and buffered mode.
     function runMigrationScenario() {
         const states = new Map();
         const ingestLog = [];

@@ -198,7 +198,7 @@ test('force=true always sends and re-baselines, even with identical intent', () 
 });
 
 // ── disabled / non-deterministic fall-through ───────────────────────────────
-test('always sends when deterministic mode is off (legacy wire unchanged)', () => {
+test('always sends when deterministic mode is off (buffered wire unchanged)', () => {
     const clock = makeClock();
     const gate = makeGate(clock, /* deterministic */ false);
     for (let i = 0; i < 5; i++) {

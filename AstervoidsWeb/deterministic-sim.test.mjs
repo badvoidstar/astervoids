@@ -10,14 +10,14 @@ const { createDeadReckoningPolicy } = require(
 // exercises the importable production presentation policy directly.
 
 // ── Mode normalization (mirrors normalizeSimMode) ───────────────────────────
-const SIM_MODES = { LEGACY: 'legacy', DETERMINISTIC: 'deterministic' };
+const SIM_MODES = { BUFFERED: 'buffered', DETERMINISTIC: 'deterministic' };
 const VALID_SIM_MODES = new Set(Object.values(SIM_MODES));
 function normalizeSimMode(raw) {
     if (typeof raw === 'string') {
         const n = raw.toLowerCase();
         if (VALID_SIM_MODES.has(n)) return n;
     }
-    return SIM_MODES.LEGACY;
+    return SIM_MODES.BUFFERED;
 }
 
 // ── Seeded RNG (mirrors makeSeededRandom + simRng) ──────────────────────────
@@ -81,13 +81,15 @@ function reckon(state, nowPerf, stepMs, maxFrames, velToDeltaX, velToDeltaY) {
 
 // ───────────────────────────────── tests ───────────────────────────────────
 
-test('normalizeSimMode: accepts known modes case-insensitively, defaults legacy', () => {
+test('normalizeSimMode: accepts known modes case-insensitively, defaults buffered', () => {
     assert.equal(normalizeSimMode('deterministic'), 'deterministic');
     assert.equal(normalizeSimMode('DETERMINISTIC'), 'deterministic');
-    assert.equal(normalizeSimMode('legacy'), 'legacy');
-    assert.equal(normalizeSimMode('nonsense'), 'legacy');
-    assert.equal(normalizeSimMode(undefined), 'legacy');
-    assert.equal(normalizeSimMode(42), 'legacy');
+    assert.equal(normalizeSimMode('buffered'), 'buffered');
+    assert.equal(normalizeSimMode('BUFFERED'), 'buffered');
+    assert.equal(normalizeSimMode('legacy'), 'buffered');
+    assert.equal(normalizeSimMode('nonsense'), 'buffered');
+    assert.equal(normalizeSimMode(undefined), 'buffered');
+    assert.equal(normalizeSimMode(42), 'buffered');
 });
 
 test('seeded RNG: same seed yields identical sequence (reproducible)', () => {
@@ -565,15 +567,15 @@ test('migration: clearing dead-reckon state lets local simulation move the objec
         'local simulation advances the object once it is no longer dead-reckoned');
 });
 
-// ── Legacy game over: ease onto the shared snapshot without a pop ────────────
+// ── Buffered game over: ease onto the shared snapshot without a pop ──────────
 //
-// Legacy remotes render from RemoteObjects.getInterpolated at
+// Buffered remotes render from RemoteObjects.getInterpolated at
 // (renderTime - adaptiveDelay): a per-member delay, so each member displays the
 // object at a different offset from the authoritative snapshot. At game over the
 // owner stops sending. Pinning straight to the snapshot (getSettling) converges
 // every member but POPS, because game over is detected ~one round-trip after the
 // final snapshot, by which point each replica has drifted off it. So
-// repositionLegacyRemotesAtRest EASES the visible transform toward the snapshot
+// repositionBufferedRemotesAtRest EASES the visible transform toward the snapshot
 // with a frame-rate-independent exponential decay: the first game-over frame
 // doesn't move (k = 0), then every member glides onto the identical shared pose
 // and holds. Mirror models below.
@@ -581,7 +583,7 @@ test('migration: clearing dead-reckon state lets local simulation move the objec
 // Per-member view of one object: a stream of snapshots + an interpolation delay.
 // displayed(now) is the (delayed) pose the member currently shows; target() is
 // the shared authoritative snapshot all members must converge to.
-function makeLegacyRemote(delayMs) {
+function makeBufferedRemote(delayMs) {
     const snaps = []; // { t, x }
     return {
         push: (t, x) => snaps.push({ t, x }),
@@ -603,7 +605,7 @@ function makeLegacyRemote(delayMs) {
     };
 }
 
-// Mirror of repositionLegacyRemotesAtRest's frame-rate-independent ease (1-D).
+// Mirror of repositionBufferedRemotesAtRest's frame-rate-independent ease (1-D).
 // k = 1 - exp(-dt/tau); pose += (target - pose) * k. First frame dt = 0 ⇒ k = 0.
 function makeSettler(startPose, tau) {
     let pose = startPose;
@@ -619,14 +621,14 @@ function makeSettler(startPose, tau) {
     };
 }
 
-test('legacy game over: members ease onto one shared pose, no first-frame pop', () => {
+test('buffered game over: members ease onto one shared pose, no first-frame pop', () => {
     const stepMs = 1000 / 60;
     const vx = 0.01; // per ms
     const tau = 140;
     // Two members observe the SAME snapshots but with different interpolation
     // delays, so they DISPLAY the object at different poses (the divergence).
-    const a = makeLegacyRemote(2 * stepMs);
-    const b = makeLegacyRemote(9 * stepMs);
+    const a = makeBufferedRemote(2 * stepMs);
+    const b = makeBufferedRemote(9 * stepMs);
     const lastSentT = 20 * stepMs;
     for (let t = 0; t <= lastSentT; t += stepMs) { a.push(t, vx * t); b.push(t, vx * t); }
 
@@ -653,7 +655,7 @@ test('legacy game over: members ease onto one shared pose, no first-frame pop', 
     assert.ok(Math.abs(sa.get() - sb.get()) < 1e-9, 'both members converge to the identical pose');
 });
 
-test('legacy game over settle: motion is monotonic toward the target (no overshoot)', () => {
+test('buffered game over settle: motion is monotonic toward the target (no overshoot)', () => {
     const tau = 140, stepMs = 1000 / 60, target = 1.0;
     const s = makeSettler(0, tau);
     let prev = s.step(0, target); // k=0 → stays at 0
@@ -666,13 +668,13 @@ test('legacy game over settle: motion is monotonic toward the target (no oversho
     }
 });
 
-// ── Legacy game over: keep ingesting the owner's late snapshots ──────────────
+// ── Buffered game over: keep ingesting the owner's late snapshots ────────────
 //
 // When the GameState owner is a DIFFERENT member from the object's owner, the
 // owner keeps simulating and broadcasting after the fatal collision until it
 // itself learns of game over (a round-trip later). The gameplay sync pass that
 // feeds RemoteObjects is gated by lives > 0, so each member stops ingesting at
-// the moment ITS own lives hit 0 — a per-member time. The legacy settle pass
+// the moment ITS own lives hit 0 — a per-member time. The buffered settle pass
 // keeps ingesting ObjectSync's latest version so members converge to the same
 // final snapshot. Deterministic terminal convergence is covered by
 // terminal-convergence.test.mjs against the production presentation helpers.
@@ -709,7 +711,7 @@ function makeMember(syncStub) {
     };
 }
 
-test('legacy game over: late owner snapshots are re-ingested so members converge', () => {
+test('buffered game over: late owner snapshots are re-ingested so members converge', () => {
     const sync = makeObjectSyncStub();
     const a = makeMember(sync); // stops its gameplay ingest early (lives hit 0 first)
     const b = makeMember(sync); // stops its gameplay ingest later
