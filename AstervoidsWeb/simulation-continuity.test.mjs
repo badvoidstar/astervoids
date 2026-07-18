@@ -12,6 +12,8 @@ const replicationClockSource = readFileSync(
     resolve(here, 'wwwroot/js/replication-clock.js'),
     'utf8');
 const { createRuntime } = require('./wwwroot/js/replication-runtime.js');
+const { integrateRateAngularPredictionFrames } = require(
+    './wwwroot/js/replication-presentation.js');
 
 function extractProductionFunction(name, nextName) {
     const start = productionSource.indexOf(`    function ${name}(`);
@@ -36,7 +38,10 @@ const FRAME_MS = 1000 / 60;
 const HEARTBEAT_FRAMES = 15;
 const HEARTBEAT_MS = HEARTBEAT_FRAMES * FRAME_MS;
 const POSITION_CAP_FRAMES = 30;
-const SHIP_ANGULAR_CAP_FRAMES = 10;
+const SHIP_RATE_WINDOW = {
+    fullFrames: HEARTBEAT_FRAMES,
+    taperFrames: 6,
+};
 const SMOOTH_MS = 90;
 const SHIP = {
     TARGET_FPS: 60,
@@ -1075,8 +1080,11 @@ function runOrderedStallCase(networkCase, stallProfile) {
     const maxLeadFrames = Math.max(0, framesFromMs(changeArrival - change.validAtMs));
     const cappedLeadFrames = Math.min(maxLeadFrames, POSITION_CAP_FRAMES);
     assert.ok(cappedLeadFrames <= POSITION_CAP_FRAMES + EPS, 'positional cap remains bounded');
-    const shipAngularLeadFrames = Math.min(maxLeadFrames, SHIP_ANGULAR_CAP_FRAMES);
-    assert.ok(shipAngularLeadFrames <= SHIP_ANGULAR_CAP_FRAMES + EPS, 'ship angular cap remains bounded');
+    const shipAngularLeadFrames = integrateRateAngularPredictionFrames(
+        Math.min(maxLeadFrames, POSITION_CAP_FRAMES),
+        SHIP_RATE_WINDOW);
+    assert.ok(shipAngularLeadFrames <= POSITION_CAP_FRAMES + EPS,
+        'adaptive ship angular prediction remains globally bounded');
 }
 
 function runCollisionAckCase(networkCase, stallProfile) {

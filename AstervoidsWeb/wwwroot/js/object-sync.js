@@ -612,13 +612,13 @@ const ObjectSync = (function() {
         objectInfo.data = expandData(objectInfo.data);
 
         // Capture wire-arrival metadata in the performance.now() domain.
-        // Current game presentation keys legacy samples by validAt and normal
+        // Current game presentation keys buffered samples by validAt and normal
         // deterministic ingest at game-loop observation time; arrivalTime is
         // retained on the object for diagnostics/future explicit baselines.
         const arrivalTime = (typeof performance !== 'undefined' && performance.now)
             ? performance.now()
             : Date.now();
-        // Server-time twin used by legacy lag-based delay sizing. Capturing at
+        // Server-time twin used by buffered lag-based delay sizing. Capturing at
         // dispatch excludes later game-loop polling from that measurement.
         const arrivalServerTime = getArrivalServerTimeMs();
 
@@ -681,7 +681,7 @@ const ObjectSync = (function() {
     /**
      * Handle a remote update batch (self echo is eliminated).
      * `validAt` is one server-validated owner FLUSH timestamp fanned out to all
-     * updated objects. It gives legacy interpolation a common monotonic axis,
+     * updated objects. It gives buffered interpolation a common monotonic axis,
      * but does not recover when each coalesced pose was originally simulated.
      *
      * @param {number} serverTimestamp - Hub-entry ms (used for batch metrics)

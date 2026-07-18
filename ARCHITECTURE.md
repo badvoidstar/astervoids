@@ -946,6 +946,16 @@ the same as buffered BUF (render delay), and it is not a packet guarantee:
 game-layer send-on-change gates may queue nothing, while in-flight backpressure
 can coalesce multiple simulation frames into a later batch.
 
+Deterministic ship rotation uses two presentation paths. Target-heading touch
+controls replay toward their transmitted target angle and cannot turn past it.
+Keyboard rate controls replay continuously through the greater of the 250 ms
+ship heartbeat, the owner's advertised send interval, and its observed packet
+interval. A jitter margin extends that full-rate horizon; if the next packet is
+late, angular input tapers linearly to zero within the global 30-frame
+dead-reckoning bound. Immediate start, stop, and reversal edges still request a
+throttle-bypassing send, and ordinary shortest-angle correction absorbs
+remaining prediction error when the authoritative packet arrives.
+
 ```mermaid
 flowchart TB
     subgraph "Per-Member BUF Calculation"

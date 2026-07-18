@@ -64,7 +64,6 @@ function reckon(state, nowPerf, stepMs, maxFrames, velToDeltaX, velToDeltaY) {
         config: {
             TARGET_FPS: 1000 / stepMs,
             DEADRECKON_MAX_FRAMES: maxFrames,
-            DEADRECKON_ANGULAR_MAX_FRAMES: maxFrames,
             DEADRECKON_SMOOTH_MS: 0,
             DEADRECKON_SNAP_DIST: Infinity
         },

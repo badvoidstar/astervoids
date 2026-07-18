@@ -1206,18 +1206,14 @@
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).
         DEADRECKON_SNAP_DIST: 0.2,
-        // Deterministic mode only, SHIPS ONLY (P2): maximum number of 60fps
-        // frames a remote ship's ANGLE may be forward-extrapolated past its last
-        // authoritative packet (positional extrapolation still uses
-        // DEADRECKON_MAX_FRAMES). rotationSpeed is a step function, so between a
-        // turn STOP and the packet that announces it the receiver would keep
-        // spinning, over-rotating across the unannounced stop before correcting
-        // back. P1 requests an immediate stop-edge send; this cap bounds the
-        // residual over-rotation when that edge is delayed/lost. Trade-off: a
-        // sustained turn at a very low send rate (high RTT) lags slightly once
-        // projection is capped, then eases forward via DEADRECKON_SMOOTH_MS.
-        // Asteroid/bullet spin is NOT clamped (constant rotation is exact).
-        DEADRECKON_ANGULAR_MAX_FRAMES: 10,
+        // Deterministic keyboard/rate turns replay at full speed through the
+        // expected next owner packet, then taper smoothly to zero if that packet
+        // is late. The horizon uses the owner's advertised/observed cadence plus
+        // jitter and remains bounded by DEADRECKON_MAX_FRAMES. Immediate
+        // start/stop/reversal sends normally re-anchor before the taper.
+        DEADRECKON_ANGULAR_MIN_HORIZON_FRAMES: 10,
+        DEADRECKON_ANGULAR_TAPER_FRAMES: 6,
+        DEADRECKON_ANGULAR_JITTER_MULT: 2,
         // Buffered mode only: time constant (ms) for easing each remote object
         // onto its latest accepted authoritative snapshot at game over.
         // Members observe game over at different times, and a replica may have
@@ -1251,10 +1247,10 @@
         // buffered mode (always sends) — gated by isDeterministicMode().
         SEND_ON_CHANGE_ENABLED: true,
         // Heartbeat gate (ms): make a re-anchor eligible this often even when
-        // nothing changed. The receiver's cap is measured from packet receipt,
-        // so a steady 250ms inter-arrival gap leaves about 250ms for jitter or
-        // an ordered delivery stall before the 500ms hold. This also bounds the
-        // age of server state used by joins, reconciliation, and migration.
+        // nothing changed. It is also the minimum expected packet cadence used
+        // by latency-aware keyboard rotation, before owner interval and jitter
+        // telemetry expand that horizon. This bounds the age of server state
+        // used by joins, reconciliation, and migration.
         //
         // This is not a wire-cadence guarantee: ObjectSync's RTT-adaptive
         // 1-20Hz flush and in-flight backpressure can coalesce or delay an
@@ -1295,12 +1291,10 @@
         // Target-heading intent lets replay follow the owner's intended heading
         // instead of projecting a stale rotationSpeed across latency.
         SHIP_INPUT_REPLAY_ENABLED: true,
-        // Deterministic mode only, ships only: display remote ship rotation by
-        // targeting authoritative heading rather than forward-projecting stale
-        // angular velocity. With replay disabled, this renders the latest
-        // authoritative angle and lets DeadReckon's correction offset ease to it
-        // (no overshoot, small heading lag). With replay enabled, target-mode
-        // controls replay forward toward the owner's intended heading.
+        // Deterministic target-heading controls only: replay toward the owner's
+        // intended heading and stop there without overshoot. Keyboard/rate
+        // controls instead use latency-aware bounded rate replay. Disabling this
+        // makes target controls fall back to rate replay.
         SHIP_ROTATION_TARGET_ENABLED: true,
         // Deterministic + input-replay mode only: suppress redundant per-frame
         // ship sends the same way SendGate does for ballistic objects. Under
@@ -1774,7 +1768,7 @@
     // correction; they do not normally snap. Extrapolation is bounded by
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
-    function createDeadReckoningState(data, recvPerf) {
+    function createDeadReckoningState(data, recvPerf, context = null) {
         return {
             x: data.x,
             y: data.y,
@@ -1800,13 +1794,38 @@
                 ? Math.max(0, Math.min(1, data.turnMagnitude))
                 : 0,
             turnBias: Number.isFinite(data.turnBias) ? data.turnBias : 0,
+            rateAngularPredictionWindow:
+                context?.rateAngularPredictionWindow || null,
             recvPerf
         };
     }
 
+    function calculateShipRateAngularPredictionWindow(ownerMemberId) {
+        const ownerTelemetry = ownerMemberId
+            ? RemoteObjects.memberDelays.get(ownerMemberId)
+            : null;
+        return ReplicationPresentation.calculateRateAngularPredictionWindow({
+            targetFps: CONFIG.TARGET_FPS,
+            heartbeatMs: CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS,
+            senderIntervalMs: ownerTelemetry?.remoteSendInterval,
+            packetIntervals: ownerTelemetry?.packetIntervals,
+            jitterMs: RemoteObjects.getJitter(),
+            jitterMultiplier: CONFIG.DEADRECKON_ANGULAR_JITTER_MULT,
+            minimumFrames: CONFIG.DEADRECKON_ANGULAR_MIN_HORIZON_FRAMES,
+            maximumFrames: CONFIG.DEADRECKON_MAX_FRAMES,
+            taperFrames: CONFIG.DEADRECKON_ANGULAR_TAPER_FRAMES
+        });
+    }
+
     // Ship replay remains a game-layer callback: the presentation policy knows
     // only that a kinematic state may opt into replay.
-    function replayDeadReckonedShip(state, frames, out, targetMode, context) {
+    function replayDeadReckonedShip(
+        state,
+        frames,
+        out,
+        targetMode,
+        context,
+        rateAngularPredictionWindow) {
         const ship = context.scratch || (context.scratch = new Ship(0, 0, 0));
         const whole = Math.floor(frames > 0 ? frames : 0);
         const fraction = (frames > 0 ? frames : 0) - whole;
@@ -1844,7 +1863,7 @@
         ship.invulnerable = 0;
         ship.shootCooldown = 0;
 
-        const driveTurn = (dt) => {
+        const driveTurn = (dt, elapsedFrames) => {
             if (targetDrive) {
                 const delta = shortestAngleDelta(state.turnTargetAngle, ship.angle);
                 const targetTurn = attainableTurnTarget(
@@ -1854,14 +1873,20 @@
                     dt);
                 ship.turnTarget = mergeTurnInputs(targetTurn, state.turnBias || 0);
             } else {
-                ship.turnTarget = Number.isFinite(state.turnTarget)
+                const target = Number.isFinite(state.turnTarget)
                     ? state.turnTarget
                     : baseTurnInput;
+                const scale =
+                    ReplicationPresentation.averageRateAngularPredictionScale(
+                        elapsedFrames,
+                        elapsedFrames + dt,
+                        rateAngularPredictionWindow);
+                ship.turnTarget = target * scale;
             }
         };
 
         for (let i = from; i < whole; i++) {
-            driveTurn(1);
+            driveTurn(1, i);
             ship.update(1);
         }
         if (!cached) {
@@ -1878,7 +1903,7 @@
         cached.turnInput = ship.turnInput;
 
         if (fraction > 1e-6) {
-            driveTurn(fraction);
+            driveTurn(fraction, whole);
             ship.update(fraction);
         }
         out.x = ship.x;
@@ -1899,11 +1924,14 @@
         shortestAngleDelta,
         createState: createDeadReckoningState,
         isRotationTarget: state => state.clampAngular
+            && state.turnControlMode === TURN_CONTROL_MODE.TARGET
             && CONFIG.SHIP_ROTATION_TARGET_ENABLED
             && isDeterministicMode(),
         shouldReplay: state => state.clampAngular
             && CONFIG.SHIP_INPUT_REPLAY_ENABLED
             && isDeterministicMode(),
+        getAngularPredictionWindow: state =>
+            state.rateAngularPredictionWindow,
         replay: replayDeadReckonedShip
     });
 
@@ -2320,11 +2348,9 @@
                 // Adapt send rate based on RTT
                 ObjectSync.updateSendRate(r.estimatedRtt);
             }
-            // Per-member adaptive delay tracking — remote broadcasts only.
-            // Each member gets independent interval tracking, computedDelay, and
-            // remoteSendInterval. This prevents members at different send rates
-            // from contaminating each other's BUF calculations.
-            if (!CONFIG.ADAPTIVE_DELAY_ENABLED) return;
+            // Per-member cadence tracking — remote broadcasts only. Buffered
+            // mode uses it for adaptive delay; deterministic mode uses it for
+            // latency-aware keyboard-turn prediction.
             if (!clientTimestamp && serverTimestamp && senderMemberId) {
                 const ad = this.getMemberDelay(senderMemberId);
                 if (senderSendIntervalMs && senderSendIntervalMs > 0) {
@@ -4945,7 +4971,14 @@
                         data,
                         getDeterministicJoinBaselinePerf(record, facts),
                         isTeleport,
-                        facts.preserveDirection);
+                        facts.preserveDirection,
+                        {
+                            rateAngularPredictionWindow:
+                                facts.type === OBJECT_TYPES.SHIP
+                                    ? calculateShipRateAngularPredictionWindow(
+                                        record.ownerMemberId)
+                                    : null
+                        });
                 } else {
                     RemoteObjects.updateState(
                         id, data, record.ownerMemberId, record.validAt, record.arrivalServerTime);
