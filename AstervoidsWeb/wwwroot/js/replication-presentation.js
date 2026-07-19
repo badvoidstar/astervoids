@@ -152,6 +152,98 @@ const ReplicationPresentation = (function () {
         };
     }
 
+    // Keep full-rate prediction through the expected next packet, while
+    // reserving a bounded tail in which stale turn intent can decelerate.
+    function calculateRateAngularPredictionWindow(options = {}) {
+        const targetFps = Number.isFinite(options.targetFps) && options.targetFps > 0
+            ? options.targetFps
+            : 60;
+        const minimumFrames = Number.isFinite(options.minimumFrames)
+            ? Math.max(0, options.minimumFrames)
+            : 0;
+        const maximumFrames = Number.isFinite(options.maximumFrames)
+            ? Math.max(0, options.maximumFrames)
+            : minimumFrames;
+        const configuredTaperFrames = Number.isFinite(options.taperFrames)
+            ? Math.max(0, options.taperFrames)
+            : 0;
+        const taperFrames = Math.min(configuredTaperFrames, maximumFrames);
+        const maximumFullFrames = Math.max(0, maximumFrames - taperFrames);
+        const minimumFullFrames = Math.min(minimumFrames, maximumFullFrames);
+
+        const intervals = Array.isArray(options.packetIntervals)
+            ? options.packetIntervals.filter(value => Number.isFinite(value) && value > 0)
+            : [];
+        const intervalMean = intervals.length > 0
+            ? intervals.reduce((sum, value) => sum + value, 0) / intervals.length
+            : 0;
+        const intervalVariance = intervals.length > 0
+            ? intervals.reduce(
+                (sum, value) => sum + (value - intervalMean) ** 2,
+                0) / intervals.length
+            : 0;
+        const intervalJitterMs = Math.sqrt(intervalVariance);
+        const senderIntervalMs = Number.isFinite(options.senderIntervalMs)
+            ? Math.max(0, options.senderIntervalMs)
+            : 0;
+        const heartbeatMs = Number.isFinite(options.heartbeatMs)
+            ? Math.max(0, options.heartbeatMs)
+            : 0;
+        const measuredJitterMs = Number.isFinite(options.jitterMs)
+            ? Math.max(0, options.jitterMs)
+            : 0;
+        const jitterMultiplier = Number.isFinite(options.jitterMultiplier)
+            ? Math.max(0, options.jitterMultiplier)
+            : 0;
+
+        const cadenceMs = Math.max(
+            heartbeatMs,
+            senderIntervalMs,
+            intervalMean);
+        const jitterMs = Math.max(measuredJitterMs, intervalJitterMs);
+        const desiredFullFrames =
+            (cadenceMs + jitterMultiplier * jitterMs) * targetFps / 1000;
+        const fullFrames = Math.max(
+            minimumFullFrames,
+            Math.min(maximumFullFrames, desiredFullFrames));
+
+        return {
+            fullFrames,
+            taperFrames: Math.min(taperFrames, maximumFrames - fullFrames)
+        };
+    }
+
+    // Integral of a turn scale that is 1 through fullFrames, falls linearly to
+    // 0 through taperFrames, and remains 0 afterward.
+    function integrateRateAngularPredictionFrames(elapsedFrames, window) {
+        const elapsed = Number.isFinite(elapsedFrames)
+            ? Math.max(0, elapsedFrames)
+            : 0;
+        if (!window) return elapsed;
+        const fullFrames = Number.isFinite(window.fullFrames)
+            ? Math.max(0, window.fullFrames)
+            : 0;
+        const taperFrames = Number.isFinite(window.taperFrames)
+            ? Math.max(0, window.taperFrames)
+            : 0;
+        if (elapsed <= fullFrames) return elapsed;
+        if (taperFrames <= 0) return fullFrames;
+        const taperElapsed = Math.min(elapsed - fullFrames, taperFrames);
+        return fullFrames
+            + taperElapsed
+            - (taperElapsed * taperElapsed) / (2 * taperFrames);
+    }
+
+    function averageRateAngularPredictionScale(startFrame, endFrame, window) {
+        if (!window) return 1;
+        const start = Number.isFinite(startFrame) ? Math.max(0, startFrame) : 0;
+        const end = Number.isFinite(endFrame) ? Math.max(start, endFrame) : start;
+        if (end <= start) return 0;
+        return (integrateRateAngularPredictionFrames(end, window)
+            - integrateRateAngularPredictionFrames(start, window))
+            / (end - start);
+    }
+
     function createDeadReckoningPolicy(options) {
         const config = options?.config;
         const nowMs = options?.nowMs;
@@ -161,6 +253,8 @@ const ReplicationPresentation = (function () {
         const createState = options?.createState;
         const isRotationTarget = options?.isRotationTarget || (() => false);
         const shouldReplay = options?.shouldReplay || (() => false);
+        const getAngularPredictionWindow =
+            options?.getAngularPredictionWindow || (() => null);
         const replay = options?.replay;
         if (!config) throw new TypeError('config is required');
         if (typeof nowMs !== 'function') throw new TypeError('nowMs must be a function');
@@ -176,6 +270,9 @@ const ReplicationPresentation = (function () {
         if (typeof createState !== 'function') {
             throw new TypeError('createState must be a function');
         }
+        if (typeof getAngularPredictionWindow !== 'function') {
+            throw new TypeError('getAngularPredictionWindow must be a function');
+        }
 
         const states = new Map();
         const lastVersions = new Map();
@@ -189,7 +286,13 @@ const ReplicationPresentation = (function () {
             smooth,
             replayCache,
 
-            updateState(id, data, baselinePerf, snap, preserveDirection = false) {
+            updateState(
+                id,
+                data,
+                baselinePerf,
+                snap,
+                preserveDirection = false,
+                stateContext = null) {
                 const now = nowMs();
                 const displayed = (!snap && states.has(id))
                     ? policy._reckonAt(id, now)
@@ -198,7 +301,7 @@ const ReplicationPresentation = (function () {
                     && Number.isFinite(baselinePerf))
                     ? baselinePerf
                     : now;
-                states.set(id, createState(data, recvPerf));
+                states.set(id, createState(data, recvPerf, stateContext));
 
                 let tau = config.DEADRECKON_SMOOTH_MS;
                 if (displayed && tau > 0) {
@@ -268,27 +371,41 @@ const ReplicationPresentation = (function () {
                     out.y = state.y + velocityToDeltaY(state.velocityY) * frames;
                 }
                 const targetMode = isRotationTarget(state);
+                const angularPredictionWindow = state.clampAngular
+                    ? getAngularPredictionWindow(state)
+                    : null;
                 if (state.angle !== null) {
                     if (targetMode) {
                         out.angle = state.angle;
                     } else {
-                        let angularFrames = frames;
-                        const cap = config.DEADRECKON_ANGULAR_MAX_FRAMES;
-                        if (state.clampAngular && cap >= 0 && angularFrames > cap) {
-                            angularFrames = cap;
-                        }
+                        const angularFrames = angularPredictionWindow
+                            ? integrateRateAngularPredictionFrames(
+                                frames, angularPredictionWindow)
+                            : frames;
                         out.angle = state.angle + state.rotationSpeed * angularFrames;
                     }
                 }
                 if (shouldReplay(state) && typeof replay === 'function') {
-                    replay(state, frames, out, targetMode, replayContext);
+                    replay(
+                        state,
+                        frames,
+                        out,
+                        targetMode,
+                        replayContext,
+                        angularPredictionWindow);
                 }
                 return out;
             },
 
             _replayShip(state, frames, out, targetMode) {
                 if (typeof replay === 'function') {
-                    replay(state, frames, out, targetMode, replayContext);
+                    replay(
+                        state,
+                        frames,
+                        out,
+                        targetMode,
+                        replayContext,
+                        getAngularPredictionWindow(state));
                 }
             },
 
@@ -818,6 +935,9 @@ const ReplicationPresentation = (function () {
         createAdaptiveDelayPolicy,
         createDeadReckoningPolicy,
         createSnapshotInterpolationPolicy,
+        calculateRateAngularPredictionWindow,
+        integrateRateAngularPredictionFrames,
+        averageRateAngularPredictionScale,
         createMemberDelay,
         findSnapshotBracket,
         hermiteBasis,

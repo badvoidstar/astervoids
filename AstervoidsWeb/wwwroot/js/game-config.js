@@ -140,7 +140,7 @@ const AstervoidsConfig = (function() {
             label: 'Max extrapolation (s)',
             min: 0, max: 5, step: 0.1,
             fmt: value => `${value.toFixed(1)} s`,
-            help: 'Caps legacy remote projection, spawn projection, and migration seed projection.',
+            help: 'Caps buffered remote projection, spawn projection, and migration seed projection.',
         }),
         control({
             key: 'SHIP_TURN_SPEED',
@@ -214,10 +214,8 @@ const AstervoidsConfig = (function() {
         }),
     ]);
 
-    const DEBUG_OVERRIDABLE_KEYS = Object.freeze([
-        ...CONFIG_CONTROLS.map(definition => definition.key),
-        'SPAWN_BRIDGE_ENABLED',
-    ]);
+    const DEBUG_OVERRIDABLE_KEYS = Object.freeze(
+        CONFIG_CONTROLS.map(definition => definition.key));
 
     function parseBooleanLike(value) {
         if (typeof value === 'boolean') return value;

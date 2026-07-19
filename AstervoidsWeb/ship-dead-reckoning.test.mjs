@@ -1,11 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
+const productionSource = readFileSync(
+    new URL('./wwwroot/index.html', import.meta.url),
+    'utf8');
 const { createControlEdgeGate } = require('./wwwroot/js/replication-send-policy.js');
-const { createDeadReckoningPolicy } = require(
-    './wwwroot/js/replication-presentation.js');
+const {
+    createDeadReckoningPolicy,
+    calculateRateAngularPredictionWindow,
+    integrateRateAngularPredictionFrames,
+    averageRateAngularPredictionScale,
+} = require('./wwwroot/js/replication-presentation.js');
 
 // Exercises extracted policies where available and mirrors the game-layer Ship
 // replay callback where Ship itself remains inline. The covered features are:
@@ -13,18 +21,17 @@ const { createDeadReckoningPolicy } = require(
 //   P1  ShipControlGate.isEdge — scheme-agnostic detection of overshoot-critical
 //       control edges (rotation start/stop/reversal, thrust on/off, brake
 //       on/off) that trigger an immediate, throttle-bypassing send.
-//   P2  DeadReckon angular-projection clamp — ships bound their forward angular
-//       extrapolation to DEADRECKON_ANGULAR_MAX_FRAMES; ballistic spinners do not.
+//   P2  DeadReckon adaptive angular prediction — keyboard/rate turns replay
+//       through the expected packet cadence and taper smoothly during a stall;
+//       ballistic spinners remain on the normal global dead-reckoning bound.
 //   P3  Physics input-replay — a remote that seeds from an authoritative packet
 //       (pose + velocity + rotationSpeed + control intent) and replays
 //       Ship.update() lands where the owner did for rate controls.
 //   P3b Target-heading replay — polar touch remotes recompute the owner's
 //       heading-alignment turn each replay step instead of projecting a stale
 //       rotationSpeed across latency.
-//   P4  Rotation-target display — deterministic ships can converge their
-//       displayed angle to authoritative snapshots without forward angular
-//       projection, while target-heading replay remains forward-projected and
-//       bounded by the target.
+//   P4  Control-mode display — target-heading controls remain bounded by their
+//       target while keyboard/rate controls display continuous bounded replay.
 
 // ----------------------------------------------------------------------------
 // P1: ShipControlGate.isEdge mirror
@@ -123,29 +130,107 @@ function reckonAngle(state, frames, cfg) {
         velocityToDeltaX: () => 0,
         velocityToDeltaY: () => 0,
         shortestAngleDelta,
-        createState: data => data
+        createState: data => data,
+        getAngularPredictionWindow: current =>
+            current.rateAngularPredictionWindow
     });
     policy.states.set('ship', { ...state, recvPerf: 0 });
     return policy._reckonRaw('ship', frames * 1000 / targetFps).angle;
 }
 
-test('P2: ship angle is clamped to DEADRECKON_ANGULAR_MAX_FRAMES', () => {
-    const cfg = { DEADRECKON_ANGULAR_MAX_FRAMES: 10 };
-    const ship = { angle: 0, rotationSpeed: 0.12, clampAngular: true };
-    // 30 frames of unclamped projection would be 0.12*30 = 3.6 rad; clamp caps it.
-    assert.equal(reckonAngle(ship, 30, cfg), 0.12 * 10);
+test('P2: heartbeat cadence keeps keyboard rotation continuous until the next expected packet', () => {
+    const window = calculateRateAngularPredictionWindow({
+        targetFps: 60,
+        heartbeatMs: 250,
+        senderIntervalMs: 50,
+        packetIntervals: [250, 250, 250],
+        jitterMs: 0,
+        jitterMultiplier: 2,
+        minimumFrames: 10,
+        maximumFrames: 30,
+        taperFrames: 6
+    });
+    assert.deepEqual(window, { fullFrames: 15, taperFrames: 6 });
 });
 
-test('P2: asteroids/bullets (constant spin) are NOT clamped', () => {
-    const cfg = { DEADRECKON_ANGULAR_MAX_FRAMES: 10 };
+test('P2: owner cadence and jitter expand the full-speed prediction horizon', () => {
+    const window = calculateRateAngularPredictionWindow({
+        targetFps: 60,
+        heartbeatMs: 250,
+        senderIntervalMs: 300,
+        packetIntervals: [280, 320],
+        jitterMs: 10,
+        jitterMultiplier: 2,
+        minimumFrames: 10,
+        maximumFrames: 30,
+        taperFrames: 6
+    });
+    assert.ok(Math.abs(window.fullFrames - 20.4) < 1e-12);
+    assert.equal(window.taperFrames, 6);
+});
+
+test('P2: prediction reserves a taper inside the global dead-reckoning bound', () => {
+    const window = calculateRateAngularPredictionWindow({
+        targetFps: 60,
+        heartbeatMs: 250,
+        senderIntervalMs: 1000,
+        jitterMs: 100,
+        jitterMultiplier: 2,
+        minimumFrames: 10,
+        maximumFrames: 30,
+        taperFrames: 6
+    });
+
+    assert.deepEqual(window, { fullFrames: 24, taperFrames: 6 });
+});
+
+test('P2: deterministic cadence telemetry is independent of buffered adaptive delay', () => {
+    const start = productionSource.indexOf(
+        '        recordPacketArrival(serverTimestamp, clientTimestamp');
+    const end = productionSource.indexOf(
+        '\n        recordMemberPacketInterval(',
+        start);
+    assert.ok(start >= 0 && end > start, 'recordPacketArrival source is present');
+    const source = productionSource.slice(start, end);
+
+    assert.match(source, /this\.recordMemberPacketInterval\(ad, interval\)/);
+    assert.doesNotMatch(source, /ADAPTIVE_DELAY_ENABLED/);
+});
+
+test('P2: late keyboard rotation tapers smoothly instead of stopping at one hard frame', () => {
+    const window = { fullFrames: 10, taperFrames: 4 };
+    assert.equal(integrateRateAngularPredictionFrames(10, window), 10);
+    assert.equal(integrateRateAngularPredictionFrames(12, window), 11.5);
+    assert.equal(integrateRateAngularPredictionFrames(14, window), 12);
+    assert.equal(integrateRateAngularPredictionFrames(30, window), 12);
+
+    const scales = [10, 11, 12, 13, 14].map(frame =>
+        averageRateAngularPredictionScale(frame, frame + 1, window));
+    assert.deepEqual(scales, [0.875, 0.625, 0.375, 0.125, 0]);
+});
+
+test('P2: ship rate prediction is bounded while ballistic spin uses the normal global bound', () => {
+    const window = { fullFrames: 10, taperFrames: 4 };
+    const ship = {
+        angle: 0,
+        rotationSpeed: 0.12,
+        clampAngular: true,
+        rateAngularPredictionWindow: window
+    };
+    assert.equal(reckonAngle(ship, 30, {}), 0.12 * 12);
+
     const rock = { angle: 0, rotationSpeed: 0.02, clampAngular: false };
-    assert.equal(reckonAngle(rock, 30, cfg), 0.02 * 30);
+    assert.equal(reckonAngle(rock, 30, {}), 0.02 * 30);
 });
 
-test('P2: short gaps under the cap are unaffected for ships', () => {
-    const cfg = { DEADRECKON_ANGULAR_MAX_FRAMES: 10 };
-    const ship = { angle: 1, rotationSpeed: 0.12, clampAngular: true };
-    assert.equal(reckonAngle(ship, 4, cfg), 1 + 0.12 * 4);
+test('P2: short gaps before the adaptive horizon are unaffected', () => {
+    const ship = {
+        angle: 1,
+        rotationSpeed: 0.12,
+        clampAngular: true,
+        rateAngularPredictionWindow: { fullFrames: 10, taperFrames: 4 }
+    };
+    assert.equal(reckonAngle(ship, 4, {}), 1 + 0.12 * 4);
 });
 
 // ----------------------------------------------------------------------------
@@ -257,7 +342,7 @@ class MiniShip {
 // packet and step it `frames` times. Rate controls replay turnTarget directly;
 // target-heading controls recompute turnTarget from targetAngle every substep
 // when targetDrive is enabled.
-function replay(packet, frames, targetDrive = true) {
+function replay(packet, frames, targetDrive = true, rateWindow = null) {
     const sh = new MiniShip();
     sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
     sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
@@ -267,6 +352,7 @@ function replay(packet, frames, targetDrive = true) {
     sh.thrustInput = packet.thrustInput || 0;
     sh.brakeInput = packet.brakeInput || 0;
     let remaining = frames > 0 ? frames : 0;
+    let elapsed = 0;
     while (remaining > 1e-6) {
         const dt = remaining > 1 ? 1 : remaining;
         if (targetDrive && packet.turnControlMode === TURN_CONTROL_MODE.TARGET) {
@@ -278,9 +364,13 @@ function replay(packet, frames, targetDrive = true) {
                 dt);
             sh.turnTarget = mergeTurnInputs(targetTurn, packet.turnBias || 0);
         } else {
-            sh.turnTarget = Number.isFinite(packet.turnTarget) ? packet.turnTarget : ti;
+            const target = Number.isFinite(packet.turnTarget) ? packet.turnTarget : ti;
+            const scale = averageRateAngularPredictionScale(
+                elapsed, elapsed + dt, rateWindow);
+            sh.turnTarget = target * scale;
         }
         sh.update(dt);
+        elapsed += dt;
         remaining -= dt;
     }
     return sh;
@@ -303,27 +393,31 @@ function staleRateReplay(packet, frames) {
 }
 
 function hybridReckon(packet, frames, { inputReplay = true, rotationTarget = true } = {}) {
+    const targetMode = rotationTarget
+        && packet.turnControlMode === TURN_CONTROL_MODE.TARGET;
     const out = {
         x: packet.x,
         y: packet.y,
         velocityX: packet.velocityX,
         velocityY: packet.velocityY,
         rotationSpeed: packet.rotationSpeed,
-        angle: rotationTarget ? packet.angle : packet.angle + packet.rotationSpeed * frames,
+        angle: targetMode
+            ? packet.angle
+            : packet.angle + packet.rotationSpeed * frames,
     };
     if (frames > 0) {
         out.x = packet.x + toNX(packet.velocityX) * frames;
         out.y = packet.y + toNY(packet.velocityY) * frames;
     }
     if (inputReplay) {
-        const targetDrive = rotationTarget && packet.turnControlMode === TURN_CONTROL_MODE.TARGET;
+        const targetDrive = targetMode;
         const sh = replay(packet, frames, targetDrive);
         out.x = sh.x;
         out.y = sh.y;
         out.velocityX = sh.velocityX;
         out.velocityY = sh.velocityY;
         out.rotationSpeed = sh.rotationSpeed;
-        if (!rotationTarget || targetDrive) out.angle = sh.angle;
+        if (!targetMode || targetDrive) out.angle = sh.angle;
     }
     return out;
 }
@@ -476,14 +570,15 @@ test('P4: authoritative-angle convergence eases without overshoot', () => {
     }
 });
 
-test('P4: non-replay target mode keeps authoritative angle instead of projecting stale rotation', () => {
+test('P4: non-replay target controls keep authoritative angle instead of projecting stale rotation', () => {
     const packet = {
         x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
         rotationSpeed: SHIP.SHIP_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.RATE,
-        turnTarget: 1,
+        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnTargetAngle: 1.5,
+        turnMagnitude: 1,
     };
     const stale = staleRateReplay(packet, 8);
     assert.ok(stale.angle > 0.9, `precondition: stale projection should lead, got ${stale.angle}`);
@@ -492,7 +587,7 @@ test('P4: non-replay target mode keeps authoritative angle instead of projecting
     assert.equal(out.angle, packet.angle);
 });
 
-test('P4: rate-mode replay updates position but keeps authoritative display angle in target mode', () => {
+test('P4: rate-mode replay displays smooth keyboard rotation as well as replayed position', () => {
     const packet = {
         x: 0.1, y: 0.2, angle: 0.4,
         velocityX: 0.2, velocityY: -0.1,
@@ -508,8 +603,8 @@ test('P4: rate-mode replay updates position but keeps authoritative display angl
     assert.ok(Math.abs(out.velocityX - scratch.velocityX) < 1e-12, 'replayed vx');
     assert.ok(Math.abs(out.velocityY - scratch.velocityY) < 1e-12, 'replayed vy');
     assert.ok(Math.abs(out.rotationSpeed - scratch.rotationSpeed) < 1e-12, 'replayed rotationSpeed');
-    assert.equal(out.angle, packet.angle);
-    assert.ok(scratch.angle > packet.angle, 'scratch replay would have led if displayed');
+    assert.equal(out.angle, scratch.angle);
+    assert.ok(out.angle > packet.angle, 'keyboard rotation should advance between packets');
 });
 
 test('P4: target-heading replay still adopts the self-arresting replayed angle', () => {
@@ -529,18 +624,45 @@ test('P4: target-heading replay still adopts the self-arresting replayed angle',
         `target replay should display the replayed target angle, got ${out.angle}`);
 });
 
-test('P4: disabling rotation target restores replayed rate angle', () => {
+test('P4: disabling rotation target restores rate replay for target controls', () => {
     const packet = {
         x: 0, y: 0, angle: 0.2,
+        velocityX: 0, velocityY: 0,
+        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        thrustInput: 0, brakeInput: 0,
+        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnTarget: 1,
+        turnTargetAngle: 0.3,
+        turnMagnitude: 1,
+    };
+    const scratch = replay(packet, 4, false);
+    const out = hybridReckon(packet, 4, { inputReplay: true, rotationTarget: false });
+    assert.equal(out.angle, scratch.angle);
+});
+
+test('P4: adaptive taper slows keyboard replay monotonically during a late packet', () => {
+    const packet = {
+        x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
         rotationSpeed: SHIP.SHIP_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
         turnControlMode: TURN_CONTROL_MODE.RATE,
         turnTarget: 1,
     };
-    const scratch = replay(packet, 4, false);
-    const out = hybridReckon(packet, 4, { inputReplay: true, rotationTarget: false });
-    assert.equal(out.angle, scratch.angle);
+    const window = { fullFrames: 3, taperFrames: 4 };
+    const angles = [];
+    for (let frames = 3; frames <= 8; frames++) {
+        angles.push(replay(packet, frames, false, window).angle);
+    }
+    const deltas = angles.slice(1).map((angle, index) => angle - angles[index]);
+    for (let i = 1; i < deltas.length; i++) {
+        assert.ok(deltas[i] <= deltas[i - 1] + 1e-12,
+            `angular step ${i} should not accelerate during taper`);
+        assert.ok(deltas[i] >= -1e-12,
+            `angular step ${i} should not reverse during taper`);
+    }
+    assert.ok(Math.abs(deltas.at(-1)) < 1e-12,
+        'rotation should settle after the taper horizon');
 });
 
 // ----------------------------------------------------------------------------

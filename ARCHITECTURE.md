@@ -942,9 +942,19 @@ flowchart LR
 ```
 
 TX is the shared ObjectSync flush cadence for both simulation modes. It is not
-the same as legacy BUF (render delay), and it is not a packet guarantee:
+the same as buffered BUF (render delay), and it is not a packet guarantee:
 game-layer send-on-change gates may queue nothing, while in-flight backpressure
 can coalesce multiple simulation frames into a later batch.
+
+Deterministic ship rotation uses two presentation paths. Target-heading touch
+controls replay toward their transmitted target angle and cannot turn past it.
+Keyboard rate controls replay continuously through the greater of the 250 ms
+ship heartbeat, the owner's advertised send interval, and its observed packet
+interval. A jitter margin extends that full-rate horizon; if the next packet is
+late, angular input tapers linearly to zero within the global 30-frame
+dead-reckoning bound. Immediate start, stop, and reversal edges still request a
+throttle-bypassing send, and ordinary shortest-angle correction absorbs
+remaining prediction error when the authoritative packet arrives.
 
 ```mermaid
 flowchart TB
@@ -994,7 +1004,7 @@ Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
 events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
 `UpdateObjects` samples once at flush and fans that value across the coalesced
 batch, so it is an ordering/presentation anchor rather than an exact simulation
-timestamp for every pose. Legacy interpolation and replacement projection use
+timestamp for every pose. Buffered interpolation and replacement projection use
 this axis; deterministic live motion normally remains arrival-anchored.
 
 ```mermaid
@@ -1021,9 +1031,9 @@ flowchart LR
 
 * **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Min-RTT sampling reduces transient queue bias, but persistent path asymmetry remains as clock error; projection callers gate initialization and cap elapsed time.
 * **`clock.wallToPerfDelta = performance.now() - Date.now()`** is refreshed on every accepted ping burst. The conversion `validAt → snapshot.time` runs through it so bracket-search stays on a monotonic clock while the snapshot key still encodes the global server-time agreement.
-* **No present-time spawn projection on observers.** Legacy mode keys the first snapshot at `validAt` and initially clamps/extrapolates on that delayed timeline. Deterministic mode arrival-anchors live lifecycle state instead.
+* **No present-time spawn projection on observers.** Buffered mode keys the first snapshot at `validAt` and initially clamps/extrapolates on that delayed timeline. Deterministic mode arrival-anchors live lifecycle state instead.
 * **Local-owner replacement projection.** The shooter who invokes `replaceObject` adopts resulting children about one operation round trip later. `updateAstervoidsFromSync` forward-projects from bounded `obj.validAt` staleness because owned objects are driven by local physics, not interpolation. Clock asymmetry and pre-invocation work remain residual error.
-* **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; legacy mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
+* **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; buffered mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
 
 ### Per-batch `validAt` collapse on `OnObjectsUpdated`
 
@@ -1086,7 +1096,7 @@ retains its incoming derivatives; if doing so would add a complete toroidal
 winding, only that axis switches to the nearest equivalent target and drops its
 presentation velocity/acceleration. This prevents a late asteroid from crossing
 the whole screen—or a ship/asteroid from making a full extra turn—just to stop at
-an equivalent pose. Legacy adaptive-delay sessions retain their existing
+an equivalent pose. Buffered adaptive-delay sessions retain their existing
 authoritative-snapshot settle behavior and do not wait for terminal targets.
 
 ## Ring Buffer Interpolation

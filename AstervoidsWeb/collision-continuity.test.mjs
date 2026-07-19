@@ -242,7 +242,9 @@ test('production join seeding targets the delayed presentation timeline only for
 test('production migration handoff skips ownership-only anchors and preserves direction', () => {
     assert.match(runtimeSource, /record\.ownershipMigrationVersion === record\.version/);
     assert.match(runtimeSource, /preserveDirection = !!transition\?\.pending && !ownershipVersion;/);
-    assert.match(productionSource, /isTeleport,\s*facts\.preserveDirection\);/);
+    assert.match(
+        productionSource,
+        /isTeleport,\s*facts\.preserveDirection,\s*\{\s*rateAngularPredictionWindow:/);
     assert.match(presentationSource, /correctionAlong \* stepMs \/ motion/);
     assert.match(presentationSource, /tauMs: tau/);
 });
