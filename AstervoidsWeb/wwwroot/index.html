@@ -4309,7 +4309,7 @@
     // cleanup resolves effects without replaying them for late joiners.
     const CollisionEffects = {
         startAsteroidHit(source, target = null, impact = null) {
-            if (!isSessionMode() || !source) return;
+            if (!source) return;
             const bulletId = source.syncObjectId || null;
             if (bulletId && game.multiplayer.seenPendingBulletIds.has(bulletId)) return;
             let key;
@@ -4343,25 +4343,36 @@
             const dy = Math.sin(bulletAngle);
             const nx = -dy;
             const ny = dx;
+            const offsetRefX = offsetAlong * dx + offsetAcross * nx;
+            const offsetRefY = offsetAlong * dy + offsetAcross * ny;
+            const hasTargetPose = Number.isFinite(target?.x) && Number.isFinite(target?.y);
+            const refDim = getReferenceDimension();
+            const now = performance.now();
 
             game.multiplayer.collisionEffects.set(key, {
                 key,
                 kind: 'asteroid',
                 bulletId,
                 targetId,
-                offsetRefX: offsetAlong * dx + offsetAcross * nx,
-                offsetRefY: offsetAlong * dy + offsetAcross * ny,
+                offsetRefX,
+                offsetRefY,
                 baseRadius: radius,
-                lastX: Number.isFinite(source.x) ? source.x : (target?.x || 0),
-                lastY: Number.isFinite(source.y) ? source.y : (target?.y || 0),
+                lastX: hasTargetPose
+                    ? target.x + offsetRefX * refDim / getGameWidth()
+                    : (Number.isFinite(source.x) ? source.x : 0),
+                lastY: hasTargetPose
+                    ? target.y + offsetRefY * refDim / getGameHeight()
+                    : (Number.isFinite(source.y) ? source.y : 0),
                 colorIndex: source.colorIndex || 0,
-                startedAt: performance.now(),
-                resolvedAt: null
+                startedAt: now,
+                // Local asteroids have no synced target to resolve when they
+                // are removed, so begin their normal post-impact fade now.
+                resolvedAt: targetId ? null : now
             });
         },
 
         startShipHit(objectId, payload, colorIndex = 0) {
-            if (!isSessionMode() || !objectId || !payload) return;
+            if (!objectId || !payload) return;
             const hitCount = Number(payload.hitCount);
             if (!Number.isFinite(hitCount)
                 || !Number.isFinite(payload.hitX)
@@ -6571,17 +6582,18 @@
                         }
                     } else {
                         // Solo mode — process locally
-                        const removedBullet = game.bullets.splice(i, 1)[0];
-                        game.astervoids.splice(j, 1);
-                        game.score += asteroid.getPoints();
-                        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
-                                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                        AudioSystem.playExplosion(explosionSize);
                         const offsetX = bullet.x - asteroid.x;
                         const offsetY = bullet.y - asteroid.y;
                         const relVelX = bullet.velocityX - asteroid.velocityX;
                         const relVelY = bullet.velocityY - asteroid.velocityY;
                         const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
+                        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+                        game.bullets.splice(i, 1);
+                        game.astervoids.splice(j, 1);
+                        game.score += asteroid.getPoints();
+                        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
+                                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+                        AudioSystem.playExplosion(explosionSize);
                         splitAsteroid(asteroid, null, impact, game.ship);
                     }
                     
@@ -6705,11 +6717,10 @@
     function handleShipHit(ship) {
         AudioSystem.playShipExplosion();
         AudioSystem.thrustSound.stop();
-        
+
+        const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
+        ship.hitCount = (ship.hitCount || 0) + 1;
         if (isSessionMode()) {
-            // Increment monotonic hitCount on ship (GameState owner watches this)
-            const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
-            ship.hitCount = (ship.hitCount || 0) + 1;
             // Phase 2.3: hitCount no longer rides on toUpdateData(); push it
             // through the per-object event channel so other peers see it
             // before the next per-frame batch.
@@ -6722,6 +6733,12 @@
             }
         } else {
             // Solo mode — handle everything locally
+            CollisionEffects.startShipHit('solo', {
+                hitCount: ship.hitCount,
+                hitX: hitPose.x,
+                hitY: hitPose.y,
+                hitAngle: hitPose.angle
+            }, ship.colorIndex);
             game.lives--;
             updateHUD();
             if (game.lives <= 0) {

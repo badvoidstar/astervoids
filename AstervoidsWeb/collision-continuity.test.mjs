@@ -192,6 +192,38 @@ test('production ship-hit event carries the pre-reset pose and deduplicates by h
     assert.match(productionSource, /CollisionEffects\.startShipHit\(/);
 });
 
+test('solo collisions start the same local cues before removing their sources', () => {
+    const asteroidCueStart = productionSource.indexOf('        startAsteroidHit(source, target = null, impact = null) {');
+    const shipCueStart = productionSource.indexOf('        startShipHit(objectId, payload, colorIndex = 0) {');
+    const resolveTargetStart = productionSource.indexOf('        resolveTarget(targetId) {');
+    assert.ok(asteroidCueStart >= 0 && shipCueStart > asteroidCueStart);
+    assert.ok(resolveTargetStart > shipCueStart);
+    const asteroidCueSource = productionSource.slice(asteroidCueStart, shipCueStart);
+    const shipCueSource = productionSource.slice(shipCueStart, resolveTargetStart);
+    assert.doesNotMatch(asteroidCueSource, /isSessionMode/);
+    assert.doesNotMatch(shipCueSource, /isSessionMode/);
+    assert.match(asteroidCueSource, /resolvedAt: targetId \? null : now/);
+
+    const soloCollisionStart = productionSource.indexOf('// Solo mode — process locally');
+    const collisionBreak = productionSource.indexOf('                    break;  // Bullet can only hit one asteroid', soloCollisionStart);
+    assert.ok(soloCollisionStart >= 0 && collisionBreak > soloCollisionStart);
+    const soloCollision = productionSource.slice(soloCollisionStart, collisionBreak);
+    const asteroidCueAt = soloCollision.indexOf(
+        'CollisionEffects.startAsteroidHit(bullet, asteroid, impact);');
+    const bulletRemovalAt = soloCollision.indexOf('game.bullets.splice(i, 1);');
+    const asteroidRemovalAt = soloCollision.indexOf('game.astervoids.splice(j, 1);');
+    assert.ok(asteroidCueAt >= 0 && asteroidCueAt < bulletRemovalAt);
+    assert.ok(asteroidCueAt < asteroidRemovalAt);
+
+    const shipHitStart = productionSource.indexOf('    function handleShipHit(ship) {');
+    const shipHitEnd = productionSource.indexOf('    function updateHUD() {', shipHitStart);
+    assert.ok(shipHitStart >= 0 && shipHitEnd > shipHitStart);
+    const shipHitSource = productionSource.slice(shipHitStart, shipHitEnd);
+    assert.match(
+        shipHitSource,
+        /CollisionEffects\.startShipHit\('solo', \{\s*hitCount: ship\.hitCount,\s*hitX: hitPose\.x,\s*hitY: hitPose\.y,\s*hitAngle: hitPose\.angle\s*\}, ship\.colorIndex\);/);
+});
+
 test('same-owner asteroid impacts broadcast a target-relative cue before replacement', () => {
     assert.match(
         productionSource,
