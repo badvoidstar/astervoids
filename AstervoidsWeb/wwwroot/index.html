@@ -4361,6 +4361,7 @@
                 targetId,
                 offsetRefX: offsetAlong * dx + offsetAcross * nx,
                 offsetRefY: offsetAlong * dy + offsetAcross * ny,
+                baseRadius: radius,
                 lastX: Number.isFinite(source.x) ? source.x : (target?.x || 0),
                 lastY: Number.isFinite(source.y) ? source.y : (target?.y || 0),
                 colorIndex: source.colorIndex || 0,
@@ -4461,7 +4462,7 @@
                 ctx.strokeStyle = effect.kind === 'ship' ? CONFIG.THRUST_COLOR : color;
                 ctx.lineWidth = 2;
                 if (effect.kind === 'ship') {
-                    const base = fromNormalizedSize(CONFIG.SHIP_SIZE);
+                    const base = fromNormalizedSize(CONFIG.SHIP_SIZE) * 3;
                     const radius = base * (0.5 + 1.8 * progress);
                     ctx.beginPath();
                     ctx.arc(x, y, radius, 0, Math.PI * 2);
@@ -4478,7 +4479,8 @@
                     }
                     ctx.stroke();
                 } else {
-                    const base = Math.max(4, fromNormalizedSize(CONFIG.BULLET_RADIUS) * 2);
+                    const base = fromNormalizedSize(
+                        effect.baseRadius || CONFIG.MIN_ASTEROID_RADIUS) * 0.5;
                     const easedProgress = 1 - Math.pow(1 - progress, 3);
                     const scale = CONFIG.ASTEROID_IMPACT_CUE_START_SCALE
                         + (CONFIG.ASTEROID_IMPACT_CUE_END_SCALE
