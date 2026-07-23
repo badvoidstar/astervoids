@@ -700,7 +700,7 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Keys or WASD to move | SPACE to shoot | ESC to pause
+            Arrow Keys or WASD to move | Click + drag to steer/thrust | SPACE to shoot | ESC to pause
         </div>
 
         <!-- Pause menu overlay -->
@@ -4640,11 +4640,11 @@
     /**
      * Anchor-based touch state (used by the `rectilinear` and `polar` schemes;
      * unused in `classic`). Multi-touch: at most one movement anchor (left
-     * half) and one fire anchor (right half) at any time. Identifiers come
-     * from Touch.identifier so we can correlate move/end events with the
-     * originating touchstart. Anchors are logical — no UI is rendered today,
-     * but coords are kept current so the visualization layer can draw a base
-     * ring + thumb at (anchorX, anchorY) → (currentX, currentY).
+     * half) and one fire anchor (right half) at any time. Touch identifiers
+     * come from Touch.identifier; mouse movement uses a private sentinel so
+     * it shares the same anchor lifecycle. Coordinates are kept current so
+     * the visualization layer can draw a base ring + thumb at
+     * (anchorX, anchorY) → (currentX, currentY).
      *
      * Coordinates are in CSS pixels relative to the viewport (clientX/clientY).
      * They survive dynamic device rotation because the compute helpers rescale
@@ -4689,7 +4689,16 @@
         polarBrake: 0,
     };
 
+    // A Symbol cannot collide with a browser Touch.identifier.
+    const MOUSE_MOVE_TOUCH_ID = Symbol('mouse-move');
+    let mouseMoveControlActive = false;
+
+    function setMouseMoveControlActive(active) {
+        mouseMoveControlActive = active;
+    }
+
     function resetStickInput() {
+        setMouseMoveControlActive(false);
         stickInput.moveTouchId = null;
         stickInput.fireTouchId = null;
         stickInput.turnTarget = 0;
@@ -6904,13 +6913,14 @@
      * we map them to canvas internal coords via canvas.getBoundingClientRect().
      * Drawn after the viewport restore so it lives in full-canvas coords and
      * is never clipped by the aspect-locked gameplay viewport. Hidden on
-     * desktop, when no anchor is held, during pause / game-over, when the
-     * scheme is classic, or when TOUCH_ANCHOR_VISUAL_ENABLED is false.
+     * desktop unless a mouse movement anchor is held, when no anchor is held,
+     * during pause / game-over, when the scheme is classic, or when
+     * TOUCH_ANCHOR_VISUAL_ENABLED is false.
      */
     function drawStickAnchors(ctx) {
         if (!isAnchorSchemeEnabled()) return;
         if (!CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED) return;
-        if (!touchControlsEnabled) return;
+        if (!touchControlsEnabled && stickInput.moveTouchId !== MOUSE_MOVE_TOUCH_ID) return;
         if (game.state !== 'playing' && game.state !== 'waveDelay') return;
         if (stickInput.moveTouchId === null && stickInput.fireTouchId === null) return;
 
@@ -8208,16 +8218,51 @@
             return true;
         }
 
+        function isPointWithinRect(clientX, clientY, rect) {
+            return clientX >= rect.left && clientX <= rect.right
+                && clientY >= rect.top && clientY <= rect.bottom;
+        }
+
         // Side test: anchored against the canvas, not the container, so off-canvas
         // letterbox bars belong to neither half and are ignored.
         function classifyTouchSide(clientX, clientY) {
             const rect = canvas.getBoundingClientRect();
-            if (clientX < rect.left || clientX > rect.right
-                || clientY < rect.top || clientY > rect.bottom) {
+            if (!isPointWithinRect(clientX, clientY, rect)) {
                 return null; // outside the canvas → ignore
             }
             const midX = rect.left + rect.width / 2;
             return clientX < midX ? 'move' : 'fire';
+        }
+
+        function beginMoveAnchor(identifier, clientX, clientY) {
+            if (stickInput.moveTouchId !== null) return false;
+            stickInput.moveTouchId = identifier;
+            stickInput.moveAnchorX = clientX;
+            stickInput.moveAnchorY = clientY;
+            stickInput.moveCurrentX = clientX;
+            stickInput.moveCurrentY = clientY;
+            return true;
+        }
+
+        function updateMoveAnchor(identifier, clientX, clientY) {
+            if (identifier !== stickInput.moveTouchId) return false;
+            stickInput.moveCurrentX = clientX;
+            stickInput.moveCurrentY = clientY;
+            return true;
+        }
+
+        function endMoveAnchor(identifier) {
+            if (identifier !== stickInput.moveTouchId) return false;
+            stickInput.moveTouchId = null;
+            stickInput.turnTarget = 0;
+            stickInput.thrustInput = 0;
+            stickInput.brakeInput = 0;
+            stickInput.polarActive = false;
+            stickInput.polarRadius = 0;
+            stickInput.polarTurnMagnitude = 0;
+            stickInput.polarThrust = 0;
+            stickInput.polarBrake = 0;
+            return true;
         }
 
         // Frame-time updater: recomputes cached analog values from the current
@@ -8315,12 +8360,7 @@
             for (const t of e.changedTouches) {
                 if (!isStickTouchTarget(t.target)) continue;
                 const side = classifyTouchSide(t.clientX, t.clientY);
-                if (side === 'move' && stickInput.moveTouchId === null) {
-                    stickInput.moveTouchId = t.identifier;
-                    stickInput.moveAnchorX = t.clientX;
-                    stickInput.moveAnchorY = t.clientY;
-                    stickInput.moveCurrentX = t.clientX;
-                    stickInput.moveCurrentY = t.clientY;
+                if (side === 'move' && beginMoveAnchor(t.identifier, t.clientX, t.clientY)) {
                     AudioSystem.init();
                     AudioSystem.resume();
                 } else if (side === 'fire' && stickInput.fireTouchId === null) {
@@ -8338,9 +8378,8 @@
         gameContainer.addEventListener('touchmove', (e) => {
             if (!isAnchorSchemeEnabled()) return;
             for (const t of e.changedTouches) {
-                if (t.identifier === stickInput.moveTouchId) {
-                    stickInput.moveCurrentX = t.clientX;
-                    stickInput.moveCurrentY = t.clientY;
+                if (updateMoveAnchor(t.identifier, t.clientX, t.clientY)) {
+                    continue;
                 } else if (t.identifier === stickInput.fireTouchId) {
                     stickInput.fireCurrentX = t.clientX;
                     stickInput.fireCurrentY = t.clientY;
@@ -8350,16 +8389,8 @@
 
         function endTouch(e) {
             for (const t of e.changedTouches) {
-                if (t.identifier === stickInput.moveTouchId) {
-                    stickInput.moveTouchId = null;
-                    stickInput.turnTarget = 0;
-                    stickInput.thrustInput = 0;
-                    stickInput.brakeInput = 0;
-                    stickInput.polarActive = false;
-                    stickInput.polarRadius = 0;
-                    stickInput.polarTurnMagnitude = 0;
-                    stickInput.polarThrust = 0;
-                    stickInput.polarBrake = 0;
+                if (endMoveAnchor(t.identifier)) {
+                    continue;
                 } else if (t.identifier === stickInput.fireTouchId) {
                     stickInput.fireTouchId = null;
                     stickInput.fireTurnTarget  = 0;
@@ -8370,6 +8401,48 @@
         }
         gameContainer.addEventListener('touchend', endTouch, { passive: true });
         gameContainer.addEventListener('touchcancel', endTouch, { passive: true });
+
+        // Mouse movement control: left drag maps to the movement touch anchor.
+        // Bounds gate only the initial press; a held drag can move off-canvas.
+        function canUseMouseMoveControl() {
+            return isAnchorSchemeEnabled()
+                && game.ship !== null
+                && (game.state === 'playing' || game.state === 'waveDelay');
+        }
+
+        function endMouseMoveControl() {
+            if (!mouseMoveControlActive) return false;
+            setMouseMoveControlActive(false);
+            endMoveAnchor(MOUSE_MOVE_TOUCH_ID);
+            return true;
+        }
+
+        gameContainer.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || e.target !== canvas || !canUseMouseMoveControl()) return;
+            if (!isPointWithinRect(e.clientX, e.clientY, canvas.getBoundingClientRect())) return;
+            if (!beginMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY)) return;
+
+            setMouseMoveControlActive(true);
+            AudioSystem.init();
+            AudioSystem.resume();
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!mouseMoveControlActive) return;
+            if (e.buttons !== undefined && (e.buttons & 1) === 0) {
+                endMouseMoveControl();
+                return;
+            }
+            updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY);
+            e.preventDefault();
+        });
+
+        document.addEventListener('mouseup', (e) => {
+            if (e.button === 0 && endMouseMoveControl()) {
+                e.preventDefault();
+            }
+        });
 
         // Drop any held anchors on orientation change or when the page is hidden.
         // The anchor's CSS-px coordinates can become meaningless across a layout
