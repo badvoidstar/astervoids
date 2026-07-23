@@ -700,15 +700,16 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Keys or WASD to move | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
+            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
         </div>
 
         <!-- Pause menu overlay -->
         <div id="pause-menu">
             <h1>PAUSED</h1>
-            <div class="menu-item desktop-only"><span>ESC</span> or <span>P</span> - Resume</div>
-            <div class="menu-item desktop-only"><span>ENTER</span> - Restart Game</div>
-            <div class="menu-item desktop-only"><span>Arrow Keys</span> / <span>WASD</span> - Move</div>
+            <div class="menu-item desktop-only"><span>ENTER</span> or <span>P</span> - Resume</div>
+            <div class="menu-item desktop-only"><span>ESC</span> - Restart Game</div>
+            <div class="menu-item desktop-only"><span>Arrow Left/Right/Up</span> / <span>A/D/W</span> - Move</div>
+            <div class="menu-item desktop-only"><span>DOWN</span> / <span>S</span> - Brake</div>
             <div class="menu-item desktop-only"><span>SPACE</span> - Shoot</div>
             <div class="menu-item touch-only">Tap <span>❚❚</span> to Resume</div>
             <div class="menu-item touch-only"><button id="pause-restart-btn">RESTART</button></div>
@@ -4695,11 +4696,17 @@
         stickInput.polarBrake = 0;
     }
 
+    function getNeutralTouchBrakeInput() {
+        const brakeMax = Math.max(0, CONFIG.TOUCH_BRAKE_MAX || 0);
+        return Math.max(0, Math.min(brakeMax, CONFIG.TOUCH_BRAKE_GAIN || 0));
+    }
+
     // Unified input helpers
     const input = {
         left: () => keys['ArrowLeft'] || keys['KeyA'] || touch.left,
         right: () => keys['ArrowRight'] || keys['KeyD'] || touch.right,
         thrust: () => keys['ArrowUp'] || keys['KeyW'] || touch.thrust,
+        brake: () => keys['KeyS'] || keys['ArrowDown'],
         fire: () => keys['Space'] || touch.fire || (isAnchorSchemeEnabled() && stickInput.fireTouchId !== null)
     };
 
@@ -6338,7 +6345,7 @@
      */
     function handleInput(dt = 1) {
         if (game.state === 'start') {
-            // Session picker handles start - don't process Enter here
+            // Session picker handles start - don't process keyboard input here
             return;
         }
         
@@ -6352,7 +6359,7 @@
 
         if (game.state === 'paused') {
             // Allow restart from pause menu (solo only, session can't pause)
-            if (keys['Enter']) {
+            if (keys['Escape']) {
                 pauseMenu.classList.remove('visible');
                 returnToStartScreen();
             }
@@ -6365,8 +6372,9 @@
         if (!game.ship) return;
 
         // Resolve analog control values for this frame. Keyboard / legacy buttons
-        // give discrete inputs (±1 turn, on/off thrust, no brake). The virtual-stick
-        // touch scheme overrides these with analog values while a move anchor is held.
+        // give discrete inputs (±1 turn, on/off thrust, configured neutral brake).
+        // The virtual-stick touch scheme overrides movement axes while a move
+        // anchor is held.
         let turnTarget;
         if (input.left()) {
             turnTarget = -1;
@@ -6377,7 +6385,8 @@
         }
         let thrustOn = input.thrust();
         let thrustMag = thrustOn ? 1 : 0;
-        let brakeMag = 0;
+        const keyboardBrake = input.brake() ? getNeutralTouchBrakeInput() : 0;
+        let brakeMag = keyboardBrake;
         let turnControlMode = TURN_CONTROL_MODE.RATE;
         let turnTargetAngle = 0;
         let turnMagnitude = 0;
@@ -6409,7 +6418,7 @@
                     turnTargetAngle = stickInput.polarTargetAngle;
                     turnMagnitude = stickInput.polarTurnMagnitude;
                     thrustMag = stickInput.polarThrust;
-                    brakeMag  = stickInput.polarBrake;
+                    brakeMag  = Math.max(keyboardBrake, stickInput.polarBrake);
                 } else if (scheme === TOUCH_SCHEMES.POLAR) {
                     // Touch held but inside the polar dead-zone → no turn /
                     // thrust, but brake STILL flows. computePolarStickInput
@@ -6418,11 +6427,11 @@
                     // "high brake" region of the control.
                     turnTarget = 0;
                     thrustMag = 0;
-                    brakeMag = stickInput.polarBrake;
+                    brakeMag = Math.max(keyboardBrake, stickInput.polarBrake);
                 } else {
                     turnTarget = stickInput.turnTarget;
                     thrustMag = stickInput.thrustInput;
-                    brakeMag = stickInput.brakeInput;
+                    brakeMag = Math.max(keyboardBrake, stickInput.brakeInput);
                 }
             }
             thrustOn = thrustMag > 0;
@@ -7931,7 +7940,8 @@
             e.preventDefault();
         }
 
-        // Escape key handling
+        // Escape leaves sessions. In solo play, it opens the pause menu while
+        // active; Escape on the pause menu is handled by handleInput as restart.
         if (e.code === 'Escape') {
             e.preventDefault();
             
@@ -7941,8 +7951,17 @@
                 return;
             }
             
-            // In solo mode: toggle pause (if not game over)
-            if (!isGameOver() && game.state !== 'start') {
+            if (!isGameOver() && game.state !== 'start' && game.state !== 'paused') {
+                togglePause();
+            }
+            return;
+        }
+
+        // Enter resumes the solo pause menu. Session-picker Enter behavior is
+        // handled by its dedicated listener below.
+        if (e.code === 'Enter') {
+            if (!e.repeat && !isSessionMode() && game.state === 'paused') {
+                e.preventDefault();
                 togglePause();
             }
             return;
