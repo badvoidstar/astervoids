@@ -1,4 +1,4 @@
-// Unit tests for the mouse-to-movement-touch adapter in the inline game runtime.
+// Unit tests for the mouse-to-touch adapters in the inline game runtime.
 // Run with: node --test AstervoidsWeb/mouse-touch-controls.test.mjs
 
 import { test } from 'node:test';
@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(here, 'wwwroot/index.html'), 'utf8');
+const gameConfig = readFileSync(join(here, 'wwwroot/js/game-config.js'), 'utf8');
 
 const boundsFn = html.match(
     /function isPointWithinRect\(clientX, clientY, rect\) \{[\s\S]*?\n {8}\}/
@@ -24,6 +25,14 @@ function mouseControlSource() {
     const end = html.indexOf('        // Drop any held anchors', start);
     assert.ok(start >= 0, 'mouse movement control must be defined');
     assert.ok(end > start, 'mouse movement control must end before reset handlers');
+    return html.slice(start, end);
+}
+
+function mouseFireControlSource() {
+    const start = html.indexOf('        // Mouse fire control:');
+    const end = html.indexOf('        // Drop any held anchors', start);
+    assert.ok(start >= 0, 'mouse fire control must be defined');
+    assert.ok(end > start, 'mouse fire control must end before reset handlers');
     return html.slice(start, end);
 }
 
@@ -63,4 +72,35 @@ test('left mouse drag is movement-only and can leave the canvas', () => {
 test('mouse drag leaves OS cursor styling unchanged', () => {
     assert.doesNotMatch(html, /mouse-move-control-active/);
     assert.doesNotMatch(html, /cursor:\s*none\s*!important/);
+});
+
+test('right touch and mouse use held firing without an analog anchor', () => {
+    const source = mouseFireControlSource();
+
+    assert.match(html, /side === 'fire' && beginFireInput\(t\.identifier\)/);
+    assert.match(html, /endFireInput\(t\.identifier\)/);
+    assert.doesNotMatch(
+        html,
+        /fireAnchor|fireCurrent|fireTurnTarget|fireThrustInput|fireBrakeInput/
+    );
+    assert.doesNotMatch(html, /TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST/);
+    assert.doesNotMatch(gameConfig, /TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST/);
+
+    assert.match(source, /e\.button !== 2/);
+    assert.match(source, /isPointWithinRect\(e\.clientX, e\.clientY, canvas\.getBoundingClientRect\(\)\)/);
+    assert.match(source, /beginFireInput\(MOUSE_FIRE_TOUCH_ID\)/);
+    assert.match(source, /endFireInput\(MOUSE_FIRE_TOUCH_ID\)/);
+    assert.match(source, /document\.addEventListener\('contextmenu'/);
+    assert.match(source, /mouseFireContextMenuTargets\?\.includes\(e\.target\)/);
+    assert.match(source, /e\.preventDefault\(\)/);
+    assert.doesNotMatch(source, /MOUSE_FIRE_CONTEXT_MENU_GRACE_MS|mouseFireContextMenuDeadline/);
+
+    const rightMouseStart = source.indexOf("gameContainer.addEventListener('mousedown'");
+    const mouseMoveStart = source.indexOf("document.addEventListener('mousemove'");
+    assert.ok(rightMouseStart >= 0 && mouseMoveStart > rightMouseStart);
+    assert.doesNotMatch(
+        source.slice(rightMouseStart, mouseMoveStart),
+        /mouseMoveControlActive/,
+        'right-click firing must remain available while left-click movement is held'
+    );
 });

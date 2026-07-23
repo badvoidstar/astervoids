@@ -16,7 +16,6 @@ const AstervoidsConfig = (function() {
         TOUCH_TURN_GAIN: 1.0,
         TOUCH_THRUST_GAIN: 1.0,
         TOUCH_BRAKE_GAIN: 1.0,
-        TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST: false,
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
@@ -204,13 +203,6 @@ const AstervoidsConfig = (function() {
             min: 4, max: 200, step: 1,
             fmt: value => `${Math.round(value)} px`,
             help: 'Radius where polar turn reaches full input and thrust begins.',
-        }),
-        control({
-            key: 'TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST',
-            label: 'Right anchor exclusive thrust/brake (0/1)',
-            min: 0, max: 1, step: 1,
-            fmt: value => `${Math.round(value)}`,
-            help: '1 lets the held right anchor exclusively control thrust and braking.',
         }),
     ]);
 

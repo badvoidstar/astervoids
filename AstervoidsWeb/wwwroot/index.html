@@ -700,7 +700,7 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Keys or WASD to move | Click + drag to steer/thrust | SPACE to shoot | ESC to pause
+            Arrow Keys or WASD to move | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
         </div>
 
         <!-- Pause menu overlay -->
@@ -1402,15 +1402,6 @@
         // is SHIP_BRAKE_STRENGTH * TOUCH_BRAKE_MAX. Set MAX=0 to disable braking.
         TOUCH_BRAKE_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_BRAKE_GAIN,
         TOUCH_BRAKE_MAX: 1.0,
-        // When true: if the right (fire) anchor is held, it has
-        // exclusive control over thrust/brake — the left-anchor thrust/brake
-        // contribution is suppressed for as long as the right touch is active.
-        // When the right anchor is released, thrust/brake fall back to the
-        // left anchor (existing behaviour).
-        // When false (default): both anchors contribute, combined via Math.max
-        // (winner-takes-all per axis; each side already clamped individually).
-        // Turning is always driven by the left anchor regardless of this flag.
-        TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST: SHARED_CONFIG_DEFAULTS.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST,
         // Anchor overlay: an 8-vertex polygon centered on each active anchor
         // whose basis form is a rectangle matching the dead-zone exactly
         // (2·TOUCH_STICK_TURN_DEADZONE_PX wide × 2·TOUCH_STICK_THRUST_DEADZONE_PX
@@ -1640,10 +1631,10 @@
         return TOUCH_SCHEMES.POLAR;
     }
 
-    // True iff the chosen scheme uses screen-half anchors (rectilinear / polar)
-    // instead of the legacy on-screen buttons (classic). Touch handlers are
-    // wired in either case; this just gates whether they actually consume
-    // touches.
+    // True iff the chosen scheme uses a left movement anchor plus right-half
+    // held firing (rectilinear / polar) instead of legacy on-screen buttons
+    // (classic). Touch handlers are wired in either case; this just gates
+    // whether they actually consume touches.
     function isAnchorSchemeEnabled() {
         const s = getTouchScheme();
         return s === TOUCH_SCHEMES.RECTILINEAR || s === TOUCH_SCHEMES.POLAR;
@@ -3287,13 +3278,11 @@
 
     /**
      * Combine two signed turn-input commands into a single command in
-     * [−1, +1]. Used by the polar touch scheme to merge the left-anchor's
-     * heading-tracking turn with the right-anchor's rectilinear turn so
-     * both fingers can contribute simultaneously (and oppose each other
-     * symmetrically when needed). Each per-anchor input is already clamped
+     * [−1, +1]. Used when a polar heading-tracking turn also carries a
+     * persisted turn bias during presentation. Each input is already clamped
      * to ≤ TOUCH_TURN_MAX (≤ 1), so the clamp here only kicks in when both
-     * fingers are pushing past 0.5 in the same direction; in normal play
-     * the sum stays in-range and the clamp is a no-op.
+     * are pushing past 0.5 in the same direction; in normal play the sum
+     * stays in-range and the clamp is a no-op.
      *
      * Pure: no DOM / globals — exercised by touch-polar-input.test.mjs.
      */
@@ -4640,11 +4629,9 @@
     /**
      * Anchor-based touch state (used by the `rectilinear` and `polar` schemes;
      * unused in `classic`). Multi-touch: at most one movement anchor (left
-     * half) and one fire anchor (right half) at any time. Touch identifiers
-     * come from Touch.identifier; mouse movement uses a private sentinel so
-     * it shares the same anchor lifecycle. Coordinates are kept current so
-     * the visualization layer can draw a base ring + thumb at
-     * (anchorX, anchorY) → (currentX, currentY).
+     * half) and one held-fire input (right half) at any time. Touch identifiers
+     * come from Touch.identifier; mouse input uses private sentinels so it
+     * shares the same lifecycle.
      *
      * Coordinates are in CSS pixels relative to the viewport (clientX/clientY).
      * They survive dynamic device rotation because the compute helpers rescale
@@ -4664,22 +4651,11 @@
         moveAnchorX: 0, moveAnchorY: 0,
         moveCurrentX: 0, moveCurrentY: 0,
         fireTouchId: null,
-        fireAnchorX: 0, fireAnchorY: 0,
-        fireCurrentX: 0, fireCurrentY: 0,
         // Cached per-frame analog values produced from the move anchor under
         // the rectilinear scheme.
         turnTarget: 0,
         thrustInput: 0,
         brakeInput: 0,
-        // Cached per-frame analog values produced from the fire anchor.
-        // The right (fire) anchor drives thrust/brake too — lateral motion
-        // produces a rectilinear turn input (used by handleInput's POLAR
-        // branch, ignored by the rectilinear branch). handleInput combines
-        // these with the move-anchor outputs (thrust/brake via max();
-        // turn via signed sum + clamp — see mergeTurnInputs).
-        fireTurnTarget: 0,
-        fireThrustInput: 0,
-        fireBrakeInput: 0,
         // Polar-scheme left-anchor cache (see computePolarStickInput).
         polarActive: false,
         polarRadius: 0,
@@ -4691,7 +4667,12 @@
 
     // A Symbol cannot collide with a browser Touch.identifier.
     const MOUSE_MOVE_TOUCH_ID = Symbol('mouse-move');
+    const MOUSE_FIRE_TOUCH_ID = Symbol('mouse-fire');
     let mouseMoveControlActive = false;
+    let mouseFireControlActive = false;
+    // Browsers dispatch contextmenu before or after mouseup. Track the start,
+    // current, and release targets so only the firing click's menu is suppressed.
+    let mouseFireContextMenuTargets = null;
 
     function setMouseMoveControlActive(active) {
         mouseMoveControlActive = active;
@@ -4699,14 +4680,13 @@
 
     function resetStickInput() {
         setMouseMoveControlActive(false);
+        mouseFireControlActive = false;
+        mouseFireContextMenuTargets = null;
         stickInput.moveTouchId = null;
         stickInput.fireTouchId = null;
         stickInput.turnTarget = 0;
         stickInput.thrustInput = 0;
         stickInput.brakeInput = 0;
-        stickInput.fireTurnTarget = 0;
-        stickInput.fireThrustInput = 0;
-        stickInput.fireBrakeInput = 0;
         stickInput.polarActive = false;
         stickInput.polarRadius = 0;
         stickInput.polarTargetAngle = 0;
@@ -6445,44 +6425,6 @@
                     brakeMag = stickInput.brakeInput;
                 }
             }
-            // Right (fire) anchor also drives thrust/brake — and, in the
-            // POLAR scheme only, turn as well (rectilinear-style lateral
-            // mapping; lets the right thumb steer + fire while the left
-            // thumb handles polar heading/thrust). In the rectilinear
-            // scheme the right-anchor turn is ignored and turning remains
-            // exclusively a left-anchor function.
-            //
-            // CONFIG.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST (default false):
-            // when true, while the right anchor is held it takes exclusive
-            // control of thrust/brake — left-anchor contributions are
-            // dropped, even if the right finger sits in its dead-zone
-            // (yielding zero). When the right anchor is released,
-            // thrust/brake fall back to the left anchor automatically.
-            //
-            // When the flag is false (default), both anchors are combined
-            // via Math.max so either can drive forward thrust or braking;
-            // values are already per-anchor clamped by computeStickInput,
-            // so max() stays within the configured limits.
-            //
-            // Turn merging in POLAR (always-combine; no exclusive flag):
-            // signed-sum-and-clamp via mergeTurnInputs — opposing fingers
-            // cancel, cooperating fingers reinforce up to ±1.
-            if (stickInput.fireTouchId !== null) {
-                if (CONFIG.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST) {
-                    thrustMag = stickInput.fireThrustInput;
-                    brakeMag  = stickInput.fireBrakeInput;
-                } else {
-                    thrustMag = Math.max(thrustMag, stickInput.fireThrustInput);
-                    brakeMag  = Math.max(brakeMag,  stickInput.fireBrakeInput);
-                }
-                if (scheme === TOUCH_SCHEMES.POLAR) {
-                    const fireTurn = stickInput.fireTurnTarget;
-                    turnTarget = mergeTurnInputs(turnTarget, fireTurn);
-                    if (turnControlMode === TURN_CONTROL_MODE.TARGET) {
-                        turnBias = fireTurn;
-                    }
-                }
-            }
             thrustOn = thrustMag > 0;
         }
 
@@ -6893,15 +6835,13 @@
     }
 
     /**
-     * Anchor overlays for the rectilinear and polar touch schemes
-     * (CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED). For each live anchor:
+     * Movement-anchor overlays for the rectilinear and polar touch schemes
+     * (CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED):
      *
-     *   rectilinear (both anchors): the 8-vertex polygon produced by
+     *   rectilinear: the 8-vertex polygon produced by
      *     computeAnchorVertices, centered on the anchor.
      *
-     *   polar (left anchor only; right keeps the rectilinear polygon since
-     *     its semantics are unchanged): up to three concentric circles
-     *     centered on the anchor —
+     *   polar: up to three concentric circles centered on the anchor —
      *       • dead-zone circle (always while held), radius = DEADZONE_PX;
      *       • dynamic circle (when r ≥ DEADZONE_PX), radius = finger r;
      *       • threshold circle (when r ≥ THRESHOLD_PX), radius = THRESHOLD_PX.
@@ -6922,7 +6862,7 @@
         if (!CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED) return;
         if (!touchControlsEnabled && stickInput.moveTouchId !== MOUSE_MOVE_TOUCH_ID) return;
         if (game.state !== 'playing' && game.state !== 'waveDelay') return;
-        if (stickInput.moveTouchId === null && stickInput.fireTouchId === null) return;
+        if (stickInput.moveTouchId === null) return;
 
         const rect = canvas.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
@@ -7034,14 +6974,6 @@
                     stickInput.moveCurrentX, stickInput.moveCurrentY);
             }
         }
-        // The right (fire) anchor always uses the rectilinear overlay because
-        // its semantics are identical in both anchor-based schemes.
-        if (stickInput.fireTouchId !== null) {
-            strokeRectAnchor(
-                stickInput.fireAnchorX, stickInput.fireAnchorY,
-                stickInput.fireCurrentX, stickInput.fireCurrentY);
-        }
-
         ctx.restore();
     }
 
@@ -8265,15 +8197,24 @@
             return true;
         }
 
+        function beginFireInput(identifier) {
+            if (stickInput.fireTouchId !== null) return false;
+            stickInput.fireTouchId = identifier;
+            return true;
+        }
+
+        function endFireInput(identifier) {
+            if (identifier !== stickInput.fireTouchId) return false;
+            stickInput.fireTouchId = null;
+            return true;
+        }
+
         // Frame-time updater: recomputes cached analog values from the current
-        // move and fire anchors each animation frame, so changes in viewport
-        // size / orientation immediately affect mapping without per-event work.
-        // The fire anchor reuses computeStickInput in every anchor-based
-        // scheme — only the thrust/brake fields are consumed downstream and
-        // its turn output is discarded. The MOVE anchor branches on scheme:
-        // rectilinear uses computeStickInput, polar uses computePolarStickInput
-        // (and caches a targetAngle that handleInput converts into a signed
-        // turn target once the ship's heading is known).
+        // movement anchor each animation frame, so changes in viewport size /
+        // orientation immediately affect mapping without per-event work. The
+        // rectilinear scheme uses computeStickInput; polar uses
+        // computePolarStickInput and caches a targetAngle that handleInput
+        // converts into a signed turn target once the ship's heading is known.
         function updateStickAnalog() {
             const scheme = getTouchScheme();
             const rectParams = {
@@ -8336,21 +8277,6 @@
                 stickInput.polarThrust = 0;
                 stickInput.polarBrake = 0;
             }
-            if (stickInput.fireTouchId !== null) {
-                const dx = stickInput.fireCurrentX - stickInput.fireAnchorX;
-                const dy = stickInput.fireCurrentY - stickInput.fireAnchorY;
-                const out = computeStickInput(dx, dy, rectParams);
-                // Lateral motion → turn (consumed by handleInput only when
-                // scheme=polar; the rectilinear scheme ignores fireTurnTarget
-                // and keeps turning exclusively on the left anchor).
-                stickInput.fireTurnTarget  = out.turn;
-                stickInput.fireThrustInput = out.thrust;
-                stickInput.fireBrakeInput  = out.brake;
-            } else {
-                stickInput.fireTurnTarget  = 0;
-                stickInput.fireThrustInput = 0;
-                stickInput.fireBrakeInput  = 0;
-            }
             requestAnimationFrame(updateStickAnalog);
         }
         requestAnimationFrame(updateStickAnalog);
@@ -8363,12 +8289,7 @@
                 if (side === 'move' && beginMoveAnchor(t.identifier, t.clientX, t.clientY)) {
                     AudioSystem.init();
                     AudioSystem.resume();
-                } else if (side === 'fire' && stickInput.fireTouchId === null) {
-                    stickInput.fireTouchId = t.identifier;
-                    stickInput.fireAnchorX = t.clientX;
-                    stickInput.fireAnchorY = t.clientY;
-                    stickInput.fireCurrentX = t.clientX;
-                    stickInput.fireCurrentY = t.clientY;
+                } else if (side === 'fire' && beginFireInput(t.identifier)) {
                     AudioSystem.init();
                     AudioSystem.resume();
                 }
@@ -8378,12 +8299,7 @@
         gameContainer.addEventListener('touchmove', (e) => {
             if (!isAnchorSchemeEnabled()) return;
             for (const t of e.changedTouches) {
-                if (updateMoveAnchor(t.identifier, t.clientX, t.clientY)) {
-                    continue;
-                } else if (t.identifier === stickInput.fireTouchId) {
-                    stickInput.fireCurrentX = t.clientX;
-                    stickInput.fireCurrentY = t.clientY;
-                }
+                updateMoveAnchor(t.identifier, t.clientX, t.clientY);
             }
         }, { passive: false });
 
@@ -8391,12 +8307,8 @@
             for (const t of e.changedTouches) {
                 if (endMoveAnchor(t.identifier)) {
                     continue;
-                } else if (t.identifier === stickInput.fireTouchId) {
-                    stickInput.fireTouchId = null;
-                    stickInput.fireTurnTarget  = 0;
-                    stickInput.fireThrustInput = 0;
-                    stickInput.fireBrakeInput  = 0;
                 }
+                endFireInput(t.identifier);
             }
         }
         gameContainer.addEventListener('touchend', endTouch, { passive: true });
@@ -8404,7 +8316,7 @@
 
         // Mouse movement control: left drag maps to the movement touch anchor.
         // Bounds gate only the initial press; a held drag can move off-canvas.
-        function canUseMouseMoveControl() {
+        function canUseMouseShipControl() {
             return isAnchorSchemeEnabled()
                 && game.ship !== null
                 && (game.state === 'playing' || game.state === 'waveDelay');
@@ -8418,7 +8330,7 @@
         }
 
         gameContainer.addEventListener('mousedown', (e) => {
-            if (e.button !== 0 || e.target !== canvas || !canUseMouseMoveControl()) return;
+            if (e.button !== 0 || e.target !== canvas || !canUseMouseShipControl()) return;
             if (!isPointWithinRect(e.clientX, e.clientY, canvas.getBoundingClientRect())) return;
             if (!beginMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY)) return;
 
@@ -8428,20 +8340,80 @@
             e.preventDefault();
         });
 
-        document.addEventListener('mousemove', (e) => {
-            if (!mouseMoveControlActive) return;
-            if (e.buttons !== undefined && (e.buttons & 1) === 0) {
-                endMouseMoveControl();
-                return;
+        // Mouse fire control: right click maps to the held-fire touch input.
+        // It deliberately has no movement-anchor dependency, so it can run
+        // alongside a held left-click movement control.
+        function endMouseFireControl(event) {
+            if (!mouseFireControlActive) return false;
+            mouseFireControlActive = false;
+            if (mouseFireContextMenuTargets !== null
+                && event?.target
+                && !mouseFireContextMenuTargets.includes(event.target)) {
+                mouseFireContextMenuTargets.push(event.target);
             }
-            updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY);
+            endFireInput(MOUSE_FIRE_TOUCH_ID);
+            return true;
+        }
+
+        gameContainer.addEventListener('mousedown', (e) => {
+            if (e.button !== 2 || e.target !== canvas || !canUseMouseShipControl()) return;
+            if (!isPointWithinRect(e.clientX, e.clientY, canvas.getBoundingClientRect())) return;
+            if (!beginFireInput(MOUSE_FIRE_TOUCH_ID)) return;
+
+            mouseFireControlActive = true;
+            mouseFireContextMenuTargets = [e.target];
+            AudioSystem.init();
+            AudioSystem.resume();
             e.preventDefault();
         });
 
-        document.addEventListener('mouseup', (e) => {
-            if (e.button === 0 && endMouseMoveControl()) {
+        document.addEventListener('mousemove', (e) => {
+            let controlsActive = false;
+            if (mouseMoveControlActive) {
+                controlsActive = true;
+                if (e.buttons !== undefined && (e.buttons & 1) === 0) {
+                    endMouseMoveControl();
+                } else {
+                    updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY);
+                }
+            }
+            if (mouseFireControlActive) {
+                controlsActive = true;
+                if (e.buttons !== undefined && (e.buttons & 2) === 0) {
+                    endMouseFireControl(e);
+                } else if (mouseFireContextMenuTargets !== null && e.target) {
+                    const startTarget = mouseFireContextMenuTargets[0];
+                    mouseFireContextMenuTargets = e.target === startTarget
+                        ? [startTarget]
+                        : [startTarget, e.target];
+                }
+            }
+            if (controlsActive) {
                 e.preventDefault();
             }
+        });
+
+        document.addEventListener('mouseup', (e) => {
+            const ended = e.button === 0
+                ? endMouseMoveControl()
+                : e.button === 2 && endMouseFireControl(e);
+            if (ended) {
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('mousedown', () => {
+            if (!mouseFireControlActive) {
+                mouseFireContextMenuTargets = null;
+            }
+        });
+
+        document.addEventListener('contextmenu', (e) => {
+            if (!mouseFireContextMenuTargets?.includes(e.target)) {
+                return;
+            }
+            mouseFireContextMenuTargets = null;
+            e.preventDefault();
         });
 
         // Drop any held anchors on orientation change or when the page is hidden.
