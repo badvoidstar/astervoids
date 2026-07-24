@@ -19,6 +19,7 @@ const AstervoidsConfig = (function() {
         ANALOG_THRUST_GAIN: 2.0,
         ANALOG_THRUST_MAX: 1.5,
         ANALOG_BRAKE_GAIN: 1.0,
+        EXTRA_LIFE_SCORE_THRESHOLD: 10000,
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
@@ -42,6 +43,7 @@ const AstervoidsConfig = (function() {
         'ASTEROID_VERTICES',
         'ASTEROID_JAGGEDNESS',
         'SIM_MODE',
+        'EXTRA_LIFE_SCORE_THRESHOLD',
     ]);
 
     function control(definition) {
@@ -59,6 +61,13 @@ const AstervoidsConfig = (function() {
             min: 0.1, max: 20, step: 0.1,
             fmt: value => value.toFixed(1),
             help: 'M = density * R^2. Density damps separation by 1/sqrt(density); deflection and spin remain velocity-driven.',
+        }),
+        control({
+            key: 'EXTRA_LIFE_SCORE_THRESHOLD',
+            label: 'Extra-life score threshold',
+            min: 0, max: 100000, step: 100,
+            fmt: value => `${Math.floor(value)} points`,
+            help: 'Awards one life for every score multiple. Set to 0 to disable score-based extra lives.',
         }),
         control({
             key: 'ASTEROID_MAX_SPEED',
@@ -289,6 +298,15 @@ const AstervoidsConfig = (function() {
         }
     }
 
+    function countExtraLivesForScore(score, threshold) {
+        const normalizedThreshold = Math.floor(Number(threshold));
+        if (!Number.isFinite(normalizedThreshold) || normalizedThreshold <= 0) return 0;
+
+        const normalizedScore = Math.floor(Number(score));
+        if (!Number.isFinite(normalizedScore) || normalizedScore <= 0) return 0;
+        return Math.floor(normalizedScore / normalizedThreshold);
+    }
+
     function snapshotConfigValues(config, keys) {
         const out = {};
         for (const key of keys) out[key] = config[key];
@@ -319,6 +337,7 @@ const AstervoidsConfig = (function() {
         coerceConfigOverrideValue,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,
         applySessionConfigMetadata,

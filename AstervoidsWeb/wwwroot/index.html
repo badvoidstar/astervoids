@@ -70,6 +70,21 @@
             pointer-events: none;
         }
 
+        #lives.life-award {
+            animation: life-award-flash 1s steps(2, end);
+        }
+
+        @keyframes life-award-flash {
+            0%, 100% {
+                color: #fff;
+                text-shadow: none;
+            }
+            15%, 45%, 75% {
+                color: #ff0;
+                text-shadow: 0 0 12px #ff0;
+            }
+        }
+
         /* Instructions shown at bottom */
         #instructions {
             position: absolute;
@@ -1495,6 +1510,7 @@
         
         // Game settings
         STARTING_LIVES: 3,          // Lives at game start
+        EXTRA_LIFE_SCORE_THRESHOLD: SHARED_CONFIG_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD,
         INVULNERABILITY_TIME: 180,  // Frames of invulnerability after respawn
         WAVE_DELAY: 120,            // Frames to wait between waves
         
@@ -1546,6 +1562,7 @@
         SESSION_CONFIG_KEYS,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,
         applySessionConfigMetadata,
@@ -4202,6 +4219,30 @@
         sessionIndicatorVisible: null
     };
 
+    let livesAwardFlashTimer = null;
+    function clearExtraLifeAwardFeedback() {
+        if (livesAwardFlashTimer !== null) {
+            clearTimeout(livesAwardFlashTimer);
+            livesAwardFlashTimer = null;
+        }
+        livesDisplay.classList.remove('life-award');
+    }
+
+    function announceExtraLifeAward() {
+        AudioSystem.playExtraLife();
+        livesDisplay.classList.remove('life-award');
+        // Restart the animation if several milestones arrive within one second.
+        void livesDisplay.offsetWidth;
+        livesDisplay.classList.add('life-award');
+        if (livesAwardFlashTimer !== null) {
+            clearTimeout(livesAwardFlashTimer);
+        }
+        livesAwardFlashTimer = setTimeout(() => {
+            livesAwardFlashTimer = null;
+            livesDisplay.classList.remove('life-award');
+        }, 1000);
+    }
+
     // Gameplay overlay references (crisp HTML text instead of canvas-drawn text)
     const waveOverlay = document.getElementById('wave-overlay');
     const waveTextEl = document.getElementById('wave-text');
@@ -4280,7 +4321,8 @@
             processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
             collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
             seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
-            seenShipHitCounts: new Map() // objectId -> highest hitCount already cued
+            seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
+            observedScoreLifeAwardCount: null
             // Join-snapshot tracking (which orphans/replicas should skip spawn
             // projection or seed onto the delayed timeline) now lives inside
             // replicationRuntime (facts.joinSnapshot), consumed one-shot per id.
@@ -5204,6 +5246,22 @@
         if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
         if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
 
+        const incomingScoreLifeAwardCount = Number(data.scoreLifeAwardCount);
+        if (Number.isFinite(incomingScoreLifeAwardCount)
+            && incomingScoreLifeAwardCount >= 0) {
+            const scoreLifeAwardCount = Math.floor(incomingScoreLifeAwardCount);
+            const observedScoreLifeAwardCount =
+                game.multiplayer.observedScoreLifeAwardCount;
+            if (observedScoreLifeAwardCount !== null
+                && scoreLifeAwardCount > observedScoreLifeAwardCount) {
+                announceExtraLifeAward();
+            }
+            if (observedScoreLifeAwardCount === null
+                || scoreLifeAwardCount > observedScoreLifeAwardCount) {
+                game.multiplayer.observedScoreLifeAwardCount = scoreLifeAwardCount;
+            }
+        }
+
         if (game.lives <= 0 && oldLives > 0) {
             AudioSystem.beat.stop();
             AudioSystem.thrustSound.stop();
@@ -5248,6 +5306,7 @@
         remove(instance) {
             if (game.multiplayer.gameStateObjectId === instance) {
                 game.multiplayer.gameStateObjectId = null;
+                game.multiplayer.observedScoreLifeAwardCount = null;
             }
         }
     };
@@ -5333,7 +5392,9 @@
         game.multiplayer.remoteShips.clear();
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
+        game.multiplayer.observedScoreLifeAwardCount = null;
         game.multiplayer.processedPendingBullets.clear();
+        clearExtraLifeAwardFeedback();
         CollisionEffects.clear();
         game.astervoids = [];
         game.bullets = [];
@@ -5620,7 +5681,8 @@
                 // terminalAt is the shared end of the deterministic convergence
                 // window and is likewise immutable for this terminal epoch.
                 gameOverAt: null,
-                terminalAt: null
+                terminalAt: null,
+                scoreLifeAwardCount: 0
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -5628,6 +5690,7 @@
                 () => isSessionMode());
             if (!objectInfo) return;
             game.multiplayer.gameStateObjectId = objectInfo.id;
+            game.multiplayer.observedScoreLifeAwardCount = 0;
         } catch (err) {
             _error('[Multiplayer] Failed to create GameState:', err);
         }
@@ -5659,12 +5722,30 @@
             return;
         }
         let groupScore = gsObj?.data?.groupScore || 0;
+        const persistedScoreLifeAwardCount =
+            Number(gsObj?.data?.scoreLifeAwardCount);
+        let scoreLifeAwardCount = Number.isFinite(persistedScoreLifeAwardCount)
+            && persistedScoreLifeAwardCount > 0
+            ? Math.floor(persistedScoreLifeAwardCount)
+            : 0;
+        let observedScoreLifeAwardCount =
+            game.multiplayer.observedScoreLifeAwardCount;
+        if (observedScoreLifeAwardCount === null
+            || scoreLifeAwardCount > observedScoreLifeAwardCount) {
+            observedScoreLifeAwardCount = scoreLifeAwardCount;
+            game.multiplayer.observedScoreLifeAwardCount =
+                observedScoreLifeAwardCount;
+        }
+        const pendingScoreLifeAwards = Math.max(
+            0, observedScoreLifeAwardCount - scoreLifeAwardCount);
+        scoreLifeAwardCount = Math.max(
+            scoreLifeAwardCount, observedScoreLifeAwardCount);
         
         // Read lives from gsObj.data (same source as processedHits/peakShipCount)
         // so that they are always from the same sync point. Using game.lives would
         // be stale if a remote delta arrived between the last updateGameStateFromSync()
         // and an ownership migration — causing incorrect lives on the new owner.
-        let lives = gsObj?.data?.lives ?? game.lives;
+        let lives = (gsObj?.data?.lives ?? game.lives) + pendingScoreLifeAwards;
         
         // Accumulate score deltas from all ships (survives member departure)
         const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
@@ -5679,6 +5760,19 @@
             }
         }
         game.score = groupScore;
+
+        // Score-based lives are derived from the authoritative shared total.
+        // The persisted count makes the award idempotent across ownership migration.
+        const eligibleScoreLifeAwards = countExtraLivesForScore(
+            groupScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+        const newScoreLifeAwards = Math.max(
+            0, eligibleScoreLifeAwards - scoreLifeAwardCount);
+        if (newScoreLifeAwards > 0 && lives > 0) {
+            lives += newScoreLifeAwards;
+            scoreLifeAwardCount += newScoreLifeAwards;
+            game.multiplayer.observedScoreLifeAwardCount = scoreLifeAwardCount;
+            announceExtraLifeAward();
+        }
         
         // Process hitCounts from all ships (idempotent via processedHits tracking)
         for (const ship of shipObjects) {
@@ -5745,7 +5839,8 @@
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
             peakShipCount: peakShipCount,
             gameOverAt: gameOverAt,
-            terminalAt: terminalAt
+            terminalAt: terminalAt,
+            scoreLifeAwardCount: scoreLifeAwardCount
         };
         
         // This queues into pendingUpdates with the other object updates.
@@ -6581,7 +6676,18 @@
                         CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
                         game.bullets.splice(i, 1);
                         game.astervoids.splice(j, 1);
+                        const previousScore = game.score;
                         game.score += asteroid.getPoints();
+                        const newScoreLifeAwards = Math.max(
+                            0,
+                            countExtraLivesForScore(
+                                game.score, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD)
+                            - countExtraLivesForScore(
+                                previousScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD));
+                        if (newScoreLifeAwards > 0) {
+                            game.lives += newScoreLifeAwards;
+                            announceExtraLifeAward();
+                        }
                         const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
                                               asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
                         AudioSystem.playExplosion(explosionSize);
@@ -9277,6 +9383,7 @@
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
                         groupScore: 'gr', peakShipCount: 'pk',
+                        scoreLifeAwardCount: 'sa',
                         gameOverAt: 'go', terminalAt: 'ta',
                         terminalEpoch: 'te', terminalX: 'tx',
                         terminalY: 'ty', terminalAngle: 'tg',

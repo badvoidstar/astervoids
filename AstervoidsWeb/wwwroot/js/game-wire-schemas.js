@@ -61,6 +61,7 @@ const AstervoidsWireSchemas = (function() {
             ['peakShipCount', 'u8'],
             ['gameOverAt', 'f64'],
             ['terminalAt', 'f64'],
+            ['scoreLifeAwardCount', 'u32'],
         ]},
     ];
 

@@ -7,10 +7,12 @@ const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
     DEBUG_OVERRIDABLE_KEYS,
+    SESSION_CONFIG_KEYS,
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
     applySessionConfigMetadata,
     buildSessionConfigMetadata,
+    countExtraLivesForScore,
 } = require('./wwwroot/js/game-config.js');
 
 test('debug controls derive defaults from the shared runtime values', () => {
@@ -37,6 +39,42 @@ test('analog thrust maximum is available as a debug override', () => {
     const cfg = { ANALOG_THRUST_MAX: 1.5 };
     applyUrlConfigOverrides(cfg, '?cfg.ANALOG_THRUST_MAX=2.5');
     assert.equal(cfg.ANALOG_THRUST_MAX, 2.5);
+});
+
+test('extra-life score threshold is configurable and session-locked', () => {
+    assert.equal(SHARED_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD, 10000);
+    const control = CONFIG_CONTROLS.find(
+        item => item.key === 'EXTRA_LIFE_SCORE_THRESHOLD');
+    assert.deepEqual(
+        control && {
+            default: control.default,
+            min: control.min,
+            max: control.max,
+            step: control.step,
+        },
+        { default: 10000, min: 0, max: 100000, step: 100 });
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('EXTRA_LIFE_SCORE_THRESHOLD'));
+    assert.ok(SESSION_CONFIG_KEYS.includes('EXTRA_LIFE_SCORE_THRESHOLD'));
+
+    const cfg = { EXTRA_LIFE_SCORE_THRESHOLD: 10000 };
+    applyUrlConfigOverrides(cfg, '?cfg.EXTRA_LIFE_SCORE_THRESHOLD=25000');
+    assert.equal(cfg.EXTRA_LIFE_SCORE_THRESHOLD, 25000);
+
+    const joinerCfg = { EXTRA_LIFE_SCORE_THRESHOLD: 10000 };
+    applySessionConfigMetadata(
+        { config: { EXTRA_LIFE_SCORE_THRESHOLD: 25000 } },
+        joinerCfg);
+    assert.equal(joinerCfg.EXTRA_LIFE_SCORE_THRESHOLD, 25000);
+});
+
+test('score milestones count only enabled whole-score thresholds', () => {
+    assert.equal(countExtraLivesForScore(9999, 10000), 0);
+    assert.equal(countExtraLivesForScore(10000, 10000), 1);
+    assert.equal(countExtraLivesForScore(30099, 10000), 3);
+    assert.equal(countExtraLivesForScore(-100, 10000), 0);
+    assert.equal(countExtraLivesForScore(10000, 0), 0);
+    assert.equal(countExtraLivesForScore(10000, -1), 0);
+    assert.equal(countExtraLivesForScore(10000, 'invalid'), 0);
 });
 
 test('ship movement defaults and debug bounds split keyboard and analog controls', () => {
