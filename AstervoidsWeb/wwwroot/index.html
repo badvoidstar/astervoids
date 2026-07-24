@@ -255,6 +255,16 @@
             display: none;
         }
 
+        /* Keep the backdrop full-screen while reducing the title and picker together. */
+        #start-screen-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            transform: scale(0.8);
+            transform-origin: center;
+        }
+
         #start-screen h1 {
             font-size: clamp(24px, 5vmin, 38px);
             margin-bottom: clamp(15px, 3vmin, 30px);
@@ -698,23 +708,25 @@
 
         <!-- Start screen overlay -->
         <div id="start-screen">
-            <h1>ASTERVOIDS</h1>
-            <div id="session-picker">
-                <div id="picker-status" class="picker-status connecting">Connecting...</div>
-                <div id="region-banner" style="display: none;"></div>
-                <div id="session-list"></div>
-                <div id="picker-buttons">
-                    <div class="region-select-row" id="create-region-row" style="display: none;">
-                        <label for="create-region-select">Host region</label>
-                        <select id="create-region-select"></select>
+            <div id="start-screen-content">
+                <h1>ASTERVOIDS</h1>
+                <div id="session-picker">
+                    <div id="picker-status" class="picker-status connecting">Connecting...</div>
+                    <div id="region-banner" style="display: none;"></div>
+                    <div id="session-list"></div>
+                    <div id="picker-buttons">
+                        <div class="region-select-row" id="create-region-row" style="display: none;">
+                            <label for="create-region-select">Host region</label>
+                            <select id="create-region-select"></select>
+                        </div>
+                        <div class="button-row">
+                            <button id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer</button>
+                            <button id="btn-start-enter" class="picker-btn action" style="display: none;">Start</button>
+                        </div>
+                        <button id="btn-solo" class="picker-btn solo">Start Solo Play</button>
+                        <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
+                        <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
                     </div>
-                    <div class="button-row">
-                        <button id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer</button>
-                        <button id="btn-start-enter" class="picker-btn action" style="display: none;">Start</button>
-                    </div>
-                    <button id="btn-solo" class="picker-btn solo">Start Solo Play</button>
-                    <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
-                    <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
                 </div>
             </div>
         </div>
