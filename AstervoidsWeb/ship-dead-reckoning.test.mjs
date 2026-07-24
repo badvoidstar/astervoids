@@ -242,21 +242,48 @@ test('P2: short gaps before the adaptive horizon are unaffected', () => {
 // (owner and replica use the identical function), so a simple deterministic
 // conversion stands in for velocityToNormalizedDeltaX/Y.
 
+test('P3: runtime maps keyboard and analog turn sources to distinct mode caps', () => {
+    const handleStart = productionSource.indexOf('    function handleInput(dt = 1)');
+    const handleEnd = productionSource.indexOf('    function checkCollisions()', handleStart);
+    const shipUpdateStart = productionSource.indexOf('        update(dt = 1) {');
+    const shipUpdateEnd = productionSource.indexOf('        /**', shipUpdateStart);
+    assert.ok(handleStart >= 0 && handleEnd > handleStart);
+    assert.ok(shipUpdateStart >= 0 && shipUpdateEnd > shipUpdateStart);
+
+    const handleSource = productionSource.slice(handleStart, handleEnd);
+    const shipUpdateSource = productionSource.slice(shipUpdateStart, shipUpdateEnd);
+    assert.match(handleSource, /let turnControlMode = TURN_CONTROL_MODE\.KEYBOARD_RATE/);
+    assert.match(handleSource, /turnControlMode = TURN_CONTROL_MODE\.ANALOG_TARGET/);
+    assert.match(handleSource, /turnControlMode = TURN_CONTROL_MODE\.ANALOG_RATE/);
+    assert.match(handleSource, /getShipTurnSpeed\(turnControlMode\)/);
+    assert.match(
+        shipUpdateSource,
+        /getShipTurnSpeed\(this\.turnControlMode\) \* this\.turnInput/);
+});
+
 const SHIP = {
     TARGET_FPS: 60,
     SHIP_THRUST: 0.009,
     SHIP_FRICTION: 0.99,
-    SHIP_TURN_SPEED: 0.12,
-    SHIP_MAX_SPEED: 0.8,
+    SHIP_KEYBOARD_TURN_SPEED: 0.2,
+    SHIP_ANALOG_TURN_SPEED: 0.3,
+    SHIP_MAX_SPEED: 1.0,
     SHIP_BRAKE_STRENGTH: 0.018,
     ACCEL_TIME: 0.0,
     DECEL_TIME: 0.0,
 };
 
 const TURN_CONTROL_MODE = {
-    RATE: 0,
-    TARGET: 1,
+    KEYBOARD_RATE: 0,
+    ANALOG_TARGET: 1,
+    ANALOG_RATE: 2,
 };
+
+function getShipTurnSpeed(turnControlMode) {
+    return turnControlMode === TURN_CONTROL_MODE.KEYBOARD_RATE
+        ? SHIP.SHIP_KEYBOARD_TURN_SPEED
+        : SHIP.SHIP_ANALOG_TURN_SPEED;
+}
 
 function shortestAngleDelta(targetAngle, currentAngle) {
     const diff = targetAngle - currentAngle;
@@ -299,7 +326,7 @@ class MiniShip {
         this.rotationSpeed = 0;
         this.turnTarget = 0; this.turnInput = 0;
         this.thrustInput = 0; this.brakeInput = 0;
-        this.turnControlMode = TURN_CONTROL_MODE.RATE;
+        this.turnControlMode = TURN_CONTROL_MODE.KEYBOARD_RATE;
         this.turnTargetAngle = 0;
         this.turnMagnitude = 0;
         this.turnBias = 0;
@@ -307,7 +334,7 @@ class MiniShip {
     update(dt = 1) {
         const dtSec = dt / SHIP.TARGET_FPS;
         this.turnInput = rampInputToward(this.turnInput, this.turnTarget, SHIP.ACCEL_TIME, SHIP.DECEL_TIME, dtSec);
-        this.rotationSpeed = SHIP.SHIP_TURN_SPEED * this.turnInput;
+        this.rotationSpeed = getShipTurnSpeed(this.turnControlMode) * this.turnInput;
         this.angle += this.rotationSpeed * dt;
         const friction = Math.pow(SHIP.SHIP_FRICTION, dt);
         this.velocityX *= friction;
@@ -319,7 +346,7 @@ class MiniShip {
         }
         const speedSq = this.velocityX ** 2 + this.velocityY ** 2;
         const maxSq = SHIP.SHIP_MAX_SPEED ** 2;
-        if (speedSq > maxSq) {
+        if (SHIP.SHIP_MAX_SPEED > 0 && speedSq > maxSq) {
             const s = Math.sqrt(speedSq);
             this.velocityX = (this.velocityX / s) * SHIP.SHIP_MAX_SPEED;
             this.velocityY = (this.velocityY / s) * SHIP.SHIP_MAX_SPEED;
@@ -338,6 +365,23 @@ class MiniShip {
     }
 }
 
+test('P3: zero ship max speed disables the speed cap', () => {
+    assert.match(
+        productionSource,
+        /if \(CONFIG\.SHIP_MAX_SPEED > 0 && speedSq > maxSpeedSq\)/);
+
+    const originalMaxSpeed = SHIP.SHIP_MAX_SPEED;
+    try {
+        SHIP.SHIP_MAX_SPEED = 0;
+        const ship = new MiniShip();
+        ship.velocityX = 0.5;
+        ship.update();
+        assert.ok(ship.velocityX > 0);
+    } finally {
+        SHIP.SHIP_MAX_SPEED = originalMaxSpeed;
+    }
+});
+
 // The replay used on the remote: seed a scratch ship from the authoritative
 // packet and step it `frames` times. Rate controls replay turnTarget directly;
 // target-heading controls recompute turnTarget from targetAngle every substep
@@ -347,7 +391,9 @@ function replay(packet, frames, targetDrive = true, rateWindow = null) {
     sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
     sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
     sh.rotationSpeed = packet.rotationSpeed;
-    const ti = SHIP.SHIP_TURN_SPEED !== 0 ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
+    sh.turnControlMode = packet.turnControlMode ?? TURN_CONTROL_MODE.KEYBOARD_RATE;
+    const turnSpeed = getShipTurnSpeed(sh.turnControlMode);
+    const ti = turnSpeed !== 0 ? packet.rotationSpeed / turnSpeed : 0;
     sh.turnInput = ti;
     sh.thrustInput = packet.thrustInput || 0;
     sh.brakeInput = packet.brakeInput || 0;
@@ -355,12 +401,12 @@ function replay(packet, frames, targetDrive = true, rateWindow = null) {
     let elapsed = 0;
     while (remaining > 1e-6) {
         const dt = remaining > 1 ? 1 : remaining;
-        if (targetDrive && packet.turnControlMode === TURN_CONTROL_MODE.TARGET) {
+        if (targetDrive && sh.turnControlMode === TURN_CONTROL_MODE.ANALOG_TARGET) {
             const delta = shortestAngleDelta(packet.turnTargetAngle || 0, sh.angle);
             const targetTurn = attainableTurnTarget(
                 delta,
                 packet.turnMagnitude || 0,
-                SHIP.SHIP_TURN_SPEED,
+                turnSpeed,
                 dt);
             sh.turnTarget = mergeTurnInputs(targetTurn, packet.turnBias || 0);
         } else {
@@ -380,7 +426,9 @@ function staleRateReplay(packet, frames) {
     const sh = new MiniShip();
     sh.x = packet.x; sh.y = packet.y; sh.angle = packet.angle;
     sh.velocityX = packet.velocityX; sh.velocityY = packet.velocityY;
-    const ti = SHIP.SHIP_TURN_SPEED !== 0 ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
+    sh.turnControlMode = packet.turnControlMode ?? TURN_CONTROL_MODE.KEYBOARD_RATE;
+    const turnSpeed = getShipTurnSpeed(sh.turnControlMode);
+    const ti = turnSpeed !== 0 ? packet.rotationSpeed / turnSpeed : 0;
     sh.turnInput = ti;
     sh.turnTarget = ti;
     let remaining = frames > 0 ? frames : 0;
@@ -394,7 +442,7 @@ function staleRateReplay(packet, frames) {
 
 function hybridReckon(packet, frames, { inputReplay = true, rotationTarget = true } = {}) {
     const targetMode = rotationTarget
-        && packet.turnControlMode === TURN_CONTROL_MODE.TARGET;
+        && packet.turnControlMode === TURN_CONTROL_MODE.ANALOG_TARGET;
     const out = {
         x: packet.x,
         y: packet.y,
@@ -463,7 +511,7 @@ test('P3: replay reproduces thrust along the rotating heading exactly', () => {
     const owner = new MiniShip();
     owner.angle = 0.5;
     owner.turnTarget = 0.5; owner.turnInput = 0.5;   // sustained turn
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput; // as set by update()
+    owner.rotationSpeed = getShipTurnSpeed(owner.turnControlMode) * owner.turnInput;
     owner.thrustInput = 1.0;                         // full thrust
     const packet = packetOf(owner);
     for (let i = 0; i < 25; i++) owner.update(1);
@@ -481,19 +529,47 @@ test('P3: replay reproduces braking (clamped damping) exactly', () => {
 
 test('P3: turnInput recovered from rotationSpeed reproduces rotation', () => {
     const owner = new MiniShip();
-    owner.turnTarget = -1; owner.turnInput = -1;     // rotationSpeed = -0.12
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput; // as set by update()
+    owner.turnTarget = -1; owner.turnInput = -1;     // rotationSpeed = -0.2
+    owner.rotationSpeed = getShipTurnSpeed(owner.turnControlMode) * owner.turnInput;
     const packet = packetOf(owner);
-    assert.ok(Math.abs(packet.rotationSpeed - (-SHIP.SHIP_TURN_SPEED)) < 1e-12);
+    assert.ok(Math.abs(packet.rotationSpeed - (-SHIP.SHIP_KEYBOARD_TURN_SPEED)) < 1e-12);
     for (let i = 0; i < 15; i++) owner.update(1);
     assertPose(replay(packet, 15), owner, 'rotation-only');
+});
+
+test('P3: keyboard-rate and analog-rate controls use separate turn-speed caps', () => {
+    const originalKeyboardSpeed = SHIP.SHIP_KEYBOARD_TURN_SPEED;
+    const originalAnalogSpeed = SHIP.SHIP_ANALOG_TURN_SPEED;
+    SHIP.SHIP_KEYBOARD_TURN_SPEED = 0.1;
+    SHIP.SHIP_ANALOG_TURN_SPEED = 0.35;
+    try {
+        const cases = [
+            [TURN_CONTROL_MODE.KEYBOARD_RATE, 0.1, 'keyboard'],
+            [TURN_CONTROL_MODE.ANALOG_RATE, 0.35, 'analog'],
+        ];
+        for (const [mode, expectedSpeed, label] of cases) {
+            const owner = new MiniShip();
+            owner.turnControlMode = mode;
+            owner.turnTarget = 1;
+            owner.turnInput = 1;
+            owner.rotationSpeed = getShipTurnSpeed(mode);
+            const packet = packetOf(owner);
+
+            assert.equal(packet.rotationSpeed, expectedSpeed, `${label} cap`);
+            for (let i = 0; i < 5; i++) owner.update(1);
+            assertPose(replay(packet, 5), owner, `${label} replay`);
+        }
+    } finally {
+        SHIP.SHIP_KEYBOARD_TURN_SPEED = originalKeyboardSpeed;
+        SHIP.SHIP_ANALOG_TURN_SPEED = originalAnalogSpeed;
+    }
 });
 
 test('P3: fractional-frame replay matches whole + remainder stepping', () => {
     const owner = new MiniShip();
     owner.velocityX = 0.3; owner.velocityY = 0.2; owner.thrustInput = 0.5; owner.angle = 0.2;
     owner.turnTarget = 0.25; owner.turnInput = 0.25;
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput; // as set by update()
+    owner.rotationSpeed = getShipTurnSpeed(owner.turnControlMode) * owner.turnInput;
     const packet = packetOf(owner);
     // Owner advances 7 whole frames + a 0.5 remainder.
     for (let i = 0; i < 7; i++) owner.update(1);
@@ -506,7 +582,7 @@ test('P3: zero elapsed frames returns the baseline pose unchanged', () => {
     owner.x = 0.42; owner.y = 0.17; owner.angle = 2.0;
     owner.velocityX = 0.1; owner.velocityY = -0.2;
     owner.turnTarget = 0.5; owner.turnInput = 0.5;
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput;
+    owner.rotationSpeed = getShipTurnSpeed(owner.turnControlMode) * owner.turnInput;
     const packet = packetOf(owner);
     assertPose(replay(packet, 0), owner, 'zero-frames');
 });
@@ -516,9 +592,9 @@ test('P3b: target-heading replay lands on target instead of projecting stale tur
     const packet = {
         x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTargetAngle: targetAngle,
         turnMagnitude: 1,
         turnBias: 0,
@@ -543,9 +619,9 @@ test('P3b: target-heading replay takes the short way across the angle seam', () 
     const packet = {
         x: 0, y: 0, angle: startAngle,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTargetAngle: targetAngle,
         turnMagnitude: 1,
         turnBias: 0,
@@ -574,9 +650,9 @@ test('P4: non-replay target controls keep authoritative angle instead of project
     const packet = {
         x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTargetAngle: 1.5,
         turnMagnitude: 1,
     };
@@ -591,9 +667,9 @@ test('P4: rate-mode replay displays smooth keyboard rotation as well as replayed
     const packet = {
         x: 0.1, y: 0.2, angle: 0.4,
         velocityX: 0.2, velocityY: -0.1,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_KEYBOARD_TURN_SPEED,
         thrustInput: 1, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.RATE,
+        turnControlMode: TURN_CONTROL_MODE.KEYBOARD_RATE,
         turnTarget: 1,
     };
     const scratch = replay(packet, 5, false);
@@ -612,9 +688,9 @@ test('P4: target-heading replay still adopts the self-arresting replayed angle',
     const packet = {
         x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTargetAngle: targetAngle,
         turnMagnitude: 1,
         turnBias: 0,
@@ -628,9 +704,9 @@ test('P4: disabling rotation target restores rate replay for target controls', (
     const packet = {
         x: 0, y: 0, angle: 0.2,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTarget: 1,
         turnTargetAngle: 0.3,
         turnMagnitude: 1,
@@ -644,9 +720,9 @@ test('P4: adaptive taper slows keyboard replay monotonically during a late packe
     const packet = {
         x: 0, y: 0, angle: 0,
         velocityX: 0, velocityY: 0,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_KEYBOARD_TURN_SPEED,
         thrustInput: 0, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.RATE,
+        turnControlMode: TURN_CONTROL_MODE.KEYBOARD_RATE,
         turnTarget: 1,
     };
     const window = { fullFrames: 3, taperFrames: 4 };
@@ -685,8 +761,11 @@ function makeCachedReplayer() {
         const f = frames > 0 ? frames : 0;
         const whole = Math.floor(f);
         const frac = f - whole;
-        const baseTurnInput = SHIP.SHIP_TURN_SPEED !== 0
-            ? packet.rotationSpeed / SHIP.SHIP_TURN_SPEED : 0;
+        sh.turnControlMode =
+            packet.turnControlMode ?? TURN_CONTROL_MODE.KEYBOARD_RATE;
+        const turnSpeed = getShipTurnSpeed(sh.turnControlMode);
+        const baseTurnInput = turnSpeed !== 0
+            ? packet.rotationSpeed / turnSpeed : 0;
         let rc = cache.get(packet);
         let from;
         if (rc && rc.whole <= whole) {
@@ -703,10 +782,11 @@ function makeCachedReplayer() {
         sh.thrustInput = packet.thrustInput || 0;
         sh.brakeInput = packet.brakeInput || 0;
         const driveTurn = (dt) => {
-            if (targetDrive && packet.turnControlMode === TURN_CONTROL_MODE.TARGET) {
+            if (targetDrive
+                && sh.turnControlMode === TURN_CONTROL_MODE.ANALOG_TARGET) {
                 const delta = shortestAngleDelta(packet.turnTargetAngle || 0, sh.angle);
                 const targetTurn = attainableTurnTarget(
-                    delta, packet.turnMagnitude || 0, SHIP.SHIP_TURN_SPEED, dt);
+                    delta, packet.turnMagnitude || 0, turnSpeed, dt);
                 sh.turnTarget = mergeTurnInputs(targetTurn, packet.turnBias || 0);
             } else {
                 sh.turnTarget = Number.isFinite(packet.turnTarget) ? packet.turnTarget : baseTurnInput;
@@ -732,8 +812,8 @@ test('PERF: incremental cache == from-scratch replay across a growing frame sequ
     owner.velocityX = 0.4; owner.velocityY = -0.25; owner.angle = 0.7;
     owner.thrustInput = 0.8;
     owner.turnTarget = 0.6; owner.turnInput = 0.6;
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput;
-    const packet = packetOf(owner);            // RATE mode
+    owner.rotationSpeed = getShipTurnSpeed(owner.turnControlMode) * owner.turnInput;
+    const packet = packetOf(owner);            // keyboard-rate mode
     const reckon = makeCachedReplayer();
     // Monotonically non-decreasing, fractional, up to and past the 30-frame clamp.
     const seq = [0, 0.3, 1, 1.5, 2, 2.7, 5, 5.5, 10.2, 17.9, 25, 29.4, 30, 30];
@@ -746,9 +826,9 @@ test('PERF: incremental cache == from-scratch replay across a growing frame sequ
     const packet = {
         x: 0.2, y: -0.1, angle: 0.0,
         velocityX: 0.1, velocityY: 0.05,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED,
+        rotationSpeed: SHIP.SHIP_ANALOG_TURN_SPEED,
         thrustInput: 0.5, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.TARGET,
+        turnControlMode: TURN_CONTROL_MODE.ANALOG_TARGET,
         turnTargetAngle: 1.3, turnMagnitude: 1, turnBias: 0,
     };
     const reckon = makeCachedReplayer();
@@ -762,9 +842,9 @@ test('PERF: a fresh snapshot object resets the cache; interleaved ships resume i
     const base = {
         x: 0, y: 0, angle: 0,
         velocityX: 0.3, velocityY: -0.2,
-        rotationSpeed: SHIP.SHIP_TURN_SPEED * 0.5,
+        rotationSpeed: SHIP.SHIP_KEYBOARD_TURN_SPEED * 0.5,
         thrustInput: 0.7, brakeInput: 0,
-        turnControlMode: TURN_CONTROL_MODE.RATE,
+        turnControlMode: TURN_CONTROL_MODE.KEYBOARD_RATE,
         turnTarget: 0.5,
     };
     const a = { ...base, angle: 0.5 };
@@ -781,7 +861,7 @@ test('PERF: repeated saturated calls stay identical (no drift) and match from-sc
     const owner = new MiniShip();
     owner.velocityX = 0.5; owner.angle = 1.0; owner.thrustInput = 1;
     owner.turnTarget = 1; owner.turnInput = 1;
-    owner.rotationSpeed = SHIP.SHIP_TURN_SPEED;
+    owner.rotationSpeed = SHIP.SHIP_KEYBOARD_TURN_SPEED;
     const packet = packetOf(owner);
     const reckon = makeCachedReplayer();
     const ref = replay(packet, 30, false);     // clamped resting projection

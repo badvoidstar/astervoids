@@ -194,6 +194,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("peakShipCount", "u8"),
             new PositionalSchemaCodec.FieldSpec("gameOverAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalAt", "f64"),
+            new PositionalSchemaCodec.FieldSpec("scoreLifeAwardCount", "u32"),
         });
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────
@@ -492,12 +493,13 @@ public class WireSizeBenchTests
             ["waveDelayTimer"] = 0d,
             ["processedHits"] = Array.Empty<byte>(),
             ["processedScores"] = Array.Empty<byte>(),
-            ["peakShipCount"] = 2
+            ["peakShipCount"] = 2,
+            ["scoreLifeAwardCount"] = 0
         });
 
         shipCreate.Length.Should().Be(47);
         asteroidCreate.Length.Should().Be(34);
         bulletCreate.Length.Should().Be(37);
-        gameStateCreate.Length.Should().Be(48);
+        gameStateCreate.Length.Should().Be(52);
     }
 }

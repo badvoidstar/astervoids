@@ -277,7 +277,7 @@ test('graceful with zero radiusPx (no NaN / no infinity)', () => {
 // ─── attainableTurnTarget ──────────────────────────────────────────────────
 //
 // Reference physics for these tests:
-//   rate (SHIP_TURN_SPEED default) = 0.12 rad/frame
+//   reference rate = 0.12 rad/frame
 //   dt = 1 (one 60fps frame)
 //   At maxMagnitude = 1.0 the ship sweeps 0.12 rad in one frame.
 //   At maxMagnitude = 0.5 the ship sweeps 0.06 rad in one frame.
@@ -487,9 +487,9 @@ test('polarAnchorTangentGeometry: triangle apex equals P regardless of orientati
 
 // ─── mergeTurnInputs ───────────────────────────────────────────────────────
 //
-// Combines the polar scheme's left-anchor turn (heading-tracking, signed,
-// already clamped to ±turnMax ≤ ±1) with the right-anchor's rectilinear
-// turn (signed, also already clamped) into a single command in [−1, +1].
+// Combines a polar heading-tracking turn (signed, already clamped to
+// ±turnMax ≤ ±1) with a persisted signed turn bias into a single command
+// in [−1, +1].
 // Pure: no DOM / globals.
 
 test('mergeTurnInputs: sum within range passes through unchanged', () => {

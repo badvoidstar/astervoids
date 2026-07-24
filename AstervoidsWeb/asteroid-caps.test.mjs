@@ -27,7 +27,7 @@ function clampSpin(rs, maxSpin) {
     return clampAsteroidMotion(0, 0, rs, 0, maxSpin).rotationSpeed;
 }
 
-test('CONFIG.ASTEROID_MAX_SPEED defaults to 0.4 (half SHIP_MAX_SPEED, same units)', () => {
+test('CONFIG.ASTEROID_MAX_SPEED defaults to 0.4 (same units as SHIP_MAX_SPEED)', () => {
     assert.equal(ASTEROID_MAX_SPEED, 0.4);
 });
 
@@ -73,12 +73,6 @@ test('clampSpin: over-cap rotationSpeed is clamped, sign preserved', () => {
 test('clampSpin: cap of 0 disables (no clamp)', () => {
     assert.equal(clampSpin(99, 0), 99);
     assert.equal(clampSpin(-99, 0), -99);
-});
-
-test('default cap is half the ship cap (deliberate — asteroids cap tighter)', () => {
-    assert.equal(
-        ASTEROID_MAX_SPEED,
-        SHARED_DEFAULTS.SHIP_MAX_SPEED / 2);
 });
 
 test('debug controls register both asteroid caps', () => {

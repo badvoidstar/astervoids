@@ -6,10 +6,13 @@ const require = createRequire(import.meta.url);
 const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
+    DEBUG_OVERRIDABLE_KEYS,
+    SESSION_CONFIG_KEYS,
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
     applySessionConfigMetadata,
     buildSessionConfigMetadata,
+    countExtraLivesForScore,
 } = require('./wwwroot/js/game-config.js');
 
 test('debug controls derive defaults from the shared runtime values', () => {
@@ -19,6 +22,112 @@ test('debug controls derive defaults from the shared runtime values', () => {
             : SHARED_DEFAULTS[control.key];
         assert.equal(control.default, expected, control.key);
     }
+});
+
+test('analog thrust maximum is available as a debug override', () => {
+    const control = CONFIG_CONTROLS.find(item => item.key === 'ANALOG_THRUST_MAX');
+    assert.deepEqual(
+        control && {
+            default: control.default,
+            min: control.min,
+            max: control.max,
+            step: control.step,
+        },
+        { default: 1.5, min: 0, max: 5, step: 0.1 });
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('ANALOG_THRUST_MAX'));
+
+    const cfg = { ANALOG_THRUST_MAX: 1.5 };
+    applyUrlConfigOverrides(cfg, '?cfg.ANALOG_THRUST_MAX=2.5');
+    assert.equal(cfg.ANALOG_THRUST_MAX, 2.5);
+});
+
+test('extra-life score threshold is configurable and session-locked', () => {
+    assert.equal(SHARED_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD, 10000);
+    const control = CONFIG_CONTROLS.find(
+        item => item.key === 'EXTRA_LIFE_SCORE_THRESHOLD');
+    assert.deepEqual(
+        control && {
+            default: control.default,
+            min: control.min,
+            max: control.max,
+            step: control.step,
+        },
+        { default: 10000, min: 0, max: 100000, step: 100 });
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('EXTRA_LIFE_SCORE_THRESHOLD'));
+    assert.ok(SESSION_CONFIG_KEYS.includes('EXTRA_LIFE_SCORE_THRESHOLD'));
+
+    const cfg = { EXTRA_LIFE_SCORE_THRESHOLD: 10000 };
+    applyUrlConfigOverrides(cfg, '?cfg.EXTRA_LIFE_SCORE_THRESHOLD=25000');
+    assert.equal(cfg.EXTRA_LIFE_SCORE_THRESHOLD, 25000);
+
+    const joinerCfg = { EXTRA_LIFE_SCORE_THRESHOLD: 10000 };
+    applySessionConfigMetadata(
+        { config: { EXTRA_LIFE_SCORE_THRESHOLD: 25000 } },
+        joinerCfg);
+    assert.equal(joinerCfg.EXTRA_LIFE_SCORE_THRESHOLD, 25000);
+});
+
+test('score milestones count only enabled whole-score thresholds', () => {
+    assert.equal(countExtraLivesForScore(9999, 10000), 0);
+    assert.equal(countExtraLivesForScore(10000, 10000), 1);
+    assert.equal(countExtraLivesForScore(30099, 10000), 3);
+    assert.equal(countExtraLivesForScore(-100, 10000), 0);
+    assert.equal(countExtraLivesForScore(10000, 0), 0);
+    assert.equal(countExtraLivesForScore(10000, -1), 0);
+    assert.equal(countExtraLivesForScore(10000, 'invalid'), 0);
+});
+
+test('ship movement defaults and debug bounds split keyboard and analog controls', () => {
+    assert.equal(SHARED_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED, 0.125);
+    assert.equal(SHARED_DEFAULTS.SHIP_ANALOG_TURN_SPEED, 0.3);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_GAIN, 0.5);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_DEADZONE_PX, 16);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX, 16);
+    assert.equal(SHARED_DEFAULTS.ANALOG_POLAR_TURN_GAIN, 2.0);
+    assert.equal(SHARED_DEFAULTS.ANALOG_THRUST_GAIN, 2.0);
+    assert.equal(SHARED_DEFAULTS.SHIP_MAX_SPEED, 1.0);
+
+    const keyboardTurnSpeed =
+        CONFIG_CONTROLS.find(item => item.key === 'SHIP_KEYBOARD_TURN_SPEED');
+    const analogTurnSpeed =
+        CONFIG_CONTROLS.find(item => item.key === 'SHIP_ANALOG_TURN_SPEED');
+    const maxSpeed = CONFIG_CONTROLS.find(item => item.key === 'SHIP_MAX_SPEED');
+    assert.equal(keyboardTurnSpeed?.max, 0.6);
+    assert.equal(analogTurnSpeed?.max, 0.6);
+    assert.equal(maxSpeed?.max, 6.0);
+});
+
+test('debug controls state calibrated anchor and velocity units', () => {
+    const controls = new Map(CONFIG_CONTROLS.map(control => [control.key, control]));
+
+    const asteroidSpeed = controls.get('ASTEROID_MAX_SPEED');
+    assert.equal(asteroidSpeed?.label, 'Asteroid max linear speed (ref-dim/s)');
+    assert.equal(asteroidSpeed?.fmt(0.4), '0.400 ref-dim/s');
+
+    const shipSpeed = controls.get('SHIP_MAX_SPEED');
+    assert.equal(shipSpeed?.label, 'Ship max linear speed (ref-dim/s)');
+    assert.match(shipSpeed?.help ?? '', /0 disables the cap/);
+    assert.equal(shipSpeed?.fmt(1), '1.000 ref-dim/s');
+
+    const rectTurnDeadzone = controls.get('ANALOG_RECTILINEAR_TURN_DEADZONE_PX');
+    assert.equal(
+        rectTurnDeadzone?.label,
+        'Analog rectilinear turn dead-zone (CSS px @ 390px gameplay ref)');
+    assert.equal(rectTurnDeadzone?.fmt(16), '16 px @ 390');
+
+    const polarDeadzone = controls.get('ANALOG_POLAR_DEADZONE_PX');
+    assert.match(polarDeadzone?.help ?? '', /polar brake remains active/);
+
+    const polarThreshold = controls.get('ANALOG_POLAR_THRESHOLD_PX');
+    assert.match(polarThreshold?.help ?? '', /ends the radial turn ramp/);
+
+    const massSplitBias = controls.get('MASS_SPLIT_BIAS');
+    assert.equal(massSplitBias?.label, 'Legacy disk-split mass bias');
+    assert.match(massSplitBias?.help ?? '', /Only used when polygon fracture/);
+
+    const brakeGain = controls.get('ANALOG_BRAKE_GAIN');
+    assert.equal(brakeGain?.label, 'Brake-input gain (analog + keyboard)');
+    assert.equal(brakeGain?.fmt(1.5), '1.50x');
 });
 
 test('URL overrides: no params preserves defaults', () => {
@@ -88,36 +197,36 @@ test('session metadata precedence: session config wins over local URL-derived va
 });
 
 test('URL overrides: string-typed config accepts arbitrary string values', () => {
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=rectilinear');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'rectilinear');
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=classic');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'classic');
+    const cfg = { SIM_MODE: 'deterministic' };
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=buffered');
+    assert.equal(cfg.SIM_MODE, 'buffered');
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=custom');
+    assert.equal(cfg.SIM_MODE, 'custom');
 });
 
 test('URL overrides: empty string-typed value is rejected (keeps current value)', () => {
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'polar');
+    const cfg = { SIM_MODE: 'deterministic' };
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=');
+    assert.equal(cfg.SIM_MODE, 'deterministic');
 });
 
 test('string-typed config: numeric / boolean raw values are stringified', () => {
     // The debug BroadcastChannel may send a Number for sliders; the
     // session metadata path may carry a Boolean from an older client. Both
     // are coerced into the string-typed slot rather than silently dropped.
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    assert.equal(coerceConfigOverrideValue(42, cfg.TOUCH_CONTROL_SCHEME), '42');
-    assert.equal(coerceConfigOverrideValue(true, cfg.TOUCH_CONTROL_SCHEME), 'true');
-    assert.equal(coerceConfigOverrideValue(false, cfg.TOUCH_CONTROL_SCHEME), 'false');
-    assert.equal(coerceConfigOverrideValue(NaN, cfg.TOUCH_CONTROL_SCHEME), undefined);
-    assert.equal(coerceConfigOverrideValue(null, cfg.TOUCH_CONTROL_SCHEME), undefined);
+    const cfg = { SIM_MODE: 'deterministic' };
+    assert.equal(coerceConfigOverrideValue(42, cfg.SIM_MODE), '42');
+    assert.equal(coerceConfigOverrideValue(true, cfg.SIM_MODE), 'true');
+    assert.equal(coerceConfigOverrideValue(false, cfg.SIM_MODE), 'false');
+    assert.equal(coerceConfigOverrideValue(NaN, cfg.SIM_MODE), undefined);
+    assert.equal(coerceConfigOverrideValue(null, cfg.SIM_MODE), undefined);
 });
 
 test('session metadata: string-typed config round-trips creator → joiner', () => {
-    const keys = ['TOUCH_CONTROL_SCHEME'];
-    const creatorCfg = { TOUCH_CONTROL_SCHEME: 'rectilinear' };
+    const keys = ['SIM_MODE'];
+    const creatorCfg = { SIM_MODE: 'buffered' };
     const sessionMetadata = { config: buildSessionConfigMetadata(creatorCfg, keys) };
-    const joinerCfg = { TOUCH_CONTROL_SCHEME: 'polar' };
+    const joinerCfg = { SIM_MODE: 'deterministic' };
     applySessionConfigMetadata(sessionMetadata, joinerCfg, keys);
-    assert.equal(joinerCfg.TOUCH_CONTROL_SCHEME, 'rectilinear');
+    assert.equal(joinerCfg.SIM_MODE, 'buffered');
 });

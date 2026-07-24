@@ -123,10 +123,12 @@ test('GameState schema stores compact counter-map bytes', () => {
     const bytes = SchemaCodec.encode(schema, {
         groupScore: 100,
         processedHits,
+        scoreLifeAwardCount: 1,
     });
     const decoded = SchemaCodec.decode(schema, bytes);
 
     assert.equal(decoded.groupScore, 100);
+    assert.equal(decoded.scoreLifeAwardCount, 1);
     assert.deepEqual(WireCodec.unpackCounterMap(decoded.processedHits), { [id]: 2 });
 });
 

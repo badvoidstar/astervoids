@@ -70,6 +70,25 @@
             pointer-events: none;
         }
 
+        #lives.life-award {
+            animation: life-award-flash 200ms steps(1, end) 25;
+        }
+
+        @keyframes life-award-flash {
+            0%, 49% {
+                color: #ff0;
+                text-shadow:
+                    0 0 6px #fff,
+                    0 0 18px #ff0,
+                    0 0 36px #ff0,
+                    0 0 54px #ff0;
+            }
+            50%, 100% {
+                color: #fff;
+                text-shadow: none;
+            }
+        }
+
         /* Instructions shown at bottom */
         #instructions {
             position: absolute;
@@ -592,39 +611,9 @@
             touch-action: none;
         }
 
-        .touch-btn:active, .touch-btn.active {
+        .touch-btn:active {
             background: rgba(255, 255, 255, 0.35);
             border-color: rgba(255, 255, 255, 0.8);
-        }
-
-        /* Left side - movement controls */
-        #touch-left {
-            width: 70px;
-            height: 70px;
-            bottom: 100px;
-            left: 20px;
-        }
-
-        #touch-right {
-            width: 70px;
-            height: 70px;
-            bottom: 100px;
-            left: 110px;
-        }
-
-        #touch-thrust {
-            width: 80px;
-            height: 80px;
-            bottom: 20px;
-            left: 60px;
-        }
-
-        /* Right side - action controls */
-        #touch-fire {
-            width: 90px;
-            height: 90px;
-            bottom: 40px;
-            right: 30px;
         }
 
         #touch-pause {
@@ -669,20 +658,6 @@
             display: none;
         }
 
-        /* Anchor-based touch schemes (rectilinear, polar) hide the legacy
-           on-screen movement / fire buttons (left/right/thrust/fire). Only the
-           "classic" scheme keeps those buttons visible. Pause, restart and
-           fullscreen stay reachable in every scheme. */
-        .touch-scheme-rectilinear #touch-left,
-        .touch-scheme-rectilinear #touch-right,
-        .touch-scheme-rectilinear #touch-thrust,
-        .touch-scheme-rectilinear #touch-fire,
-        .touch-scheme-polar #touch-left,
-        .touch-scheme-polar #touch-right,
-        .touch-scheme-polar #touch-thrust,
-        .touch-scheme-polar #touch-fire {
-            display: none !important;
-        }
     </style>
 </head>
 <body>
@@ -700,15 +675,16 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Keys or WASD to move | SPACE to shoot | ESC to pause
+            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
         </div>
 
         <!-- Pause menu overlay -->
         <div id="pause-menu">
             <h1>PAUSED</h1>
-            <div class="menu-item desktop-only"><span>ESC</span> or <span>P</span> - Resume</div>
-            <div class="menu-item desktop-only"><span>ENTER</span> - Restart Game</div>
-            <div class="menu-item desktop-only"><span>Arrow Keys</span> / <span>WASD</span> - Move</div>
+            <div class="menu-item desktop-only"><span>ENTER</span> or <span>P</span> - Resume</div>
+            <div class="menu-item desktop-only"><span>ESC</span> - Restart Game</div>
+            <div class="menu-item desktop-only"><span>Arrow Left/Right/Up</span> / <span>A/D/W</span> - Move</div>
+            <div class="menu-item desktop-only"><span>DOWN</span> / <span>S</span> - Brake</div>
             <div class="menu-item desktop-only"><span>SPACE</span> - Shoot</div>
             <div class="menu-item touch-only">Tap <span>❚❚</span> to Resume</div>
             <div class="menu-item touch-only"><button id="pause-restart-btn">RESTART</button></div>
@@ -733,10 +709,11 @@
                         <select id="create-region-select"></select>
                     </div>
                     <div class="button-row">
-                        <button id="btn-leave-create" class="picker-btn" disabled>Create</button>
+                        <button id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer</button>
                         <button id="btn-start-enter" class="picker-btn action" style="display: none;">Start</button>
                     </div>
-                    <button id="btn-solo" class="picker-btn solo">Solo Play</button>
+                    <button id="btn-solo" class="picker-btn solo">Start Solo Play</button>
+                    <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
                     <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
                 </div>
             </div>
@@ -756,10 +733,6 @@
 
         <!-- Mobile touch controls -->
         <div id="mobile-controls">
-            <div id="touch-left" class="touch-btn">◀</div>
-            <div id="touch-right" class="touch-btn">▶</div>
-            <div id="touch-thrust" class="touch-btn">▲</div>
-            <div id="touch-fire" class="touch-btn">FIRE</div>
             <div id="touch-pause" class="touch-btn">❚❚</div>
             <div id="touch-restart" class="touch-btn">RESTART</div>
             <div id="touch-fullscreen" class="touch-btn">⛶</div>
@@ -1317,107 +1290,96 @@
         // several objects and coalesce multiple local frames into one invoke.
         SHIP_SEND_ON_CHANGE_ENABLED: true,
 
-        // Ship settings (normalized: sizes relative to shorter dimension)
+        // Ship settings: sizes are fractions of the gameplay reference dimension;
+        // velocities are reference-dimension units per second.
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
-        SHIP_THRUST: 0.009,         // Acceleration per frame (normalized, ~0.15/600*60)
+        SHIP_THRUST: 0.009,         // Full-input velocity increment per nominal 60 Hz tick (0.54 ref-dim/s^2)
         SHIP_FRICTION: 0.99,        // Velocity decay (1 = no friction)
-        SHIP_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_TURN_SPEED,
+        SHIP_KEYBOARD_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED,
+        SHIP_ANALOG_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_ANALOG_TURN_SPEED,
         SHIP_MAX_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_MAX_SPEED,
         // Turning input ramping: time in seconds for the ship's angular speed to
-        // ramp up from 0 to ±SHIP_TURN_SPEED (accel) or back down to 0 (decel).
+        // ramp up from 0 to the active keyboard or analog turn-speed cap (accel)
+        // or back down to 0 (decel).
         // 0 = instantaneous (legacy behavior).
-        SHIP_TURN_ACCEL_TIME: 0.0,  // Seconds for rotation speed: 0 -> ±SHIP_TURN_SPEED
-        SHIP_TURN_DECEL_TIME: 0.0,  // Seconds for rotation speed: ±SHIP_TURN_SPEED -> 0
-        // Maximum braking deceleration when brakeInput == 1.0, in the same
-        // per-60fps-frame units as SHIP_THRUST. Used by the virtual-stick
-        // touch scheme: braking is pure damping opposing current velocity and
-        // is clamped at full stop, so it can never reverse the ship.
+        SHIP_TURN_ACCEL_TIME: 0.0,
+        SHIP_TURN_DECEL_TIME: 0.0,
+        // Maximum full-input braking velocity decrement per nominal 60 Hz tick,
+        // in ref-dim/s. Braking is pure damping opposing current velocity and is
+        // clamped at full stop, so it can never reverse the ship.
         SHIP_BRAKE_STRENGTH: 0.018,
 
-        // === Touch control scheme ===
-        // Selects the touch input scheme by name. Three values are recognized:
-        //   'classic'     — legacy on-screen ◀ ▶ ▲ FIRE buttons (boolean inputs).
-        //   'rectilinear' — anchor scheme with rectangular dead-zone on BOTH
-        //                   halves: lateral displacement → rotation velocity,
-        //                   upward → thrust, downward → brake. (Was the
-        //                   `TOUCH_VIRTUAL_STICK_ENABLED = true` scheme.)
-        //   'polar'       — NEW left-side polar anchor (vector magnitude/length
-        //                   → turn speed, length past threshold → thrust,
-        //                   inverse-of-turn → brake; turn direction = shortest
-        //                   rotation toward the vector); right side keeps the
-        //                   existing rectilinear anchor for thrust/brake + fire.
-        // Affects touch routing only; keyboard always uses discrete inputs.
-        // Unknown values fall back to 'polar'. Override at runtime with
-        // ?cfg.TOUCH_CONTROL_SCHEME=classic|rectilinear|polar.
-        TOUCH_CONTROL_SCHEME: 'polar',
-        // Touch anchor sizing is expressed in absolute CSS pixels (not viewport
-        // fractions) so the on-screen geometry stays a constant physical size
-        // across device sizes and orientations. CSS px are device-calibrated
-        // (Apple HIG: 44px = recommended min touch target; Material: 48dp), so
-        // PX values give a stable physical feel from phone to tablet.
-        //
+        // === Analog anchor controls ===
+        // The picker toggles the shared touch/mouse control mode between
+        // rectilinear and polar. Keyboard always uses discrete inputs.
+        // Anchor distances are calibrated in CSS px at the gameplay short-edge
+        // baseline below. getAnalogAnchorScale() scales them with the current
+        // gameplay short edge, keeping anchor geometry and input travel
+        // proportional to game objects.
+        ANALOG_ANCHOR_REFERENCE_DIMENSION_PX: 390,
         // RADIUS: drag distance the finger must move from the anchor to reach
         // a stick deflection of 1.0 (before per-axis clamping). In the polar
         // scheme this also sets the scale of the 2nd parameter (thrust): a
-        // length of RADIUS past TOUCH_POLAR_THRESHOLD_PX maps to thrust=1.0
+        // length of RADIUS past ANALOG_POLAR_THRESHOLD_PX maps to thrust=1.0
         // before gain/clamp.
-        TOUCH_STICK_RADIUS_PX: 48,
+        //
+        // The values below are CSS-pixel distances at the 390px gameplay
+        // short-edge baseline above. At runtime they scale with the gameplay
+        // viewport's short edge.
+        ANALOG_STICK_RADIUS_PX: 48,
         // Dead-zone half-extents (rectilinear scheme). The dead-zone is a
         // RECTANGLE: lateral displacements with |dx| <= TURN_DEADZONE_PX are
         // ignored for turning, and vertical displacements with |dy| <=
         // THRUST_DEADZONE_PX are ignored for thrust/brake. Independent knobs
         // let turning be more responsive (smaller deadzone) than thrust/brake.
-        TOUCH_STICK_TURN_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_STICK_TURN_DEADZONE_PX,
-        TOUCH_STICK_THRUST_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_STICK_THRUST_DEADZONE_PX,
+        ANALOG_RECTILINEAR_TURN_DEADZONE_PX:
+            SHARED_CONFIG_DEFAULTS.ANALOG_RECTILINEAR_TURN_DEADZONE_PX,
+        ANALOG_RECTILINEAR_THRUST_DEADZONE_PX:
+            SHARED_CONFIG_DEFAULTS.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX,
         // Polar scheme radii (left anchor only). The polar control's response
         // is determined by the length of the finger displacement vector:
-        //   • r ≤ TOUCH_POLAR_DEADZONE_PX   → no turn / thrust, but BRAKE
+        //   • r ≤ ANALOG_POLAR_DEADZONE_PX   → no turn / thrust, but BRAKE
         //                                     still flows (see below).
         //   • DEADZONE < r ≤ THRESHOLD      → p1 ramps 0→1 (turn-speed).
         //   • r > THRESHOLD                 → p1 clamped at 1 (max turn);
         //                                     p2 ramps 0→… with length past
         //                                     threshold, scaled by
-        //                                     TOUCH_STICK_RADIUS_PX (so 1.0
+        //                                     ANALOG_STICK_RADIUS_PX (so 1.0
         //                                     at THRESHOLD + RADIUS, before
         //                                     gain/clamp), driving thrust.
         // Brake is independent of the dead-zone and scales linearly with the
         // raw radius: brake = clamp01(1 − r / THRESHOLD), so r=0 is full
         // brake and r=THRESHOLD is no brake. This lets the dead-zone double
         // as the "high brake" region of the control.
-        TOUCH_POLAR_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.TOUCH_POLAR_DEADZONE_PX,
-        TOUCH_POLAR_THRESHOLD_PX: SHARED_CONFIG_DEFAULTS.TOUCH_POLAR_THRESHOLD_PX,
+        ANALOG_POLAR_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_DEADZONE_PX,
+        ANALOG_POLAR_THRESHOLD_PX: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_THRESHOLD_PX,
         // Linear gain applied to normalized lateral displacement → turnTarget.
         // turnTarget = clamp(xNorm * GAIN, -MAX, +MAX). Peak rotation rate is
-        // SHIP_TURN_SPEED * TOUCH_TURN_MAX (so MAX=1 reuses the existing cap).
-        TOUCH_TURN_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_TURN_GAIN,
-        TOUCH_TURN_MAX: 1.0,
+        // SHIP_ANALOG_TURN_SPEED * ANALOG_TURN_MAX (so MAX=1 reuses the
+        // analog turn-speed cap).
+        ANALOG_RECTILINEAR_TURN_GAIN:
+            SHARED_CONFIG_DEFAULTS.ANALOG_RECTILINEAR_TURN_GAIN,
+        ANALOG_POLAR_TURN_GAIN: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_TURN_GAIN,
+        ANALOG_TURN_MAX: 1.0,
         // Forward-thrust mapping from upward displacement (finger above anchor).
         // thrustInput = clamp(|yNorm| * GAIN, 0, MAX). Peak forward accel is
-        // SHIP_THRUST * TOUCH_THRUST_MAX. Downward displacement does NOT drive
+        // SHIP_THRUST * ANALOG_THRUST_MAX. Downward displacement does NOT drive
         // thrust here — it goes to brake below, with independent scaling/clamp.
-        TOUCH_THRUST_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_THRUST_GAIN,
-        TOUCH_THRUST_MAX: 1.0,
+        ANALOG_THRUST_GAIN: SHARED_CONFIG_DEFAULTS.ANALOG_THRUST_GAIN,
+        ANALOG_THRUST_MAX: SHARED_CONFIG_DEFAULTS.ANALOG_THRUST_MAX,
         // Brake mapping from downward displacement (finger below anchor).
         // brakeInput = clamp(|yNorm| * GAIN, 0, MAX). Peak braking deceleration
-        // is SHIP_BRAKE_STRENGTH * TOUCH_BRAKE_MAX. Set MAX=0 to disable braking.
-        TOUCH_BRAKE_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_BRAKE_GAIN,
-        TOUCH_BRAKE_MAX: 1.0,
-        // When true: if the right (fire) anchor is held, it has
-        // exclusive control over thrust/brake — the left-anchor thrust/brake
-        // contribution is suppressed for as long as the right touch is active.
-        // When the right anchor is released, thrust/brake fall back to the
-        // left anchor (existing behaviour).
-        // When false (default): both anchors contribute, combined via Math.max
-        // (winner-takes-all per axis; each side already clamped individually).
-        // Turning is always driven by the left anchor regardless of this flag.
-        TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST: SHARED_CONFIG_DEFAULTS.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST,
+        // is SHIP_BRAKE_STRENGTH * ANALOG_BRAKE_MAX. Set MAX=0 to disable braking.
+        ANALOG_BRAKE_GAIN: SHARED_CONFIG_DEFAULTS.ANALOG_BRAKE_GAIN,
+        ANALOG_BRAKE_MAX: 1.0,
         // Anchor overlay: an 8-vertex polygon centered on each active anchor
         // whose basis form is a rectangle matching the dead-zone exactly
-        // (2·TOUCH_STICK_TURN_DEADZONE_PX wide × 2·TOUCH_STICK_THRUST_DEADZONE_PX
+        // (2·ANALOG_RECTILINEAR_TURN_DEADZONE_PX wide ×
+        //  2·ANALOG_RECTILINEAR_THRUST_DEADZONE_PX
         // tall). When the finger is outside the dead-zone, exactly one vertex
         // tracks the finger position (zone-→-vertex mapping documented in
         // computeAnchorVertices). Local UI only; never serialized.
-        TOUCH_ANCHOR_VISUAL_ENABLED: true,
+        ANALOG_ANCHOR_VISUAL_ENABLED: true,
         // Basis stroke color used by every anchor overlay (rectilinear
         // 8-vertex polygon AND polar circles). The polar anchor overrides
         // this on the threshold circle when r > threshold (it switches to
@@ -1425,24 +1387,24 @@
         // CSS color string works (named, hex, rgb(), rgba(), hsl(), …).
         // Default is 50% grey at the historical 0.55 alpha for parity with
         // the previous white default's visibility.
-        TOUCH_ANCHOR_STROKE_COLOR: 'rgba(128,128,128,0.55)',
-        TOUCH_ANCHOR_LINE_WIDTH: 2,
+        ANALOG_ANCHOR_STROKE_COLOR: 'rgba(128,128,128,0.55)',
+        ANALOG_ANCHOR_LINE_WIDTH: 2,
 
-        // Bullet settings (normalized)
-        BULLET_SPEED: 1.0,          // Bullet speed per second (normalized)
-        BULLET_LIFETIME: 60,        // Frames before bullet expires
-        BULLET_RADIUS: 0.0033,      // Bullet size (normalized)
+        // Bullet settings
+        BULLET_SPEED: 1.0,          // Bullet speed (ref-dim/s)
+        BULLET_LIFETIME: 60,        // Nominal 60 Hz ticks until expiry (~1.0 s)
+        BULLET_RADIUS: 0.0033,      // Fraction of gameplay reference dimension
         MAX_BULLETS: 10,            // Maximum bullets on screen
-        SHOOT_COOLDOWN: 10,         // Frames between shots
+        SHOOT_COOLDOWN: 10,         // Nominal 60 Hz ticks between shots (~0.17 s)
         
-        // Asteroid settings (normalized)
+        // Asteroid settings
         ASTEROID_BASE_COUNT: 1,     // Starting astervoids in wave 1
-        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed per second (normalized)
-        ASTEROID_SPEED_VARIANCE: 0.1, // Random speed variation (normalized)
-        // Per-frame caps applied to locally-owned asteroids in Asteroid.update().
+        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed (ref-dim/s)
+        ASTEROID_SPEED_VARIANCE: 0.1, // Random speed addition (ref-dim/s)
+        // Caps enforced on locally-owned asteroids in Asteroid.update().
         // ASTEROID_MAX_SPEED uses the same units as SHIP_MAX_SPEED (normalized
         // reference-dim per second). ASTEROID_MAX_SPIN uses the same units as
-        // SHIP_TURN_SPEED (radians per 60fps frame); the default π/6 corresponds
+        // ship turn speed (radians per 60fps frame); the default π/6 corresponds
         // to 5 full rotations per second (5 · 2π rad/s ÷ 60 frames/s = π/6).
         // Caps apply after split impulses, so chains of close-range hits can no
         // longer compound velocity/spin past these limits.
@@ -1548,13 +1510,14 @@
         POINTS_LARGE: 20,           // Points for large astervoids
         POINTS_MEDIUM: 50,          // Points for medium astervoids
         POINTS_SMALL: 100,          // Points for small astervoids
-        ASTEROID_LARGE_THRESHOLD: 0.067,  // ~40px at 600 ref
-        ASTEROID_MEDIUM_THRESHOLD: 0.042, // ~25px at 600 ref
+        ASTEROID_LARGE_THRESHOLD: 0.067,  // Fraction of game ref dim (~40px at 600px ref)
+        ASTEROID_MEDIUM_THRESHOLD: 0.042, // Fraction of game ref dim (~25px at 600px ref)
         
         // Game settings
         STARTING_LIVES: 3,          // Lives at game start
-        INVULNERABILITY_TIME: 180,  // Frames of invulnerability after respawn
-        WAVE_DELAY: 120,            // Frames to wait between waves
+        EXTRA_LIFE_SCORE_THRESHOLD: SHARED_CONFIG_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD,
+        INVULNERABILITY_TIME: 180,  // Nominal 60 Hz ticks of invulnerability (~3.0 s)
+        WAVE_DELAY: 120,            // Nominal 60 Hz ticks between waves (~2.0 s)
         
         // Wave progression
         WAVE_ASTEROID_INCREMENT: 1, // Extra astervoids per wave
@@ -1564,7 +1527,7 @@
         // Visual settings
         STROKE_COLOR: '#fff',       // Primary drawing color
         THRUST_COLOR: '#f80',       // Thrust flame color
-        INVULN_BLINK_RATE: 10,      // Blink frequency when invulnerable
+        INVULN_BLINK_RATE: 10,      // Nominal 60 Hz ticks per visibility toggle
         COLLISION_CUE_MIN_MS: 120,   // Minimum visible hold before a resolved cue fades
         COLLISION_CUE_FADE_MS: 180,  // Fade time after authoritative resolution
         COLLISION_CUE_MAX_MS: 1000,  // Safety cap for a pending cue with no resolution
@@ -1574,7 +1537,7 @@
         
         // Start screen
         START_SCREEN_ASTERVOIDS: 4,  // Astervoids shown on start screen
-        SPAWN_MIN_DISTANCE: 0.25,   // Minimum spawn distance from ship (normalized)
+        SPAWN_MIN_DISTANCE: 0.25,   // Minimum normalized game-space distance from ship
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 3,          // Shared lives pool for multiplayer sessions
@@ -1604,6 +1567,7 @@
         SESSION_CONFIG_KEYS,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,
         applySessionConfigMetadata,
@@ -1614,49 +1578,84 @@
     applyUrlConfigOverrides(CONFIG, window.location.search);
     const LOCAL_CONFIG_BASELINE = snapshotConfigValues(CONFIG, SESSION_CONFIG_KEYS);
 
-    // Touch control scheme registry. Keep the constants in lock-step with the
-    // CSS class names (`touch-scheme-<value>`) and the CONFIG knob doc string.
-    const TOUCH_SCHEMES = Object.freeze({
-        CLASSIC: 'classic',
+    // The picker exposes both anchor-based analog modes.
+    const ANALOG_CONTROL_SCHEMES = Object.freeze({
         RECTILINEAR: 'rectilinear',
         POLAR: 'polar',
     });
-    const VALID_TOUCH_SCHEMES = new Set(Object.values(TOUCH_SCHEMES));
+    let analogControlScheme = ANALOG_CONTROL_SCHEMES.POLAR;
+    const analogControlModeButton = document.getElementById('btn-control-mode');
 
     const TURN_CONTROL_MODE = Object.freeze({
-        RATE: 0,
-        TARGET: 1,
+        KEYBOARD_RATE: 0,
+        ANALOG_TARGET: 1,
+        ANALOG_RATE: 2,
     });
 
-    // Resolve CONFIG.TOUCH_CONTROL_SCHEME with a fallback to the default
-    // ('polar'). Tolerates unknown / mistyped values so a stray URL override
-    // can't brick input on a live device.
-    function getTouchScheme() {
-        const raw = CONFIG.TOUCH_CONTROL_SCHEME;
-        if (typeof raw === 'string') {
-            const normalized = raw.toLowerCase();
-            if (VALID_TOUCH_SCHEMES.has(normalized)) return normalized;
+    function normalizeTurnControlMode(mode) {
+        if (mode === TURN_CONTROL_MODE.ANALOG_TARGET
+            || mode === TURN_CONTROL_MODE.ANALOG_RATE) {
+            return mode;
         }
-        return TOUCH_SCHEMES.POLAR;
+        return TURN_CONTROL_MODE.KEYBOARD_RATE;
     }
 
-    // True iff the chosen scheme uses screen-half anchors (rectilinear / polar)
-    // instead of the legacy on-screen buttons (classic). Touch handlers are
-    // wired in either case; this just gates whether they actually consume
-    // touches.
-    function isAnchorSchemeEnabled() {
-        const s = getTouchScheme();
-        return s === TOUCH_SCHEMES.RECTILINEAR || s === TOUCH_SCHEMES.POLAR;
+    function getShipTurnSpeed(controlMode) {
+        return normalizeTurnControlMode(controlMode)
+            === TURN_CONTROL_MODE.KEYBOARD_RATE
+            ? CONFIG.SHIP_KEYBOARD_TURN_SPEED
+            : CONFIG.SHIP_ANALOG_TURN_SPEED;
     }
 
-    // Reflect the touch control scheme on the game-container so CSS can hide
-    // legacy on-screen buttons in anchor-based schemes. The class is set once
-    // (the scheme isn't expected to flip after page load).
-    {
-        const containerEl = document.getElementById('game-container');
-        const scheme = getTouchScheme();
-        containerEl.classList.add(`touch-scheme-${scheme}`);
+    function getAnalogControlScheme() {
+        return analogControlScheme;
     }
+
+    function updateAnalogControlModeButton() {
+        const scheme = getAnalogControlScheme();
+        const currentLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
+            ? 'Polar'
+            : 'Rectilinear';
+        const nextLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
+            ? 'Rectilinear'
+            : 'Polar';
+
+        if (analogControlModeButton) {
+            analogControlModeButton.textContent = `🕹️ ${currentLabel}`;
+            analogControlModeButton.title = `Switch to ${nextLabel} controls`;
+            analogControlModeButton.setAttribute(
+                'aria-label',
+                `Control mode: ${currentLabel}. Switch to ${nextLabel} controls.`);
+        }
+    }
+
+    function setAnalogControlScheme(scheme) {
+        const isSupported = scheme === ANALOG_CONTROL_SCHEMES.RECTILINEAR
+            || scheme === ANALOG_CONTROL_SCHEMES.POLAR;
+        if (!isSupported || scheme === analogControlScheme) {
+            return false;
+        }
+        resetStickInput();
+        analogControlScheme = scheme;
+        updateAnalogControlModeButton();
+        return true;
+    }
+
+    function toggleAnalogControlScheme() {
+        return setAnalogControlScheme(
+            analogControlScheme === ANALOG_CONTROL_SCHEMES.POLAR
+                ? ANALOG_CONTROL_SCHEMES.RECTILINEAR
+                : ANALOG_CONTROL_SCHEMES.POLAR);
+    }
+
+    // Both picker modes use a left movement anchor plus right-half held firing.
+    function isAnalogControlSchemeEnabled() {
+        const s = getAnalogControlScheme();
+        return s === ANALOG_CONTROL_SCHEMES.RECTILINEAR
+            || s === ANALOG_CONTROL_SCHEMES.POLAR;
+    }
+
+    updateAnalogControlModeButton();
 
     function restoreLocalConfigBaseline(config = CONFIG) {
         for (const key of SESSION_CONFIG_KEYS) {
@@ -1769,6 +1768,8 @@
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
     function createDeadReckoningState(data, recvPerf, context = null) {
+        const turnControlMode = normalizeTurnControlMode(data.turnControlMode);
+        const turnSpeed = getShipTurnSpeed(turnControlMode);
         return {
             x: data.x,
             y: data.y,
@@ -1779,13 +1780,11 @@
             clampAngular: data.type === OBJECT_TYPES.SHIP,
             thrustInput: data.thrustInput || 0,
             brakeInput: data.brakeInput || 0,
-            turnControlMode: data.turnControlMode === TURN_CONTROL_MODE.TARGET
-                ? TURN_CONTROL_MODE.TARGET
-                : TURN_CONTROL_MODE.RATE,
+            turnControlMode,
             turnTarget: Number.isFinite(data.turnTarget)
                 ? data.turnTarget
-                : (CONFIG.SHIP_TURN_SPEED !== 0
-                    ? (data.rotationSpeed || 0) / CONFIG.SHIP_TURN_SPEED
+                : (turnSpeed !== 0
+                    ? (data.rotationSpeed || 0) / turnSpeed
                     : 0),
             turnTargetAngle: Number.isFinite(data.turnTargetAngle)
                 ? data.turnTargetAngle
@@ -1829,12 +1828,12 @@
         const ship = context.scratch || (context.scratch = new Ship(0, 0, 0));
         const whole = Math.floor(frames > 0 ? frames : 0);
         const fraction = (frames > 0 ? frames : 0) - whole;
-        const turnSpeed = CONFIG.SHIP_TURN_SPEED;
+        const turnSpeed = getShipTurnSpeed(state.turnControlMode);
         const baseTurnInput = turnSpeed !== 0
             ? state.rotationSpeed / turnSpeed
             : 0;
         const targetDrive = targetMode
-            && state.turnControlMode === TURN_CONTROL_MODE.TARGET
+            && state.turnControlMode === TURN_CONTROL_MODE.ANALOG_TARGET
             && state.angle !== null;
 
         let cached = context.replayCache.get(state);
@@ -1858,6 +1857,7 @@
             ship.turnInput = baseTurnInput;
             from = 0;
         }
+        ship.turnControlMode = state.turnControlMode;
         ship.thrustInput = state.thrustInput || 0;
         ship.brakeInput = state.brakeInput || 0;
         ship.invulnerable = 0;
@@ -1869,7 +1869,7 @@
                 const targetTurn = attainableTurnTarget(
                     delta,
                     state.turnMagnitude || 0,
-                    CONFIG.SHIP_TURN_SPEED,
+                    turnSpeed,
                     dt);
                 ship.turnTarget = mergeTurnInputs(targetTurn, state.turnBias || 0);
             } else {
@@ -1924,7 +1924,7 @@
         shortestAngleDelta,
         createState: createDeadReckoningState,
         isRotationTarget: state => state.clampAngular
-            && state.turnControlMode === TURN_CONTROL_MODE.TARGET
+            && state.turnControlMode === TURN_CONTROL_MODE.ANALOG_TARGET
             && CONFIG.SHIP_ROTATION_TARGET_ENABLED
             && isDeterministicMode(),
         shouldReplay: state => state.clampAngular
@@ -1977,7 +1977,7 @@
     //
     // Keying off DERIVED state (rotationSpeed / thrustInput / brakeInput /
     // thrusting), NOT individual input handlers, makes it scheme-agnostic:
-    // keyboard, classic on-screen buttons, and the analog touch schemes all
+    // keyboard and the analog touch schemes both
     // funnel into these fields via handleInput. Only DISCONTINUITIES are edges —
     // rotation start/stop & sign reversal, thrust on/off, brake on/off. Analog
     // schemes vary magnitude continuously, but those mid-gesture changes are
@@ -2720,10 +2720,20 @@
     /**
      * Get the reference dimension for size normalization (shorter of width/height)
      * This ensures circles remain circular regardless of aspect ratio
-     * @returns {number} Reference dimension in pixels
+     * @returns {number} Gameplay reference dimension in CSS pixels
      */
     function getReferenceDimension() {
         return Math.min(getGameWidth(), getGameHeight());
+    }
+
+    /**
+     * Scale 390px-baseline touch-anchor distances with the current gameplay
+     * short edge, in CSS pixels.
+     */
+    function getAnalogAnchorScale() {
+        const calibrationReference = Math.max(
+            1, CONFIG.ANALOG_ANCHOR_REFERENCE_DIMENSION_PX);
+        return getReferenceDimension() / calibrationReference;
     }
 
     /**
@@ -3099,8 +3109,8 @@
      *              turnGain, turnMax,
      *              thrustGain, thrustMax,
      *              brakeGain, brakeMax }
-     *            All sizes are in CSS pixels (device-calibrated) so the
-     *            response is invariant under viewport rotation / device size.
+     *            All sizes are runtime CSS pixels after the 390px gameplay
+     *            reference baseline has been scaled to the current viewport.
      *            turnDeadzonePx and thrustDeadzonePx are independent — turn
      *            uses the lateral (X) deadzone, thrust/brake the vertical (Y).
      *
@@ -3169,7 +3179,8 @@
      *                   already clamped to turnMax). Treated as the upper
      *                   limit of the returned magnitude.
      *   ratePerFrame  : rotation rate at |turnInput|=1, in radians per 60fps
-     *                   frame (= CONFIG.SHIP_TURN_SPEED). Ship.update applies
+     *                   frame (the active keyboard or analog turn-speed cap).
+     *                   Ship.update applies
      *                   angle += ratePerFrame · turnInput · dt, so the
      *                   attainable angular sweep this frame is
      *                   ratePerFrame · |turnInput| · dt.
@@ -3287,13 +3298,11 @@
 
     /**
      * Combine two signed turn-input commands into a single command in
-     * [−1, +1]. Used by the polar touch scheme to merge the left-anchor's
-     * heading-tracking turn with the right-anchor's rectilinear turn so
-     * both fingers can contribute simultaneously (and oppose each other
-     * symmetrically when needed). Each per-anchor input is already clamped
-     * to ≤ TOUCH_TURN_MAX (≤ 1), so the clamp here only kicks in when both
-     * fingers are pushing past 0.5 in the same direction; in normal play
-     * the sum stays in-range and the clamp is a no-op.
+     * [−1, +1]. Used when a polar heading-tracking turn also carries a
+     * persisted turn bias during presentation. Each input is already clamped
+     * to ≤ ANALOG_TURN_MAX (≤ 1), so the clamp here only kicks in when both
+     * are pushing past 0.5 in the same direction; in normal play the sum
+     * stays in-range and the clamp is a no-op.
      *
      * Pure: no DOM / globals — exercised by touch-polar-input.test.mjs.
      */
@@ -3355,7 +3364,7 @@
 
     /**
      * Build the 8-vertex polygon for the anchor overlay
-     * (CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED). Coordinates are returned relative
+     * (CONFIG.ANALOG_ANCHOR_VISUAL_ENABLED). Coordinates are returned relative
      * to the anchor — callers translate the canvas context to the anchor and
      * stroke the polygon as-is.
      *
@@ -3363,10 +3372,12 @@
      *                halfHeight; positive dy = below anchor, matching screen
      *                coords).
      *   halfWidth  : half the lateral side length of the dead-zone rectangle
-     *                (positive). Equal to TOUCH_STICK_TURN_DEADZONE_PX in
+     *                (positive). Equal to ANALOG_RECTILINEAR_TURN_DEADZONE_PX
+     *                in
      *                callers — independently controls the X-axis (turn) zone.
      *   halfHeight : half the vertical side length of the dead-zone rectangle
-     *                (positive). Equal to TOUCH_STICK_THRUST_DEADZONE_PX in
+     *                (positive). Equal to ANALOG_RECTILINEAR_THRUST_DEADZONE_PX
+     *                in
      *                callers — independently controls the Y-axis (thrust/brake)
      *                zone. When halfWidth != halfHeight the basis polygon is a
      *                rectangle, not a square; the 8-vertex layout (4 corners +
@@ -3452,9 +3463,9 @@
             this.rotationSpeed = 0;        // Current rotation speed (radians per frame at 60fps)
             this.thrusting = false;        // Is thrust active? (boolean — drives flame visual + sync)
             // Turn-input ramping: handleInput sets turnTarget (∈ [-1, +1], analog
-            // for virtual-stick / discrete ±1 for keyboard); Ship.update ramps
+            // for touch/mouse anchors / discrete ±1 for keyboard); Ship.update ramps
             // turnInput toward it over CONFIG.SHIP_TURN_ACCEL/DECEL_TIME, then sets
-            // rotationSpeed = SHIP_TURN_SPEED * turnInput. Thrust is intentionally NOT
+            // rotationSpeed from the matching keyboard or analog speed cap. Thrust is intentionally NOT
             // ramped: it remains a per-frame acceleration whose magnitude is now scaled
             // by thrustInput (1.0 for keyboard/buttons; analog for virtual-stick).
             // brakeInput drives a velocity-only damping that is clamped at full stop —
@@ -3463,7 +3474,7 @@
             this.turnInput = 0;            // Current ramped turn input in [-1, 1]
             this.thrustInput = 0;          // Analog forward thrust magnitude (≥ 0)
             this.brakeInput = 0;           // Analog brake magnitude (≥ 0)
-            this.turnControlMode = TURN_CONTROL_MODE.RATE;
+            this.turnControlMode = TURN_CONTROL_MODE.KEYBOARD_RATE;
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
@@ -3559,7 +3570,9 @@
             if (data.invulnerable !== undefined) this.invulnerable = data.invulnerable;
             if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
             if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
-            if (data.turnControlMode !== undefined) this.turnControlMode = data.turnControlMode;
+            if (data.turnControlMode !== undefined) {
+                this.turnControlMode = normalizeTurnControlMode(data.turnControlMode);
+            }
             if (data.turnTarget !== undefined) this.turnTarget = data.turnTarget;
             if (data.turnTargetAngle !== undefined) this.turnTargetAngle = data.turnTargetAngle;
             if (data.turnMagnitude !== undefined) this.turnMagnitude = data.turnMagnitude;
@@ -3584,7 +3597,7 @@
             this.thrusting = false;
             this.thrustInput = 0;
             this.brakeInput = 0;
-            this.turnControlMode = TURN_CONTROL_MODE.RATE;
+            this.turnControlMode = TURN_CONTROL_MODE.KEYBOARD_RATE;
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
@@ -3606,7 +3619,7 @@
             );
 
             // Apply rotation from ramped turn input
-            this.rotationSpeed = CONFIG.SHIP_TURN_SPEED * this.turnInput;
+            this.rotationSpeed = getShipTurnSpeed(this.turnControlMode) * this.turnInput;
             this.angle += this.rotationSpeed * dt;
 
             // Apply friction to slow down gradually (adjust for delta time)
@@ -3614,9 +3627,10 @@
             this.velocityX *= friction;
             this.velocityY *= friction;
 
-            // Apply thrust in facing direction (normalized acceleration). thrustInput
-            // is the analog magnitude (1.0 from keyboard/legacy buttons; per-frame analog
-            // from the virtual-stick scheme). The `thrusting` boolean (set by handleInput)
+            // Apply thrust in facing direction. Each nominal 60 Hz tick adds
+            // SHIP_THRUST * thrustInput to the ref-dim/s velocity. thrustInput
+            // is the analog magnitude (1.0 from keyboard; per-tick analog from
+            // the active anchor mode). The `thrusting` boolean (set by handleInput)
             // still drives flame rendering and remote sync.
             if (this.thrustInput > 0) {
                 const a = CONFIG.SHIP_THRUST * this.thrustInput;
@@ -3624,11 +3638,11 @@
                 this.velocityY += Math.sin(this.angle) * a * dt;
             }
             
-            // Limit to max speed (in reference-dimension per second).
+            // Limit to max speed (in reference-dimension per second) when enabled.
             // Compare squared magnitudes to skip sqrt when under the cap.
             const speedSq = this.velocityX * this.velocityX + this.velocityY * this.velocityY;
             const maxSpeedSq = CONFIG.SHIP_MAX_SPEED * CONFIG.SHIP_MAX_SPEED;
-            if (speedSq > maxSpeedSq) {
+            if (CONFIG.SHIP_MAX_SPEED > 0 && speedSq > maxSpeedSq) {
                 const speed = Math.sqrt(speedSq);
                 this.velocityX = (this.velocityX / speed) * CONFIG.SHIP_MAX_SPEED;
                 this.velocityY = (this.velocityY / speed) * CONFIG.SHIP_MAX_SPEED;
@@ -4211,6 +4225,30 @@
         sessionIndicatorVisible: null
     };
 
+    let livesAwardFlashTimer = null;
+    function clearExtraLifeAwardFeedback() {
+        if (livesAwardFlashTimer !== null) {
+            clearTimeout(livesAwardFlashTimer);
+            livesAwardFlashTimer = null;
+        }
+        livesDisplay.classList.remove('life-award');
+    }
+
+    function announceExtraLifeAward() {
+        AudioSystem.playExtraLife();
+        livesDisplay.classList.remove('life-award');
+        // Restart the animation if several milestones arrive within one second.
+        void livesDisplay.offsetWidth;
+        livesDisplay.classList.add('life-award');
+        if (livesAwardFlashTimer !== null) {
+            clearTimeout(livesAwardFlashTimer);
+        }
+        livesAwardFlashTimer = setTimeout(() => {
+            livesAwardFlashTimer = null;
+            livesDisplay.classList.remove('life-award');
+        }, 5000);
+    }
+
     // Gameplay overlay references (crisp HTML text instead of canvas-drawn text)
     const waveOverlay = document.getElementById('wave-overlay');
     const waveTextEl = document.getElementById('wave-text');
@@ -4289,7 +4327,8 @@
             processedPendingBullets: new Set(),  // Track pendingHit bullets we've already processed
             collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
             seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
-            seenShipHitCounts: new Map() // objectId -> highest hitCount already cued
+            seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
+            observedScoreLifeAwardCount: null
             // Join-snapshot tracking (which orphans/replicas should skip spawn
             // projection or seed onto the delayed timeline) now lives inside
             // replicationRuntime (facts.joinSnapshot), consumed one-shot per id.
@@ -4319,7 +4358,7 @@
     // cleanup resolves effects without replaying them for late joiners.
     const CollisionEffects = {
         startAsteroidHit(source, target = null, impact = null) {
-            if (!isSessionMode() || !source) return;
+            if (!source) return;
             const bulletId = source.syncObjectId || null;
             if (bulletId && game.multiplayer.seenPendingBulletIds.has(bulletId)) return;
             let key;
@@ -4353,25 +4392,36 @@
             const dy = Math.sin(bulletAngle);
             const nx = -dy;
             const ny = dx;
+            const offsetRefX = offsetAlong * dx + offsetAcross * nx;
+            const offsetRefY = offsetAlong * dy + offsetAcross * ny;
+            const hasTargetPose = Number.isFinite(target?.x) && Number.isFinite(target?.y);
+            const refDim = getReferenceDimension();
+            const now = performance.now();
 
             game.multiplayer.collisionEffects.set(key, {
                 key,
                 kind: 'asteroid',
                 bulletId,
                 targetId,
-                offsetRefX: offsetAlong * dx + offsetAcross * nx,
-                offsetRefY: offsetAlong * dy + offsetAcross * ny,
+                offsetRefX,
+                offsetRefY,
                 baseRadius: radius,
-                lastX: Number.isFinite(source.x) ? source.x : (target?.x || 0),
-                lastY: Number.isFinite(source.y) ? source.y : (target?.y || 0),
+                lastX: hasTargetPose
+                    ? target.x + offsetRefX * refDim / getGameWidth()
+                    : (Number.isFinite(source.x) ? source.x : 0),
+                lastY: hasTargetPose
+                    ? target.y + offsetRefY * refDim / getGameHeight()
+                    : (Number.isFinite(source.y) ? source.y : 0),
                 colorIndex: source.colorIndex || 0,
-                startedAt: performance.now(),
-                resolvedAt: null
+                startedAt: now,
+                // Local asteroids have no synced target to resolve when they
+                // are removed, so begin their normal post-impact fade now.
+                resolvedAt: targetId ? null : now
             });
         },
 
         startShipHit(objectId, payload, colorIndex = 0) {
-            if (!isSessionMode() || !objectId || !payload) return;
+            if (!objectId || !payload) return;
             const hitCount = Number(payload.hitCount);
             if (!Number.isFinite(hitCount)
                 || !Number.isFinite(payload.hitX)
@@ -4629,22 +4679,11 @@
     // Input tracking
     const keys = {};
     
-    // Touch input tracking (mirrors keys for mobile — legacy on-screen buttons)
-    const touch = {
-        left: false,
-        right: false,
-        thrust: false,
-        fire: false
-    };
-
     /**
-     * Anchor-based touch state (used by the `rectilinear` and `polar` schemes;
-     * unused in `classic`). Multi-touch: at most one movement anchor (left
-     * half) and one fire anchor (right half) at any time. Identifiers come
-     * from Touch.identifier so we can correlate move/end events with the
-     * originating touchstart. Anchors are logical — no UI is rendered today,
-     * but coords are kept current so the visualization layer can draw a base
-     * ring + thumb at (anchorX, anchorY) → (currentX, currentY).
+     * Anchor-based analog state for the `rectilinear` and `polar` modes. Touch
+     * input allows one movement anchor (left half) and one held-fire input
+     * (right half); mouse input uses private sentinels through the same
+     * lifecycle.
      *
      * Coordinates are in CSS pixels relative to the viewport (clientX/clientY).
      * They survive dynamic device rotation because the compute helpers rescale
@@ -4664,22 +4703,11 @@
         moveAnchorX: 0, moveAnchorY: 0,
         moveCurrentX: 0, moveCurrentY: 0,
         fireTouchId: null,
-        fireAnchorX: 0, fireAnchorY: 0,
-        fireCurrentX: 0, fireCurrentY: 0,
         // Cached per-frame analog values produced from the move anchor under
         // the rectilinear scheme.
         turnTarget: 0,
         thrustInput: 0,
         brakeInput: 0,
-        // Cached per-frame analog values produced from the fire anchor.
-        // The right (fire) anchor drives thrust/brake too — lateral motion
-        // produces a rectilinear turn input (used by handleInput's POLAR
-        // branch, ignored by the rectilinear branch). handleInput combines
-        // these with the move-anchor outputs (thrust/brake via max();
-        // turn via signed sum + clamp — see mergeTurnInputs).
-        fireTurnTarget: 0,
-        fireThrustInput: 0,
-        fireBrakeInput: 0,
         // Polar-scheme left-anchor cache (see computePolarStickInput).
         polarActive: false,
         polarRadius: 0,
@@ -4689,15 +4717,28 @@
         polarBrake: 0,
     };
 
+    // A Symbol cannot collide with a browser Touch.identifier.
+    const MOUSE_MOVE_TOUCH_ID = Symbol('mouse-move');
+    const MOUSE_FIRE_TOUCH_ID = Symbol('mouse-fire');
+    let mouseMoveControlActive = false;
+    let mouseFireControlActive = false;
+    // Browsers dispatch contextmenu before or after mouseup. Track the start,
+    // current, and release targets so only the firing click's menu is suppressed.
+    let mouseFireContextMenuTargets = null;
+
+    function setMouseMoveControlActive(active) {
+        mouseMoveControlActive = active;
+    }
+
     function resetStickInput() {
+        setMouseMoveControlActive(false);
+        mouseFireControlActive = false;
+        mouseFireContextMenuTargets = null;
         stickInput.moveTouchId = null;
         stickInput.fireTouchId = null;
         stickInput.turnTarget = 0;
         stickInput.thrustInput = 0;
         stickInput.brakeInput = 0;
-        stickInput.fireTurnTarget = 0;
-        stickInput.fireThrustInput = 0;
-        stickInput.fireBrakeInput = 0;
         stickInput.polarActive = false;
         stickInput.polarRadius = 0;
         stickInput.polarTargetAngle = 0;
@@ -4706,12 +4747,18 @@
         stickInput.polarBrake = 0;
     }
 
+    function getNeutralAnalogBrakeInput() {
+        const brakeMax = Math.max(0, CONFIG.ANALOG_BRAKE_MAX || 0);
+        return Math.max(0, Math.min(brakeMax, CONFIG.ANALOG_BRAKE_GAIN || 0));
+    }
+
     // Unified input helpers
     const input = {
-        left: () => keys['ArrowLeft'] || keys['KeyA'] || touch.left,
-        right: () => keys['ArrowRight'] || keys['KeyD'] || touch.right,
-        thrust: () => keys['ArrowUp'] || keys['KeyW'] || touch.thrust,
-        fire: () => keys['Space'] || touch.fire || (isAnchorSchemeEnabled() && stickInput.fireTouchId !== null)
+        left: () => keys['ArrowLeft'] || keys['KeyA'],
+        right: () => keys['ArrowRight'] || keys['KeyD'],
+        thrust: () => keys['ArrowUp'] || keys['KeyW'],
+        brake: () => keys['KeyS'] || keys['ArrowDown'],
+        fire: () => keys['Space'] || stickInput.fireTouchId !== null
     };
 
     // ============================================
@@ -5205,6 +5252,22 @@
         if (data.speedMultiplier !== undefined) game.speedMultiplier = data.speedMultiplier;
         if (data.waveDelayTimer !== undefined) game.waveDelayTimer = data.waveDelayTimer;
 
+        const incomingScoreLifeAwardCount = Number(data.scoreLifeAwardCount);
+        if (Number.isFinite(incomingScoreLifeAwardCount)
+            && incomingScoreLifeAwardCount >= 0) {
+            const scoreLifeAwardCount = Math.floor(incomingScoreLifeAwardCount);
+            const observedScoreLifeAwardCount =
+                game.multiplayer.observedScoreLifeAwardCount;
+            if (observedScoreLifeAwardCount !== null
+                && scoreLifeAwardCount > observedScoreLifeAwardCount) {
+                announceExtraLifeAward();
+            }
+            if (observedScoreLifeAwardCount === null
+                || scoreLifeAwardCount > observedScoreLifeAwardCount) {
+                game.multiplayer.observedScoreLifeAwardCount = scoreLifeAwardCount;
+            }
+        }
+
         if (game.lives <= 0 && oldLives > 0) {
             AudioSystem.beat.stop();
             AudioSystem.thrustSound.stop();
@@ -5249,6 +5312,7 @@
         remove(instance) {
             if (game.multiplayer.gameStateObjectId === instance) {
                 game.multiplayer.gameStateObjectId = null;
+                game.multiplayer.observedScoreLifeAwardCount = null;
             }
         }
     };
@@ -5334,7 +5398,9 @@
         game.multiplayer.remoteShips.clear();
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
+        game.multiplayer.observedScoreLifeAwardCount = null;
         game.multiplayer.processedPendingBullets.clear();
+        clearExtraLifeAwardFeedback();
         CollisionEffects.clear();
         game.astervoids = [];
         game.bullets = [];
@@ -5621,7 +5687,8 @@
                 // terminalAt is the shared end of the deterministic convergence
                 // window and is likewise immutable for this terminal epoch.
                 gameOverAt: null,
-                terminalAt: null
+                terminalAt: null,
+                scoreLifeAwardCount: 0
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -5629,6 +5696,7 @@
                 () => isSessionMode());
             if (!objectInfo) return;
             game.multiplayer.gameStateObjectId = objectInfo.id;
+            game.multiplayer.observedScoreLifeAwardCount = 0;
         } catch (err) {
             _error('[Multiplayer] Failed to create GameState:', err);
         }
@@ -5660,12 +5728,30 @@
             return;
         }
         let groupScore = gsObj?.data?.groupScore || 0;
+        const persistedScoreLifeAwardCount =
+            Number(gsObj?.data?.scoreLifeAwardCount);
+        let scoreLifeAwardCount = Number.isFinite(persistedScoreLifeAwardCount)
+            && persistedScoreLifeAwardCount > 0
+            ? Math.floor(persistedScoreLifeAwardCount)
+            : 0;
+        let observedScoreLifeAwardCount =
+            game.multiplayer.observedScoreLifeAwardCount;
+        if (observedScoreLifeAwardCount === null
+            || scoreLifeAwardCount > observedScoreLifeAwardCount) {
+            observedScoreLifeAwardCount = scoreLifeAwardCount;
+            game.multiplayer.observedScoreLifeAwardCount =
+                observedScoreLifeAwardCount;
+        }
+        const pendingScoreLifeAwards = Math.max(
+            0, observedScoreLifeAwardCount - scoreLifeAwardCount);
+        scoreLifeAwardCount = Math.max(
+            scoreLifeAwardCount, observedScoreLifeAwardCount);
         
         // Read lives from gsObj.data (same source as processedHits/peakShipCount)
         // so that they are always from the same sync point. Using game.lives would
         // be stale if a remote delta arrived between the last updateGameStateFromSync()
         // and an ownership migration — causing incorrect lives on the new owner.
-        let lives = gsObj?.data?.lives ?? game.lives;
+        let lives = (gsObj?.data?.lives ?? game.lives) + pendingScoreLifeAwards;
         
         // Accumulate score deltas from all ships (survives member departure)
         const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
@@ -5680,6 +5766,19 @@
             }
         }
         game.score = groupScore;
+
+        // Score-based lives are derived from the authoritative shared total.
+        // The persisted count makes the award idempotent across ownership migration.
+        const eligibleScoreLifeAwards = countExtraLivesForScore(
+            groupScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+        const newScoreLifeAwards = Math.max(
+            0, eligibleScoreLifeAwards - scoreLifeAwardCount);
+        if (newScoreLifeAwards > 0 && lives > 0) {
+            lives += newScoreLifeAwards;
+            scoreLifeAwardCount += newScoreLifeAwards;
+            game.multiplayer.observedScoreLifeAwardCount = scoreLifeAwardCount;
+            announceExtraLifeAward();
+        }
         
         // Process hitCounts from all ships (idempotent via processedHits tracking)
         for (const ship of shipObjects) {
@@ -5746,7 +5845,8 @@
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
             peakShipCount: peakShipCount,
             gameOverAt: gameOverAt,
-            terminalAt: terminalAt
+            terminalAt: terminalAt,
+            scoreLifeAwardCount: scoreLifeAwardCount
         };
         
         // This queues into pendingUpdates with the other object updates.
@@ -6349,7 +6449,7 @@
      */
     function handleInput(dt = 1) {
         if (game.state === 'start') {
-            // Session picker handles start - don't process Enter here
+            // Session picker handles start - don't process keyboard input here
             return;
         }
         
@@ -6363,7 +6463,7 @@
 
         if (game.state === 'paused') {
             // Allow restart from pause menu (solo only, session can't pause)
-            if (keys['Enter']) {
+            if (keys['Escape']) {
                 pauseMenu.classList.remove('visible');
                 returnToStartScreen();
             }
@@ -6375,9 +6475,10 @@
         // Need a ship to control
         if (!game.ship) return;
 
-        // Resolve analog control values for this frame. Keyboard / legacy buttons
-        // give discrete inputs (±1 turn, on/off thrust, no brake). The virtual-stick
-        // touch scheme overrides these with analog values while a move anchor is held.
+        // Resolve control values for this frame. Keyboard input gives discrete
+        // values (±1 turn, on/off thrust, configured neutral brake).
+        // The analog anchor schemes override movement axes while a move anchor
+        // is held.
         let turnTarget;
         if (input.left()) {
             turnTarget = -1;
@@ -6388,14 +6489,15 @@
         }
         let thrustOn = input.thrust();
         let thrustMag = thrustOn ? 1 : 0;
-        let brakeMag = 0;
-        let turnControlMode = TURN_CONTROL_MODE.RATE;
+        const keyboardBrake = input.brake() ? getNeutralAnalogBrakeInput() : 0;
+        let brakeMag = keyboardBrake;
+        let turnControlMode = TURN_CONTROL_MODE.KEYBOARD_RATE;
         let turnTargetAngle = 0;
         let turnMagnitude = 0;
         let turnBias = 0;
 
-        if (isAnchorSchemeEnabled()) {
-            const scheme = getTouchScheme();
+        if (isAnalogControlSchemeEnabled()) {
+            const scheme = getAnalogControlScheme();
             // Left (move) anchor drives turn + thrust + brake when held. The
             // rectilinear scheme caches signed turn/thrust/brake directly; the
             // polar scheme caches (targetAngle, turnMagnitude, thrust, brake)
@@ -6404,74 +6506,35 @@
             // that aligns ship.angle to the finger-vs-anchor vector with the
             // minimum sweep.
             if (stickInput.moveTouchId !== null) {
-                if (scheme === TOUCH_SCHEMES.POLAR && stickInput.polarActive) {
-                    const delta = shortestAngleDelta(
-                        stickInput.polarTargetAngle, game.ship.angle);
-                    // Cap the commanded turn so the ship can't sweep past the
-                    // target angle in one frame — eliminates the bang-bang
-                    // oscillation when |delta| is smaller than the per-frame
-                    // angular reach at full polarTurnMagnitude.
-                    turnTarget = attainableTurnTarget(
-                        delta,
-                        stickInput.polarTurnMagnitude,
-                        CONFIG.SHIP_TURN_SPEED,
-                        dt);
-                    turnControlMode = TURN_CONTROL_MODE.TARGET;
-                    turnTargetAngle = stickInput.polarTargetAngle;
-                    turnMagnitude = stickInput.polarTurnMagnitude;
-                    thrustMag = stickInput.polarThrust;
-                    brakeMag  = stickInput.polarBrake;
-                } else if (scheme === TOUCH_SCHEMES.POLAR) {
-                    // Touch held but inside the polar dead-zone → no turn /
-                    // thrust, but brake STILL flows. computePolarStickInput
-                    // populated polarBrake from (1 − r/threshold), which is
-                    // at its strongest near r=0, so the dead-zone is the
-                    // "high brake" region of the control.
-                    turnTarget = 0;
-                    thrustMag = 0;
-                    brakeMag = stickInput.polarBrake;
+                if (scheme === ANALOG_CONTROL_SCHEMES.POLAR) {
+                    turnControlMode = TURN_CONTROL_MODE.ANALOG_TARGET;
+                    if (stickInput.polarActive) {
+                        const delta = shortestAngleDelta(
+                            stickInput.polarTargetAngle, game.ship.angle);
+                        // Cap the commanded turn so the ship can't sweep past
+                        // the target angle in one frame — eliminates bang-bang
+                        // oscillation near the target heading.
+                        turnTarget = attainableTurnTarget(
+                            delta,
+                            stickInput.polarTurnMagnitude,
+                            getShipTurnSpeed(turnControlMode),
+                            dt);
+                        turnTargetAngle = stickInput.polarTargetAngle;
+                        turnMagnitude = stickInput.polarTurnMagnitude;
+                        thrustMag = stickInput.polarThrust;
+                        brakeMag = Math.max(keyboardBrake, stickInput.polarBrake);
+                    } else {
+                        // An anchor held inside the polar dead-zone has no turn
+                        // or thrust, but retains its high-brake behavior.
+                        turnTarget = 0;
+                        thrustMag = 0;
+                        brakeMag = Math.max(keyboardBrake, stickInput.polarBrake);
+                    }
                 } else {
+                    turnControlMode = TURN_CONTROL_MODE.ANALOG_RATE;
                     turnTarget = stickInput.turnTarget;
                     thrustMag = stickInput.thrustInput;
-                    brakeMag = stickInput.brakeInput;
-                }
-            }
-            // Right (fire) anchor also drives thrust/brake — and, in the
-            // POLAR scheme only, turn as well (rectilinear-style lateral
-            // mapping; lets the right thumb steer + fire while the left
-            // thumb handles polar heading/thrust). In the rectilinear
-            // scheme the right-anchor turn is ignored and turning remains
-            // exclusively a left-anchor function.
-            //
-            // CONFIG.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST (default false):
-            // when true, while the right anchor is held it takes exclusive
-            // control of thrust/brake — left-anchor contributions are
-            // dropped, even if the right finger sits in its dead-zone
-            // (yielding zero). When the right anchor is released,
-            // thrust/brake fall back to the left anchor automatically.
-            //
-            // When the flag is false (default), both anchors are combined
-            // via Math.max so either can drive forward thrust or braking;
-            // values are already per-anchor clamped by computeStickInput,
-            // so max() stays within the configured limits.
-            //
-            // Turn merging in POLAR (always-combine; no exclusive flag):
-            // signed-sum-and-clamp via mergeTurnInputs — opposing fingers
-            // cancel, cooperating fingers reinforce up to ±1.
-            if (stickInput.fireTouchId !== null) {
-                if (CONFIG.TOUCH_RIGHT_ANCHOR_EXCLUSIVE_THRUST) {
-                    thrustMag = stickInput.fireThrustInput;
-                    brakeMag  = stickInput.fireBrakeInput;
-                } else {
-                    thrustMag = Math.max(thrustMag, stickInput.fireThrustInput);
-                    brakeMag  = Math.max(brakeMag,  stickInput.fireBrakeInput);
-                }
-                if (scheme === TOUCH_SCHEMES.POLAR) {
-                    const fireTurn = stickInput.fireTurnTarget;
-                    turnTarget = mergeTurnInputs(turnTarget, fireTurn);
-                    if (turnControlMode === TURN_CONTROL_MODE.TARGET) {
-                        turnBias = fireTurn;
-                    }
+                    brakeMag = Math.max(keyboardBrake, stickInput.brakeInput);
                 }
             }
             thrustOn = thrustMag > 0;
@@ -6611,17 +6674,29 @@
                         }
                     } else {
                         // Solo mode — process locally
-                        const removedBullet = game.bullets.splice(i, 1)[0];
-                        game.astervoids.splice(j, 1);
-                        game.score += asteroid.getPoints();
-                        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' : 
-                                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                        AudioSystem.playExplosion(explosionSize);
                         const offsetX = bullet.x - asteroid.x;
                         const offsetY = bullet.y - asteroid.y;
                         const relVelX = bullet.velocityX - asteroid.velocityX;
                         const relVelY = bullet.velocityY - asteroid.velocityY;
                         const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
+                        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+                        game.bullets.splice(i, 1);
+                        game.astervoids.splice(j, 1);
+                        const previousScore = game.score;
+                        game.score += asteroid.getPoints();
+                        const newScoreLifeAwards = Math.max(
+                            0,
+                            countExtraLivesForScore(
+                                game.score, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD)
+                            - countExtraLivesForScore(
+                                previousScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD));
+                        if (newScoreLifeAwards > 0) {
+                            game.lives += newScoreLifeAwards;
+                            announceExtraLifeAward();
+                        }
+                        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
+                                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+                        AudioSystem.playExplosion(explosionSize);
                         splitAsteroid(asteroid, null, impact, game.ship);
                     }
                     
@@ -6745,11 +6820,10 @@
     function handleShipHit(ship) {
         AudioSystem.playShipExplosion();
         AudioSystem.thrustSound.stop();
-        
+
+        const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
+        ship.hitCount = (ship.hitCount || 0) + 1;
         if (isSessionMode()) {
-            // Increment monotonic hitCount on ship (GameState owner watches this)
-            const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
-            ship.hitCount = (ship.hitCount || 0) + 1;
             // Phase 2.3: hitCount no longer rides on toUpdateData(); push it
             // through the per-object event channel so other peers see it
             // before the next per-frame batch.
@@ -6762,6 +6836,12 @@
             }
         } else {
             // Solo mode — handle everything locally
+            CollisionEffects.startShipHit('solo', {
+                hitCount: ship.hitCount,
+                hitX: hitPose.x,
+                hitY: hitPose.y,
+                hitAngle: hitPose.angle
+            }, ship.colorIndex);
             game.lives--;
             updateHUD();
             if (game.lives <= 0) {
@@ -6884,15 +6964,13 @@
     }
 
     /**
-     * Anchor overlays for the rectilinear and polar touch schemes
-     * (CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED). For each live anchor:
+     * Movement-anchor overlays for the rectilinear and polar analog schemes
+     * (CONFIG.ANALOG_ANCHOR_VISUAL_ENABLED):
      *
-     *   rectilinear (both anchors): the 8-vertex polygon produced by
+     *   rectilinear: the 8-vertex polygon produced by
      *     computeAnchorVertices, centered on the anchor.
      *
-     *   polar (left anchor only; right keeps the rectilinear polygon since
-     *     its semantics are unchanged): up to three concentric circles
-     *     centered on the anchor —
+     *   polar: up to three concentric circles centered on the anchor —
      *       • dead-zone circle (always while held), radius = DEADZONE_PX;
      *       • dynamic circle (when r ≥ DEADZONE_PX), radius = finger r;
      *       • threshold circle (when r ≥ THRESHOLD_PX), radius = THRESHOLD_PX.
@@ -6900,36 +6978,37 @@
      *     actually reaches their radius, so the overlay narrates exactly
      *     which control band the player is in (turn / thrust transition).
      *
-     * Coordinate conversion: anchor/finger are in CSS px (Touch.clientX/Y);
+     * Coordinate conversion: anchor/finger are in CSS px (touch or mouse
+     * client coordinates);
      * we map them to canvas internal coords via canvas.getBoundingClientRect().
      * Drawn after the viewport restore so it lives in full-canvas coords and
      * is never clipped by the aspect-locked gameplay viewport. Hidden on
-     * desktop, when no anchor is held, during pause / game-over, when the
-     * scheme is classic, or when TOUCH_ANCHOR_VISUAL_ENABLED is false.
+     * desktop unless a mouse movement anchor is held, when no anchor is held,
+     * during pause / game-over, or when ANALOG_ANCHOR_VISUAL_ENABLED is false.
      */
-    function drawStickAnchors(ctx) {
-        if (!isAnchorSchemeEnabled()) return;
-        if (!CONFIG.TOUCH_ANCHOR_VISUAL_ENABLED) return;
-        if (!touchControlsEnabled) return;
+    function drawAnalogAnchors(ctx) {
+        if (!isAnalogControlSchemeEnabled()) return;
+        if (!CONFIG.ANALOG_ANCHOR_VISUAL_ENABLED) return;
+        if (!touchControlsEnabled && stickInput.moveTouchId !== MOUSE_MOVE_TOUCH_ID) return;
         if (game.state !== 'playing' && game.state !== 'waveDelay') return;
-        if (stickInput.moveTouchId === null && stickInput.fireTouchId === null) return;
+        if (stickInput.moveTouchId === null) return;
 
         const rect = canvas.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
         const sx = canvas.width  / rect.width;
         const sy = canvas.height / rect.height;
+        const anchorScale = getAnalogAnchorScale();
 
-        // Dead-zone half-extents in canvas px. Use sx for both axes since
-        // resizeCanvas keeps the canvas internal aspect equal to its CSS box
-        // (sx and sy are normally identical); using sx alone keeps the overlay
-        // axis-aligned on a pixel-stretched canvas. CSS px → canvas px scaling
-        // preserves on-screen physical size across device sizes / orientations.
-        const halfWidth  = CONFIG.TOUCH_STICK_TURN_DEADZONE_PX   * sx;
-        const halfHeight = CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX * sx;
+        // Scale the anchor's logical CSS-pixel distances first, then convert
+        // them to canvas pixels for drawing.
+        const halfWidth =
+            CONFIG.ANALOG_RECTILINEAR_TURN_DEADZONE_PX * anchorScale * sx;
+        const halfHeight =
+            CONFIG.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX * anchorScale * sx;
 
         ctx.save();
-        ctx.strokeStyle = CONFIG.TOUCH_ANCHOR_STROKE_COLOR;
-        ctx.lineWidth   = CONFIG.TOUCH_ANCHOR_LINE_WIDTH;
+        ctx.strokeStyle = CONFIG.ANALOG_ANCHOR_STROKE_COLOR;
+        ctx.lineWidth = CONFIG.ANALOG_ANCHOR_LINE_WIDTH;
 
         function strokeRectAnchor(anchorX, anchorY, currentX, currentY) {
             const cx = (anchorX  - rect.left) * sx;
@@ -6955,8 +7034,8 @@
             const dx = (currentX - anchorX) * sx;
             const dy = (currentY - anchorY) * sy;
             const r = Math.hypot(dx, dy);
-            const deadZone  = CONFIG.TOUCH_POLAR_DEADZONE_PX  * sx;
-            const threshold = CONFIG.TOUCH_POLAR_THRESHOLD_PX * sx;
+            const deadZone = CONFIG.ANALOG_POLAR_DEADZONE_PX * anchorScale * sx;
+            const threshold = CONFIG.ANALOG_POLAR_THRESHOLD_PX * anchorScale * sx;
             const theta = Math.atan2(dy, dx);
             // Triangle geometry exists only when the finger has cleared the
             // dead-zone (and the dead-zone has non-zero radius). When it
@@ -7012,9 +7091,9 @@
             ctx.restore();
         }
 
-        const scheme = getTouchScheme();
+        const scheme = getAnalogControlScheme();
         if (stickInput.moveTouchId !== null) {
-            if (scheme === TOUCH_SCHEMES.POLAR) {
+            if (scheme === ANALOG_CONTROL_SCHEMES.POLAR) {
                 strokePolarAnchor(
                     stickInput.moveAnchorX, stickInput.moveAnchorY,
                     stickInput.moveCurrentX, stickInput.moveCurrentY);
@@ -7024,14 +7103,6 @@
                     stickInput.moveCurrentX, stickInput.moveCurrentY);
             }
         }
-        // The right (fire) anchor always uses the rectilinear overlay because
-        // its semantics are identical in both anchor-based schemes.
-        if (stickInput.fireTouchId !== null) {
-            strokeRectAnchor(
-                stickInput.fireAnchorX, stickInput.fireAnchorY,
-                stickInput.fireCurrentX, stickInput.fireCurrentY);
-        }
-
         ctx.restore();
     }
 
@@ -7968,7 +8039,7 @@
         // Touch overlay (virtual-stick anchor). Drawn last and in full-canvas
         // coords so it sits on top of gameplay and isn't clipped by the
         // aspect-locked viewport. No-op on desktop / when no anchor is held.
-        drawStickAnchors(ctx);
+        drawAnalogAnchors(ctx);
     }
 
     // ============================================
@@ -7989,7 +8060,8 @@
             e.preventDefault();
         }
 
-        // Escape key handling
+        // Escape leaves sessions. In solo play, it opens the pause menu while
+        // active; Escape on the pause menu is handled by handleInput as restart.
         if (e.code === 'Escape') {
             e.preventDefault();
             
@@ -7999,8 +8071,17 @@
                 return;
             }
             
-            // In solo mode: toggle pause (if not game over)
-            if (!isGameOver() && game.state !== 'start') {
+            if (!isGameOver() && game.state !== 'start' && game.state !== 'paused') {
+                togglePause();
+            }
+            return;
+        }
+
+        // Enter resumes the solo pause menu. Session-picker Enter behavior is
+        // handled by its dedicated listener below.
+        if (e.code === 'Enter') {
+            if (!e.repeat && !isSessionMode() && game.state === 'paused') {
+                e.preventDefault();
                 togglePause();
             }
             return;
@@ -8049,48 +8130,9 @@
 
     // Touch control elements
     const touchButtons = {
-        left: document.getElementById('touch-left'),
-        right: document.getElementById('touch-right'),
-        thrust: document.getElementById('touch-thrust'),
-        fire: document.getElementById('touch-fire'),
         pause: document.getElementById('touch-pause'),
         restart: document.getElementById('touch-restart')
     };
-
-    // Helper to set touch state
-    function setTouchState(control, active) {
-        touch[control] = active;
-        if (touchButtons[control]) {
-            touchButtons[control].classList.toggle('active', active);
-        }
-    }
-
-    // Setup touch button handlers
-    function setupTouchButton(element, control) {
-        if (!element) return;
-
-        element.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            // Initialize and resume audio on first touch
-            AudioSystem.init();
-            AudioSystem.resume();
-            setTouchState(control, true);
-        }, { passive: false });
-
-        element.addEventListener('touchend', (e) => {
-            e.preventDefault();
-            setTouchState(control, false);
-        }, { passive: false });
-
-        element.addEventListener('touchcancel', (e) => {
-            setTouchState(control, false);
-        });
-    }
-
-    // Initialize touch controls for game buttons
-    ['left', 'right', 'thrust', 'fire'].forEach(control => {
-        setupTouchButton(touchButtons[control], control);
-    });
 
     // Pause button handler
     if (touchButtons.pause) {
@@ -8164,6 +8206,9 @@
     if (menuFullscreenBtn) {
         menuFullscreenBtn.addEventListener('click', () => toggleFullscreen());
     }
+    if (analogControlModeButton) {
+        analogControlModeButton.addEventListener('click', toggleAnalogControlScheme);
+    }
 
     // Track fullscreen state
     function handleFullscreenChange() {
@@ -8191,14 +8236,12 @@
         e.preventDefault();
     }, { passive: false });
 
-    // ─── Anchor-based touch schemes ──────────────────────────────────────────
-    // Active when CONFIG.TOUCH_CONTROL_SCHEME is 'rectilinear' or 'polar'.
-    // The handlers are always wired; the early-return below makes them no-ops
-    // when the legacy button scheme is active, so the same DOM works for both.
+    // ─── Anchor-based analog schemes ─────────────────────────────────────────
+    // The picker switches these handlers between rectilinear and polar modes.
     {
         const gameContainer = document.getElementById('game-container');
 
-        // True iff a touch occurred on a legacy on-screen button or the session
+        // True iff a touch occurred on a mobile overlay control or the session
         // picker — those have their own handlers and must not be hijacked.
         function isStickTouchTarget(target) {
             if (!target || target.classList && target.classList.contains('touch-btn')) {
@@ -8208,54 +8251,103 @@
             return true;
         }
 
+        function isPointWithinRect(clientX, clientY, rect) {
+            return clientX >= rect.left && clientX <= rect.right
+                && clientY >= rect.top && clientY <= rect.bottom;
+        }
+
         // Side test: anchored against the canvas, not the container, so off-canvas
         // letterbox bars belong to neither half and are ignored.
         function classifyTouchSide(clientX, clientY) {
             const rect = canvas.getBoundingClientRect();
-            if (clientX < rect.left || clientX > rect.right
-                || clientY < rect.top || clientY > rect.bottom) {
+            if (!isPointWithinRect(clientX, clientY, rect)) {
                 return null; // outside the canvas → ignore
             }
             const midX = rect.left + rect.width / 2;
             return clientX < midX ? 'move' : 'fire';
         }
 
+        function beginMoveAnchor(identifier, clientX, clientY) {
+            if (stickInput.moveTouchId !== null) return false;
+            stickInput.moveTouchId = identifier;
+            stickInput.moveAnchorX = clientX;
+            stickInput.moveAnchorY = clientY;
+            stickInput.moveCurrentX = clientX;
+            stickInput.moveCurrentY = clientY;
+            return true;
+        }
+
+        function updateMoveAnchor(identifier, clientX, clientY) {
+            if (identifier !== stickInput.moveTouchId) return false;
+            stickInput.moveCurrentX = clientX;
+            stickInput.moveCurrentY = clientY;
+            return true;
+        }
+
+        function endMoveAnchor(identifier) {
+            if (identifier !== stickInput.moveTouchId) return false;
+            stickInput.moveTouchId = null;
+            stickInput.turnTarget = 0;
+            stickInput.thrustInput = 0;
+            stickInput.brakeInput = 0;
+            stickInput.polarActive = false;
+            stickInput.polarRadius = 0;
+            stickInput.polarTurnMagnitude = 0;
+            stickInput.polarThrust = 0;
+            stickInput.polarBrake = 0;
+            return true;
+        }
+
+        function beginFireInput(identifier) {
+            if (stickInput.fireTouchId !== null) return false;
+            stickInput.fireTouchId = identifier;
+            return true;
+        }
+
+        function endFireInput(identifier) {
+            if (identifier !== stickInput.fireTouchId) return false;
+            stickInput.fireTouchId = null;
+            return true;
+        }
+
         // Frame-time updater: recomputes cached analog values from the current
-        // move and fire anchors each animation frame, so changes in viewport
-        // size / orientation immediately affect mapping without per-event work.
-        // The fire anchor reuses computeStickInput in every anchor-based
-        // scheme — only the thrust/brake fields are consumed downstream and
-        // its turn output is discarded. The MOVE anchor branches on scheme:
-        // rectilinear uses computeStickInput, polar uses computePolarStickInput
-        // (and caches a targetAngle that handleInput converts into a signed
-        // turn target once the ship's heading is known).
+        // movement anchor each animation frame, so changes in viewport size /
+        // orientation immediately affect mapping without per-event work. The
+        // rectilinear scheme uses computeStickInput; polar uses
+        // computePolarStickInput and caches a targetAngle that handleInput
+        // converts into a signed turn target once the ship's heading is known.
         function updateStickAnalog() {
-            const scheme = getTouchScheme();
+            const scheme = getAnalogControlScheme();
+            const anchorScale = getAnalogAnchorScale();
             const rectParams = {
-                radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX,
-                turnDeadzonePx: CONFIG.TOUCH_STICK_TURN_DEADZONE_PX,
-                thrustDeadzonePx: CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX,
-                turnGain: CONFIG.TOUCH_TURN_GAIN,
-                turnMax: CONFIG.TOUCH_TURN_MAX,
-                thrustGain: CONFIG.TOUCH_THRUST_GAIN,
-                thrustMax: CONFIG.TOUCH_THRUST_MAX,
-                brakeGain: CONFIG.TOUCH_BRAKE_GAIN,
-                brakeMax: CONFIG.TOUCH_BRAKE_MAX,
+                radiusPx: CONFIG.ANALOG_STICK_RADIUS_PX * anchorScale,
+                turnDeadzonePx:
+                    CONFIG.ANALOG_RECTILINEAR_TURN_DEADZONE_PX * anchorScale,
+                thrustDeadzonePx:
+                    CONFIG.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX * anchorScale,
+                turnGain: CONFIG.ANALOG_RECTILINEAR_TURN_GAIN,
+                turnMax: CONFIG.ANALOG_TURN_MAX,
+                thrustGain: CONFIG.ANALOG_THRUST_GAIN,
+                thrustMax: CONFIG.ANALOG_THRUST_MAX,
+                brakeGain: CONFIG.ANALOG_BRAKE_GAIN,
+                brakeMax: CONFIG.ANALOG_BRAKE_MAX,
             };
             if (stickInput.moveTouchId !== null) {
                 const dx = stickInput.moveCurrentX - stickInput.moveAnchorX;
                 const dy = stickInput.moveCurrentY - stickInput.moveAnchorY;
-                if (scheme === TOUCH_SCHEMES.POLAR) {
+                if (scheme === ANALOG_CONTROL_SCHEMES.POLAR) {
                     const polarParams = {
-                        radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX,
-                        deadZonePx: CONFIG.TOUCH_POLAR_DEADZONE_PX,
-                        thresholdPx: CONFIG.TOUCH_POLAR_THRESHOLD_PX,
-                        turnGain: CONFIG.TOUCH_TURN_GAIN,
-                        turnMax: CONFIG.TOUCH_TURN_MAX,
-                        thrustGain: CONFIG.TOUCH_THRUST_GAIN,
-                        thrustMax: CONFIG.TOUCH_THRUST_MAX,
-                        brakeGain: CONFIG.TOUCH_BRAKE_GAIN,
-                        brakeMax: CONFIG.TOUCH_BRAKE_MAX,
+                        radiusPx: CONFIG.ANALOG_STICK_RADIUS_PX * anchorScale,
+                        deadZonePx:
+                            CONFIG.ANALOG_POLAR_DEADZONE_PX * anchorScale,
+                        thresholdPx:
+                            CONFIG.ANALOG_POLAR_THRESHOLD_PX * anchorScale,
+                        turnGain: CONFIG.ANALOG_POLAR_TURN_GAIN,
+                        turnMax: CONFIG.ANALOG_TURN_MAX,
+                        thrustGain: CONFIG.ANALOG_THRUST_GAIN,
+                        thrustMax: CONFIG.ANALOG_THRUST_MAX,
+                        brakeGain: CONFIG.ANALOG_BRAKE_GAIN,
+                        brakeMax: CONFIG.ANALOG_BRAKE_MAX,
                     };
                     const out = computePolarStickInput(dx, dy, polarParams);
                     stickInput.polarActive = out.active;
@@ -8264,9 +8356,8 @@
                     stickInput.polarTurnMagnitude = out.turnMagnitude;
                     stickInput.polarThrust = out.thrust;
                     stickInput.polarBrake = out.brake;
-                    // Clear the rectilinear cache so a mid-session scheme
-                    // change (e.g. via debug override) doesn't leak stale
-                    // values into handleInput's rectilinear branch.
+                    // Clear the rectilinear cache so a mode change doesn't
+                    // leak stale values into handleInput's rectilinear branch.
                     stickInput.turnTarget = 0;
                     stickInput.thrustInput = 0;
                     stickInput.brakeInput = 0;
@@ -8291,44 +8382,19 @@
                 stickInput.polarThrust = 0;
                 stickInput.polarBrake = 0;
             }
-            if (stickInput.fireTouchId !== null) {
-                const dx = stickInput.fireCurrentX - stickInput.fireAnchorX;
-                const dy = stickInput.fireCurrentY - stickInput.fireAnchorY;
-                const out = computeStickInput(dx, dy, rectParams);
-                // Lateral motion → turn (consumed by handleInput only when
-                // scheme=polar; the rectilinear scheme ignores fireTurnTarget
-                // and keeps turning exclusively on the left anchor).
-                stickInput.fireTurnTarget  = out.turn;
-                stickInput.fireThrustInput = out.thrust;
-                stickInput.fireBrakeInput  = out.brake;
-            } else {
-                stickInput.fireTurnTarget  = 0;
-                stickInput.fireThrustInput = 0;
-                stickInput.fireBrakeInput  = 0;
-            }
             requestAnimationFrame(updateStickAnalog);
         }
         requestAnimationFrame(updateStickAnalog);
 
         gameContainer.addEventListener('touchstart', (e) => {
-            if (!isAnchorSchemeEnabled()) return;
+            if (!isAnalogControlSchemeEnabled()) return;
             for (const t of e.changedTouches) {
                 if (!isStickTouchTarget(t.target)) continue;
                 const side = classifyTouchSide(t.clientX, t.clientY);
-                if (side === 'move' && stickInput.moveTouchId === null) {
-                    stickInput.moveTouchId = t.identifier;
-                    stickInput.moveAnchorX = t.clientX;
-                    stickInput.moveAnchorY = t.clientY;
-                    stickInput.moveCurrentX = t.clientX;
-                    stickInput.moveCurrentY = t.clientY;
+                if (side === 'move' && beginMoveAnchor(t.identifier, t.clientX, t.clientY)) {
                     AudioSystem.init();
                     AudioSystem.resume();
-                } else if (side === 'fire' && stickInput.fireTouchId === null) {
-                    stickInput.fireTouchId = t.identifier;
-                    stickInput.fireAnchorX = t.clientX;
-                    stickInput.fireAnchorY = t.clientY;
-                    stickInput.fireCurrentX = t.clientX;
-                    stickInput.fireCurrentY = t.clientY;
+                } else if (side === 'fire' && beginFireInput(t.identifier)) {
                     AudioSystem.init();
                     AudioSystem.resume();
                 }
@@ -8336,40 +8402,124 @@
         }, { passive: false });
 
         gameContainer.addEventListener('touchmove', (e) => {
-            if (!isAnchorSchemeEnabled()) return;
+            if (!isAnalogControlSchemeEnabled()) return;
             for (const t of e.changedTouches) {
-                if (t.identifier === stickInput.moveTouchId) {
-                    stickInput.moveCurrentX = t.clientX;
-                    stickInput.moveCurrentY = t.clientY;
-                } else if (t.identifier === stickInput.fireTouchId) {
-                    stickInput.fireCurrentX = t.clientX;
-                    stickInput.fireCurrentY = t.clientY;
-                }
+                updateMoveAnchor(t.identifier, t.clientX, t.clientY);
             }
         }, { passive: false });
 
         function endTouch(e) {
             for (const t of e.changedTouches) {
-                if (t.identifier === stickInput.moveTouchId) {
-                    stickInput.moveTouchId = null;
-                    stickInput.turnTarget = 0;
-                    stickInput.thrustInput = 0;
-                    stickInput.brakeInput = 0;
-                    stickInput.polarActive = false;
-                    stickInput.polarRadius = 0;
-                    stickInput.polarTurnMagnitude = 0;
-                    stickInput.polarThrust = 0;
-                    stickInput.polarBrake = 0;
-                } else if (t.identifier === stickInput.fireTouchId) {
-                    stickInput.fireTouchId = null;
-                    stickInput.fireTurnTarget  = 0;
-                    stickInput.fireThrustInput = 0;
-                    stickInput.fireBrakeInput  = 0;
+                if (endMoveAnchor(t.identifier)) {
+                    continue;
                 }
+                endFireInput(t.identifier);
             }
         }
         gameContainer.addEventListener('touchend', endTouch, { passive: true });
         gameContainer.addEventListener('touchcancel', endTouch, { passive: true });
+
+        // Mouse movement control: left drag maps to the movement touch anchor.
+        // Bounds gate only the initial press; a held drag can move off-canvas.
+        function canUseMouseShipControl() {
+            return isAnalogControlSchemeEnabled()
+                && game.ship !== null
+                && (game.state === 'playing' || game.state === 'waveDelay');
+        }
+
+        function endMouseMoveControl() {
+            if (!mouseMoveControlActive) return false;
+            setMouseMoveControlActive(false);
+            endMoveAnchor(MOUSE_MOVE_TOUCH_ID);
+            return true;
+        }
+
+        gameContainer.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || e.target !== canvas || !canUseMouseShipControl()) return;
+            if (!isPointWithinRect(e.clientX, e.clientY, canvas.getBoundingClientRect())) return;
+            if (!beginMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY)) return;
+
+            setMouseMoveControlActive(true);
+            AudioSystem.init();
+            AudioSystem.resume();
+            e.preventDefault();
+        });
+
+        // Mouse fire control: right click maps to the held-fire touch input.
+        // It deliberately has no movement-anchor dependency, so it can run
+        // alongside a held left-click movement control.
+        function endMouseFireControl(event) {
+            if (!mouseFireControlActive) return false;
+            mouseFireControlActive = false;
+            if (mouseFireContextMenuTargets !== null
+                && event?.target
+                && !mouseFireContextMenuTargets.includes(event.target)) {
+                mouseFireContextMenuTargets.push(event.target);
+            }
+            endFireInput(MOUSE_FIRE_TOUCH_ID);
+            return true;
+        }
+
+        gameContainer.addEventListener('mousedown', (e) => {
+            if (e.button !== 2 || e.target !== canvas || !canUseMouseShipControl()) return;
+            if (!isPointWithinRect(e.clientX, e.clientY, canvas.getBoundingClientRect())) return;
+            if (!beginFireInput(MOUSE_FIRE_TOUCH_ID)) return;
+
+            mouseFireControlActive = true;
+            mouseFireContextMenuTargets = [e.target];
+            AudioSystem.init();
+            AudioSystem.resume();
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            let controlsActive = false;
+            if (mouseMoveControlActive) {
+                controlsActive = true;
+                if (e.buttons !== undefined && (e.buttons & 1) === 0) {
+                    endMouseMoveControl();
+                } else {
+                    updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY);
+                }
+            }
+            if (mouseFireControlActive) {
+                controlsActive = true;
+                if (e.buttons !== undefined && (e.buttons & 2) === 0) {
+                    endMouseFireControl(e);
+                } else if (mouseFireContextMenuTargets !== null && e.target) {
+                    const startTarget = mouseFireContextMenuTargets[0];
+                    mouseFireContextMenuTargets = e.target === startTarget
+                        ? [startTarget]
+                        : [startTarget, e.target];
+                }
+            }
+            if (controlsActive) {
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('mouseup', (e) => {
+            const ended = e.button === 0
+                ? endMouseMoveControl()
+                : e.button === 2 && endMouseFireControl(e);
+            if (ended) {
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('mousedown', () => {
+            if (!mouseFireControlActive) {
+                mouseFireContextMenuTargets = null;
+            }
+        });
+
+        document.addEventListener('contextmenu', (e) => {
+            if (!mouseFireContextMenuTargets?.includes(e.target)) {
+                return;
+            }
+            mouseFireContextMenuTargets = null;
+            e.preventDefault();
+        });
 
         // Drop any held anchors on orientation change or when the page is hidden.
         // The anchor's CSS-px coordinates can become meaningless across a layout
@@ -8829,15 +8979,15 @@
             sessionPicker.btnLeaveCreate = fresh;
             fresh.addEventListener('click', handleLeaveCreateButton);
         } else {
-            // Not in a session - show Create. Label includes destination region
+            // Not in a session - show Create Multiplayer. Label includes destination region
             // so the user knows where their session will land BEFORE they click
             // (essential on touch where hover tooltips don't exist).
             const createEligibility = getCreateEligibility();
             const regionName = getCreateRegionDisplayName(createEligibility.regionId);
             const multiRegion = sessionPicker.regions.length > 1;
             btnLeaveCreate.textContent = (regionName && sessionPicker.regions.length > 1)
-                ? `Create in ${regionName}`
-                : 'Create';
+                ? `Create Multiplayer in ${regionName}`
+                : 'Create Multiplayer';
             btnLeaveCreate.disabled = !createEligibility.canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
             if (!canCreate) {
@@ -8853,7 +9003,7 @@
                     ? 'Waiting for region routing information'
                     : 'Connecting to server';
             } else if (regionName && sessionPicker.regions.length > 1) {
-                btnLeaveCreate.title = `Create a new session hosted in ${regionName}`;
+                btnLeaveCreate.title = `Create a new multiplayer session hosted in ${regionName}`;
             } else {
                 btnLeaveCreate.title = '';
             }
@@ -9239,6 +9389,7 @@
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
                         groupScore: 'gr', peakShipCount: 'pk',
+                        scoreLifeAwardCount: 'sa',
                         gameOverAt: 'go', terminalAt: 'ta',
                         terminalEpoch: 'te', terminalX: 'tx',
                         terminalY: 'ty', terminalAngle: 'tg',
