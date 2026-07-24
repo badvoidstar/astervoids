@@ -13,5 +13,8 @@ test('extra-life feedback flashes the lives HUD at 5 Hz for five seconds', () =>
         /animation: life-award-flash 200ms steps\(1, end\) 25;/);
     assert.match(
         source,
+        /text-shadow:\s*0 0 6px #fff,\s*0 0 18px #ff0,\s*0 0 36px #ff0,\s*0 0 54px #ff0;/);
+    assert.match(
+        source,
         /setTimeout\(\(\) => \{[\s\S]*?livesDisplay\.classList\.remove\('life-award'\);\s*\}, 5000\);/);
 });

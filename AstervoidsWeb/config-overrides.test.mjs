@@ -79,7 +79,7 @@ test('score milestones count only enabled whole-score thresholds', () => {
 
 test('ship movement defaults and debug bounds split keyboard and analog controls', () => {
     assert.equal(SHARED_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED, 0.125);
-    assert.equal(SHARED_DEFAULTS.SHIP_ANALOG_TURN_SPEED, 0.2);
+    assert.equal(SHARED_DEFAULTS.SHIP_ANALOG_TURN_SPEED, 0.3);
     assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_GAIN, 0.5);
     assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_DEADZONE_PX, 16);
     assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX, 16);

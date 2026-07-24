@@ -8,7 +8,7 @@ const AstervoidsConfig = (function() {
     const SHARED_DEFAULTS = Object.freeze({
         TARGET_FPS: 60,
         SHIP_KEYBOARD_TURN_SPEED: 0.125,
-        SHIP_ANALOG_TURN_SPEED: 0.2,
+        SHIP_ANALOG_TURN_SPEED: 0.3,
         SHIP_MAX_SPEED: 1.0,
         ANALOG_RECTILINEAR_TURN_DEADZONE_PX: 16,
         ANALOG_RECTILINEAR_THRUST_DEADZONE_PX: 16,
