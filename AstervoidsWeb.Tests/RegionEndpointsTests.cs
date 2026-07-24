@@ -30,6 +30,7 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
                 {
                     ["Region:Id"] = "westus2",
                     ["Region:DisplayName"] = "US West",
+                    ["Region:ApexHostname"] = "https://astervoids.example.com",
                     ["Region:Regions:0:Id"] = "westus2",
                     ["Region:Regions:0:DisplayName"] = "US West",
                     ["Region:Regions:0:Hostname"] = "https://astervoids-westus2.example.com",
@@ -134,6 +135,24 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
     }
 
     // -------------------------------------------------------------------------
+    // /api/srvmon
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetServerMonitor_ReturnsMetricsSnapshot()
+    {
+        var client = _factory.CreateClient();
+        var response = await client.GetAsync("/api/srvmon");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        body.TryGetProperty("system", out _).Should().BeTrue();
+        body.TryGetProperty("connections", out _).Should().BeTrue();
+        body.TryGetProperty("sessions", out _).Should().BeTrue();
+    }
+
+    // -------------------------------------------------------------------------
     // /api/sessions
     // -------------------------------------------------------------------------
 
@@ -195,6 +214,7 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
     [Theory]
     [InlineData("/api/ping")]
     [InlineData("/api/regions")]
+    [InlineData("/api/srvmon")]
     [InlineData("/api/sessions")]
     public async Task RegionalEndpoints_AllowCrossRegionOrigin(string path)
     {
@@ -216,6 +236,7 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
     [Theory]
     [InlineData("/api/ping")]
     [InlineData("/api/regions")]
+    [InlineData("/api/srvmon")]
     [InlineData("/api/sessions")]
     public async Task RegionalEndpoints_RejectUntrustedOrigin(string path)
     {
@@ -237,5 +258,20 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
             .ToList();
         allowOrigin.Should().NotContain("https://evil.example.com",
             "an unconfigured origin must not receive an Access-Control-Allow-Origin echo");
+    }
+
+    [Fact]
+    public async Task ServerMonitor_AllowStaticApexOrigin()
+    {
+        var client = _factory.CreateClient();
+        var request = new HttpRequestMessage(HttpMethod.Get, "/api/srvmon");
+        request.Headers.Add("Origin", "https://astervoids.example.com");
+
+        var response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Access-Control-Allow-Origin")
+            .Should().Contain("https://astervoids.example.com",
+                "the static apex hosts srvmon in a multi-region deployment");
     }
 }

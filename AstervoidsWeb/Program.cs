@@ -41,7 +41,7 @@ var sessionSettings = builder.Configuration.GetSection(SessionSettings.SectionNa
 
 // CORS for cross-region API calls and cross-region SignalR connections.
 //
-// The client needs to reach three resources on every configured region
+// The client needs to reach five resources on every configured region
 // hostname (not just its landing origin):
 //   1. /api/ping        — RTT measurement bursts
 //   2. /api/regions     — manifest discovery
@@ -50,6 +50,7 @@ var sessionSettings = builder.Configuration.GetSection(SessionSettings.SectionNa
 //                         OnSessionsChanged for live cross-region updates
 //                         (Phase 3), plus the join/create connection itself
 //                         when the user picks a non-landing region.
+//   5. /api/srvmon      — selected-region server monitoring from the static apex
 //
 // SignalR requires AllowCredentials() (it uses sticky-session cookies) and
 // AllowAnyHeader() (the JS client sets custom headers during negotiation).
@@ -226,7 +227,8 @@ app.MapHub<SessionHub>("/sessionHub").RequireCors("RegionalApi");
 
 // Server monitoring metrics API endpoint
 app.MapGet("/api/srvmon", (ServerMetricsService metrics, ISessionService sessionService) =>
-    Results.Ok(metrics.GetSnapshot(sessionService)));
+    Results.Ok(metrics.GetSnapshot(sessionService)))
+    .RequireCors("RegionalApi");
 
 // GET /api/sessions — REST mirror of SessionHub.GetActiveSessions, stamped with this
 // region's id. The client polls this on every region (in parallel) to merge a unified
