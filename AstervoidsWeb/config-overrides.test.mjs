@@ -22,8 +22,8 @@ test('debug controls derive defaults from the shared runtime values', () => {
     }
 });
 
-test('touch thrust maximum is available as a debug override', () => {
-    const control = CONFIG_CONTROLS.find(item => item.key === 'TOUCH_THRUST_MAX');
+test('analog thrust maximum is available as a debug override', () => {
+    const control = CONFIG_CONTROLS.find(item => item.key === 'ANALOG_THRUST_MAX');
     assert.deepEqual(
         control && {
             default: control.default,
@@ -32,22 +32,30 @@ test('touch thrust maximum is available as a debug override', () => {
             step: control.step,
         },
         { default: 1.5, min: 0, max: 5, step: 0.1 });
-    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('TOUCH_THRUST_MAX'));
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('ANALOG_THRUST_MAX'));
 
-    const cfg = { TOUCH_THRUST_MAX: 1.5 };
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_THRUST_MAX=2.5');
-    assert.equal(cfg.TOUCH_THRUST_MAX, 2.5);
+    const cfg = { ANALOG_THRUST_MAX: 1.5 };
+    applyUrlConfigOverrides(cfg, '?cfg.ANALOG_THRUST_MAX=2.5');
+    assert.equal(cfg.ANALOG_THRUST_MAX, 2.5);
 });
 
-test('ship movement defaults and debug bounds use the high-speed tuning', () => {
-    assert.equal(SHARED_DEFAULTS.SHIP_TURN_SPEED, 0.2);
-    assert.equal(SHARED_DEFAULTS.TOUCH_TURN_GAIN, 2.0);
-    assert.equal(SHARED_DEFAULTS.TOUCH_THRUST_GAIN, 2.0);
+test('ship movement defaults and debug bounds split keyboard and analog controls', () => {
+    assert.equal(SHARED_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED, 0.125);
+    assert.equal(SHARED_DEFAULTS.SHIP_ANALOG_TURN_SPEED, 0.2);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_GAIN, 0.5);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_TURN_DEADZONE_PX, 16);
+    assert.equal(SHARED_DEFAULTS.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX, 16);
+    assert.equal(SHARED_DEFAULTS.ANALOG_POLAR_TURN_GAIN, 2.0);
+    assert.equal(SHARED_DEFAULTS.ANALOG_THRUST_GAIN, 2.0);
     assert.equal(SHARED_DEFAULTS.SHIP_MAX_SPEED, 1.0);
 
-    const turnSpeed = CONFIG_CONTROLS.find(item => item.key === 'SHIP_TURN_SPEED');
+    const keyboardTurnSpeed =
+        CONFIG_CONTROLS.find(item => item.key === 'SHIP_KEYBOARD_TURN_SPEED');
+    const analogTurnSpeed =
+        CONFIG_CONTROLS.find(item => item.key === 'SHIP_ANALOG_TURN_SPEED');
     const maxSpeed = CONFIG_CONTROLS.find(item => item.key === 'SHIP_MAX_SPEED');
-    assert.equal(turnSpeed?.max, 0.6);
+    assert.equal(keyboardTurnSpeed?.max, 0.6);
+    assert.equal(analogTurnSpeed?.max, 0.6);
     assert.equal(maxSpeed?.max, 6.0);
 });
 
@@ -118,36 +126,36 @@ test('session metadata precedence: session config wins over local URL-derived va
 });
 
 test('URL overrides: string-typed config accepts arbitrary string values', () => {
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=rectilinear');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'rectilinear');
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=classic');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'classic');
+    const cfg = { SIM_MODE: 'deterministic' };
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=buffered');
+    assert.equal(cfg.SIM_MODE, 'buffered');
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=custom');
+    assert.equal(cfg.SIM_MODE, 'custom');
 });
 
 test('URL overrides: empty string-typed value is rejected (keeps current value)', () => {
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_CONTROL_SCHEME=');
-    assert.equal(cfg.TOUCH_CONTROL_SCHEME, 'polar');
+    const cfg = { SIM_MODE: 'deterministic' };
+    applyUrlConfigOverrides(cfg, '?cfg.SIM_MODE=');
+    assert.equal(cfg.SIM_MODE, 'deterministic');
 });
 
 test('string-typed config: numeric / boolean raw values are stringified', () => {
     // The debug BroadcastChannel may send a Number for sliders; the
     // session metadata path may carry a Boolean from an older client. Both
     // are coerced into the string-typed slot rather than silently dropped.
-    const cfg = { TOUCH_CONTROL_SCHEME: 'polar' };
-    assert.equal(coerceConfigOverrideValue(42, cfg.TOUCH_CONTROL_SCHEME), '42');
-    assert.equal(coerceConfigOverrideValue(true, cfg.TOUCH_CONTROL_SCHEME), 'true');
-    assert.equal(coerceConfigOverrideValue(false, cfg.TOUCH_CONTROL_SCHEME), 'false');
-    assert.equal(coerceConfigOverrideValue(NaN, cfg.TOUCH_CONTROL_SCHEME), undefined);
-    assert.equal(coerceConfigOverrideValue(null, cfg.TOUCH_CONTROL_SCHEME), undefined);
+    const cfg = { SIM_MODE: 'deterministic' };
+    assert.equal(coerceConfigOverrideValue(42, cfg.SIM_MODE), '42');
+    assert.equal(coerceConfigOverrideValue(true, cfg.SIM_MODE), 'true');
+    assert.equal(coerceConfigOverrideValue(false, cfg.SIM_MODE), 'false');
+    assert.equal(coerceConfigOverrideValue(NaN, cfg.SIM_MODE), undefined);
+    assert.equal(coerceConfigOverrideValue(null, cfg.SIM_MODE), undefined);
 });
 
 test('session metadata: string-typed config round-trips creator → joiner', () => {
-    const keys = ['TOUCH_CONTROL_SCHEME'];
-    const creatorCfg = { TOUCH_CONTROL_SCHEME: 'rectilinear' };
+    const keys = ['SIM_MODE'];
+    const creatorCfg = { SIM_MODE: 'buffered' };
     const sessionMetadata = { config: buildSessionConfigMetadata(creatorCfg, keys) };
-    const joinerCfg = { TOUCH_CONTROL_SCHEME: 'polar' };
+    const joinerCfg = { SIM_MODE: 'deterministic' };
     applySessionConfigMetadata(sessionMetadata, joinerCfg, keys);
-    assert.equal(joinerCfg.TOUCH_CONTROL_SCHEME, 'rectilinear');
+    assert.equal(joinerCfg.SIM_MODE, 'buffered');
 });

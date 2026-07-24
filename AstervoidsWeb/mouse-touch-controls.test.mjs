@@ -74,6 +74,57 @@ test('mouse drag leaves OS cursor styling unchanged', () => {
     assert.doesNotMatch(html, /cursor:\s*none\s*!important/);
 });
 
+test('legacy on-screen movement and fire buttons are absent', () => {
+    assert.doesNotMatch(
+        html,
+        /id="touch-(left|right|thrust|fire)"/);
+    assert.doesNotMatch(
+        html,
+        /const touch = \{/);
+    assert.doesNotMatch(
+        html,
+        /function (setTouchState|setupTouchButton)\(/);
+});
+
+test('picker provides a polar-default analog mode toggle instead of a config selector', () => {
+    const soloIndex = html.indexOf('id="btn-solo"');
+    const controlModeIndex = html.indexOf('id="btn-control-mode"');
+    const fullscreenIndex = html.indexOf('id="btn-fullscreen"');
+    assert.ok(soloIndex >= 0 && controlModeIndex > soloIndex
+        && fullscreenIndex > controlModeIndex);
+    assert.match(
+        html.slice(soloIndex, controlModeIndex),
+        /Start Solo Play/);
+    assert.match(
+        html.slice(controlModeIndex, fullscreenIndex),
+        /🕹️ Polar/);
+    assert.match(
+        html,
+        /let analogControlScheme = ANALOG_CONTROL_SCHEMES\.POLAR/);
+    assert.match(
+        html,
+        /function toggleAnalogControlScheme\(\)/);
+    assert.match(
+        html,
+        /analogControlScheme === ANALOG_CONTROL_SCHEMES\.POLAR[\s\S]*?ANALOG_CONTROL_SCHEMES\.RECTILINEAR/);
+    assert.match(
+        html,
+        /analogControlModeButton\.textContent = `🕹️ \$\{currentLabel\}`/);
+    assert.match(
+        html,
+        /analogControlModeButton\.addEventListener\('click', toggleAnalogControlScheme\)/);
+    assert.doesNotMatch(html, /\bANALOG_CONTROL_SCHEME\b/);
+    assert.doesNotMatch(gameConfig, /\bANALOG_CONTROL_SCHEME\b/);
+});
+
+test('picker labels multiplayer creation consistently', () => {
+    assert.match(
+        html,
+        /id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer<\/button>/);
+    assert.match(html, /Create Multiplayer in \$\{regionName\}/);
+    assert.match(html, /: 'Create Multiplayer'/);
+});
+
 test('right touch and mouse use held firing without an analog anchor', () => {
     const source = mouseFireControlSource();
 

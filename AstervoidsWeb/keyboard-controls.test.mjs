@@ -19,34 +19,34 @@ function sourceBetween(startMarker, endMarker) {
 }
 
 const neutralBrakeMatch = html.match(
-    /function getNeutralTouchBrakeInput\(\) \{[\s\S]*?\n {4}\}/
+    /function getNeutralAnalogBrakeInput\(\) \{[\s\S]*?\n {4}\}/
 );
-assert.ok(neutralBrakeMatch, 'getNeutralTouchBrakeInput must be defined');
+assert.ok(neutralBrakeMatch, 'getNeutralAnalogBrakeInput must be defined');
 // eslint-disable-next-line no-new-func
-const makeNeutralTouchBrakeInput = new Function(
+const makeNeutralAnalogBrakeInput = new Function(
     'CONFIG',
-    `${neutralBrakeMatch[0]}; return getNeutralTouchBrakeInput;`
+    `${neutralBrakeMatch[0]}; return getNeutralAnalogBrakeInput;`
 );
 
 function handleInputSource() {
     return sourceBetween('    function handleInput(dt = 1)', '    function checkCollisions()');
 }
 
-test('S and Down Arrow use the same configured brake magnitude as a neutral polar touch', () => {
+test('S and Down Arrow use the same configured brake magnitude as a neutral polar analog input', () => {
     assert.equal(
-        makeNeutralTouchBrakeInput({ TOUCH_BRAKE_GAIN: 1, TOUCH_BRAKE_MAX: 1 })(),
+        makeNeutralAnalogBrakeInput({ ANALOG_BRAKE_GAIN: 1, ANALOG_BRAKE_MAX: 1 })(),
         1
     );
     assert.equal(
-        makeNeutralTouchBrakeInput({ TOUCH_BRAKE_GAIN: 0.6, TOUCH_BRAKE_MAX: 1 })(),
+        makeNeutralAnalogBrakeInput({ ANALOG_BRAKE_GAIN: 0.6, ANALOG_BRAKE_MAX: 1 })(),
         0.6
     );
     assert.equal(
-        makeNeutralTouchBrakeInput({ TOUCH_BRAKE_GAIN: 2, TOUCH_BRAKE_MAX: 0.4 })(),
+        makeNeutralAnalogBrakeInput({ ANALOG_BRAKE_GAIN: 2, ANALOG_BRAKE_MAX: 0.4 })(),
         0.4
     );
     assert.equal(
-        makeNeutralTouchBrakeInput({ TOUCH_BRAKE_GAIN: 1, TOUCH_BRAKE_MAX: 0 })(),
+        makeNeutralAnalogBrakeInput({ ANALOG_BRAKE_GAIN: 1, ANALOG_BRAKE_MAX: 0 })(),
         0
     );
 });
@@ -56,7 +56,7 @@ test('S and Down Arrow are independent brake inputs that remain active with a mo
     const handleInput = handleInputSource();
 
     assert.match(inputSource, /brake: \(\) => keys\['KeyS'\] \|\| keys\['ArrowDown'\]/);
-    assert.match(handleInput, /const keyboardBrake = input\.brake\(\) \? getNeutralTouchBrakeInput\(\) : 0/);
+    assert.match(handleInput, /const keyboardBrake = input\.brake\(\) \? getNeutralAnalogBrakeInput\(\) : 0/);
     assert.match(handleInput, /Math\.max\(keyboardBrake, stickInput\.polarBrake\)/);
     assert.match(handleInput, /Math\.max\(keyboardBrake, stickInput\.brakeInput\)/);
 });

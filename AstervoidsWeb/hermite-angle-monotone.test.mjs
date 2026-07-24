@@ -2,7 +2,7 @@
  * Tests for the Fritsch–Carlson monotone-Hermite clamp applied to the
  * production interpolation policy. Without the clamp, short-lived
  * turn-input taps on the owner side produce a Hermite tangent bulge on
- * remote observers: prev.rotationSpeed ≈ ±SHIP_TURN_SPEED but the actual
+ * remote observers: prev.rotationSpeed is near a turn-speed cap but the actual
  * endpoint chord dAngle is much smaller, so the cubic curves past a1
  * before settling — visible as a one-frame angular overshoot even with
  * good network conditions and no extrapolation. The owner never sees
