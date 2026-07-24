@@ -1290,9 +1290,10 @@
         // several objects and coalesce multiple local frames into one invoke.
         SHIP_SEND_ON_CHANGE_ENABLED: true,
 
-        // Ship settings (normalized: sizes relative to shorter dimension)
+        // Ship settings: sizes are fractions of the gameplay reference dimension;
+        // velocities are reference-dimension units per second.
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
-        SHIP_THRUST: 0.009,         // Acceleration per frame (normalized, ~0.15/600*60)
+        SHIP_THRUST: 0.009,         // Full-input velocity increment per nominal 60 Hz tick (0.54 ref-dim/s^2)
         SHIP_FRICTION: 0.99,        // Velocity decay (1 = no friction)
         SHIP_KEYBOARD_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED,
         SHIP_ANALOG_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_ANALOG_TURN_SPEED,
@@ -1303,19 +1304,18 @@
         // 0 = instantaneous (legacy behavior).
         SHIP_TURN_ACCEL_TIME: 0.0,
         SHIP_TURN_DECEL_TIME: 0.0,
-        // Maximum braking deceleration when brakeInput == 1.0, in the same
-        // per-60fps-frame units as SHIP_THRUST. Used by the virtual-stick
-        // touch scheme: braking is pure damping opposing current velocity and
-        // is clamped at full stop, so it can never reverse the ship.
+        // Maximum full-input braking velocity decrement per nominal 60 Hz tick,
+        // in ref-dim/s. Braking is pure damping opposing current velocity and is
+        // clamped at full stop, so it can never reverse the ship.
         SHIP_BRAKE_STRENGTH: 0.018,
 
         // === Analog anchor controls ===
         // The picker toggles the shared touch/mouse control mode between
         // rectilinear and polar. Keyboard always uses discrete inputs.
-        // Analog anchor distances are calibrated in CSS px at this mobile-sized
-        // gameplay reference dimension. getAnalogAnchorScale() then applies the
-        // same shorter-viewport-axis scale used by ships and asteroids, keeping
-        // anchor geometry and input travel proportional to game objects.
+        // Anchor distances are calibrated in CSS px at the gameplay short-edge
+        // baseline below. getAnalogAnchorScale() scales them with the current
+        // gameplay short edge, keeping anchor geometry and input travel
+        // proportional to game objects.
         ANALOG_ANCHOR_REFERENCE_DIMENSION_PX: 390,
         // RADIUS: drag distance the finger must move from the anchor to reach
         // a stick deflection of 1.0 (before per-axis clamping). In the polar
@@ -1323,8 +1323,9 @@
         // length of RADIUS past ANALOG_POLAR_THRESHOLD_PX maps to thrust=1.0
         // before gain/clamp.
         //
-        // The values below are CSS-pixel distances at the reference dimension
-        // above. At a 390px phone short edge they retain the existing feel.
+        // The values below are CSS-pixel distances at the 390px gameplay
+        // short-edge baseline above. At runtime they scale with the gameplay
+        // viewport's short edge.
         ANALOG_STICK_RADIUS_PX: 48,
         // Dead-zone half-extents (rectilinear scheme). The dead-zone is a
         // RECTANGLE: lateral displacements with |dx| <= TURN_DEADZONE_PX are
@@ -1389,18 +1390,18 @@
         ANALOG_ANCHOR_STROKE_COLOR: 'rgba(128,128,128,0.55)',
         ANALOG_ANCHOR_LINE_WIDTH: 2,
 
-        // Bullet settings (normalized)
-        BULLET_SPEED: 1.0,          // Bullet speed per second (normalized)
-        BULLET_LIFETIME: 60,        // Frames before bullet expires
-        BULLET_RADIUS: 0.0033,      // Bullet size (normalized)
+        // Bullet settings
+        BULLET_SPEED: 1.0,          // Bullet speed (ref-dim/s)
+        BULLET_LIFETIME: 60,        // Nominal 60 Hz ticks until expiry (~1.0 s)
+        BULLET_RADIUS: 0.0033,      // Fraction of gameplay reference dimension
         MAX_BULLETS: 10,            // Maximum bullets on screen
-        SHOOT_COOLDOWN: 10,         // Frames between shots
+        SHOOT_COOLDOWN: 10,         // Nominal 60 Hz ticks between shots (~0.17 s)
         
-        // Asteroid settings (normalized)
+        // Asteroid settings
         ASTEROID_BASE_COUNT: 1,     // Starting astervoids in wave 1
-        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed per second (normalized)
-        ASTEROID_SPEED_VARIANCE: 0.1, // Random speed variation (normalized)
-        // Per-frame caps applied to locally-owned asteroids in Asteroid.update().
+        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed (ref-dim/s)
+        ASTEROID_SPEED_VARIANCE: 0.1, // Random speed addition (ref-dim/s)
+        // Caps enforced on locally-owned asteroids in Asteroid.update().
         // ASTEROID_MAX_SPEED uses the same units as SHIP_MAX_SPEED (normalized
         // reference-dim per second). ASTEROID_MAX_SPIN uses the same units as
         // ship turn speed (radians per 60fps frame); the default π/6 corresponds
@@ -1509,14 +1510,14 @@
         POINTS_LARGE: 20,           // Points for large astervoids
         POINTS_MEDIUM: 50,          // Points for medium astervoids
         POINTS_SMALL: 100,          // Points for small astervoids
-        ASTEROID_LARGE_THRESHOLD: 0.067,  // ~40px at 600 ref
-        ASTEROID_MEDIUM_THRESHOLD: 0.042, // ~25px at 600 ref
+        ASTEROID_LARGE_THRESHOLD: 0.067,  // Fraction of game ref dim (~40px at 600px ref)
+        ASTEROID_MEDIUM_THRESHOLD: 0.042, // Fraction of game ref dim (~25px at 600px ref)
         
         // Game settings
         STARTING_LIVES: 3,          // Lives at game start
         EXTRA_LIFE_SCORE_THRESHOLD: SHARED_CONFIG_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD,
-        INVULNERABILITY_TIME: 180,  // Frames of invulnerability after respawn
-        WAVE_DELAY: 120,            // Frames to wait between waves
+        INVULNERABILITY_TIME: 180,  // Nominal 60 Hz ticks of invulnerability (~3.0 s)
+        WAVE_DELAY: 120,            // Nominal 60 Hz ticks between waves (~2.0 s)
         
         // Wave progression
         WAVE_ASTEROID_INCREMENT: 1, // Extra astervoids per wave
@@ -1526,7 +1527,7 @@
         // Visual settings
         STROKE_COLOR: '#fff',       // Primary drawing color
         THRUST_COLOR: '#f80',       // Thrust flame color
-        INVULN_BLINK_RATE: 10,      // Blink frequency when invulnerable
+        INVULN_BLINK_RATE: 10,      // Nominal 60 Hz ticks per visibility toggle
         COLLISION_CUE_MIN_MS: 120,   // Minimum visible hold before a resolved cue fades
         COLLISION_CUE_FADE_MS: 180,  // Fade time after authoritative resolution
         COLLISION_CUE_MAX_MS: 1000,  // Safety cap for a pending cue with no resolution
@@ -1536,7 +1537,7 @@
         
         // Start screen
         START_SCREEN_ASTERVOIDS: 4,  // Astervoids shown on start screen
-        SPAWN_MIN_DISTANCE: 0.25,   // Minimum spawn distance from ship (normalized)
+        SPAWN_MIN_DISTANCE: 0.25,   // Minimum normalized game-space distance from ship
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 3,          // Shared lives pool for multiplayer sessions
@@ -2719,15 +2720,15 @@
     /**
      * Get the reference dimension for size normalization (shorter of width/height)
      * This ensures circles remain circular regardless of aspect ratio
-     * @returns {number} Reference dimension in pixels
+     * @returns {number} Gameplay reference dimension in CSS pixels
      */
     function getReferenceDimension() {
         return Math.min(getGameWidth(), getGameHeight());
     }
 
     /**
-     * Scale CSS-pixel touch-anchor distances with the same game-space
-     * reference dimension that sizes ships, asteroids, and bullets.
+     * Scale 390px-baseline touch-anchor distances with the current gameplay
+     * short edge, in CSS pixels.
      */
     function getAnalogAnchorScale() {
         const calibrationReference = Math.max(
@@ -3108,8 +3109,8 @@
      *              turnGain, turnMax,
      *              thrustGain, thrustMax,
      *              brakeGain, brakeMax }
-     *            All sizes are in CSS pixels (device-calibrated) so the
-     *            response is invariant under viewport rotation / device size.
+     *            All sizes are runtime CSS pixels after the 390px gameplay
+     *            reference baseline has been scaled to the current viewport.
      *            turnDeadzonePx and thrustDeadzonePx are independent — turn
      *            uses the lateral (X) deadzone, thrust/brake the vertical (Y).
      *
@@ -3626,9 +3627,10 @@
             this.velocityX *= friction;
             this.velocityY *= friction;
 
-            // Apply thrust in facing direction (normalized acceleration). thrustInput
-            // is the analog magnitude (1.0 from keyboard; per-frame analog
-            // from the active anchor mode). The `thrusting` boolean (set by handleInput)
+            // Apply thrust in facing direction. Each nominal 60 Hz tick adds
+            // SHIP_THRUST * thrustInput to the ref-dim/s velocity. thrustInput
+            // is the analog magnitude (1.0 from keyboard; per-tick analog from
+            // the active anchor mode). The `thrusting` boolean (set by handleInput)
             // still drives flame rendering and remote sync.
             if (this.thrustInput > 0) {
                 const a = CONFIG.SHIP_THRUST * this.thrustInput;
@@ -3636,11 +3638,11 @@
                 this.velocityY += Math.sin(this.angle) * a * dt;
             }
             
-            // Limit to max speed (in reference-dimension per second).
+            // Limit to max speed (in reference-dimension per second) when enabled.
             // Compare squared magnitudes to skip sqrt when under the cap.
             const speedSq = this.velocityX * this.velocityX + this.velocityY * this.velocityY;
             const maxSpeedSq = CONFIG.SHIP_MAX_SPEED * CONFIG.SHIP_MAX_SPEED;
-            if (speedSq > maxSpeedSq) {
+            if (CONFIG.SHIP_MAX_SPEED > 0 && speedSq > maxSpeedSq) {
                 const speed = Math.sqrt(speedSq);
                 this.velocityX = (this.velocityX / speed) * CONFIG.SHIP_MAX_SPEED;
                 this.velocityY = (this.velocityY / speed) * CONFIG.SHIP_MAX_SPEED;

@@ -97,6 +97,39 @@ test('ship movement defaults and debug bounds split keyboard and analog controls
     assert.equal(maxSpeed?.max, 6.0);
 });
 
+test('debug controls state calibrated anchor and velocity units', () => {
+    const controls = new Map(CONFIG_CONTROLS.map(control => [control.key, control]));
+
+    const asteroidSpeed = controls.get('ASTEROID_MAX_SPEED');
+    assert.equal(asteroidSpeed?.label, 'Asteroid max linear speed (ref-dim/s)');
+    assert.equal(asteroidSpeed?.fmt(0.4), '0.400 ref-dim/s');
+
+    const shipSpeed = controls.get('SHIP_MAX_SPEED');
+    assert.equal(shipSpeed?.label, 'Ship max linear speed (ref-dim/s)');
+    assert.match(shipSpeed?.help ?? '', /0 disables the cap/);
+    assert.equal(shipSpeed?.fmt(1), '1.000 ref-dim/s');
+
+    const rectTurnDeadzone = controls.get('ANALOG_RECTILINEAR_TURN_DEADZONE_PX');
+    assert.equal(
+        rectTurnDeadzone?.label,
+        'Analog rectilinear turn dead-zone (CSS px @ 390px gameplay ref)');
+    assert.equal(rectTurnDeadzone?.fmt(16), '16 px @ 390');
+
+    const polarDeadzone = controls.get('ANALOG_POLAR_DEADZONE_PX');
+    assert.match(polarDeadzone?.help ?? '', /polar brake remains active/);
+
+    const polarThreshold = controls.get('ANALOG_POLAR_THRESHOLD_PX');
+    assert.match(polarThreshold?.help ?? '', /ends the radial turn ramp/);
+
+    const massSplitBias = controls.get('MASS_SPLIT_BIAS');
+    assert.equal(massSplitBias?.label, 'Legacy disk-split mass bias');
+    assert.match(massSplitBias?.help ?? '', /Only used when polygon fracture/);
+
+    const brakeGain = controls.get('ANALOG_BRAKE_GAIN');
+    assert.equal(brakeGain?.label, 'Brake-input gain (analog + keyboard)');
+    assert.equal(brakeGain?.fmt(1.5), '1.50x');
+});
+
 test('URL overrides: no params preserves defaults', () => {
     const cfg = { FRACTURE_ENABLED: false, FRACTURE_JAGGEDNESS: 0.35 };
     applyUrlConfigOverrides(cfg, '');

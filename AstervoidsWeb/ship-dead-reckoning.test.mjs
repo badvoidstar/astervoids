@@ -346,7 +346,7 @@ class MiniShip {
         }
         const speedSq = this.velocityX ** 2 + this.velocityY ** 2;
         const maxSq = SHIP.SHIP_MAX_SPEED ** 2;
-        if (speedSq > maxSq) {
+        if (SHIP.SHIP_MAX_SPEED > 0 && speedSq > maxSq) {
             const s = Math.sqrt(speedSq);
             this.velocityX = (this.velocityX / s) * SHIP.SHIP_MAX_SPEED;
             this.velocityY = (this.velocityY / s) * SHIP.SHIP_MAX_SPEED;
@@ -364,6 +364,23 @@ class MiniShip {
         this.y += toNY(this.velocityY) * dt;
     }
 }
+
+test('P3: zero ship max speed disables the speed cap', () => {
+    assert.match(
+        productionSource,
+        /if \(CONFIG\.SHIP_MAX_SPEED > 0 && speedSq > maxSpeedSq\)/);
+
+    const originalMaxSpeed = SHIP.SHIP_MAX_SPEED;
+    try {
+        SHIP.SHIP_MAX_SPEED = 0;
+        const ship = new MiniShip();
+        ship.velocityX = 0.5;
+        ship.update();
+        assert.ok(ship.velocityX > 0);
+    } finally {
+        SHIP.SHIP_MAX_SPEED = originalMaxSpeed;
+    }
+});
 
 // The replay used on the remote: seed a scratch ship from the authoritative
 // packet and step it `frames` times. Rate controls replay turnTarget directly;
