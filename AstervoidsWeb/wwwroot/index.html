@@ -71,17 +71,17 @@
         }
 
         #lives.life-award {
-            animation: life-award-flash 1s steps(2, end);
+            animation: life-award-flash 200ms steps(1, end) 25;
         }
 
         @keyframes life-award-flash {
-            0%, 100% {
-                color: #fff;
-                text-shadow: none;
-            }
-            15%, 45%, 75% {
+            0%, 49% {
                 color: #ff0;
                 text-shadow: 0 0 12px #ff0;
+            }
+            50%, 100% {
+                color: #fff;
+                text-shadow: none;
             }
         }
 
@@ -4240,7 +4240,7 @@
         livesAwardFlashTimer = setTimeout(() => {
             livesAwardFlashTimer = null;
             livesDisplay.classList.remove('life-award');
-        }, 1000);
+        }, 5000);
     }
 
     // Gameplay overlay references (crisp HTML text instead of canvas-drawn text)
