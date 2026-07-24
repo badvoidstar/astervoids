@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
+    DEBUG_OVERRIDABLE_KEYS,
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
     applySessionConfigMetadata,
@@ -19,6 +20,35 @@ test('debug controls derive defaults from the shared runtime values', () => {
             : SHARED_DEFAULTS[control.key];
         assert.equal(control.default, expected, control.key);
     }
+});
+
+test('touch thrust maximum is available as a debug override', () => {
+    const control = CONFIG_CONTROLS.find(item => item.key === 'TOUCH_THRUST_MAX');
+    assert.deepEqual(
+        control && {
+            default: control.default,
+            min: control.min,
+            max: control.max,
+            step: control.step,
+        },
+        { default: 1.5, min: 0, max: 5, step: 0.1 });
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('TOUCH_THRUST_MAX'));
+
+    const cfg = { TOUCH_THRUST_MAX: 1.5 };
+    applyUrlConfigOverrides(cfg, '?cfg.TOUCH_THRUST_MAX=2.5');
+    assert.equal(cfg.TOUCH_THRUST_MAX, 2.5);
+});
+
+test('ship movement defaults and debug bounds use the high-speed tuning', () => {
+    assert.equal(SHARED_DEFAULTS.SHIP_TURN_SPEED, 0.2);
+    assert.equal(SHARED_DEFAULTS.TOUCH_TURN_GAIN, 2.0);
+    assert.equal(SHARED_DEFAULTS.TOUCH_THRUST_GAIN, 2.0);
+    assert.equal(SHARED_DEFAULTS.SHIP_MAX_SPEED, 1.0);
+
+    const turnSpeed = CONFIG_CONTROLS.find(item => item.key === 'SHIP_TURN_SPEED');
+    const maxSpeed = CONFIG_CONTROLS.find(item => item.key === 'SHIP_MAX_SPEED');
+    assert.equal(turnSpeed?.max, 0.6);
+    assert.equal(maxSpeed?.max, 6.0);
 });
 
 test('URL overrides: no params preserves defaults', () => {

@@ -246,8 +246,8 @@ const SHIP = {
     TARGET_FPS: 60,
     SHIP_THRUST: 0.009,
     SHIP_FRICTION: 0.99,
-    SHIP_TURN_SPEED: 0.12,
-    SHIP_MAX_SPEED: 0.8,
+    SHIP_TURN_SPEED: 0.2,
+    SHIP_MAX_SPEED: 1.0,
     SHIP_BRAKE_STRENGTH: 0.018,
     ACCEL_TIME: 0.0,
     DECEL_TIME: 0.0,
@@ -481,7 +481,7 @@ test('P3: replay reproduces braking (clamped damping) exactly', () => {
 
 test('P3: turnInput recovered from rotationSpeed reproduces rotation', () => {
     const owner = new MiniShip();
-    owner.turnTarget = -1; owner.turnInput = -1;     // rotationSpeed = -0.12
+    owner.turnTarget = -1; owner.turnInput = -1;     // rotationSpeed = -0.2
     owner.rotationSpeed = SHIP.SHIP_TURN_SPEED * owner.turnInput; // as set by update()
     const packet = packetOf(owner);
     assert.ok(Math.abs(packet.rotationSpeed - (-SHIP.SHIP_TURN_SPEED)) < 1e-12);

@@ -277,7 +277,7 @@ test('graceful with zero radiusPx (no NaN / no infinity)', () => {
 // ─── attainableTurnTarget ──────────────────────────────────────────────────
 //
 // Reference physics for these tests:
-//   rate (SHIP_TURN_SPEED default) = 0.12 rad/frame
+//   reference rate = 0.12 rad/frame
 //   dt = 1 (one 60fps frame)
 //   At maxMagnitude = 1.0 the ship sweeps 0.12 rad in one frame.
 //   At maxMagnitude = 0.5 the ship sweeps 0.06 rad in one frame.

@@ -96,14 +96,14 @@ test('zero-chord short-circuit returns currAngle (preserves spawn-bridge fix)', 
     }
 });
 
-test('short-tap with prevRot=SHIP_TURN_SPEED, currRot=0 does NOT overshoot', () => {
+test('short-tap with prior rotation then stop does NOT overshoot', () => {
     // Owner taps turn key briefly: prev snapshot caught the tap mid-flight
     // (rotationSpeed ≈ +0.12 rad/frame), curr snapshot is after release
     // (rotationSpeed = 0). The chord dAngle is small relative to the
     // 100 ms send interval × 7.2 rad/s tangent.
     const prevAngle = 0;
     const currAngle = 0.05;   // ≈ 2.9° of net rotation across the bracket
-    const prevRot = 0.12;     // SHIP_TURN_SPEED, rad/frame at 60fps
+    const prevRot = 0.12;     // Representative rotation speed, rad/frame at 60fps
     const currRot = 0;
     const timeDiffMs = 100;
 
@@ -115,7 +115,7 @@ test('short-tap with prevRot=SHIP_TURN_SPEED, currRot=0 does NOT overshoot', () 
         `unclamped Hermite must overshoot here (got ${overshootUnclamped}); test premise is broken otherwise`);
 });
 
-test('short-tap on the release edge (prevRot=0, currRot=SHIP_TURN_SPEED) does not overshoot', () => {
+test('short-tap on the release edge (prevRot=0, currRot>0) does not overshoot', () => {
     // Mirror: the bracket spans the tap-start instead of the tap-end.
     const prevAngle = 0;
     const currAngle = 0.05;

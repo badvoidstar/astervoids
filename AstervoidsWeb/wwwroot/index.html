@@ -1351,17 +1351,19 @@
         // Unknown values fall back to 'polar'. Override at runtime with
         // ?cfg.TOUCH_CONTROL_SCHEME=classic|rectilinear|polar.
         TOUCH_CONTROL_SCHEME: 'polar',
-        // Touch anchor sizing is expressed in absolute CSS pixels (not viewport
-        // fractions) so the on-screen geometry stays a constant physical size
-        // across device sizes and orientations. CSS px are device-calibrated
-        // (Apple HIG: 44px = recommended min touch target; Material: 48dp), so
-        // PX values give a stable physical feel from phone to tablet.
-        //
+        // Touch anchor distances are calibrated in CSS px at this mobile-sized
+        // gameplay reference dimension. getTouchAnchorScale() then applies the
+        // same shorter-viewport-axis scale used by ships and asteroids, keeping
+        // anchor geometry and input travel proportional to game objects.
+        TOUCH_ANCHOR_REFERENCE_DIMENSION_PX: 390,
         // RADIUS: drag distance the finger must move from the anchor to reach
         // a stick deflection of 1.0 (before per-axis clamping). In the polar
         // scheme this also sets the scale of the 2nd parameter (thrust): a
         // length of RADIUS past TOUCH_POLAR_THRESHOLD_PX maps to thrust=1.0
         // before gain/clamp.
+        //
+        // The values below are CSS-pixel distances at the reference dimension
+        // above. At a 390px phone short edge they retain the existing feel.
         TOUCH_STICK_RADIUS_PX: 48,
         // Dead-zone half-extents (rectilinear scheme). The dead-zone is a
         // RECTANGLE: lateral displacements with |dx| <= TURN_DEADZONE_PX are
@@ -1397,7 +1399,7 @@
         // SHIP_THRUST * TOUCH_THRUST_MAX. Downward displacement does NOT drive
         // thrust here — it goes to brake below, with independent scaling/clamp.
         TOUCH_THRUST_GAIN: SHARED_CONFIG_DEFAULTS.TOUCH_THRUST_GAIN,
-        TOUCH_THRUST_MAX: 1.0,
+        TOUCH_THRUST_MAX: SHARED_CONFIG_DEFAULTS.TOUCH_THRUST_MAX,
         // Brake mapping from downward displacement (finger below anchor).
         // brakeInput = clamp(|yNorm| * GAIN, 0, MAX). Peak braking deceleration
         // is SHIP_BRAKE_STRENGTH * TOUCH_BRAKE_MAX. Set MAX=0 to disable braking.
@@ -2716,6 +2718,16 @@
      */
     function getReferenceDimension() {
         return Math.min(getGameWidth(), getGameHeight());
+    }
+
+    /**
+     * Scale CSS-pixel touch-anchor distances with the same game-space
+     * reference dimension that sizes ships, asteroids, and bullets.
+     */
+    function getTouchAnchorScale() {
+        const calibrationReference = Math.max(
+            1, CONFIG.TOUCH_ANCHOR_REFERENCE_DIMENSION_PX);
+        return getReferenceDimension() / calibrationReference;
     }
 
     /**
@@ -6894,14 +6906,12 @@
         if (rect.width <= 0 || rect.height <= 0) return;
         const sx = canvas.width  / rect.width;
         const sy = canvas.height / rect.height;
+        const anchorScale = getTouchAnchorScale();
 
-        // Dead-zone half-extents in canvas px. Use sx for both axes since
-        // resizeCanvas keeps the canvas internal aspect equal to its CSS box
-        // (sx and sy are normally identical); using sx alone keeps the overlay
-        // axis-aligned on a pixel-stretched canvas. CSS px → canvas px scaling
-        // preserves on-screen physical size across device sizes / orientations.
-        const halfWidth  = CONFIG.TOUCH_STICK_TURN_DEADZONE_PX   * sx;
-        const halfHeight = CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX * sx;
+        // Scale the anchor's logical CSS-pixel distances first, then convert
+        // them to canvas pixels for drawing.
+        const halfWidth = CONFIG.TOUCH_STICK_TURN_DEADZONE_PX * anchorScale * sx;
+        const halfHeight = CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX * anchorScale * sx;
 
         ctx.save();
         ctx.strokeStyle = CONFIG.TOUCH_ANCHOR_STROKE_COLOR;
@@ -6931,8 +6941,8 @@
             const dx = (currentX - anchorX) * sx;
             const dy = (currentY - anchorY) * sy;
             const r = Math.hypot(dx, dy);
-            const deadZone  = CONFIG.TOUCH_POLAR_DEADZONE_PX  * sx;
-            const threshold = CONFIG.TOUCH_POLAR_THRESHOLD_PX * sx;
+            const deadZone = CONFIG.TOUCH_POLAR_DEADZONE_PX * anchorScale * sx;
+            const threshold = CONFIG.TOUCH_POLAR_THRESHOLD_PX * anchorScale * sx;
             const theta = Math.atan2(dy, dx);
             // Triangle geometry exists only when the finger has cleared the
             // dead-zone (and the dead-zone has non-zero radius). When it
@@ -8253,10 +8263,11 @@
         // converts into a signed turn target once the ship's heading is known.
         function updateStickAnalog() {
             const scheme = getTouchScheme();
+            const anchorScale = getTouchAnchorScale();
             const rectParams = {
-                radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX,
-                turnDeadzonePx: CONFIG.TOUCH_STICK_TURN_DEADZONE_PX,
-                thrustDeadzonePx: CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX,
+                radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX * anchorScale,
+                turnDeadzonePx: CONFIG.TOUCH_STICK_TURN_DEADZONE_PX * anchorScale,
+                thrustDeadzonePx: CONFIG.TOUCH_STICK_THRUST_DEADZONE_PX * anchorScale,
                 turnGain: CONFIG.TOUCH_TURN_GAIN,
                 turnMax: CONFIG.TOUCH_TURN_MAX,
                 thrustGain: CONFIG.TOUCH_THRUST_GAIN,
@@ -8269,9 +8280,9 @@
                 const dy = stickInput.moveCurrentY - stickInput.moveAnchorY;
                 if (scheme === TOUCH_SCHEMES.POLAR) {
                     const polarParams = {
-                        radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX,
-                        deadZonePx: CONFIG.TOUCH_POLAR_DEADZONE_PX,
-                        thresholdPx: CONFIG.TOUCH_POLAR_THRESHOLD_PX,
+                        radiusPx: CONFIG.TOUCH_STICK_RADIUS_PX * anchorScale,
+                        deadZonePx: CONFIG.TOUCH_POLAR_DEADZONE_PX * anchorScale,
+                        thresholdPx: CONFIG.TOUCH_POLAR_THRESHOLD_PX * anchorScale,
                         turnGain: CONFIG.TOUCH_TURN_GAIN,
                         turnMax: CONFIG.TOUCH_TURN_MAX,
                         thrustGain: CONFIG.TOUCH_THRUST_GAIN,
