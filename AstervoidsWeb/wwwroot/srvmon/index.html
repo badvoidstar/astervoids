@@ -26,6 +26,22 @@
             margin-bottom: 20px;
         }
 
+        #region-select-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+            font-size: 0.9rem;
+        }
+
+        #region-select {
+            background: #111;
+            border: 1px solid #555;
+            color: #00ff00;
+            font: inherit;
+            padding: 4px 6px;
+        }
+
         .columns {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -122,6 +138,12 @@
 <body>
     <h1>Astervoids Server Monitor</h1>
     <div id="status-label">Connecting…</div>
+    <div id="region-select-row">
+        <label for="region-select">Monitor region</label>
+        <select id="region-select" disabled>
+            <option>Loading regions…</option>
+        </select>
+    </div>
     <div id="error-label"></div>
 
     <div class="columns">
@@ -140,6 +162,8 @@
         <div id="sessions-list"></div>
     </div>
 
+    <script src="/region-bootstrap.js"></script>
+    <script src="/js/region-service.js"></script>
     <script>
         const POLL_INTERVAL_MS = 2000;
 
@@ -148,11 +172,16 @@
         const sessionsEl  = document.getElementById('sessions-list');
         const statusEl    = document.getElementById('status-label');
         const errorEl     = document.getElementById('error-label');
+        const regionSelectEl = document.getElementById('region-select');
 
         // Rate tracking
         let prevInvocations = null;
         let prevTimestamp    = null;
         let prevMemberBytes  = {};   // { memberId: { txBytes, rxBytes } }
+        let monitorRegions = [];
+        let selectedRegion = null;
+        let hasManualRegionSelection = false;
+        let pollTimer = null;
 
         // ── Formatters ─────────────────────────────────────────────────────────
 
@@ -192,6 +221,98 @@
             if (pct <= 60) return 'rtt-good';
             if (pct <= 85) return 'rtt-ok';
             return 'rtt-bad';
+        }
+
+        function resetRateTracking() {
+            prevInvocations = null;
+            prevTimestamp = null;
+            prevMemberBytes = {};
+        }
+
+        function monitorUrl() {
+            return selectedRegion
+                ? `${selectedRegion.hostname.replace(/\/$/, '')}/api/srvmon`
+                : null;
+        }
+
+        function selectRegion(regionId, manual = false) {
+            const region = monitorRegions.find(item => item.id === regionId);
+            if (!region) return false;
+
+            selectedRegion = region;
+            hasManualRegionSelection = manual;
+            regionSelectEl.value = region.id;
+            resetRateTracking();
+            poll();
+            if (pollTimer === null) {
+                pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+            }
+            return true;
+        }
+
+        function refreshNearestRegion() {
+            if (hasManualRegionSelection) return;
+            const bestRegionId = window.RegionService.bestRegion();
+            if (bestRegionId) {
+                if (selectedRegion?.id !== bestRegionId) {
+                    selectRegion(bestRegionId);
+                }
+                return;
+            }
+            if (window.RegionService.areAllRegionsAssessed()) {
+                errorEl.textContent = 'No configured regional monitor endpoint is reachable.';
+                errorEl.style.display = '';
+                statusEl.textContent = 'Region selection failed';
+            }
+        }
+
+        function populateRegionSelector() {
+            regionSelectEl.innerHTML = '';
+            if (monitorRegions.length > 1) {
+                const nearestOption = document.createElement('option');
+                nearestOption.value = '';
+                nearestOption.textContent = 'Nearest region (measuring…)';
+                regionSelectEl.appendChild(nearestOption);
+            }
+            for (const region of monitorRegions) {
+                const option = document.createElement('option');
+                option.value = region.id;
+                option.textContent = region.displayName;
+                regionSelectEl.appendChild(option);
+            }
+            regionSelectEl.disabled = false;
+            regionSelectEl.addEventListener('change', () => {
+                if (!regionSelectEl.value) {
+                    hasManualRegionSelection = false;
+                    refreshNearestRegion();
+                    return;
+                }
+                selectRegion(regionSelectEl.value, true);
+            });
+        }
+
+        async function initializeRegionRouting() {
+            try {
+                await window.RegionService.load();
+                monitorRegions = window.RegionService.getRegions();
+                if (monitorRegions.length === 0) {
+                    throw new Error('No monitor regions configured');
+                }
+                populateRegionSelector();
+
+                if (monitorRegions.length === 1) {
+                    selectRegion(monitorRegions[0].id);
+                    return;
+                }
+
+                statusEl.textContent = 'Measuring regional latency…';
+                window.RegionService.on('rttUpdated', refreshNearestRegion);
+                window.RegionService.start();
+            } catch (err) {
+                errorEl.textContent = `Region routing error: ${err.message}`;
+                errorEl.style.display = '';
+                statusEl.textContent = 'Unable to select a monitor region';
+            }
         }
 
         // ── Render helpers ─────────────────────────────────────────────────────
@@ -294,7 +415,9 @@
 
         async function poll() {
             try {
-                const res = await fetch('/api/srvmon');
+                const url = monitorUrl();
+                if (!url) return;
+                const res = await fetch(url, { cache: 'no-store', mode: 'cors' });
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
 
@@ -314,17 +437,18 @@
                 renderConnections(data.connections, invocationsPerSec);
                 renderSessions(data.sessions, elapsedMs);
 
-                statusEl.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+                statusEl.textContent =
+                    `Last updated (${selectedRegion.displayName}): ${new Date().toLocaleTimeString()}`;
                 errorEl.style.display = 'none';
             } catch (err) {
-                errorEl.textContent = `Poll error: ${err.message}`;
+                const label = selectedRegion?.displayName || 'Selected region';
+                errorEl.textContent = `${label} poll error: ${err.message}`;
                 errorEl.style.display = '';
                 statusEl.textContent = 'Error — retrying…';
             }
         }
 
-        poll();
-        setInterval(poll, POLL_INTERVAL_MS);
+        initializeRegionRouting();
     </script>
 </body>
 </html>
