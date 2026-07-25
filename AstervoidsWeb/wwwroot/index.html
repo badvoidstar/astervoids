@@ -8650,6 +8650,17 @@
         userOverrodeCreateRegion: false
     };
 
+    let pickerOperationGeneration = 0;
+
+    function beginPickerOperation() {
+        const generation = ++pickerOperationGeneration;
+        return () => generation === pickerOperationGeneration;
+    }
+
+    function cancelPickerOperations() {
+        pickerOperationGeneration++;
+    }
+
     // Update status message
     function setPickerStatus(message, type = '') {
         sessionPicker.statusEl.textContent = message;
@@ -9341,6 +9352,7 @@
                 // reconnected but the server already processed our disconnect (member
                 // removed). Trigger full rejoin to restore session membership.
                 ObjectSync.on('onReconciliationFailed', () => {
+                    if (!isSessionMode()) return;
                     _warn('[Session] Reconciliation failed — server no longer recognizes this connection. Triggering full rejoin.');
                     const lostSessionId = sessionPicker.currentSessionId || SessionClient.getLastSessionId();
                     if (lostSessionId) {
@@ -9445,6 +9457,7 @@
         const session = sessionPicker.sessions.find(s => s.id === sessionId);
         if (!session || session.memberCount >= session.maxMembers) return;
 
+        const isCurrentOperation = beginPickerOperation();
         setPickerStatus('Joining...', 'connecting');
         sessionPicker.btnLeaveCreate.disabled = true;
 
@@ -9452,6 +9465,7 @@
             // Leave current session if in one
             if (sessionPicker.currentSessionId) {
                 await SessionClient.leaveSession();
+                if (!isCurrentOperation()) return;
             }
 
             // Multi-region: close spectator connections to the OTHER regions
@@ -9461,13 +9475,21 @@
             const targetHostname = getRegionHostnameById(session.regionId);
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
+                if (!isCurrentOperation()) return;
                 if (targetHostname) {
                     await connectToSessionHub(true, targetHostname, false);
+                    if (!isCurrentOperation()) return;
                     setPickerStatus('Joining...', 'connecting');
                 }
             }
 
             const result = await SessionClient.joinSession(sessionId);
+            if (!isCurrentOperation()) {
+                if (result && isActiveSoloGame()) {
+                    leaveSessionInBackground('Failed to leave session after starting solo play:');
+                }
+                return;
+            }
             if (result) {
                 // Record pre-existing object ids so we don't spawn-project
                 // adopted orphans (e.g. entering an emptied session).
@@ -9503,6 +9525,7 @@
                 setPickerStatus('Could not join - session may be full', 'error');
             }
         } catch (err) {
+            if (!isCurrentOperation()) return;
             _error('Join session failed:', err);
             await activateSessionPickerUpdates();
             setPickerStatus('Failed to join session', 'error');
@@ -9522,6 +9545,7 @@
             return;
         }
 
+        const isCurrentOperation = beginPickerOperation();
         setPickerStatus('Creating...', 'connecting');
         sessionPicker.btnLeaveCreate.disabled = true;
 
@@ -9529,6 +9553,7 @@
             // Leave current session if in one
             if (sessionPicker.currentSessionId) {
                 await SessionClient.leaveSession();
+                if (!isCurrentOperation()) return;
                 sessionPicker.currentSessionId = null;
             }
 
@@ -9539,8 +9564,10 @@
             const targetHostname = getCreateRegionHostname();
             if (sessionPicker.regions.length > 1) {
                 await teardownMultiRegionPicker();
+                if (!isCurrentOperation()) return;
                 if (targetHostname) {
                     await connectToSessionHub(true, targetHostname, false);
+                    if (!isCurrentOperation()) return;
                     setPickerStatus('Creating...', 'connecting');
                 }
             }
@@ -9553,6 +9580,12 @@
                 schemas: WIREOPT_SCHEMAS,
                 seed: generateSessionSeed(),
             });
+            if (!isCurrentOperation()) {
+                if (result && isActiveSoloGame()) {
+                    leaveSessionInBackground('Failed to leave session after starting solo play:');
+                }
+                return;
+            }
             if (result) {
                 // Newly created session: no pre-existing objects to guard.
                 replicationRuntime.beginSession({
@@ -9585,31 +9618,46 @@
                 setPickerStatus('Could not create - max sessions reached', 'error');
             }
         } catch (err) {
+            if (!isCurrentOperation()) return;
             _error('Create session failed:', err);
             await activateSessionPickerUpdates();
             setPickerStatus('Failed to create session', 'error');
         }
     }
 
-    // Handle solo play - leave any session first
+    function isActiveSoloGame() {
+        return game.mode === 'solo' && game.state !== 'start';
+    }
+
+    function leaveSessionInBackground(errorMessage) {
+        void SessionClient.leaveSession().catch(err => {
+            _error(errorMessage, err);
+        });
+    }
+
+    // Handle solo play without waiting for multiplayer services.
     async function handleSoloPlay() {
-        // Multi-region: close every spectator connection — Solo has no
-        // need for live session updates.
+        cancelPickerOperations();
+        const shouldLeaveSessionInBackground = sessionPicker.currentSessionId
+            && SessionClient.isConnected();
+        sessionPicker.currentSessionId = null;
+        sessionPicker.isServer = false;
+        sessionPicker.gameStarted = false;
+
+        // Solo play does not need live session updates, but closing service
+        // connections must not delay a local game start.
         if (sessionPicker.regions.length > 1) {
-            await teardownMultiRegionPicker();
+            void teardownMultiRegionPicker().catch(err => {
+                _warn('[Picker] Failed to stop regional updates for solo play:', err);
+            });
         }
-        // Leave current session if in one
-        if (sessionPicker.currentSessionId && SessionClient.isConnected()) {
-            try {
-                await SessionClient.leaveSession();
-            } catch (err) {
-                _error('Failed to leave session before solo:', err);
-            }
-            sessionPicker.currentSessionId = null;
-            sessionPicker.isServer = false;
-            sessionPicker.gameStarted = false;
+
+        // Tell the server about a prior session without making local solo play
+        // dependent on a reachable hub.
+        if (shouldLeaveSessionInBackground) {
+            leaveSessionInBackground('Failed to leave session before solo:');
         }
-        
+
         game.mode = 'solo';
         game.sessionInfo = null;
         restoreLocalConfigBaseline();
@@ -9741,7 +9789,7 @@
         operation.promise = (async () => {
             if (!isCurrent()) return;
             try {
-                if (sessionPicker.regions.length > 1) {
+                if (context.mode === 'session' && sessionPicker.regions.length > 1) {
                     await teardownMultiRegionPicker();
                     if (!isCurrent()) return;
                 }
@@ -9882,8 +9930,9 @@
      * @param {string} sessionId - The session ID to rejoin
      */
     async function attemptAutoRejoin(sessionId) {
-        if (rejoinInProgress || leavingSession) {
-            _log('[Rejoin] Skipped — rejoinInProgress:', rejoinInProgress, 'leavingSession:', leavingSession);
+        if (rejoinInProgress || leavingSession || !isSessionMode()) {
+            _log('[Rejoin] Skipped — rejoinInProgress:', rejoinInProgress,
+                'leavingSession:', leavingSession, 'isSessionMode:', isSessionMode());
             return;
         }
 
@@ -9914,6 +9963,7 @@
         const maxAttempts = 5;
         try {
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                if (leavingSession || !isSessionMode()) return;
                 try {
                     // Wait before each attempt (including first). Mobile browsers may
                     // need a brief pause after tab-visible before WebSocket works.
@@ -9922,6 +9972,7 @@
                         setPickerStatus(`Reconnecting... (attempt ${attempt + 1}/${maxAttempts})`, 'error');
                     }
                     await new Promise(r => setTimeout(r, delay));
+                    if (leavingSession || !isSessionMode()) return;
 
                     // Always force a fresh connection — after mobile background,
                     // the old connection may appear "Connected" but the underlying
@@ -9929,6 +9980,7 @@
                     // on the new connection and cancels any stale auto-reconnect.
                     setPickerStatus(`Reconnecting... (connecting)`, 'error');
                     await connectToSessionHub(true, reconnectHubHostname, false);
+                    if (leavingSession || !isSessionMode()) return;
                     if (!SessionClient.isConnected()) {
                         _warn('[Rejoin] Connect failed on attempt', attempt + 1);
                         setPickerStatus(`Reconnecting... (connect failed)`, 'error');
@@ -9954,6 +10006,13 @@
                     // SessionClient proves ownership using its stored reconnect identity.
                     setPickerStatus(`Reconnecting... (joining session)`, 'error');
                     const result = await SessionClient.joinSession(sessionId);
+                    if (leavingSession || !isSessionMode()) {
+                        if (result && isActiveSoloGame()) {
+                            leaveSessionInBackground(
+                                'Failed to leave session after starting solo play:');
+                        }
+                        return;
+                    }
                     if (result) {
                         // Record pre-existing object ids so re-adopted orphans
                         // aren't spawn-projected on rejoin.
@@ -10079,11 +10138,9 @@
         // try/catch tolerates ping failures, but a quiet stop keeps the event
         // loop unloaded during the disconnected window.
         RemoteObjects.stopClockSync();
-        // If the user is voluntarily leaving, do nothing — leavingSession is set
-        // synchronously at the top of returnToStartScreen / handleLeaveLobby. Without
-        // this guard a transport drop during leave teardown would auto-rejoin into
-        // the session we're leaving, producing ghost membership.
-        if (leavingSession) return;
+        // A solo game is local. Do not let a service disconnect interrupt it;
+        // likewise, a voluntary multiplayer leave must not trigger auto-rejoin.
+        if (leavingSession || isActiveSoloGame()) return;
 
         const lostSessionId = sessionPicker.currentSessionId;
         sessionPicker.currentSessionId = null;
@@ -10117,6 +10174,7 @@
 
     // Handle session expiration (server-side timeout)
     SessionClient.on('onSessionExpired', (reason) => {
+        if (!isSessionMode()) return;
         _warn('[Game] Session expired:', reason);
         returnToStartScreen(reason);
     });

@@ -362,7 +362,7 @@ test('create is guarded by regional readiness and avoids a global refresh during
         'normal connection startup may refresh, while routed Create explicitly opts out');
 });
 
-test('entering gameplay tears down picker updates before initialization', () => {
+test('entering session gameplay tears down picker updates before initialization', () => {
     const startGameStart = html.indexOf('async function startGameFromPicker()');
     const returnStart = html.indexOf('async function returnToStartScreen', startGameStart);
     assert.ok(startGameStart >= 0 && returnStart > startGameStart);
@@ -370,7 +370,71 @@ test('entering gameplay tears down picker updates before initialization', () => 
     const startGameSource = html.slice(startGameStart, returnStart);
     assert.match(
         startGameSource,
-        /await teardownMultiRegionPicker\(\);[\s\S]*?await init\(isCurrent\);/
+        /if \(context\.mode === 'session' && sessionPicker\.regions\.length > 1\) \{[\s\S]*?await teardownMultiRegionPicker\(\);[\s\S]*?await init\(isCurrent\);/
+    );
+});
+
+test('solo play starts without waiting for regional or session services', () => {
+    const soloSource = extractFunctionSource('handleSoloPlay');
+    const startGameSource = extractFunctionSource('startGameFromPicker');
+    const leaveSource = extractFunctionSource('leaveSessionInBackground');
+
+    assert.match(
+        html,
+        /<button id="btn-solo" class="picker-btn solo">Start Solo Play<\/button>/);
+    assert.match(soloSource, /cancelPickerOperations\(\);/);
+    assert.match(
+        soloSource,
+        /void teardownMultiRegionPicker\(\)\.catch\(/,
+        'regional teardown must continue in the background');
+    assert.match(
+        soloSource,
+        /leaveSessionInBackground\('Failed to leave session before solo:'\);/,
+        'session departure must continue in the background');
+    assert.match(leaveSource, /void SessionClient\.leaveSession\(\)\.catch\(/);
+    assert.doesNotMatch(soloSource, /await (teardownMultiRegionPicker|SessionClient\.leaveSession)\(/);
+    assert.match(
+        startGameSource,
+        /context\.mode === 'session' && sessionPicker\.regions\.length > 1/,
+        'only session gameplay may wait for regional teardown');
+});
+
+test('a transport disconnect cannot interrupt an active solo game', () => {
+    const disconnectStart = html.indexOf("SessionClient.on('onDisconnected'");
+    const expirationStart = html.indexOf("SessionClient.on('onSessionExpired'", disconnectStart);
+    const roleChangeStart = html.indexOf("SessionClient.on('onRoleChanged'", expirationStart);
+    assert.ok(disconnectStart >= 0 && expirationStart > disconnectStart);
+    assert.ok(roleChangeStart > expirationStart);
+
+    const disconnectSource = html.slice(disconnectStart, expirationStart);
+    const expirationSource = html.slice(expirationStart, roleChangeStart);
+    assert.match(
+        disconnectSource,
+        /if \(leavingSession \|\| isActiveSoloGame\(\)\) return;/
+    );
+    assert.match(expirationSource, /if \(!isSessionMode\(\)\) return;/);
+});
+
+test('solo play cancels delayed join and create workflows', () => {
+    const selectSource = extractFunctionSource('handleSelectSession');
+    const createSource = extractFunctionSource('handleCreateSession');
+
+    for (const source of [selectSource, createSource]) {
+        assert.match(source, /const isCurrentOperation = beginPickerOperation\(\);/);
+        assert.match(source, /if \(!isCurrentOperation\(\)\) return;/);
+        assert.match(
+            source,
+            /if \(result && isActiveSoloGame\(\)\) \{\s*leaveSessionInBackground\('Failed to leave session after starting solo play:'\);/
+        );
+    }
+});
+
+test('solo play cleans up a delayed auto-rejoin', () => {
+    const rejoinSource = extractFunctionSource('attemptAutoRejoin');
+
+    assert.match(
+        rejoinSource,
+        /const result = await SessionClient\.joinSession\(sessionId\);\s*if \(leavingSession \|\| !isSessionMode\(\)\) \{\s*if \(result && isActiveSoloGame\(\)\) \{\s*leaveSessionInBackground\(\s*'Failed to leave session after starting solo play:'\);/
     );
 });
 
