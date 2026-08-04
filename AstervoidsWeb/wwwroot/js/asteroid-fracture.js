@@ -142,6 +142,103 @@ const AstervoidsFracture = (function() {
         }));
     }
 
+    /**
+     * Centroidal moment of inertia for a uniform-density planar polygon.
+     *
+     * Uses the standard shoelace-derived formula:
+     *   I_origin = (ρ/12) Σ |cross_i| (r_i² + r_i·r_{i+1} + r_{i+1}²)
+     * where ρ = mass / area, then applies the parallel-axis correction:
+     *   I_centroid = I_origin − mass * (cx² + cy²)
+     *
+     * The polygon is assumed to be in local (origin-centred) coordinates, so
+     * the centroid offset is the centroid returned by polygonCentroid().
+     *
+     * Returns the disk approximation 0.5 * mass * radius^2 as a safe fallback
+     * when the polygon is degenerate or has too few vertices.
+     *
+     * @param {Array<{x:number,y:number}>} vertices  – polygon in XY coordinates
+     * @param {number} mass    – total mass of the polygon
+     * @param {number} radius  – equivalent disk radius used as fallback
+     */
+    function polygonMomentOfInertia(vertices, mass, radius) {
+        if (!vertices || vertices.length < 3 || !(mass > 0)) {
+            return 0.5 * mass * radius * radius;
+        }
+        const n = vertices.length;
+        let area = 0;
+        let Iorigin = 0;
+        let cx = 0;
+        let cy = 0;
+        for (let i = 0; i < n; i++) {
+            const next = (i + 1) % n;
+            const xi = vertices[i].x, yi = vertices[i].y;
+            const xj = vertices[next].x, yj = vertices[next].y;
+            const cross = xi * yj - xj * yi;
+            area += cross;
+            Iorigin += cross * (xi * xi + xi * xj + xj * xj + yi * yi + yi * yj + yj * yj);
+            cx += (xi + xj) * cross;
+            cy += (yi + yj) * cross;
+        }
+        area *= 0.5;
+        if (Math.abs(area) < 1e-18) {
+            return 0.5 * mass * radius * radius;
+        }
+        const density = mass / Math.abs(area);
+        const Iorig = (density / 12) * Math.abs(Iorigin);
+        cx /= 6 * area;
+        cy /= 6 * area;
+        // Parallel-axis theorem: shift from origin to centroid.
+        const I = Iorig - mass * (cx * cx + cy * cy);
+        // Guard against numerical noise yielding a slightly negative result.
+        return Math.max(I, 0.5 * mass * radius * radius * 1e-6);
+    }
+
+    /**
+     * Intersects a ray (origin + t*dir) with a polygon boundary and returns
+     * the hit point closest to the polygon surface along the *incoming*
+     * (negative-t) direction.  Used to find the actual contact point for
+     * impact torque when a polygon asteroid is hit.
+     *
+     * The ray direction is the bullet travel direction; we look for the
+     * intersection with the smallest non-positive t so the contact point is
+     * on the entry face of the polygon.
+     *
+     * @param {Array<{x:number,y:number}>} polygon  – convex or concave polygon
+     * @param {number} ox  – ray origin x (impact offset projected to contact plane)
+     * @param {number} oy  – ray origin y
+     * @param {number} dx  – ray direction x (unit vector, bullet travel direction)
+     * @param {number} dy  – ray direction y
+     * @returns {{ x:number, y:number }|null}  contact point, or null on miss
+     */
+    function polygonRayIntersect(polygon, ox, oy, dx, dy) {
+        const n = polygon.length;
+        if (n < 3) return null;
+        let bestT = Infinity;
+        let found = false;
+        for (let i = 0; i < n; i++) {
+            const next = (i + 1) % n;
+            const ex = polygon[next].x - polygon[i].x;
+            const ey = polygon[next].y - polygon[i].y;
+            // denom = cross(dir, edge)
+            const denom = dx * ey - dy * ex;
+            if (Math.abs(denom) < 1e-18) continue;
+            const fx = polygon[i].x - ox;
+            const fy = polygon[i].y - oy;
+            const t = (fx * ey - fy * ex) / denom;
+            const u = (fx * dy - fy * dx) / denom;
+            if (u >= 0 && u <= 1) {
+                // We want the entry intersection: t should be <= 0 (bullet
+                // travels toward the polygon), and as close to 0 as possible.
+                if (t <= 1e-9 && t < bestT) {
+                    bestT = t;
+                    found = true;
+                }
+            }
+        }
+        if (!found) return null;
+        return { x: ox + dx * bestT, y: oy + dy * bestT };
+    }
+
     function effectiveSeparationEnergy(radius, config) {
         const blend = Math.max(0, Math.min(1, config.SEPARATION_ENERGY_SIZE_BLEND));
         const radiusRatio = radius / config.INITIAL_ASTEROID_RADIUS;
@@ -187,13 +284,78 @@ const AstervoidsFracture = (function() {
         const normalY = directionX;
         const radius = asteroid.radius;
         const density = Math.max(1e-6, config.ASTEROID_DENSITY);
-        const mass = density * radius * radius;
-        const inertia = 0.5 * mass * radius * radius;
+
+        // ── Goal 1: geometry-based parent mass ──────────────────────────────
+        // Build the parent polygon in world-space once; it is needed for mass,
+        // inertia, impact-point, and fracture calculations below.
+        // If vertices are missing or degenerate we fall back to the disk proxy.
+        let parentPolygon = null;
+        let parentArea = 0;
+        let effectivePi = Math.PI;
+        const rawVerts = asteroid.vertices;
+        if (config.FRACTURE_ENABLED
+                && Array.isArray(rawVerts)
+                && rawVerts.length >= 3) {
+            parentPolygon = rawVerts.map(vertex => ({
+                x: Math.cos(vertex.angle + asteroid.angle) * vertex.distance,
+                y: Math.sin(vertex.angle + asteroid.angle) * vertex.distance,
+            }));
+            parentArea = Math.abs(polygonArea(parentPolygon));
+            if (parentArea > 0) {
+                // Calibrate so that a perfectly circular asteroid's mass equals
+                // the legacy disk value: mass = density * area / effectivePi * π
+                // = density * R².  For a circle effectivePi = π, so:
+                //   mass = density * parentArea / effectivePi
+                // = density * (π R²) / π = density * R²  ✓
+                effectivePi = parentArea / (radius * radius);
+            } else {
+                parentPolygon = null; // degenerate – treat as no polygon
+            }
+        }
+
+        // mass is calibrated so that a "round" asteroid matches the legacy
+        // disk value (density * R²), while irregular shapes reflect their
+        // actual area via the effectivePi calibration.
+        const mass = parentPolygon
+            ? density * parentArea / effectivePi   // = density * R² * (A / (π_eff * R²)) * (π_eff / 1)
+                                                    //   which simplifies to density * A / (A/R²)
+                                                    //   = density * R²  (by definition of effectivePi)
+            : density * radius * radius;
+
+        // ── Goal 2: true centroidal polygon moment of inertia ───────────────
+        const inertia = parentPolygon
+            ? polygonMomentOfInertia(parentPolygon, mass, radius)
+            : 0.5 * mass * radius * radius;
+
         const impactOffset = offsetN * radius;
-        const impactAlongDirection = -Math.sqrt(
-            Math.max(0, radius * radius - impactOffset * impactOffset));
-        const impactX = impactAlongDirection * directionX + impactOffset * normalX;
-        const impactY = impactAlongDirection * directionY + impactOffset * normalY;
+
+        // ── Goal 3: actual polygon-boundary impact point ─────────────────────
+        // The ray origin is the impact offset point perpendicular to the bullet;
+        // we shoot along the bullet direction and find the entry intersection.
+        let impactX, impactY;
+        if (parentPolygon) {
+            // Ray origin: the impact offset applied perpendicular to bullet direction.
+            const rayOx = impactOffset * normalX;
+            const rayOy = impactOffset * normalY;
+            const hit = polygonRayIntersect(
+                parentPolygon, rayOx, rayOy, directionX, directionY);
+            if (hit) {
+                impactX = hit.x;
+                impactY = hit.y;
+            } else {
+                // Fallback to circular approximation.
+                const impactAlongDirection = -Math.sqrt(
+                    Math.max(0, radius * radius - impactOffset * impactOffset));
+                impactX = impactAlongDirection * directionX + impactOffset * normalX;
+                impactY = impactAlongDirection * directionY + impactOffset * normalY;
+            }
+        } else {
+            const impactAlongDirection = -Math.sqrt(
+                Math.max(0, radius * radius - impactOffset * impactOffset));
+            impactX = impactAlongDirection * directionX + impactOffset * normalX;
+            impactY = impactAlongDirection * directionY + impactOffset * normalY;
+        }
+
         const impulseMagnitude = mass * Math.max(0, config.DEFLECTION_KICK);
         const impulseX = impulseMagnitude * directionX;
         const impulseY = impulseMagnitude * directionY;
@@ -208,15 +370,7 @@ const AstervoidsFracture = (function() {
 
         let children = null;
         let fracture = null;
-        if (config.FRACTURE_ENABLED) {
-            const parentPolygon = asteroid.vertices.map(vertex => ({
-                x: Math.cos(vertex.angle + asteroid.angle) * vertex.distance,
-                y: Math.sin(vertex.angle + asteroid.angle) * vertex.distance,
-            }));
-            const parentArea = Math.abs(polygonArea(parentPolygon));
-            const effectivePi = parentArea > 0
-                ? parentArea / (radius * radius)
-                : Math.PI;
+        if (config.FRACTURE_ENABLED && parentPolygon) {
             const probe = fractureSplitPolygon(
                 parentPolygon, { x: normalX, y: normalY }, impactOffset, []);
             if (probe) {
@@ -269,7 +423,7 @@ const AstervoidsFracture = (function() {
                         const largeRadius = Math.sqrt(largeSide.area / effectivePi);
                         const smallMass = (smallSide.area / parentArea) * mass;
                         const largeMass = (largeSide.area / parentArea) * mass;
-                        const recenter = (polygon, center) => verticesFromXY(
+                         const recenter = (polygon, center) => verticesFromXY(
                             polygon.map(point => ({
                                 x: point.x - center.x,
                                 y: point.y - center.y,
@@ -279,10 +433,26 @@ const AstervoidsFracture = (function() {
                         const largeVertices = recenter(
                             largeSide.polygon, largeCenter);
 
+                        // ── Goal 4: fragment-specific inertia ─────────────
+                        // Compute each fragment's centroidal polygon inertia
+                        // from its recentered vertices so subsequent hits use
+                        // the correct (non-disk) moment of inertia.
+                        const smallInertia = polygonMomentOfInertia(
+                            smallSide.polygon.map(p => ({
+                                x: p.x - smallCenter.x,
+                                y: p.y - smallCenter.y,
+                            })), smallMass, smallRadius);
+                        const largeInertia = polygonMomentOfInertia(
+                            largeSide.polygon.map(p => ({
+                                x: p.x - largeCenter.x,
+                                y: p.y - largeCenter.y,
+                            })), largeMass, largeRadius);
+
                         if (smallRadius < config.MIN_ASTEROID_RADIUS) {
                             children = [{
                                 r: largeRadius,
                                 m: largeMass,
+                                inertia: largeInertia,
                                 cx: largeCenter.x,
                                 cy: largeCenter.y,
                                 vx: velocityX - angularVelocity * largeCenter.y,
@@ -316,6 +486,7 @@ const AstervoidsFracture = (function() {
                                 {
                                     r: smallRadius,
                                     m: smallMass,
+                                    inertia: smallInertia,
                                     cx: smallCenter.x,
                                     cy: smallCenter.y,
                                     vx: smallRigidVelocity.x
@@ -328,6 +499,7 @@ const AstervoidsFracture = (function() {
                                 {
                                     r: largeRadius,
                                     m: largeMass,
+                                    inertia: largeInertia,
                                     cx: largeCenter.x,
                                     cy: largeCenter.y,
                                     vx: largeRigidVelocity.x
@@ -430,6 +602,8 @@ const AstervoidsFracture = (function() {
     return Object.freeze({
         polygonArea,
         polygonCentroid,
+        polygonMomentOfInertia,
+        polygonRayIntersect,
         fractureSplitPolygon,
         buildFracturePolyline,
         makeSeededRandom,
