@@ -60,7 +60,7 @@ const AstervoidsConfig = (function() {
             label: 'Asteroid density',
             min: 0.1, max: 20, step: 0.1,
             fmt: value => value.toFixed(1),
-            help: 'M = density * R^2. Density damps separation by 1/sqrt(density); deflection and spin remain velocity-driven.',
+            help: 'M = density * R² for disk/fallback asteroids; for polygon asteroids M = density * area / (area/R²) = density * R² (calibrated so a circle matches exactly). Density damps separation by 1/sqrt(density); deflection and spin remain velocity-driven.',
         }),
         control({
             key: 'EXTRA_LIFE_SCORE_THRESHOLD',
