@@ -9283,26 +9283,12 @@
                         //     child's velocity drives the extrapolation past the
                         //     bridge (which becomes the latest snapshot) along the
                         //     authoritative trajectory.
-                        const bridgeVx = bridgeIsBeforeAuth
+                        let bridgeVx = bridgeIsBeforeAuth
                             ? (parentInterp.velocityX || 0)
                             : (child.data.velocityX || 0);
-                        const bridgeVy = bridgeIsBeforeAuth
+                        let bridgeVy = bridgeIsBeforeAuth
                             ? (parentInterp.velocityY || 0)
                             : (child.data.velocityY || 0);
-
-                        // Back-project child's authoritative COM by `bridgeV` over
-                        // the bridge interval. For DISK children (cx=cy=0 in
-                        // splitAsteroid), this reduces to parent.x_at_bridgeTime
-                        // exactly. For FRACTURE children the result includes the
-                        // fragment's centroid offset so the polygon's WORLD
-                        // VERTICES align with where they were on the parent at
-                        // bridge.time. Without this, bridge.x = parentInterp.x
-                        // produced a visible "centroid teleport" — the fragment
-                        // polygon rendered offset by ~0.68 × centroid for the
-                        // first ~3 frames of the bridge interval (the dominant
-                        // remote-spawn glitch).
-                        const bridgeX = child.data.x - bridgeVx * velScaleX * timeDiffSec;
-                        const bridgeY = child.data.y - bridgeVy * velScaleY * timeDiffSec;
 
                         // Angle override is conditional: fracture children store
                         // vertices already in world-aligned frame (parent rotation
@@ -9315,13 +9301,60 @@
                         // angular continuity.
                         const isFractureChild =
                             AstervoidsWireCodec.hasAsteroidVertices(child.data.vertices);
+                        let bridgeX;
+                        let bridgeY;
+                        let bridgeAngle;
+                        if (isFractureChild && bridgeIsBeforeAuth) {
+                            // Reconstruct the fragment's pre-split rigid transform.
+                            // Its explicit vertices and centroid are stored in the
+                            // split-time world frame, so rotate both back by the
+                            // parent's intervening angular motion. The centroid's
+                            // rigid-body velocity supplies the matching Hermite
+                            // tangent at the bridge end.
+                            const parentVx = parentInterp.velocityX || 0;
+                            const parentVy = parentInterp.velocityY || 0;
+                            const angularSpeed =
+                                (parentInterp.rotationSpeed || 0) * CONFIG.TARGET_FPS;
+                            const rotationDelta = -angularSpeed * timeDiffSec;
+                            const parentAtSplitX =
+                                parentInterp.x + parentVx * velScaleX * timeDiffSec;
+                            const parentAtSplitY =
+                                parentInterp.y + parentVy * velScaleY * timeDiffSec;
+                            const centroidX =
+                                (child.data.x - parentAtSplitX) / velScaleX;
+                            const centroidY =
+                                (child.data.y - parentAtSplitY) / velScaleY;
+                            const cos = Math.cos(rotationDelta);
+                            const sin = Math.sin(rotationDelta);
+                            const bridgeCentroidX =
+                                centroidX * cos - centroidY * sin;
+                            const bridgeCentroidY =
+                                centroidX * sin + centroidY * cos;
+                            bridgeX = parentInterp.x + bridgeCentroidX * velScaleX;
+                            bridgeY = parentInterp.y + bridgeCentroidY * velScaleY;
+                            bridgeAngle = rotationDelta;
+                            bridgeVx = parentVx - angularSpeed * bridgeCentroidY;
+                            bridgeVy = parentVy + angularSpeed * bridgeCentroidX;
+                        } else {
+                            // Disk children have no centroid offset. A bridge newer
+                            // than authority follows the child's post-split path.
+                            bridgeX =
+                                child.data.x - bridgeVx * velScaleX * timeDiffSec;
+                            bridgeY =
+                                child.data.y - bridgeVy * velScaleY * timeDiffSec;
+                            bridgeAngle = isFractureChild
+                                ? (child.data.angle || 0)
+                                    - (child.data.rotationSpeed || 0)
+                                    * CONFIG.TARGET_FPS * timeDiffSec
+                                : parentInterp.angle;
+                        }
                         const bridgeData = {
                             ...child.data,
                             x: bridgeX,
                             y: bridgeY,
                             velocityX: bridgeVx,
                             velocityY: bridgeVy,
-                            ...(isFractureChild ? {} : { angle: parentInterp.angle }),
+                            angle: bridgeAngle,
                         };
                         if (bridgeIsBeforeAuth) {
                             // LAN: bridge older than authority → bridge first.

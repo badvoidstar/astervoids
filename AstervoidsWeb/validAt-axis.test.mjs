@@ -407,6 +407,7 @@ test('wallToPerfDelta refresh sequence: monotonic snapshot times preserved', () 
  * bridge values directly.
  */
 function installSpawnBridge(parentState, childState, childData, childValidAt, baseDelay, clock) {
+    const targetFps = 60;
     const renderTime = clock.perfNow();
     const parentInterp = getInterpolated(parentState, renderTime, baseDelay);
     if (!parentInterp) return null;
@@ -418,29 +419,49 @@ function installSpawnBridge(parentState, childState, childData, childValidAt, ba
     //     COM to where the fragment was at bridge.time;
     //   - bridge snapshot velocity used for Hermite tangent (LAN bracket) and
     //     for extrapolation past the bridge (high-latency).
-    const bridgeVx = bridgeIsBeforeAuth
+    let bridgeVx = bridgeIsBeforeAuth
         ? (parentInterp.velocityX || 0)
         : (childData.velocityX || 0);
-    const bridgeVy = bridgeIsBeforeAuth
+    let bridgeVy = bridgeIsBeforeAuth
         ? (parentInterp.velocityY || 0)
         : (childData.velocityY || 0);
-    // Back-project child's authoritative COM to bridge.time. For DISK
-    // children (centroid offset = 0, childData.x ≡ parent.x_at_validAt),
-    // this REDUCES TO parentInterp.x exactly. For FRACTURE children
-    // (centroid offset ≠ 0, childData.x ≡ parent.x_at_validAt + centroid),
-    // the result is parentInterp.x + centroid — the position at which the
-    // fragment's polygon (whose vertices already encode the centroid)
-    // renders at the SAME world coordinates as before the split.
-    const bridgeX = (childData.x || 0) - bridgeVx * timeDiffSec;
-    const bridgeY = (childData.y || 0) - bridgeVy * timeDiffSec;
     const isFractureChild = Array.isArray(childData.vertices) && childData.vertices.length > 0;
+    let bridgeX;
+    let bridgeY;
+    let bridgeAngle;
+    if (isFractureChild && bridgeIsBeforeAuth) {
+        const parentVx = parentInterp.velocityX || 0;
+        const parentVy = parentInterp.velocityY || 0;
+        const angularSpeed = (parentInterp.rotationSpeed || 0) * targetFps;
+        const rotationDelta = -angularSpeed * timeDiffSec;
+        const parentAtSplitX = parentInterp.x + parentVx * timeDiffSec;
+        const parentAtSplitY = parentInterp.y + parentVy * timeDiffSec;
+        const centroidX = (childData.x || 0) - parentAtSplitX;
+        const centroidY = (childData.y || 0) - parentAtSplitY;
+        const cos = Math.cos(rotationDelta);
+        const sin = Math.sin(rotationDelta);
+        const bridgeCentroidX = centroidX * cos - centroidY * sin;
+        const bridgeCentroidY = centroidX * sin + centroidY * cos;
+        bridgeX = parentInterp.x + bridgeCentroidX;
+        bridgeY = parentInterp.y + bridgeCentroidY;
+        bridgeAngle = rotationDelta;
+        bridgeVx = parentVx - angularSpeed * bridgeCentroidY;
+        bridgeVy = parentVy + angularSpeed * bridgeCentroidX;
+    } else {
+        bridgeX = (childData.x || 0) - bridgeVx * timeDiffSec;
+        bridgeY = (childData.y || 0) - bridgeVy * timeDiffSec;
+        bridgeAngle = isFractureChild
+            ? (childData.angle || 0)
+                - (childData.rotationSpeed || 0) * targetFps * timeDiffSec
+            : parentInterp.angle;
+    }
     const bridgeData = {
         ...childData,
         x: bridgeX,
         y: bridgeY,
         velocityX: bridgeVx,
         velocityY: bridgeVy,
-        ...(isFractureChild ? {} : { angle: parentInterp.angle }),
+        angle: bridgeAngle,
     };
     if (bridgeIsBeforeAuth) {
         // LAN: bridge older than authority — install bridge first.
@@ -748,6 +769,66 @@ test('spawn bridge: fracture child position back-projects from child.data along 
     // interval. The new formula eliminates this teleport.
     assert.notEqual(childState.snapshots[0].data.x, 5,
         'NOT the old (parent_interp.x) anchor — that would teleport the polygon by -cx');
+});
+
+test('spawn bridge: rotating fracture child preserves pre-split rigid transform', () => {
+    const clock = makeClock({ offsetMs: 0, wallClockNow: 1000, perfStart: 1000 });
+    const parentState = newState();
+    updateState(parentState, {
+        x: 0,
+        y: 0,
+        angle: 0,
+        velocityX: 100,
+        velocityY: 0,
+        rotationSpeed: 0.01,
+    }, 900, clock);
+    const childData = {
+        x: 23,
+        y: 4,
+        angle: 0,
+        velocityX: 200,
+        velocityY: 50,
+        rotationSpeed: 0.02,
+        vertices: [{ angle: 0, distance: 1 }, { angle: 1, distance: 1 }, { angle: 2, distance: 1 }],
+    };
+    const childState = newState();
+    const { bridgeData } = installSpawnBridge(
+        parentState, childState, childData, 1100, 50, clock);
+
+    const dt = 0.15;
+    const delta = -0.01 * 60 * dt;
+    const cos = Math.cos(delta);
+    const sin = Math.sin(delta);
+    const centroidX = 3;
+    const centroidY = 4;
+    const rotatedX = centroidX * cos - centroidY * sin;
+    const rotatedY = centroidX * sin + centroidY * cos;
+    assert.ok(Math.abs(bridgeData.x - (5 + rotatedX)) < 1e-12);
+    assert.ok(Math.abs(bridgeData.y - rotatedY) < 1e-12);
+    assert.ok(Math.abs(bridgeData.angle - delta) < 1e-12);
+    assert.ok(Math.abs(bridgeData.velocityX - (100 - 0.6 * rotatedY)) < 1e-12);
+    assert.ok(Math.abs(bridgeData.velocityY - (0.6 * rotatedX)) < 1e-12);
+});
+
+test('spawn bridge: delayed fracture child projects post-split rotation', () => {
+    const clock = makeClock({ offsetMs: 0, wallClockNow: 1300, perfStart: 1300 });
+    const parentState = newState();
+    updateState(parentState, { x: 0, velocityX: 100 }, 900, clock);
+    const childData = {
+        x: 10,
+        y: 0,
+        angle: 0,
+        velocityX: 50,
+        velocityY: 0,
+        rotationSpeed: 0.02,
+        vertices: [{ angle: 0, distance: 1 }, { angle: 1, distance: 1 }, { angle: 2, distance: 1 }],
+    };
+    const childState = newState();
+    const { bridgeData } = installSpawnBridge(
+        parentState, childState, childData, 1000, 50, clock);
+
+    assert.equal(bridgeData.x, 22.5);
+    assert.ok(Math.abs(bridgeData.angle - 0.3) < 1e-12);
 });
 
 test('spawn bridge: disk child (centroid=0) bridge.x reduces to parentInterp.x (no regression)', () => {
