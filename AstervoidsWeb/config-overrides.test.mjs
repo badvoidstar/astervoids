@@ -67,6 +67,19 @@ test('extra-life score threshold is configurable and session-locked', () => {
     assert.equal(joinerCfg.EXTRA_LIFE_SCORE_THRESHOLD, 25000);
 });
 
+test('separation angle variance is configurable with a pi/8 default', () => {
+    assert.equal(SHARED_DEFAULTS.SEPARATION_ANGLE_VARIANCE, Math.PI / 8);
+    const control = CONFIG_CONTROLS.find(
+        item => item.key === 'SEPARATION_ANGLE_VARIANCE');
+    assert.equal(control?.min, 0);
+    assert.equal(control?.max, Math.PI);
+    assert.ok(DEBUG_OVERRIDABLE_KEYS.includes('SEPARATION_ANGLE_VARIANCE'));
+
+    const cfg = { SEPARATION_ANGLE_VARIANCE: Math.PI / 8 };
+    applyUrlConfigOverrides(cfg, '?cfg.SEPARATION_ANGLE_VARIANCE=0.25');
+    assert.equal(cfg.SEPARATION_ANGLE_VARIANCE, 0.25);
+});
+
 test('score milestones count only enabled whole-score thresholds', () => {
     assert.equal(countExtraLivesForScore(9999, 10000), 0);
     assert.equal(countExtraLivesForScore(10000, 10000), 1);

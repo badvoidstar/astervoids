@@ -29,6 +29,7 @@ const AstervoidsConfig = (function() {
         ASTEROID_DENSITY: 5.0,
         SEPARATION_ENERGY_SIZE_BLEND: 1.0,
         SEPARATION_ENERGY: 2.00e-4,
+        SEPARATION_ANGLE_VARIANCE: Math.PI / 8,
         MASS_SPLIT_BIAS: 0.6,
         FRACTURE_ENABLED: true,
         FRACTURE_VERTEX_DENSITY: 1.0,
@@ -103,6 +104,13 @@ const AstervoidsConfig = (function() {
             min: 0, max: 1, step: 0.01,
             fmt: value => value.toFixed(2),
             help: '0 uses fixed energy per hit; 1 scales energy by parent radius squared.',
+        }),
+        control({
+            key: 'SEPARATION_ANGLE_VARIANCE',
+            label: 'Separation angle variance (rad)',
+            min: 0, max: Math.PI, step: Math.PI / 180,
+            fmt: value => `${value.toFixed(3)} rad`,
+            help: 'Maximum deterministic random rotation applied to separation momentum in either direction. 0 follows the cut normal exactly.',
         }),
         control({
             key: 'MASS_SPLIT_BIAS',

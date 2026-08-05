@@ -36,9 +36,13 @@ const { SHARED_DEFAULTS } = require('./wwwroot/js/game-config.js');
 const {
     calculateAsteroidFragments,
     effectiveSeparationEnergy,
+    separationAngleOffset,
 } = require('./wwwroot/js/asteroid-fracture.js');
 
-const CONFIG = SHARED_DEFAULTS;
+const CONFIG = {
+    ...SHARED_DEFAULTS,
+    SEPARATION_ANGLE_VARIANCE: 0,
+};
 
 function effectiveEsep(R, cfg = CONFIG) {
     return effectiveSeparationEnergy(R, cfg);
@@ -403,6 +407,7 @@ test('orthogonality: deflection and separation knobs decouple', () => {
         vx: (cs[0].m * cs[0].vx + cs[1].m * cs[1].vx) / M,
         vy: (cs[0].m * cs[0].vy + cs[1].m * cs[1].vy) / M,
     });
+
     const cvBase = comV(cBase), cv2E = comV(c2E);
     assert.ok(Math.abs(cvBase.vx - cv2E.vx) < 1e-12, `COM vx changed by SEPARATION_ENERGY: ${cvBase.vx} vs ${cv2E.vx}`);
     assert.ok(Math.abs(cvBase.vy - cv2E.vy) < 1e-12, `COM vy changed by SEPARATION_ENERGY: ${cvBase.vy} vs ${cv2E.vy}`);
@@ -453,4 +458,63 @@ test('orthogonality: deflection and separation knobs decouple', () => {
     const s2K   = sepRel(c2K,   2 * CONFIG.DEFLECTION_KICK);
     assert.ok(Math.abs(sBase - s2K) < 1e-12,
         `pure separation magnitude changed by DEFLECTION_KICK: base=${sBase}, 2×kick=${s2K}`);
+});
+
+test('separation angle variance defaults to pi/8', () => {
+    assert.equal(SHARED_DEFAULTS.SEPARATION_ANGLE_VARIANCE, Math.PI / 8);
+});
+
+test('separation angle offset is deterministic, bounded, and disabled at zero', () => {
+    const asteroid = { seed: 0.314159 };
+    const impact = { bulletAngle: 0.7, offsetN: -0.4 };
+    const limit = Math.PI / 8;
+    const first = separationAngleOffset(asteroid, impact, limit);
+    const second = separationAngleOffset(asteroid, impact, limit);
+
+    assert.equal(first, second);
+    assert.ok(first >= -limit && first <= limit);
+    assert.equal(separationAngleOffset(asteroid, impact, 0), 0);
+});
+
+test('random angle rotates only separation momentum and preserves its magnitude', () => {
+    const asteroid = {
+        radius: 0.08,
+        velocityX: 0,
+        velocityY: 0,
+        rotationSpeed: 0,
+        angle: 0,
+        seed: 0.271828,
+        vertices: [],
+    };
+    const impact = { offsetN: 0, bulletAngle: 0 };
+    const base = calculateAsteroidFragments(
+        asteroid, impact, { ...CONFIG, FRACTURE_ENABLED: false });
+    const rotatedConfig = {
+        ...CONFIG,
+        FRACTURE_ENABLED: false,
+        SEPARATION_ANGLE_VARIANCE: Math.PI / 8,
+    };
+    const rotated = calculateAsteroidFragments(asteroid, impact, rotatedConfig);
+    const relative = result => ({
+        x: result.children[0].vx - result.children[1].vx,
+        y: result.children[0].vy - result.children[1].vy,
+    });
+    const baseRelative = relative(base);
+    const rotatedRelative = relative(rotated);
+    const expectedOffset = separationAngleOffset(
+        asteroid, impact, rotatedConfig.SEPARATION_ANGLE_VARIANCE);
+    const observedOffset =
+        Math.atan2(rotatedRelative.y, rotatedRelative.x)
+        - Math.atan2(baseRelative.y, baseRelative.x);
+
+    assert.ok(Math.abs(Math.hypot(rotatedRelative.x, rotatedRelative.y)
+        - Math.hypot(baseRelative.x, baseRelative.y)) < 1e-12);
+    assert.ok(Math.abs(observedOffset - expectedOffset) < 1e-12);
+
+    const { children, mass } = rotated;
+    const momentumX = children.reduce((sum, child) => sum + child.m * child.vx, 0);
+    const momentumY = children.reduce((sum, child) => sum + child.m * child.vy, 0);
+    assert.ok(Math.abs(momentumX - rotated.impulse.x) < 1e-12);
+    assert.ok(Math.abs(momentumY - rotated.impulse.y) < 1e-12);
+    assert.ok(Math.abs(children.reduce((sum, child) => sum + child.m, 0) - mass) < 1e-12);
 });

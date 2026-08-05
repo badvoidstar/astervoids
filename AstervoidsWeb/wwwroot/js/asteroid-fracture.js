@@ -246,6 +246,22 @@ const AstervoidsFracture = (function() {
         return Math.max(0, config.SEPARATION_ENERGY) * sizeMultiplier;
     }
 
+    function separationAngleOffset(asteroid, impact, maxAngle) {
+        const limit = Number.isFinite(maxAngle) ? Math.max(0, maxAngle) : 0;
+        if (limit === 0) return 0;
+
+        const seedFraction = ((asteroid.seed || 0) * 0x100000000) >>> 0;
+        const bulletAngle = Number.isFinite(impact?.bulletAngle)
+            ? impact.bulletAngle
+            : 0;
+        const offsetN = Number.isFinite(impact?.offsetN) ? impact.offsetN : 0;
+        const seed = (seedFraction
+            ^ (Math.floor((bulletAngle + 10) * 1e6) >>> 0)
+            ^ (Math.floor((offsetN + 10) * 1e6) >>> 0)
+            ^ 0xA511E9B3) >>> 0;
+        return (makeSeededRandom(seed)() * 2 - 1) * limit;
+    }
+
     function clampAsteroidMotion(
         velocityX,
         velocityY,
@@ -367,6 +383,14 @@ const AstervoidsFracture = (function() {
         const sideSign = offsetN >= 0 ? 1 : -1;
         const separationX = sideSign * normalX;
         const separationY = sideSign * normalY;
+        const separationRotation = separationAngleOffset(
+            asteroid, impact, config.SEPARATION_ANGLE_VARIANCE);
+        const separationCos = Math.cos(separationRotation);
+        const separationSin = Math.sin(separationRotation);
+        const momentumSeparationX =
+            separationX * separationCos - separationY * separationSin;
+        const momentumSeparationY =
+            separationX * separationSin + separationY * separationCos;
 
         let children = null;
         let fracture = null;
@@ -479,9 +503,9 @@ const AstervoidsFracture = (function() {
                                 + smallCenter.y * separationY;
                             const separationDirection = projection >= 0 ? 1 : -1;
                             const fragmentSeparationX =
-                                separationDirection * separationX;
+                                separationDirection * momentumSeparationX;
                             const fragmentSeparationY =
-                                separationDirection * separationY;
+                                separationDirection * momentumSeparationY;
                             children = [
                                 {
                                     r: smallRadius,
@@ -562,8 +586,10 @@ const AstervoidsFracture = (function() {
                         m: smallMass,
                         cx: smallDistance * separationX,
                         cy: smallDistance * separationY,
-                        vx: smallRigidVelocity.x + separationSpeed * separationX,
-                        vy: smallRigidVelocity.y + separationSpeed * separationY,
+                        vx: smallRigidVelocity.x
+                            + separationSpeed * momentumSeparationX,
+                        vy: smallRigidVelocity.y
+                            + separationSpeed * momentumSeparationY,
                         omega: angularVelocity,
                         vertices: null,
                     },
@@ -573,10 +599,10 @@ const AstervoidsFracture = (function() {
                         cx: largeDistance * separationX,
                         cy: largeDistance * separationY,
                         vx: largeRigidVelocity.x
-                            - separationSpeed * separationX
+                            - separationSpeed * momentumSeparationX
                             * (smallMass / largeMass),
                         vy: largeRigidVelocity.y
-                            - separationSpeed * separationY
+                            - separationSpeed * momentumSeparationY
                             * (smallMass / largeMass),
                         omega: angularVelocity,
                         vertices: null,
@@ -609,6 +635,7 @@ const AstervoidsFracture = (function() {
         makeSeededRandom,
         verticesFromXY,
         effectiveSeparationEnergy,
+        separationAngleOffset,
         clampAsteroidMotion,
         calculateAsteroidFragments,
     });

@@ -1465,6 +1465,11 @@
         // and separation independently. Default chosen so per-hit separation matches
         // the previous κ=1e-4 / (1−κ)·E_b ≈ 6e-5 budget.
         SEPARATION_ENERGY: SHARED_CONFIG_DEFAULTS.SEPARATION_ENERGY,
+        // Maximum random angular rotation, in either direction, applied to the
+        // cut-normal axis when calculating separation momentum. The offset is
+        // deterministically derived from asteroid/impact data so a given fracture
+        // is reproducible. Set to 0 to separate exactly along the cut normal.
+        SEPARATION_ANGLE_VARIANCE: SHARED_CONFIG_DEFAULTS.SEPARATION_ANGLE_VARIANCE,
         // Weighting factor [0..1] applied to |offsetN| when computing the mass-split
         // ratio. With bias=1 the mass split follows the geometric formula
         //   fSmall = max(MIN_SPLIT_RATIO, 0.5·(1 − |offsetN|))
