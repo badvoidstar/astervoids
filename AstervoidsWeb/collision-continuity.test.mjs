@@ -127,6 +127,9 @@ test('asteroid impact cues ease out from 0.75x to 4x across their animation', ()
     assert.match(productionSource, /const easedProgress = 1 - Math\.pow\(1 - progress, 3\);/);
     assert.match(
         productionSource,
+        /effect\.baseRadius \|\| CONFIG\.MIN_ASTEROID_RADIUS\) \* 0\.4;/);
+    assert.match(
+        productionSource,
         /const radius = base \* scale;/);
 });
 
