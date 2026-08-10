@@ -20,6 +20,7 @@ const AstervoidsConfig = (function() {
         ANALOG_THRUST_MAX: 1.5,
         ANALOG_BRAKE_GAIN: 1.0,
         EXTRA_LIFE_SCORE_THRESHOLD: 10000,
+        ASTEROID_ASPECT_SIZE_SPEED_BALANCE: 0.5,
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
@@ -43,6 +44,7 @@ const AstervoidsConfig = (function() {
         'FRACTURE_ENABLED',
         'ASTEROID_VERTICES',
         'ASTEROID_JAGGEDNESS',
+        'ASTEROID_ASPECT_SIZE_SPEED_BALANCE',
         'SIM_MODE',
         'EXTRA_LIFE_SCORE_THRESHOLD',
     ]);
@@ -56,6 +58,17 @@ const AstervoidsConfig = (function() {
     }
 
     const CONFIG_CONTROLS = Object.freeze([
+        control({
+            key: 'ASTEROID_ASPECT_SIZE_SPEED_BALANCE',
+            label: 'Aspect compensation balance (0 = size only, 1 = speed only)',
+            min: 0, max: 1, step: 0.05,
+            fmt: value => {
+                if (value <= 0) return 'Size only (0)';
+                if (value >= 1) return 'Speed only (1)';
+                return `${Math.round(value * 100)}% speed / ${Math.round((1 - value) * 100)}% size`;
+            },
+            help: 'Distributes aspect-ratio difficulty compensation between asteroid radius (size) and translational speed. 0 = size-only; 0.5 = geometrically balanced (radiusScale = speedScale = √severity); 1 = speed-only. radiusScale × speedScale always equals the aspect severity.',
+        }),
         control({
             key: 'ASTEROID_DENSITY',
             label: 'Asteroid density',

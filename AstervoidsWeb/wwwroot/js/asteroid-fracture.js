@@ -625,6 +625,46 @@ const AstervoidsFracture = (function() {
         };
     }
 
+    /**
+     * Returns the aspect severity for a viewport: max(w,h)/min(w,h).
+     * Portrait and landscape reciprocals (e.g. 16:9 and 9:16) produce the
+     * same value. Square viewports return 1.
+     * @param {number} width  viewport width in any consistent unit
+     * @param {number} height viewport height in the same unit
+     * @returns {number} severity >= 1
+     */
+    function getAspectSeverity(width, height) {
+        const shortEdge = Math.max(1, Math.min(width, height));
+        const longEdge = Math.max(width, height);
+        return longEdge / shortEdge;
+    }
+
+    /**
+     * Compute asteroid radius and speed scaling factors from aspect severity
+     * and a balance parameter in [0, 1].
+     *
+     *   radiusScale = aspectSeverity ** (1 - balance)
+     *   speedScale  = aspectSeverity ** balance
+     *
+     * Invariant: radiusScale * speedScale === aspectSeverity (within float tolerance).
+     *
+     * balance = 0 → size-only compensation (radiusScale = severity, speedScale = 1).
+     * balance = 0.5 → equal geometric split (both scales = sqrt(severity)).
+     * balance = 1 → speed-only compensation (radiusScale = 1, speedScale = severity).
+     *
+     * @param {number} aspectSeverity  result of getAspectSeverity(), >= 1
+     * @param {number} balance         value clamped to [0, 1]
+     * @returns {{ radiusScale: number, speedScale: number }}
+     */
+    function getAsteroidAspectScales(aspectSeverity, balance) {
+        const clampedBalance = Math.max(0, Math.min(1, Number.isFinite(balance) ? balance : 0.5));
+        const severity = Math.max(1, Number.isFinite(aspectSeverity) ? aspectSeverity : 1);
+        return {
+            radiusScale: Math.pow(severity, 1 - clampedBalance),
+            speedScale: Math.pow(severity, clampedBalance),
+        };
+    }
+
     return Object.freeze({
         polygonArea,
         polygonCentroid,
@@ -638,6 +678,8 @@ const AstervoidsFracture = (function() {
         separationAngleOffset,
         clampAsteroidMotion,
         calculateAsteroidFragments,
+        getAspectSeverity,
+        getAsteroidAspectScales,
     });
 })();
 

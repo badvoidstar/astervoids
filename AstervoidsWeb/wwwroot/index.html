@@ -1680,10 +1680,42 @@
         }
     }
 
+    // ── Aspect severity adoption ─────────────────────────────────────────────
+    // Session-locked portrait/landscape-symmetric aspect severity.
+    // Adopted from session metadata on create/join; used for asteroid physics
+    // so all session members share the same compensation regardless of their
+    // local viewport. Defaults to 1 (square/no compensation) until adopted.
+    let adoptedAspectSeverity = 1;
+
+    // Returns the effective aspect severity for asteroid physics:
+    // session-locked in multiplayer, local viewport in solo play.
+    function getEffectiveAspectSeverity() {
+        if (isSessionMode()) {
+            return adoptedAspectSeverity;
+        }
+        return AstervoidsFracture.getAspectSeverity(getGameWidth(), getGameHeight());
+    }
+
+    // Returns the aspect compensation scales derived from the effective severity
+    // and the current CONFIG balance parameter.
+    function getEffectiveAsteroidAspectScales() {
+        return AstervoidsFracture.getAsteroidAspectScales(
+            getEffectiveAspectSeverity(),
+            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE);
+    }
+
     function adoptSessionConfig(metadata, config = CONFIG) {
         restoreLocalConfigBaseline(config);
         applySessionConfigMetadata(metadata, config);
         adoptSessionSim(metadata);
+        // Adopt portrait/landscape-symmetric aspect severity from metadata.
+        // Falls back to 1 (square) for sessions that pre-date this field.
+        const rawSeverity = metadata && typeof metadata === 'object'
+            ? metadata.aspectSeverity
+            : undefined;
+        adoptedAspectSeverity = (typeof rawSeverity === 'number' && Number.isFinite(rawSeverity))
+            ? Math.max(1, rawSeverity)
+            : 1;
     }
 
     // ── Deterministic simulation mode ───────────────────────────────────────
@@ -4010,7 +4042,7 @@
                 this.velocityX,
                 this.velocityY,
                 this.rotationSpeed,
-                CONFIG.ASTEROID_MAX_SPEED,
+                CONFIG.ASTEROID_MAX_SPEED * getEffectiveAsteroidAspectScales().speedScale,
                 CONFIG.ASTEROID_MAX_SPIN);
             this.velocityX = cappedMotion.velocityX;
             this.velocityY = cappedMotion.velocityY;
@@ -6139,9 +6171,10 @@
         
         // Random velocity direction
         const angle = simRandom() * Math.PI * 2;
+        const aspectScales = getEffectiveAsteroidAspectScales();
         const speed = (CONFIG.ASTEROID_BASE_SPEED + 
                        simRandom() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
-                      game.speedMultiplier;
+                      game.speedMultiplier * aspectScales.speedScale;
         
         // In deterministic mode, derive the shape seed and spin from the same
         // deterministic stream so the authoritative asteroid is fully reproducible
@@ -6149,7 +6182,7 @@
         const shapeSeed = isDeterministicMode() ? simRng.nextSeed() : null;
         const asteroid = new Asteroid(
             x, y,
-            CONFIG.INITIAL_ASTEROID_RADIUS,
+            CONFIG.INITIAL_ASTEROID_RADIUS * aspectScales.radiusScale,
             Math.cos(angle) * speed,
             Math.sin(angle) * speed,
             shapeSeed
@@ -6335,15 +6368,28 @@
      * @param {Ship|null} shooterShip ship that fired the destroying shot; null skips deflection
      */
     function splitAsteroid(asteroid, childOwnerMemberId = null, impact = null, shooterShip = null) {
-        if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS) {
+        const splitScales = getEffectiveAsteroidAspectScales();
+        const effectiveMinRadius = CONFIG.MIN_ASTEROID_RADIUS * splitScales.radiusScale;
+        if (asteroid.radius <= effectiveMinRadius) {
             if (isSessionMode() && asteroid.syncObjectId) {
                 deleteSyncedAsteroid(asteroid);
             }
             return;
         }
 
+        // Build a config view with aspect-scaled physics values so that
+        // DEFLECTION_KICK, SEPARATION_ENERGY, and radius thresholds are already
+        // at their world-space effective magnitudes. This avoids compounding the
+        // scale across successive fracture generations.
+        const fractureConfig = Object.assign({}, CONFIG, {
+            DEFLECTION_KICK: CONFIG.DEFLECTION_KICK * splitScales.speedScale,
+            SEPARATION_ENERGY: CONFIG.SEPARATION_ENERGY
+                * splitScales.speedScale * splitScales.speedScale,
+            MIN_ASTEROID_RADIUS: effectiveMinRadius,
+            INITIAL_ASTEROID_RADIUS: CONFIG.INITIAL_ASTEROID_RADIUS * splitScales.radiusScale,
+        });
         const { children } = AstervoidsFracture.calculateAsteroidFragments(
-            asteroid, impact, CONFIG);
+            asteroid, impact, fractureConfig);
 
         // ─── Shooter-deflection (linear-only) ──────────────────────────────
         // After fragment kinematics are settled, nudge any surviving child off a
@@ -8579,14 +8625,18 @@
         game.astervoids = [];
         game.bullets = [];
         game.cosmeticAstervoids = [];
+        const cosmeticScales = AstervoidsFracture.getAsteroidAspectScales(
+            AstervoidsFracture.getAspectSeverity(getGameWidth(), getGameHeight()),
+            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE);
         for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
             const angle = Math.random() * Math.PI * 2;
-            const speed = CONFIG.ASTEROID_BASE_SPEED
-                + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE;
+            const speed = (CONFIG.ASTEROID_BASE_SPEED
+                + Math.random() * CONFIG.ASTEROID_SPEED_VARIANCE)
+                * cosmeticScales.speedScale;
             game.cosmeticAstervoids.push(new Asteroid(
                 Math.random(),
                 Math.random(),
-                CONFIG.INITIAL_ASTEROID_RADIUS,
+                CONFIG.INITIAL_ASTEROID_RADIUS * cosmeticScales.radiusScale,
                 Math.cos(angle) * speed,
                 Math.sin(angle) * speed
             ));
@@ -9614,6 +9664,9 @@
             const currentAspectRatio = canvas.width / canvas.height;
             const result = await SessionClient.createSession({
                 aspectRatio: currentAspectRatio,
+                // Portrait/landscape-symmetric severity stored for joiner physics.
+                aspectSeverity: AstervoidsFracture.getAspectSeverity(
+                    getGameWidth(), getGameHeight()),
                 config: buildSessionConfigMetadata(CONFIG),
                 schemas: WIREOPT_SCHEMAS,
                 seed: generateSessionSeed(),
