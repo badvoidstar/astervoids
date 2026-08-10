@@ -4012,7 +4012,7 @@
                 this.velocityX,
                 this.velocityY,
                 this.rotationSpeed,
-                CONFIG.ASTEROID_MAX_SPEED * game.asteroidScale.speed,
+                CONFIG.ASTEROID_MAX_SPEED * game.asteroidScale.speedScale,
                 CONFIG.ASTEROID_MAX_SPIN);
             this.velocityX = cappedMotion.velocityX;
             this.velocityY = cappedMotion.velocityY;
@@ -4356,7 +4356,7 @@
         cosmeticAstervoids: [],
         // Frozen aspect-ratio compensation scales derived from CONFIG.ASPECT_COMPENSATION
         // at game/session start.  Never updated during gameplay; resize does not change it.
-        asteroidScale: { size: 1, speed: 1 },
+        asteroidScale: { sizeScale: 1, speedScale: 1 },
         // Connection-loss flag: true when multiplayer connection is lost during gameplay
         connectionLost: false
     };
@@ -6156,7 +6156,7 @@
         const angle = simRandom() * Math.PI * 2;
         const speed = (CONFIG.ASTEROID_BASE_SPEED + 
                        simRandom() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
-                      game.speedMultiplier * game.asteroidScale.speed;
+                      game.speedMultiplier * game.asteroidScale.speedScale;
         
         // In deterministic mode, derive the shape seed and spin from the same
         // deterministic stream so the authoritative asteroid is fully reproducible
@@ -6164,7 +6164,7 @@
         const shapeSeed = isDeterministicMode() ? simRng.nextSeed() : null;
         const asteroid = new Asteroid(
             x, y,
-            CONFIG.INITIAL_ASTEROID_RADIUS * game.asteroidScale.size,
+            CONFIG.INITIAL_ASTEROID_RADIUS * game.asteroidScale.sizeScale,
             Math.cos(angle) * speed,
             Math.sin(angle) * speed,
             shapeSeed
@@ -6350,7 +6350,7 @@
      * @param {Ship|null} shooterShip ship that fired the destroying shot; null skips deflection
      */
     function splitAsteroid(asteroid, childOwnerMemberId = null, impact = null, shooterShip = null) {
-        if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS * game.asteroidScale.size) {
+        if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS * game.asteroidScale.sizeScale) {
             if (isSessionMode() && asteroid.syncObjectId) {
                 deleteSyncedAsteroid(asteroid);
             }
@@ -6359,7 +6359,7 @@
 
         // Build a scaled config for fragment physics so DEFLECTION_KICK, SEPARATION_ENERGY,
         // and size thresholds honour the same aspect-compensation applied at spawn time.
-        const { size: ss, speed: sv } = game.asteroidScale;
+        const { sizeScale: ss, speedScale: sv } = game.asteroidScale;
         const fractureConfig = (ss !== 1 || sv !== 1) ? Object.assign({}, CONFIG, {
             DEFLECTION_KICK:        CONFIG.DEFLECTION_KICK * sv,
             SEPARATION_ENERGY:      CONFIG.SEPARATION_ENERGY * sv * sv,

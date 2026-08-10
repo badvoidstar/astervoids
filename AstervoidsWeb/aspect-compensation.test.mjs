@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 const AstervoidsAspectCompensation = require('./wwwroot/js/aspect-compensation.js');
@@ -243,4 +244,12 @@ test('compensation remains frozen across resize for a running game', () => {
     assert.notEqual(differentViewport, initialFactor);
     // frozen value is still the original
     assert.equal(frozenFactor, initialFactor);
+});
+
+test('gameplay consumes the scale property names returned by asteroidAspectScales', () => {
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
+
+    assert.match(source, /game\.asteroidScale\.sizeScale/);
+    assert.match(source, /game\.asteroidScale\.speedScale/);
+    assert.doesNotMatch(source, /game\.asteroidScale\.(?:size|speed)\b/);
 });
