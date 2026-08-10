@@ -24,6 +24,14 @@ const AstervoidsConfig = (function() {
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
         INITIAL_ASTEROID_RADIUS: 0.083,
+        // Aspect-ratio compensation.  ASPECT_COMPENSATION is the capped aspect
+        // factor (max(w,h)/min(w,h), capped at ASPECT_MAX_COMPENSATED) frozen at
+        // session/game creation time.  It is included in SESSION_CONFIG_KEYS so
+        // every multiplayer peer uses the same value regardless of viewport.
+        // Default 1.0 means no compensation (square viewport equivalent).
+        ASPECT_COMPENSATION: 1.0,
+        ASPECT_SIZE_WEIGHT: 0.45,
+        ASPECT_MAX_COMPENSATED: 2.25,
         MIN_SPLIT_RATIO: 0.1,
         DEFLECTION_KICK: 2.00e-3,
         ASTEROID_DENSITY: 5.0,
@@ -45,6 +53,7 @@ const AstervoidsConfig = (function() {
         'ASTEROID_JAGGEDNESS',
         'SIM_MODE',
         'EXTRA_LIFE_SCORE_THRESHOLD',
+        'ASPECT_COMPENSATION',
     ]);
 
     function control(definition) {

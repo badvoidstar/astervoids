@@ -760,6 +760,8 @@
     <!-- Shared runtime/debug/test gameplay defaults and override policy -->
     <script src="/js/game-config.js"></script>
     <!-- Pure asteroid fracture geometry and kinematics -->
+    <script src="/js/aspect-compensation.js"></script>
+
     <script src="/js/asteroid-fracture.js"></script>
     <!-- Canonical Astervoids positional schemas and selector -->
     <script src="/js/game-wire-schemas.js"></script>
@@ -4010,7 +4012,7 @@
                 this.velocityX,
                 this.velocityY,
                 this.rotationSpeed,
-                CONFIG.ASTEROID_MAX_SPEED,
+                CONFIG.ASTEROID_MAX_SPEED * game.asteroidScale.speed,
                 CONFIG.ASTEROID_MAX_SPIN);
             this.velocityX = cappedMotion.velocityX;
             this.velocityY = cappedMotion.velocityY;
@@ -4352,6 +4354,9 @@
         },
         // Cosmetic astervoids for start screen (separate from game astervoids)
         cosmeticAstervoids: [],
+        // Frozen aspect-ratio compensation scales derived from CONFIG.ASPECT_COMPENSATION
+        // at game/session start.  Never updated during gameplay; resize does not change it.
+        asteroidScale: { size: 1, speed: 1 },
         // Connection-loss flag: true when multiplayer connection is lost during gameplay
         connectionLost: false
     };
@@ -5910,7 +5915,17 @@
         // create/join time (before init runs), so don't override it here.
         if (!isSessionMode()) {
             adoptSoloSim();
+            // Freeze aspect compensation for solo play from the current viewport.
+            // This must happen once here and must not be updated on resize.
+            CONFIG.ASPECT_COMPENSATION = AstervoidsAspectCompensation.computeAspectFactor(
+                getGameWidth(), getGameHeight(), CONFIG.ASPECT_MAX_COMPENSATED);
         }
+
+        // Derive and freeze asteroid scale multipliers from the now-fixed
+        // ASPECT_COMPENSATION.  Session clients all share the same value via
+        // session metadata; solo derives it above.
+        game.asteroidScale = AstervoidsAspectCompensation.asteroidAspectScales(
+            CONFIG.ASPECT_COMPENSATION, CONFIG.ASPECT_SIZE_WEIGHT);
         
         // Determine if we're the authority (Server role in session mode)
         if (isSessionMode()) {
@@ -6141,7 +6156,7 @@
         const angle = simRandom() * Math.PI * 2;
         const speed = (CONFIG.ASTEROID_BASE_SPEED + 
                        simRandom() * CONFIG.ASTEROID_SPEED_VARIANCE) * 
-                      game.speedMultiplier;
+                      game.speedMultiplier * game.asteroidScale.speed;
         
         // In deterministic mode, derive the shape seed and spin from the same
         // deterministic stream so the authoritative asteroid is fully reproducible
@@ -6149,7 +6164,7 @@
         const shapeSeed = isDeterministicMode() ? simRng.nextSeed() : null;
         const asteroid = new Asteroid(
             x, y,
-            CONFIG.INITIAL_ASTEROID_RADIUS,
+            CONFIG.INITIAL_ASTEROID_RADIUS * game.asteroidScale.size,
             Math.cos(angle) * speed,
             Math.sin(angle) * speed,
             shapeSeed
@@ -6335,15 +6350,24 @@
      * @param {Ship|null} shooterShip ship that fired the destroying shot; null skips deflection
      */
     function splitAsteroid(asteroid, childOwnerMemberId = null, impact = null, shooterShip = null) {
-        if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS) {
+        if (asteroid.radius <= CONFIG.MIN_ASTEROID_RADIUS * game.asteroidScale.size) {
             if (isSessionMode() && asteroid.syncObjectId) {
                 deleteSyncedAsteroid(asteroid);
             }
             return;
         }
 
+        // Build a scaled config for fragment physics so DEFLECTION_KICK, SEPARATION_ENERGY,
+        // and size thresholds honour the same aspect-compensation applied at spawn time.
+        const { size: ss, speed: sv } = game.asteroidScale;
+        const fractureConfig = (ss !== 1 || sv !== 1) ? Object.assign({}, CONFIG, {
+            DEFLECTION_KICK:        CONFIG.DEFLECTION_KICK * sv,
+            SEPARATION_ENERGY:      CONFIG.SEPARATION_ENERGY * sv * sv,
+            INITIAL_ASTEROID_RADIUS: CONFIG.INITIAL_ASTEROID_RADIUS * ss,
+            MIN_ASTEROID_RADIUS:    CONFIG.MIN_ASTEROID_RADIUS * ss,
+        }) : CONFIG;
         const { children } = AstervoidsFracture.calculateAsteroidFragments(
-            asteroid, impact, CONFIG);
+            asteroid, impact, fractureConfig);
 
         // ─── Shooter-deflection (linear-only) ──────────────────────────────
         // After fragment kinematics are settled, nudge any surviving child off a
@@ -9612,6 +9636,10 @@
 
             // Capture the current aspect ratio at the moment of session creation
             const currentAspectRatio = canvas.width / canvas.height;
+            // Freeze aspect compensation in CONFIG so it is captured by
+            // buildSessionConfigMetadata and shared with every session peer.
+            CONFIG.ASPECT_COMPENSATION = AstervoidsAspectCompensation.computeAspectFactor(
+                getGameWidth(), getGameHeight(), CONFIG.ASPECT_MAX_COMPENSATED);
             const result = await SessionClient.createSession({
                 aspectRatio: currentAspectRatio,
                 config: buildSessionConfigMetadata(CONFIG),
