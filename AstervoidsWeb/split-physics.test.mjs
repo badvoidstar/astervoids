@@ -309,7 +309,12 @@ test('size blend = 0 → effectiveEsep is exactly SEPARATION_ENERGY', () => {
 
 // ─── Test 9: blend=1 → generation-independent separation speed ──────────────
 test('size blend = 1 → separation speed is constant across parent radius (head-on)', () => {
-    const cfg = { ...CONFIG, SEPARATION_ENERGY_SIZE_BLEND: 1.0, ASTEROID_DENSITY: 1.0 };
+    const cfg = {
+        ...CONFIG,
+        SEPARATION_ENERGY_SIZE_BLEND: 1.0,
+        ASTEROID_DENSITY: 1.0,
+        MIN_ASTEROID_RADIUS: 0.01,
+    };
     const Rfull = cfg.INITIAL_ASTEROID_RADIUS;
     const Rhalf = Rfull * 0.5;
 
@@ -331,7 +336,12 @@ test('size blend = 1 → separation speed is constant across parent radius (head
 
 // ─── Test 10: blend=0 → separation speed compounds as 1/R (legacy regression) ─
 test('size blend = 0 → relative separation speed scales as 1/R across generations', () => {
-    const cfg = { ...CONFIG, SEPARATION_ENERGY_SIZE_BLEND: 0, ASTEROID_DENSITY: 1.0 };
+    const cfg = {
+        ...CONFIG,
+        SEPARATION_ENERGY_SIZE_BLEND: 0,
+        ASTEROID_DENSITY: 1.0,
+        MIN_ASTEROID_RADIUS: 0.01,
+    };
     const Rfull = cfg.INITIAL_ASTEROID_RADIUS;
     const Rhalf = Rfull * 0.5;
 
