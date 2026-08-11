@@ -235,6 +235,10 @@
 
         channel.onmessage = (event) => {
             const data = event.data;
+            if (data && data.type === 'config-request') {
+                pushAllOverrides();
+                return;
+            }
             noDataEl.style.display = 'none';
             if (data.sessionName) {
                 sessionLabelEl.textContent = `Session: ${data.sessionName}`;

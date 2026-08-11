@@ -292,16 +292,7 @@ test('solo canvas resize rescales existing gameplay and cosmetic asteroids', () 
         /const previousAspectScales = dimensionsChanged && !isSessionMode\(\)/);
     assert.match(
         resizeSource,
-        /nextAspectScales\.radiusScale \/ previousAspectScales\.radiusScale/);
-    assert.match(
-        resizeSource,
-        /nextAspectScales\.speedScale \/ previousAspectScales\.speedScale/);
-    assert.match(
-        resizeSource,
-        /for \(const asteroid of game\.astervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
-    assert.match(
-        resizeSource,
-        /for \(const asteroid of game\.cosmeticAstervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
+        /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
 });
 
 test('dynamic aspect rescaling updates asteroid geometry, bounds, and velocity', () => {
@@ -317,6 +308,37 @@ test('dynamic aspect rescaling updates asteroid geometry, bounds, and velocity',
     assert.match(functionSource, /asteroid\.velocityX \*= speedRatio/);
     assert.match(functionSource, /asteroid\.velocityY \*= speedRatio/);
     assert.match(functionSource, /asteroid\._cachedVerts = null/);
+    assert.match(functionSource,
+        /nextScales\.radiusScale \/ previousScales\.radiusScale/);
+    assert.match(functionSource,
+        /nextScales\.speedScale \/ previousScales\.speedScale/);
+    assert.match(functionSource,
+        /for \(const asteroid of game\.astervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
+    assert.match(functionSource,
+        /for \(const asteroid of game\.cosmeticAstervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
+});
+
+test('debug config changes immediately rescale existing asteroids', () => {
+    const handlerStart = indexSource.indexOf('    debugChannel.onmessage = (event) => {');
+    const handlerEnd = indexSource.indexOf('\n    };', handlerStart);
+    assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+    const handlerSource = indexSource.slice(handlerStart, handlerEnd);
+
+    assert.match(handlerSource,
+        /const previousAspectScales = getEffectiveAsteroidAspectScales\(\)/);
+    assert.match(handlerSource,
+        /const nextAspectScales = getEffectiveAsteroidAspectScales\(\)/);
+    assert.match(handlerSource,
+        /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
+});
+
+test('game requests persisted debug config immediately on startup', () => {
+    assert.match(indexSource,
+        /debugChannel\.postMessage\(\{ type: 'config-request' \}\)/);
+    const debugSource = readFileSync(
+        new URL('./wwwroot/debug/index.html', import.meta.url), 'utf8');
+    assert.match(debugSource,
+        /data && data\.type === 'config-request'[\s\S]*?pushAllOverrides\(\)/);
 });
 
 // ── 11. Existing square-aspect behavior unchanged ─────────────────────────────
@@ -337,6 +359,8 @@ test('square aspect: severity is 1 and all scales are 1 regardless of balance', 
 
 test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE defaults to 0.5', () => {
     assert.equal(SHARED_DEFAULTS.ASTEROID_ASPECT_SIZE_SPEED_BALANCE, 0.5);
+    assert.match(indexSource,
+        /ASTEROID_ASPECT_SIZE_SPEED_BALANCE:\s*SHARED_CONFIG_DEFAULTS\.ASTEROID_ASPECT_SIZE_SPEED_BALANCE/);
 });
 
 test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE debug control exists with correct range', () => {
@@ -351,6 +375,8 @@ test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE debug control exists with correct range
 
 test('difficulty defaults to 0.8 and has a 0.0 to 2.0 debug control', () => {
     assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.8);
+    assert.match(indexSource,
+        /ASTEROID_DIFFICULTY_FACTOR:\s*SHARED_CONFIG_DEFAULTS\.ASTEROID_DIFFICULTY_FACTOR/);
     const ctrl = CONFIG_CONTROLS.find(c => c.key === 'ASTEROID_DIFFICULTY_FACTOR');
     assert.ok(ctrl, 'control must be registered');
     assert.equal(ctrl.min, 0);

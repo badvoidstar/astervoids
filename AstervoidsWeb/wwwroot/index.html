@@ -1424,6 +1424,10 @@
         ASTEROID_MAX_SPIN: SHARED_CONFIG_DEFAULTS.ASTEROID_MAX_SPIN,
         ASTEROID_VERTICES: 10,      // Number of vertices per asteroid
         ASTEROID_JAGGEDNESS: 0.4,   // Shape irregularity (0-1)
+        ASTEROID_ASPECT_SIZE_SPEED_BALANCE:
+            SHARED_CONFIG_DEFAULTS.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,
+        ASTEROID_DIFFICULTY_FACTOR:
+            SHARED_CONFIG_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR,
         MIN_ASTEROID_RADIUS: SHARED_CONFIG_DEFAULTS.MIN_ASTEROID_RADIUS,
         INITIAL_ASTEROID_RADIUS: SHARED_CONFIG_DEFAULTS.INITIAL_ASTEROID_RADIUS,
         
@@ -1714,6 +1718,17 @@
         asteroid.velocityX *= speedRatio;
         asteroid.velocityY *= speedRatio;
         asteroid._cachedVerts = null;
+    }
+
+    function rescaleAsteroidsForAspectChange(previousScales, nextScales) {
+        const radiusRatio = nextScales.radiusScale / previousScales.radiusScale;
+        const speedRatio = nextScales.speedScale / previousScales.speedScale;
+        for (const asteroid of game.astervoids) {
+            rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
+        }
+        for (const asteroid of game.cosmeticAstervoids) {
+            rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
+        }
     }
 
     function adoptSessionConfig(metadata, config = CONFIG) {
@@ -2919,14 +2934,7 @@
 
         if (previousAspectScales) {
             const nextAspectScales = getEffectiveAsteroidAspectScales();
-            const radiusRatio = nextAspectScales.radiusScale / previousAspectScales.radiusScale;
-            const speedRatio = nextAspectScales.speedScale / previousAspectScales.speedScale;
-            for (const asteroid of game.astervoids) {
-                rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
-            }
-            for (const asteroid of game.cosmeticAstervoids) {
-                rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
-            }
+            rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
         }
         
         // Position HUD within the viewport and scale text to viewport size
@@ -4366,10 +4374,14 @@
         if (data && data.type === 'config-update'
             && DEBUG_OVERRIDABLE_KEYS.has(data.key)
             && data.value !== undefined) {
+            const previousAspectScales = getEffectiveAsteroidAspectScales();
             const applied = applyConfigOverride(CONFIG, data.key, data.value);
             if (!applied) return;
+            const nextAspectScales = getEffectiveAsteroidAspectScales();
+            rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
         }
     };
+    debugChannel.postMessage({ type: 'config-request' });
 
     // Game state object
     const game = {
