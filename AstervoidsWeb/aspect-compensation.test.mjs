@@ -8,7 +8,13 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { SHARED_DEFAULTS, SESSION_CONFIG_KEYS, CONFIG_CONTROLS } =
+const {
+    SHARED_DEFAULTS,
+    SESSION_CONFIG_KEYS,
+    CONFIG_CONTROLS,
+    buildSessionConfigMetadata,
+    applySessionConfigMetadata,
+} =
     require('./wwwroot/js/game-config.js');
 const {
     getAspectSeverity,
@@ -18,9 +24,9 @@ const {
 const EPS = 1e-10;
 const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 
-test('asteroid basis radius and speed use the reduced balance values', () => {
-    assert.equal(SHARED_DEFAULTS.INITIAL_ASTEROID_RADIUS, 0.0664);
-    assert.match(indexSource, /ASTEROID_BASE_SPEED:\s*0\.12,/);
+test('asteroid basis radius and speed use the configured defaults', () => {
+    assert.equal(SHARED_DEFAULTS.INITIAL_ASTEROID_RADIUS, 0.085);
+    assert.match(indexSource, /ASTEROID_BASE_SPEED:\s*0\.15,/);
 });
 
 // ── 1. Portrait/landscape symmetry ──────────────────────────────────────────
@@ -230,6 +236,22 @@ test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE is in SESSION_CONFIG_KEYS', () => {
         'ASTEROID_ASPECT_SIZE_SPEED_BALANCE must be session-authoritative');
 });
 
+test('ASTEROID_DIFFICULTY_FACTOR is session-authoritative', () => {
+    assert.ok(SESSION_CONFIG_KEYS.includes('ASTEROID_DIFFICULTY_FACTOR'),
+        'ASTEROID_DIFFICULTY_FACTOR must be inherited from the session creator');
+});
+
+test('joiners inherit the session creator difficulty', () => {
+    const creatorConfig = { ASTEROID_DIFFICULTY_FACTOR: 1.4 };
+    const metadata = {
+        config: buildSessionConfigMetadata(creatorConfig, ['ASTEROID_DIFFICULTY_FACTOR']),
+    };
+    const joinerConfig = { ASTEROID_DIFFICULTY_FACTOR: 0.3 };
+    applySessionConfigMetadata(
+        metadata, joinerConfig, ['ASTEROID_DIFFICULTY_FACTOR']);
+    assert.equal(joinerConfig.ASTEROID_DIFFICULTY_FACTOR, 1.4);
+});
+
 test('aspect scales from session metadata override local reciprocal viewport', () => {
     // Session was created on a 16:9 display.
     const sessionSeverity = getAspectSeverity(1920, 1080);
@@ -325,4 +347,38 @@ test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE debug control exists with correct range
     assert.equal(ctrl.max, 1);
     assert.ok(ctrl.step > 0 && ctrl.step <= 0.1,
         `step ${ctrl.step} should be small (≤ 0.1)`);
+});
+
+test('difficulty defaults to 0.8 and has a 0.0 to 2.0 debug control', () => {
+    assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.8);
+    const ctrl = CONFIG_CONTROLS.find(c => c.key === 'ASTEROID_DIFFICULTY_FACTOR');
+    assert.ok(ctrl, 'control must be registered');
+    assert.equal(ctrl.min, 0);
+    assert.equal(ctrl.max, 2);
+});
+
+test('difficulty compounds with severity before applying size/speed balance', () => {
+    const severity = getAspectSeverity(1920, 1080);
+    const difficulty = 0.8;
+    const combined = severity * difficulty;
+    const { radiusScale, speedScale } =
+        getAsteroidAspectScales(severity, 0.5, difficulty);
+    assert.ok(Math.abs(radiusScale - Math.sqrt(combined)) < EPS);
+    assert.ok(Math.abs(speedScale - Math.sqrt(combined)) < EPS);
+    assert.ok(Math.abs(radiusScale * speedScale - combined) < EPS);
+    assert.match(
+        indexSource,
+        /getEffectiveAspectSeverity\(\),\s*CONFIG\.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,\s*CONFIG\.ASTEROID_DIFFICULTY_FACTOR/);
+});
+
+test('difficulty uses the configured balance endpoints', () => {
+    const severity = 1.5;
+    const difficulty = 0.8;
+    const combined = severity * difficulty;
+    assert.deepEqual(
+        getAsteroidAspectScales(severity, 0, difficulty),
+        { radiusScale: combined, speedScale: 1 });
+    assert.deepEqual(
+        getAsteroidAspectScales(severity, 1, difficulty),
+        { radiusScale: 1, speedScale: combined });
 });

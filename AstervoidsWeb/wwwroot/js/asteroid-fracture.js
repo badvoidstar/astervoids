@@ -640,28 +640,33 @@ const AstervoidsFracture = (function() {
     }
 
     /**
-     * Compute asteroid radius and speed scaling factors from aspect severity
-     * and a balance parameter in [0, 1].
+     * Compute asteroid radius and speed scaling factors from aspect severity,
+     * a difficulty factor, and a balance parameter in [0, 1].
      *
-     *   radiusScale = aspectSeverity ** (1 - balance)
-     *   speedScale  = aspectSeverity ** balance
+     *   combinedFactor = aspectSeverity * difficultyFactor
+     *   radiusScale = combinedFactor ** (1 - balance)
+     *   speedScale  = combinedFactor ** balance
      *
-     * Invariant: radiusScale * speedScale === aspectSeverity (within float tolerance).
+     * Invariant: radiusScale * speedScale === combinedFactor (within float tolerance).
      *
-     * balance = 0 → size-only compensation (radiusScale = severity, speedScale = 1).
-     * balance = 0.5 → equal geometric split (both scales = sqrt(severity)).
-     * balance = 1 → speed-only compensation (radiusScale = 1, speedScale = severity).
+     * balance = 0 → size-only compensation (radiusScale = combinedFactor, speedScale = 1).
+     * balance = 0.5 → equal geometric split (both scales = sqrt(combinedFactor)).
+     * balance = 1 → speed-only compensation (radiusScale = 1, speedScale = combinedFactor).
      *
      * @param {number} aspectSeverity  result of getAspectSeverity(), >= 1
      * @param {number} balance         value clamped to [0, 1]
+     * @param {number} difficultyFactor non-negative multiplier; defaults to 1
      * @returns {{ radiusScale: number, speedScale: number }}
      */
-    function getAsteroidAspectScales(aspectSeverity, balance) {
+    function getAsteroidAspectScales(aspectSeverity, balance, difficultyFactor = 1) {
         const clampedBalance = Math.max(0, Math.min(1, Number.isFinite(balance) ? balance : 0.5));
         const severity = Math.max(1, Number.isFinite(aspectSeverity) ? aspectSeverity : 1);
+        const difficulty = Math.max(
+            0, Number.isFinite(difficultyFactor) ? difficultyFactor : 1);
+        const combinedFactor = severity * difficulty;
         return {
-            radiusScale: Math.pow(severity, 1 - clampedBalance),
-            speedScale: Math.pow(severity, clampedBalance),
+            radiusScale: Math.pow(combinedFactor, 1 - clampedBalance),
+            speedScale: Math.pow(combinedFactor, clampedBalance),
         };
     }
 

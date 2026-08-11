@@ -1411,7 +1411,7 @@
         
         // Asteroid settings
         ASTEROID_BASE_COUNT: 1,     // Starting astervoids in wave 1
-        ASTEROID_BASE_SPEED: 0.12,  // Base asteroid speed (ref-dim/s)
+        ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed (ref-dim/s)
         ASTEROID_SPEED_VARIANCE: 0.1, // Random speed addition (ref-dim/s)
         // Caps enforced on locally-owned asteroids in Asteroid.update().
         // ASTEROID_MAX_SPEED uses the same units as SHIP_MAX_SPEED (normalized
@@ -1701,7 +1701,8 @@
     function getEffectiveAsteroidAspectScales() {
         return AstervoidsFracture.getAsteroidAspectScales(
             getEffectiveAspectSeverity(),
-            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE);
+            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,
+            CONFIG.ASTEROID_DIFFICULTY_FACTOR);
     }
 
     function rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio) {
@@ -8653,7 +8654,8 @@
         game.cosmeticAstervoids = [];
         const cosmeticScales = AstervoidsFracture.getAsteroidAspectScales(
             AstervoidsFracture.getAspectSeverity(getGameWidth(), getGameHeight()),
-            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE);
+            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,
+            CONFIG.ASTEROID_DIFFICULTY_FACTOR);
         for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
             const angle = Math.random() * Math.PI * 2;
             const speed = (CONFIG.ASTEROID_BASE_SPEED
