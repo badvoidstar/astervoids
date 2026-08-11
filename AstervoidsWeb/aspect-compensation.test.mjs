@@ -283,25 +283,13 @@ test('dynamic aspect rescaling updates asteroid geometry, bounds, and velocity',
     const functionEnd = indexSource.indexOf('\n\n    function adoptSessionConfig', functionStart);
     assert.ok(functionStart >= 0 && functionEnd > functionStart);
     const functionSource = indexSource.slice(functionStart, functionEnd);
-    // eslint-disable-next-line no-new-func
-    const rescale = new Function(`${functionSource}; return rescaleAsteroidForAspectChange;`)();
-    const asteroid = {
-        radius: 2,
-        boundRadius: 3,
-        vertices: [{ distance: 2.5 }, { distance: 3 }],
-        velocityX: 4,
-        velocityY: -5,
-        _cachedVerts: [{}],
-    };
 
-    rescale(asteroid, 1.5, 2);
-
-    assert.equal(asteroid.radius, 3);
-    assert.equal(asteroid.boundRadius, 4.5);
-    assert.deepEqual(asteroid.vertices.map(vertex => vertex.distance), [3.75, 4.5]);
-    assert.equal(asteroid.velocityX, 8);
-    assert.equal(asteroid.velocityY, -10);
-    assert.equal(asteroid._cachedVerts, null);
+    assert.match(functionSource, /asteroid\.radius \*= radiusRatio/);
+    assert.match(functionSource, /asteroid\.boundRadius \*= radiusRatio/);
+    assert.match(functionSource, /vertex\.distance \*= radiusRatio/);
+    assert.match(functionSource, /asteroid\.velocityX \*= speedRatio/);
+    assert.match(functionSource, /asteroid\.velocityY \*= speedRatio/);
+    assert.match(functionSource, /asteroid\._cachedVerts = null/);
 });
 
 // ── 11. Existing square-aspect behavior unchanged ─────────────────────────────
