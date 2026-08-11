@@ -1595,8 +1595,8 @@
         applySessionConfigMetadata,
     } = AstervoidsConfig;
 
-    // Baseline config is defaults + URL overrides. Session metadata may override
-    // this while in a session; leaving session restores this local baseline.
+    // Baseline config is defaults plus URL and persisted debug overrides. Session
+    // metadata may override it while in a session; leaving restores this baseline.
     applyUrlConfigOverrides(CONFIG, window.location.search);
     applyStoredDebugConfigOverrides(CONFIG, window.localStorage);
     const LOCAL_CONFIG_BASELINE = snapshotConfigValues(CONFIG, SESSION_CONFIG_KEYS);

@@ -349,11 +349,11 @@ test('game requests persisted debug config immediately on startup', () => {
         /data && data\.type === 'config-request'[\s\S]*?pushAllOverrides\(\)/);
 });
 
-test('session config adoption immediately rescales cosmetic asteroids', () => {
+test('session config adoption immediately rebuilds cosmetic asteroids', () => {
     const functionStart = indexSource.indexOf(
         '    function adoptSessionConfig(metadata, config = CONFIG)');
     const functionEnd = indexSource.indexOf(
-        '\n\n    // ── Deterministic simulation runtime', functionStart);
+        '\n    const SIM_MODES = Object.freeze', functionStart);
     assert.ok(functionStart >= 0 && functionEnd > functionStart);
     const functionSource = indexSource.slice(functionStart, functionEnd);
 
