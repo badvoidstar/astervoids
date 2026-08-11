@@ -18,6 +18,11 @@ const {
 const EPS = 1e-10;
 const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 
+test('asteroid basis radius and speed use the reduced balance values', () => {
+    assert.equal(SHARED_DEFAULTS.INITIAL_ASTEROID_RADIUS, 0.0664);
+    assert.match(indexSource, /ASTEROID_BASE_SPEED:\s*0\.12,/);
+});
+
 // ── 1. Portrait/landscape symmetry ──────────────────────────────────────────
 
 test('16:9 and 9:16 produce identical aspect severity', () => {
@@ -201,7 +206,7 @@ test('asteroid spawn count constants are not affected by aspect compensation', (
         DEFLECTION_KICK: 2e-3,
         SEPARATION_ENERGY: 2e-4,
         MIN_ASTEROID_RADIUS: 0.025,
-        INITIAL_ASTEROID_RADIUS: 0.083,
+        INITIAL_ASTEROID_RADIUS: SHARED_DEFAULTS.INITIAL_ASTEROID_RADIUS,
     };
     const scales = getAsteroidAspectScales(getAspectSeverity(1920, 1080), 0.5);
     const overlay = {

@@ -24,7 +24,7 @@ const AstervoidsConfig = (function() {
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
-        INITIAL_ASTEROID_RADIUS: 0.083,
+        INITIAL_ASTEROID_RADIUS: 0.0664,
         MIN_SPLIT_RATIO: 0.1,
         DEFLECTION_KICK: 2.00e-3,
         ASTEROID_DENSITY: 5.0,
