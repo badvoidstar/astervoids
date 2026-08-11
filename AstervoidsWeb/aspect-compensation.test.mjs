@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 const { SHARED_DEFAULTS, SESSION_CONFIG_KEYS, CONFIG_CONTROLS } =
@@ -15,6 +16,7 @@ const {
 } = require('./wwwroot/js/asteroid-fracture.js');
 
 const EPS = 1e-10;
+const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 
 // ── 1. Portrait/landscape symmetry ──────────────────────────────────────────
 
@@ -250,6 +252,56 @@ test('aspect scales with absent metadata aspectSeverity fall back to 1 (square)'
     const { radiusScale, speedScale } = getAsteroidAspectScales(adopted, 0.5);
     assert.ok(Math.abs(radiusScale - 1) < EPS);
     assert.ok(Math.abs(speedScale  - 1) < EPS);
+});
+
+test('solo canvas resize rescales existing gameplay and cosmetic asteroids', () => {
+    const resizeStart = indexSource.indexOf('    function resizeCanvas(forceViewportRecalc = false)');
+    const resizeEnd = indexSource.indexOf('\n    /**\n     * Get the gameplay area width', resizeStart);
+    assert.ok(resizeStart >= 0 && resizeEnd > resizeStart);
+    const resizeSource = indexSource.slice(resizeStart, resizeEnd);
+
+    assert.match(
+        resizeSource,
+        /const previousAspectScales = dimensionsChanged && !isSessionMode\(\)/);
+    assert.match(
+        resizeSource,
+        /nextAspectScales\.radiusScale \/ previousAspectScales\.radiusScale/);
+    assert.match(
+        resizeSource,
+        /nextAspectScales\.speedScale \/ previousAspectScales\.speedScale/);
+    assert.match(
+        resizeSource,
+        /for \(const asteroid of game\.astervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
+    assert.match(
+        resizeSource,
+        /for \(const asteroid of game\.cosmeticAstervoids\)[\s\S]*?rescaleAsteroidForAspectChange/);
+});
+
+test('dynamic aspect rescaling updates asteroid geometry, bounds, and velocity', () => {
+    const functionStart = indexSource.indexOf(
+        '    function rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio)');
+    const functionEnd = indexSource.indexOf('\n\n    function adoptSessionConfig', functionStart);
+    assert.ok(functionStart >= 0 && functionEnd > functionStart);
+    const functionSource = indexSource.slice(functionStart, functionEnd);
+    // eslint-disable-next-line no-new-func
+    const rescale = new Function(`${functionSource}; return rescaleAsteroidForAspectChange;`)();
+    const asteroid = {
+        radius: 2,
+        boundRadius: 3,
+        vertices: [{ distance: 2.5 }, { distance: 3 }],
+        velocityX: 4,
+        velocityY: -5,
+        _cachedVerts: [{}],
+    };
+
+    rescale(asteroid, 1.5, 2);
+
+    assert.equal(asteroid.radius, 3);
+    assert.equal(asteroid.boundRadius, 4.5);
+    assert.deepEqual(asteroid.vertices.map(vertex => vertex.distance), [3.75, 4.5]);
+    assert.equal(asteroid.velocityX, 8);
+    assert.equal(asteroid.velocityY, -10);
+    assert.equal(asteroid._cachedVerts, null);
 });
 
 // ── 11. Existing square-aspect behavior unchanged ─────────────────────────────

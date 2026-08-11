@@ -1704,6 +1704,17 @@
             CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE);
     }
 
+    function rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio) {
+        asteroid.radius *= radiusRatio;
+        asteroid.boundRadius *= radiusRatio;
+        for (const vertex of asteroid.vertices) {
+            vertex.distance *= radiusRatio;
+        }
+        asteroid.velocityX *= speedRatio;
+        asteroid.velocityY *= speedRatio;
+        asteroid._cachedVerts = null;
+    }
+
     function adoptSessionConfig(metadata, config = CONFIG) {
         restoreLocalConfigBaseline(config);
         applySessionConfigMetadata(metadata, config);
@@ -2868,6 +2879,9 @@
         // Only resize if dimensions changed, unless forcing viewport recalculation
         const dimensionsChanged = newWidth !== canvas.width || newHeight !== canvas.height;
         if (!dimensionsChanged && !forceViewportRecalc) return;
+        const previousAspectScales = dimensionsChanged && !isSessionMode()
+            ? getEffectiveAsteroidAspectScales()
+            : null;
         
         // Update canvas dimensions to fill container
         canvas.width = newWidth;
@@ -2900,6 +2914,18 @@
             game.viewport.y = 0;
             game.viewport.width = newWidth;
             game.viewport.height = newHeight;
+        }
+
+        if (previousAspectScales) {
+            const nextAspectScales = getEffectiveAsteroidAspectScales();
+            const radiusRatio = nextAspectScales.radiusScale / previousAspectScales.radiusScale;
+            const speedRatio = nextAspectScales.speedScale / previousAspectScales.speedScale;
+            for (const asteroid of game.astervoids) {
+                rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
+            }
+            for (const asteroid of game.cosmeticAstervoids) {
+                rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
+            }
         }
         
         // Position HUD within the viewport and scale text to viewport size
