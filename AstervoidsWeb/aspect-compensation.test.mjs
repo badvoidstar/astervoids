@@ -330,15 +330,34 @@ test('debug config changes immediately rescale existing asteroids', () => {
         /const nextAspectScales = getEffectiveAsteroidAspectScales\(\)/);
     assert.match(handlerSource,
         /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
+    assert.match(handlerSource,
+        /LOCAL_CONFIG_BASELINE\[data\.key\] = CONFIG\[data\.key\]/);
 });
 
 test('game requests persisted debug config immediately on startup', () => {
+    const baselineIndex = indexSource.indexOf(
+        '    const LOCAL_CONFIG_BASELINE = snapshotConfigValues(CONFIG, SESSION_CONFIG_KEYS);');
+    const storedOverrideIndex = indexSource.indexOf(
+        '    applyStoredDebugConfigOverrides(CONFIG, window.localStorage);');
+    assert.ok(storedOverrideIndex >= 0 && storedOverrideIndex < baselineIndex,
+        'persisted overrides must apply before the local baseline is captured');
     assert.match(indexSource,
         /debugChannel\.postMessage\(\{ type: 'config-request' \}\)/);
     const debugSource = readFileSync(
         new URL('./wwwroot/debug/index.html', import.meta.url), 'utf8');
     assert.match(debugSource,
         /data && data\.type === 'config-request'[\s\S]*?pushAllOverrides\(\)/);
+});
+
+test('session config adoption immediately rescales cosmetic asteroids', () => {
+    const functionStart = indexSource.indexOf(
+        '    function adoptSessionConfig(metadata, config = CONFIG)');
+    const functionEnd = indexSource.indexOf(
+        '\n\n    // ── Deterministic simulation runtime', functionStart);
+    assert.ok(functionStart >= 0 && functionEnd > functionStart);
+    const functionSource = indexSource.slice(functionStart, functionEnd);
+
+    assert.match(functionSource, /resetCosmeticAsteroids\(\)/);
 });
 
 // ── 11. Existing square-aspect behavior unchanged ─────────────────────────────

@@ -7,13 +7,44 @@ const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
     DEBUG_OVERRIDABLE_KEYS,
+    DEBUG_CONFIG_STORAGE_KEY,
     SESSION_CONFIG_KEYS,
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
+    applyStoredDebugConfigOverrides,
     applySessionConfigMetadata,
     buildSessionConfigMetadata,
     countExtraLivesForScore,
 } = require('./wwwroot/js/game-config.js');
+
+test('persisted debug overrides apply synchronously from shared storage', () => {
+    const cfg = {
+        ASTEROID_DIFFICULTY_FACTOR: SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR,
+        SHIP_MAX_SPEED: SHARED_DEFAULTS.SHIP_MAX_SPEED,
+    };
+    const storage = {
+        getItem(key) {
+            assert.equal(key, DEBUG_CONFIG_STORAGE_KEY);
+            return JSON.stringify({
+                ASTEROID_DIFFICULTY_FACTOR: 1.4,
+                SHIP_MAX_SPEED: 2,
+                UNKNOWN_KEY: 99,
+            });
+        },
+    };
+
+    applyStoredDebugConfigOverrides(cfg, storage);
+
+    assert.equal(cfg.ASTEROID_DIFFICULTY_FACTOR, 1.4);
+    assert.equal(cfg.SHIP_MAX_SPEED, 2);
+    assert.equal(cfg.UNKNOWN_KEY, undefined);
+});
+
+test('invalid persisted debug state leaves configuration unchanged', () => {
+    const cfg = { ASTEROID_DIFFICULTY_FACTOR: 0.8 };
+    applyStoredDebugConfigOverrides(cfg, { getItem: () => '{invalid' });
+    assert.equal(cfg.ASTEROID_DIFFICULTY_FACTOR, 0.8);
+});
 
 test('debug controls derive defaults from the shared runtime values', () => {
     for (const control of CONFIG_CONTROLS) {

@@ -1588,6 +1588,7 @@
         SESSION_CONFIG_KEYS,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        applyStoredDebugConfigOverrides,
         countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,
@@ -1597,6 +1598,7 @@
     // Baseline config is defaults + URL overrides. Session metadata may override
     // this while in a session; leaving session restores this local baseline.
     applyUrlConfigOverrides(CONFIG, window.location.search);
+    applyStoredDebugConfigOverrides(CONFIG, window.localStorage);
     const LOCAL_CONFIG_BASELINE = snapshotConfigValues(CONFIG, SESSION_CONFIG_KEYS);
 
     // The picker exposes both anchor-based analog modes.
@@ -1743,6 +1745,7 @@
         adoptedAspectSeverity = (typeof rawSeverity === 'number' && Number.isFinite(rawSeverity))
             ? Math.max(1, rawSeverity)
             : 1;
+        resetCosmeticAsteroids();
     }
 
     // ── Deterministic simulation mode ───────────────────────────────────────
@@ -4377,6 +4380,9 @@
             const previousAspectScales = getEffectiveAsteroidAspectScales();
             const applied = applyConfigOverride(CONFIG, data.key, data.value);
             if (!applied) return;
+            if (SESSION_CONFIG_KEYS.includes(data.key)) {
+                LOCAL_CONFIG_BASELINE[data.key] = CONFIG[data.key];
+            }
             const nextAspectScales = getEffectiveAsteroidAspectScales();
             rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
         }
@@ -8659,15 +8665,9 @@
         });
     }
 
-    function resetStartScreenVisuals() {
-        game.ship = null;
-        game.astervoids = [];
-        game.bullets = [];
+    function resetCosmeticAsteroids() {
         game.cosmeticAstervoids = [];
-        const cosmeticScales = AstervoidsFracture.getAsteroidAspectScales(
-            AstervoidsFracture.getAspectSeverity(getGameWidth(), getGameHeight()),
-            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,
-            CONFIG.ASTEROID_DIFFICULTY_FACTOR);
+        const cosmeticScales = getEffectiveAsteroidAspectScales();
         for (let i = 0; i < CONFIG.START_SCREEN_ASTERVOIDS; i++) {
             const angle = Math.random() * Math.PI * 2;
             const speed = (CONFIG.ASTEROID_BASE_SPEED
@@ -8681,6 +8681,13 @@
                 Math.sin(angle) * speed
             ));
         }
+    }
+
+    function resetStartScreenVisuals() {
+        game.ship = null;
+        game.astervoids = [];
+        game.bullets = [];
+        resetCosmeticAsteroids();
     }
 
     // Initial canvas sizing and cosmetic objects before game starts.

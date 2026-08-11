@@ -51,6 +51,8 @@ const AstervoidsConfig = (function() {
         'EXTRA_LIFE_SCORE_THRESHOLD',
     ]);
 
+    const DEBUG_CONFIG_STORAGE_KEY = 'astervoids-debug-config';
+
     function control(definition) {
         const runtimeDefault = SHARED_DEFAULTS[definition.key];
         const defaultValue = typeof runtimeDefault === 'boolean'
@@ -328,6 +330,22 @@ const AstervoidsConfig = (function() {
         }
     }
 
+    function applyStoredDebugConfigOverrides(config, storage) {
+        try {
+            const raw = storage?.getItem(DEBUG_CONFIG_STORAGE_KEY);
+            if (!raw) return;
+            const overrides = JSON.parse(raw);
+            if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return;
+            for (const key of DEBUG_OVERRIDABLE_KEYS) {
+                if (Object.prototype.hasOwnProperty.call(overrides, key)) {
+                    applyConfigOverride(config, key, overrides[key]);
+                }
+            }
+        } catch {
+            // Storage access and malformed debug state must not block game startup.
+        }
+    }
+
     function countExtraLivesForScore(score, threshold) {
         const normalizedThreshold = Math.floor(Number(threshold));
         if (!Number.isFinite(normalizedThreshold) || normalizedThreshold <= 0) return 0;
@@ -362,11 +380,13 @@ const AstervoidsConfig = (function() {
         SHARED_DEFAULTS,
         CONFIG_CONTROLS,
         DEBUG_OVERRIDABLE_KEYS,
+        DEBUG_CONFIG_STORAGE_KEY,
         SESSION_CONFIG_KEYS,
         parseBooleanLike,
         coerceConfigOverrideValue,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        applyStoredDebugConfigOverrides,
         countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,

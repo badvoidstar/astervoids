@@ -253,7 +253,7 @@
         // on load so a page refresh (game or debug) doesn't drop the user's tuning.
         const CONFIG_DEFS = AstervoidsConfig.CONFIG_CONTROLS;
 
-        const STORAGE_KEY = 'astervoids-debug-config';
+        const STORAGE_KEY = AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY;
         const overrides = (() => {
             try {
                 const raw = localStorage.getItem(STORAGE_KEY);
