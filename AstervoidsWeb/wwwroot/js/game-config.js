@@ -14,7 +14,7 @@ const AstervoidsConfig = (function() {
         ANALOG_RECTILINEAR_THRUST_DEADZONE_PX: 16,
         ANALOG_POLAR_DEADZONE_PX: 16,
         ANALOG_POLAR_THRESHOLD_PX: 64,
-        ANALOG_RECTILINEAR_TURN_GAIN: 0.5,
+        ANALOG_RECTILINEAR_TURN_GAIN: 1.5,
         ANALOG_POLAR_TURN_GAIN: 2.0,
         ANALOG_THRUST_GAIN: 2.0,
         ANALOG_THRUST_MAX: 1.5,
@@ -201,10 +201,10 @@ const AstervoidsConfig = (function() {
         }),
         control({
             key: 'ANALOG_RECTILINEAR_TURN_GAIN',
-            label: 'Analog rectilinear turn-input gain',
+            label: 'Analog rectilinear rotation-offset gain',
             min: 0, max: 5, step: 0.1,
-            fmt: value => `${value.toFixed(2)}x`,
-            help: 'Multiplies post-dead-zone lateral displacement normalized by stick radius.',
+            fmt: value => `${value.toFixed(2)} rad/radius`,
+            help: 'Maps post-dead-zone lateral displacement normalized by stick radius to a relative heading offset, clamped to ±π.',
         }),
         control({
             key: 'ANALOG_POLAR_TURN_GAIN',

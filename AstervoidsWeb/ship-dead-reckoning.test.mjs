@@ -254,11 +254,33 @@ test('P3: runtime maps keyboard and analog turn sources to distinct mode caps', 
     const shipUpdateSource = productionSource.slice(shipUpdateStart, shipUpdateEnd);
     assert.match(handleSource, /let turnControlMode = TURN_CONTROL_MODE\.KEYBOARD_RATE/);
     assert.match(handleSource, /turnControlMode = TURN_CONTROL_MODE\.ANALOG_TARGET/);
-    assert.match(handleSource, /turnControlMode = TURN_CONTROL_MODE\.ANALOG_RATE/);
     assert.match(handleSource, /getShipTurnSpeed\(turnControlMode\)/);
     assert.match(
         shipUpdateSource,
         /getShipTurnSpeed\(this\.turnControlMode\) \* this\.turnInput/);
+});
+
+test('P3: rectilinear anchor targets an offset from its captured heading', () => {
+    const handleStart = productionSource.indexOf('    function handleInput(dt = 1)');
+    const handleEnd = productionSource.indexOf('    function checkCollisions()', handleStart);
+    const anchorStart = productionSource.indexOf(
+        '        function beginMoveAnchor(identifier, clientX, clientY)');
+    const anchorEnd = productionSource.indexOf(
+        '        function updateMoveAnchor(identifier, clientX, clientY)', anchorStart);
+    assert.ok(handleStart >= 0 && handleEnd > handleStart);
+    assert.ok(anchorStart >= 0 && anchorEnd > anchorStart);
+
+    const handleSource = productionSource.slice(handleStart, handleEnd);
+    const anchorSource = productionSource.slice(anchorStart, anchorEnd);
+    assert.match(
+        anchorSource,
+        /stickInput\.rectCapturedHeading =\s*Number\.isFinite\(game\.ship\?\.angle\)/);
+    assert.match(
+        handleSource,
+        /turnTargetAngle =\s*stickInput\.rectCapturedHeading \+ stickInput\.rectRotationOffset/);
+    assert.match(handleSource, /turnMagnitude = CONFIG\.ANALOG_TURN_MAX/);
+    assert.match(handleSource, /shortestAngleDelta\(turnTargetAngle, game\.ship\.angle\)/);
+    assert.doesNotMatch(handleSource, /turnControlMode = TURN_CONTROL_MODE\.ANALOG_RATE/);
 });
 
 const SHIP = {
