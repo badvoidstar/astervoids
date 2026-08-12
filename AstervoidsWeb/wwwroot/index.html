@@ -1365,10 +1365,9 @@
         // as the "high brake" region of the control.
         ANALOG_POLAR_DEADZONE_PX: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_DEADZONE_PX,
         ANALOG_POLAR_THRESHOLD_PX: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_THRESHOLD_PX,
-        // Linear gain applied to normalized lateral displacement → turnTarget.
-        // turnTarget = clamp(xNorm * GAIN, -MAX, +MAX). Peak rotation rate is
-        // SHIP_ANALOG_TURN_SPEED * ANALOG_TURN_MAX (so MAX=1 reuses the
-        // analog turn-speed cap).
+        // Linear gain, in radians, applied to normalized lateral displacement
+        // to produce the rectilinear target-heading offset. The offset is
+        // clamped to ±π; ANALOG_TURN_MAX remains the target-tracking speed cap.
         ANALOG_RECTILINEAR_TURN_GAIN:
             SHARED_CONFIG_DEFAULTS.ANALOG_RECTILINEAR_TURN_GAIN,
         ANALOG_POLAR_TURN_GAIN: SHARED_CONFIG_DEFAULTS.ANALOG_POLAR_TURN_GAIN,
@@ -3131,10 +3130,10 @@
      *            turnDeadzonePx and thrustDeadzonePx are independent — turn
      *            uses the lateral (X) deadzone, thrust/brake the vertical (Y).
      *
-     * Returns { turn, thrust, brake }:
-     *   turn   ∈ [-turnMax, +turnMax]   — drives ship.turnTarget
-     *   thrust ∈ [0, thrustMax]         — drives ship.thrustInput  (upward only)
-     *   brake  ∈ [0, brakeMax]          — drives ship.brakeInput   (downward only)
+     * Returns { rotationOffset, thrust, brake }:
+     *   rotationOffset ∈ [-π, +π] — target offset from the anchor-start heading
+     *   thrust ∈ [0, thrustMax]    — drives ship.thrustInput  (upward only)
+     *   brake  ∈ [0, brakeMax]     — drives ship.brakeInput   (downward only)
      *
      * Pure: no DOM / window access; exercised by touch-stick-input.test.mjs.
      */
@@ -3142,15 +3141,14 @@
         const radiusPx = Math.max(1e-6, params.radiusPx || 0);
         const turnDeadzonePx = Math.max(0, params.turnDeadzonePx || 0);
         const thrustDeadzonePx = Math.max(0, params.thrustDeadzonePx || 0);
-        const turnMax = Math.max(0, params.turnMax);
         const thrustMax = Math.max(0, params.thrustMax);
         const brakeMax = Math.max(0, params.brakeMax);
 
-        // Lateral → turn (positive dx = right = clockwise screen rotation).
+        // Lateral → relative target heading (positive dx = clockwise).
         const xMag = Math.max(0, Math.abs(dx) - turnDeadzonePx);
         const xNorm = xMag === 0 ? 0 : Math.sign(dx) * (xMag / radiusPx);
-        const rawTurn = xNorm * (params.turnGain || 0);
-        const turn = Math.max(-turnMax, Math.min(turnMax, rawTurn));
+        const rawRotationOffset = xNorm * (params.turnGain || 0);
+        const rotationOffset = Math.max(-Math.PI, Math.min(Math.PI, rawRotationOffset));
 
         // Vertical: dy < 0 → upward → forward thrust; dy > 0 → downward → brake.
         const yMag = Math.max(0, Math.abs(dy) - thrustDeadzonePx);
@@ -3164,7 +3162,7 @@
             const raw = yNorm * (params.brakeGain || 0);
             brake = Math.max(0, Math.min(brakeMax, raw));
         }
-        return { turn, thrust, brake };
+        return { rotationOffset, thrust, brake };
     }
 
     /**
@@ -4708,6 +4706,9 @@
      * orientationchange / visibility loss we reset the state outright so a
      * stale anchor can't drive input across an aspect-ratio change.
      *
+     * Rectilinear anchors capture the ship heading when activated, then map
+     * lateral displacement to a bounded relative target-heading offset.
+     *
      * Polar-scheme cache: when scheme === 'polar', the left anchor produces
      * (targetAngle, turnMagnitude, thrust, brake) instead of a signed turn —
      * the signed turn target is computed each frame in handleInput once the
@@ -4720,9 +4721,9 @@
         moveAnchorX: 0, moveAnchorY: 0,
         moveCurrentX: 0, moveCurrentY: 0,
         fireTouchId: null,
-        // Cached per-frame analog values produced from the move anchor under
-        // the rectilinear scheme.
-        turnTarget: 0,
+        // Cached rectilinear target-heading state and vertical inputs.
+        rectCapturedHeading: 0,
+        rectRotationOffset: 0,
         thrustInput: 0,
         brakeInput: 0,
         // Polar-scheme left-anchor cache (see computePolarStickInput).
@@ -4753,7 +4754,8 @@
         mouseFireContextMenuTargets = null;
         stickInput.moveTouchId = null;
         stickInput.fireTouchId = null;
-        stickInput.turnTarget = 0;
+        stickInput.rectCapturedHeading = 0;
+        stickInput.rectRotationOffset = 0;
         stickInput.thrustInput = 0;
         stickInput.brakeInput = 0;
         stickInput.polarActive = false;
@@ -6548,8 +6550,16 @@
                         brakeMag = Math.max(keyboardBrake, stickInput.polarBrake);
                     }
                 } else {
-                    turnControlMode = TURN_CONTROL_MODE.ANALOG_RATE;
-                    turnTarget = stickInput.turnTarget;
+                    turnControlMode = TURN_CONTROL_MODE.ANALOG_TARGET;
+                    turnTargetAngle =
+                        stickInput.rectCapturedHeading + stickInput.rectRotationOffset;
+                    turnMagnitude = CONFIG.ANALOG_TURN_MAX;
+                    const delta = shortestAngleDelta(turnTargetAngle, game.ship.angle);
+                    turnTarget = attainableTurnTarget(
+                        delta,
+                        turnMagnitude,
+                        getShipTurnSpeed(turnControlMode),
+                        dt);
                     thrustMag = stickInput.thrustInput;
                     brakeMag = Math.max(keyboardBrake, stickInput.brakeInput);
                 }
@@ -8291,6 +8301,9 @@
             stickInput.moveAnchorY = clientY;
             stickInput.moveCurrentX = clientX;
             stickInput.moveCurrentY = clientY;
+            stickInput.rectCapturedHeading =
+                Number.isFinite(game.ship?.angle) ? game.ship.angle : 0;
+            stickInput.rectRotationOffset = 0;
             return true;
         }
 
@@ -8304,7 +8317,7 @@
         function endMoveAnchor(identifier) {
             if (identifier !== stickInput.moveTouchId) return false;
             stickInput.moveTouchId = null;
-            stickInput.turnTarget = 0;
+            stickInput.rectRotationOffset = 0;
             stickInput.thrustInput = 0;
             stickInput.brakeInput = 0;
             stickInput.polarActive = false;
@@ -8343,7 +8356,6 @@
                 thrustDeadzonePx:
                     CONFIG.ANALOG_RECTILINEAR_THRUST_DEADZONE_PX * anchorScale,
                 turnGain: CONFIG.ANALOG_RECTILINEAR_TURN_GAIN,
-                turnMax: CONFIG.ANALOG_TURN_MAX,
                 thrustGain: CONFIG.ANALOG_THRUST_GAIN,
                 thrustMax: CONFIG.ANALOG_THRUST_MAX,
                 brakeGain: CONFIG.ANALOG_BRAKE_GAIN,
@@ -8375,12 +8387,12 @@
                     stickInput.polarBrake = out.brake;
                     // Clear the rectilinear cache so a mode change doesn't
                     // leak stale values into handleInput's rectilinear branch.
-                    stickInput.turnTarget = 0;
+                    stickInput.rectRotationOffset = 0;
                     stickInput.thrustInput = 0;
                     stickInput.brakeInput = 0;
                 } else {
                     const out = computeStickInput(dx, dy, rectParams);
-                    stickInput.turnTarget = out.turn;
+                    stickInput.rectRotationOffset = out.rotationOffset;
                     stickInput.thrustInput = out.thrust;
                     stickInput.brakeInput = out.brake;
                     stickInput.polarActive = false;
@@ -8390,7 +8402,7 @@
                     stickInput.polarBrake = 0;
                 }
             } else {
-                stickInput.turnTarget = 0;
+                stickInput.rectRotationOffset = 0;
                 stickInput.thrustInput = 0;
                 stickInput.brakeInput = 0;
                 stickInput.polarActive = false;
