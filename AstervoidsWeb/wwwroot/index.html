@@ -4710,11 +4710,8 @@
      * lateral displacement to a bounded relative target-heading offset.
      *
      * Polar-scheme cache: when scheme === 'polar', the left anchor produces
-     * (targetAngle, turnMagnitude, thrust, brake) instead of a signed turn —
-     * the signed turn target is computed each frame in handleInput once the
-     * ship's current heading is known. Fields prefixed `polar*` are populated
-     * only by the polar scheme; the rectilinear scheme keeps using the
-     * legacy turn/thrust/brake fields above.
+     * (targetAngle, turnMagnitude, thrust, brake). Fields prefixed `polar*`
+     * are populated only by the polar scheme.
      */
     const stickInput = {
         moveTouchId: null,
@@ -6517,13 +6514,10 @@
 
         if (isAnalogControlSchemeEnabled()) {
             const scheme = getAnalogControlScheme();
-            // Left (move) anchor drives turn + thrust + brake when held. The
-            // rectilinear scheme caches signed turn/thrust/brake directly; the
-            // polar scheme caches (targetAngle, turnMagnitude, thrust, brake)
-            // and the signed turn target is resolved here using the ship's
-            // current heading. shortestAngleDelta picks the rotation direction
-            // that aligns ship.angle to the finger-vs-anchor vector with the
-            // minimum sweep.
+            // Left (move) anchor drives turn + thrust + brake when held. Both
+            // schemes resolve a target heading into a signed turn command:
+            // rectilinear offsets the captured anchor-start heading, while polar
+            // targets the finger-vs-anchor angle.
             if (stickInput.moveTouchId !== null) {
                 if (scheme === ANALOG_CONTROL_SCHEMES.POLAR) {
                     turnControlMode = TURN_CONTROL_MODE.ANALOG_TARGET;

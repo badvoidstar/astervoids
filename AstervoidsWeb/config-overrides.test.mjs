@@ -128,6 +128,11 @@ test('debug controls state calibrated anchor and velocity units', () => {
         'Analog rectilinear turn dead-zone (CSS px @ 390px gameplay ref)');
     assert.equal(rectTurnDeadzone?.fmt(16), '16 px @ 390');
 
+    const rectTurnGain = controls.get('ANALOG_RECTILINEAR_TURN_GAIN');
+    assert.equal(rectTurnGain?.label, 'Analog rectilinear rotation-offset gain');
+    assert.equal(rectTurnGain?.fmt(0.5), '0.50 rad/radius');
+    assert.match(rectTurnGain?.help ?? '', /relative heading offset, clamped to ±π/);
+
     const polarDeadzone = controls.get('ANALOG_POLAR_DEADZONE_PX');
     assert.match(polarDeadzone?.help ?? '', /polar brake remains active/);
 
