@@ -346,6 +346,23 @@ const AstervoidsConfig = (function() {
         }
     }
 
+    function applyLiveConfigOverride(
+        config,
+        localSessionBaseline,
+        key,
+        rawValue,
+        sessionActive,
+        sessionKeys = SESSION_CONFIG_KEYS) {
+        if (!sessionKeys.includes(key)) {
+            return applyConfigOverride(config, key, rawValue);
+        }
+
+        const applied = applyConfigOverride(localSessionBaseline, key, rawValue);
+        if (!applied || sessionActive) return false;
+        config[key] = localSessionBaseline[key];
+        return true;
+    }
+
     function countExtraLivesForScore(score, threshold) {
         const normalizedThreshold = Math.floor(Number(threshold));
         if (!Number.isFinite(normalizedThreshold) || normalizedThreshold <= 0) return 0;
@@ -387,6 +404,7 @@ const AstervoidsConfig = (function() {
         applyConfigOverride,
         applyUrlConfigOverrides,
         applyStoredDebugConfigOverrides,
+        applyLiveConfigOverride,
         countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,

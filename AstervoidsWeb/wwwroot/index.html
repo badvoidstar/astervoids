@@ -1585,9 +1585,9 @@
 
     const {
         SESSION_CONFIG_KEYS,
-        applyConfigOverride,
         applyUrlConfigOverrides,
         applyStoredDebugConfigOverrides,
+        applyLiveConfigOverride,
         countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,
@@ -4386,11 +4386,13 @@
             && DEBUG_OVERRIDABLE_KEYS.has(data.key)
             && data.value !== undefined) {
             const previousAspectScales = getEffectiveAsteroidAspectScales();
-            const applied = applyConfigOverride(CONFIG, data.key, data.value);
+            const applied = applyLiveConfigOverride(
+                CONFIG,
+                LOCAL_CONFIG_BASELINE,
+                data.key,
+                data.value,
+                isSessionMode());
             if (!applied) return;
-            if (SESSION_CONFIG_KEYS.includes(data.key)) {
-                LOCAL_CONFIG_BASELINE[data.key] = CONFIG[data.key];
-            }
             const nextAspectScales = getEffectiveAsteroidAspectScales();
             rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
         }

@@ -12,6 +12,7 @@ const {
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
     applyStoredDebugConfigOverrides,
+    applyLiveConfigOverride,
     applySessionConfigMetadata,
     buildSessionConfigMetadata,
     countExtraLivesForScore,
@@ -238,6 +239,52 @@ test('session metadata precedence: session config wins over local URL-derived va
     assert.equal(cfg.FRACTURE_ENABLED, true);
     applySessionConfigMetadata({ config: { FRACTURE_ENABLED: false } }, cfg, keys);
     assert.equal(cfg.FRACTURE_ENABLED, false);
+});
+
+test('live debug updates cannot replace active session configuration', () => {
+    const cfg = { FRACTURE_ENABLED: false };
+    const localBaseline = { FRACTURE_ENABLED: false };
+
+    const configChanged = applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'FRACTURE_ENABLED',
+        true,
+        true);
+
+    assert.equal(configChanged, false);
+    assert.equal(cfg.FRACTURE_ENABLED, false);
+    assert.equal(localBaseline.FRACTURE_ENABLED, true);
+});
+
+test('live debug updates become effective after leaving a session', () => {
+    const cfg = { FRACTURE_ENABLED: false };
+    const localBaseline = { FRACTURE_ENABLED: false };
+
+    applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'FRACTURE_ENABLED',
+        true,
+        true);
+    cfg.FRACTURE_ENABLED = localBaseline.FRACTURE_ENABLED;
+
+    assert.equal(cfg.FRACTURE_ENABLED, true);
+});
+
+test('live debug updates still apply non-session settings during a session', () => {
+    const cfg = { SHIP_MAX_SPEED: 1 };
+    const localBaseline = {};
+
+    const configChanged = applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'SHIP_MAX_SPEED',
+        2,
+        true);
+
+    assert.equal(configChanged, true);
+    assert.equal(cfg.SHIP_MAX_SPEED, 2);
 });
 
 test('URL overrides: string-typed config accepts arbitrary string values', () => {

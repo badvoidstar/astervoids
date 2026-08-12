@@ -331,7 +331,7 @@ test('debug config changes immediately rescale existing asteroids', () => {
     assert.match(handlerSource,
         /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
     assert.match(handlerSource,
-        /LOCAL_CONFIG_BASELINE\[data\.key\] = CONFIG\[data\.key\]/);
+        /applyLiveConfigOverride\([\s\S]*?isSessionMode\(\)\)/);
 });
 
 test('game requests persisted debug config immediately on startup', () => {
