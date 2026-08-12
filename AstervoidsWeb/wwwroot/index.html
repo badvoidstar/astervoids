@@ -1324,20 +1324,19 @@
         // === Analog anchor controls ===
         // The picker toggles the shared touch/mouse control mode between
         // rectilinear and polar. Keyboard always uses discrete inputs.
-        // Anchor distances are calibrated in CSS px at the gameplay short-edge
-        // baseline below. getAnalogAnchorScale() scales them with the current
-        // gameplay short edge, keeping anchor geometry and input travel
-        // proportional to game objects.
+        // Anchor distances are calibrated in CSS px for a typical 390x844
+        // mobile viewport. getAnalogAnchorScale() compounds short-edge scaling
+        // with aspect severity relative to this baseline.
         ANALOG_ANCHOR_REFERENCE_DIMENSION_PX: 390,
+        ANALOG_ANCHOR_REFERENCE_ASPECT_SEVERITY: 844 / 390,
         // RADIUS: drag distance the finger must move from the anchor to reach
         // a stick deflection of 1.0 (before per-axis clamping). In the polar
         // scheme this also sets the scale of the 2nd parameter (thrust): a
         // length of RADIUS past ANALOG_POLAR_THRESHOLD_PX maps to thrust=1.0
         // before gain/clamp.
         //
-        // The values below are CSS-pixel distances at the 390px gameplay
-        // short-edge baseline above. At runtime they scale with the gameplay
-        // viewport's short edge.
+        // The values below are CSS-pixel distances at the 390x844 gameplay
+        // viewport baseline above.
         ANALOG_STICK_RADIUS_PX: 48,
         // Dead-zone half-extents (rectilinear scheme). The dead-zone is a
         // RECTANGLE: lateral displacements with |dx| <= TURN_DEADZONE_PX are
@@ -2806,13 +2805,22 @@
     }
 
     /**
-     * Scale 390px-baseline touch-anchor distances with the current gameplay
-     * short edge, in CSS pixels.
+     * Scale 390x844-baseline touch-anchor distances with the current gameplay
+     * short edge and aspect severity. The scaled control system is capped at
+     * the short edge as a whole; individual off-center anchors are not fitted
+     * within the viewport and may therefore be clipped.
      */
     function getAnalogAnchorScale() {
         const calibrationReference = Math.max(
             1, CONFIG.ANALOG_ANCHOR_REFERENCE_DIMENSION_PX);
-        return getReferenceDimension() / calibrationReference;
+        const referenceSeverity = Math.max(
+            1, CONFIG.ANALOG_ANCHOR_REFERENCE_ASPECT_SEVERITY);
+        const shortEdge = getReferenceDimension();
+        const severity = AstervoidsFracture.getAspectSeverity(
+            getGameWidth(), getGameHeight());
+        const severityScaledDimension =
+            shortEdge * severity / referenceSeverity;
+        return Math.min(shortEdge, severityScaledDimension) / calibrationReference;
     }
 
     /**
