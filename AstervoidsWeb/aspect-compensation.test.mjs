@@ -433,3 +433,8 @@ test('difficulty is clamped to a positive 0.01 minimum', () => {
     assert.deepEqual(getAsteroidAspectScales(1.5, 0.5, 0), expected);
     assert.deepEqual(getAsteroidAspectScales(1.5, 0.5, -1), expected);
 });
+
+test('difficulty is clamped to a 2.0 maximum', () => {
+    const expected = getAsteroidAspectScales(1.5, 0.5, 2);
+    assert.deepEqual(getAsteroidAspectScales(1.5, 0.5, 3), expected);
+});
