@@ -392,13 +392,13 @@ test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE debug control exists with correct range
         `step ${ctrl.step} should be small (≤ 0.1)`);
 });
 
-test('difficulty defaults to 0.8 and has a 0.0 to 2.0 debug control', () => {
+test('difficulty defaults to 0.8 and has a 0.01 to 2.0 debug control', () => {
     assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.8);
     assert.match(indexSource,
         /ASTEROID_DIFFICULTY_FACTOR:\s*SHARED_CONFIG_DEFAULTS\.ASTEROID_DIFFICULTY_FACTOR/);
     const ctrl = CONFIG_CONTROLS.find(c => c.key === 'ASTEROID_DIFFICULTY_FACTOR');
     assert.ok(ctrl, 'control must be registered');
-    assert.equal(ctrl.min, 0);
+    assert.equal(ctrl.min, 0.01);
     assert.equal(ctrl.max, 2);
 });
 
