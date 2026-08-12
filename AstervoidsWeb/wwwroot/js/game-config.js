@@ -76,7 +76,7 @@ const AstervoidsConfig = (function() {
         control({
             key: 'ASTEROID_DIFFICULTY_FACTOR',
             label: 'Asteroid difficulty factor',
-            min: 0.01, max: 2, step: 0.05,
+            min: 0.01, max: 2, step: 0.01,
             fmt: value => value.toFixed(2),
             help: 'Compounds with aspect severity and uses the same size/speed balance. 1.0 is neutral; lower values reduce asteroid size and speed, while higher values increase them.',
         }),

@@ -400,6 +400,7 @@ test('difficulty defaults to 0.8 and has a 0.01 to 2.0 debug control', () => {
     assert.ok(ctrl, 'control must be registered');
     assert.equal(ctrl.min, 0.01);
     assert.equal(ctrl.max, 2);
+    assert.equal(ctrl.step, 0.01);
 });
 
 test('difficulty compounds with severity before applying size/speed balance', () => {
