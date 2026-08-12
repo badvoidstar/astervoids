@@ -655,14 +655,14 @@ const AstervoidsFracture = (function() {
      *
      * @param {number} aspectSeverity  result of getAspectSeverity(), >= 1
      * @param {number} balance         value clamped to [0, 1]
-     * @param {number} difficultyFactor non-negative multiplier; defaults to 1
+     * @param {number} difficultyFactor multiplier clamped to at least 0.01; defaults to 1
      * @returns {{ radiusScale: number, speedScale: number }}
      */
     function getAsteroidAspectScales(aspectSeverity, balance, difficultyFactor = 1) {
         const clampedBalance = Math.max(0, Math.min(1, Number.isFinite(balance) ? balance : 0.5));
         const severity = Math.max(1, Number.isFinite(aspectSeverity) ? aspectSeverity : 1);
         const difficulty = Math.max(
-            0, Number.isFinite(difficultyFactor) ? difficultyFactor : 1);
+            0.01, Number.isFinite(difficultyFactor) ? difficultyFactor : 1);
         const combinedFactor = severity * difficulty;
         return {
             radiusScale: Math.pow(combinedFactor, 1 - clampedBalance),

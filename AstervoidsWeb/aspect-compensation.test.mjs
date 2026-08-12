@@ -427,3 +427,9 @@ test('difficulty uses the configured balance endpoints', () => {
         getAsteroidAspectScales(severity, 1, difficulty),
         { radiusScale: 1, speedScale: combined });
 });
+
+test('difficulty is clamped to a positive 0.01 minimum', () => {
+    const expected = getAsteroidAspectScales(1.5, 0.5, 0.01);
+    assert.deepEqual(getAsteroidAspectScales(1.5, 0.5, 0), expected);
+    assert.deepEqual(getAsteroidAspectScales(1.5, 0.5, -1), expected);
+});
