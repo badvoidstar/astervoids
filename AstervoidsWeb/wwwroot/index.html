@@ -3122,7 +3122,7 @@
      *            (i.e. screen-down; conventional touch coords).
      *   params : { radiusPx,
      *              turnDeadzonePx, thrustDeadzonePx,
-     *              turnGain, turnMax,
+     *              turnGain,
      *              thrustGain, thrustMax,
      *              brakeGain, brakeMax }
      *            All sizes are runtime CSS pixels after the 390px gameplay
@@ -8337,9 +8337,8 @@
         // Frame-time updater: recomputes cached analog values from the current
         // movement anchor each animation frame, so changes in viewport size /
         // orientation immediately affect mapping without per-event work. The
-        // rectilinear scheme uses computeStickInput; polar uses
-        // computePolarStickInput and caches a targetAngle that handleInput
-        // converts into a signed turn target once the ship's heading is known.
+        // rectilinear scheme uses computeStickInput to cache a rotation offset;
+        // polar uses computePolarStickInput to cache an absolute target angle.
         function updateStickAnalog() {
             const scheme = getAnalogControlScheme();
             const anchorScale = getAnalogAnchorScale();
