@@ -7,13 +7,45 @@ const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
     DEBUG_OVERRIDABLE_KEYS,
+    DEBUG_CONFIG_STORAGE_KEY,
     SESSION_CONFIG_KEYS,
     coerceConfigOverrideValue,
     applyUrlConfigOverrides,
+    applyStoredDebugConfigOverrides,
+    applyLiveConfigOverride,
     applySessionConfigMetadata,
     buildSessionConfigMetadata,
     countExtraLivesForScore,
 } = require('./wwwroot/js/game-config.js');
+
+test('persisted debug overrides apply synchronously from shared storage', () => {
+    const cfg = {
+        ASTEROID_DIFFICULTY_FACTOR: SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR,
+        SHIP_MAX_SPEED: SHARED_DEFAULTS.SHIP_MAX_SPEED,
+    };
+    const storage = {
+        getItem(key) {
+            assert.equal(key, DEBUG_CONFIG_STORAGE_KEY);
+            return JSON.stringify({
+                ASTEROID_DIFFICULTY_FACTOR: 1.4,
+                SHIP_MAX_SPEED: 2,
+                UNKNOWN_KEY: 99,
+            });
+        },
+    };
+
+    applyStoredDebugConfigOverrides(cfg, storage);
+
+    assert.equal(cfg.ASTEROID_DIFFICULTY_FACTOR, 1.4);
+    assert.equal(cfg.SHIP_MAX_SPEED, 2);
+    assert.equal(cfg.UNKNOWN_KEY, undefined);
+});
+
+test('invalid persisted debug state leaves configuration unchanged', () => {
+    const cfg = { ASTEROID_DIFFICULTY_FACTOR: 0.8 };
+    applyStoredDebugConfigOverrides(cfg, { getItem: () => '{invalid' });
+    assert.equal(cfg.ASTEROID_DIFFICULTY_FACTOR, 0.8);
+});
 
 test('debug controls derive defaults from the shared runtime values', () => {
     for (const control of CONFIG_CONTROLS) {
@@ -207,6 +239,52 @@ test('session metadata precedence: session config wins over local URL-derived va
     assert.equal(cfg.FRACTURE_ENABLED, true);
     applySessionConfigMetadata({ config: { FRACTURE_ENABLED: false } }, cfg, keys);
     assert.equal(cfg.FRACTURE_ENABLED, false);
+});
+
+test('live debug updates cannot replace active session configuration', () => {
+    const cfg = { FRACTURE_ENABLED: false };
+    const localBaseline = { FRACTURE_ENABLED: false };
+
+    const configChanged = applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'FRACTURE_ENABLED',
+        true,
+        true);
+
+    assert.equal(configChanged, false);
+    assert.equal(cfg.FRACTURE_ENABLED, false);
+    assert.equal(localBaseline.FRACTURE_ENABLED, true);
+});
+
+test('live debug updates become effective after leaving a session', () => {
+    const cfg = { FRACTURE_ENABLED: false };
+    const localBaseline = { FRACTURE_ENABLED: false };
+
+    applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'FRACTURE_ENABLED',
+        true,
+        true);
+    cfg.FRACTURE_ENABLED = localBaseline.FRACTURE_ENABLED;
+
+    assert.equal(cfg.FRACTURE_ENABLED, true);
+});
+
+test('live debug updates still apply non-session settings during a session', () => {
+    const cfg = { SHIP_MAX_SPEED: 1 };
+    const localBaseline = {};
+
+    const configChanged = applyLiveConfigOverride(
+        cfg,
+        localBaseline,
+        'SHIP_MAX_SPEED',
+        2,
+        true);
+
+    assert.equal(configChanged, true);
+    assert.equal(cfg.SHIP_MAX_SPEED, 2);
 });
 
 test('URL overrides: string-typed config accepts arbitrary string values', () => {

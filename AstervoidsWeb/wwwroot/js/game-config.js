@@ -20,10 +20,12 @@ const AstervoidsConfig = (function() {
         ANALOG_THRUST_MAX: 1.5,
         ANALOG_BRAKE_GAIN: 1.0,
         EXTRA_LIFE_SCORE_THRESHOLD: 10000,
+        ASTEROID_ASPECT_SIZE_SPEED_BALANCE: 0.5,
+        ASTEROID_DIFFICULTY_FACTOR: 0.8,
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
-        INITIAL_ASTEROID_RADIUS: 0.083,
+        INITIAL_ASTEROID_RADIUS: 0.085,
         MIN_SPLIT_RATIO: 0.1,
         DEFLECTION_KICK: 2.00e-3,
         ASTEROID_DENSITY: 5.0,
@@ -43,9 +45,13 @@ const AstervoidsConfig = (function() {
         'FRACTURE_ENABLED',
         'ASTEROID_VERTICES',
         'ASTEROID_JAGGEDNESS',
+        'ASTEROID_ASPECT_SIZE_SPEED_BALANCE',
+        'ASTEROID_DIFFICULTY_FACTOR',
         'SIM_MODE',
         'EXTRA_LIFE_SCORE_THRESHOLD',
     ]);
+
+    const DEBUG_CONFIG_STORAGE_KEY = 'astervoids-debug-config';
 
     function control(definition) {
         const runtimeDefault = SHARED_DEFAULTS[definition.key];
@@ -56,6 +62,24 @@ const AstervoidsConfig = (function() {
     }
 
     const CONFIG_CONTROLS = Object.freeze([
+        control({
+            key: 'ASTEROID_ASPECT_SIZE_SPEED_BALANCE',
+            label: 'Aspect compensation balance (0 = size only, 1 = speed only)',
+            min: 0, max: 1, step: 0.05,
+            fmt: value => {
+                if (value <= 0) return 'Size only (0)';
+                if (value >= 1) return 'Speed only (1)';
+                return `${Math.round(value * 100)}% speed / ${Math.round((1 - value) * 100)}% size`;
+            },
+            help: 'Distributes the combined aspect and difficulty compensation between asteroid radius (size) and translational speed. 0 = size-only; 0.5 = geometrically balanced; 1 = speed-only.',
+        }),
+        control({
+            key: 'ASTEROID_DIFFICULTY_FACTOR',
+            label: 'Asteroid difficulty factor',
+            min: 0.01, max: 2, step: 0.01,
+            fmt: value => value.toFixed(2),
+            help: 'Compounds with aspect severity and uses the same size/speed balance. 1.0 is neutral; lower values reduce asteroid size and speed, while higher values increase them.',
+        }),
         control({
             key: 'ASTEROID_DENSITY',
             label: 'Asteroid density',
@@ -306,6 +330,39 @@ const AstervoidsConfig = (function() {
         }
     }
 
+    function applyStoredDebugConfigOverrides(config, storage) {
+        try {
+            const raw = storage?.getItem(DEBUG_CONFIG_STORAGE_KEY);
+            if (!raw) return;
+            const overrides = JSON.parse(raw);
+            if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return;
+            for (const key of DEBUG_OVERRIDABLE_KEYS) {
+                if (Object.prototype.hasOwnProperty.call(overrides, key)) {
+                    applyConfigOverride(config, key, overrides[key]);
+                }
+            }
+        } catch {
+            // Storage access and malformed debug state must not block game startup.
+        }
+    }
+
+    function applyLiveConfigOverride(
+        config,
+        localSessionBaseline,
+        key,
+        rawValue,
+        sessionActive,
+        sessionKeys = SESSION_CONFIG_KEYS) {
+        if (!sessionKeys.includes(key)) {
+            return applyConfigOverride(config, key, rawValue);
+        }
+
+        const applied = applyConfigOverride(localSessionBaseline, key, rawValue);
+        if (!applied || sessionActive) return false;
+        config[key] = localSessionBaseline[key];
+        return true;
+    }
+
     function countExtraLivesForScore(score, threshold) {
         const normalizedThreshold = Math.floor(Number(threshold));
         if (!Number.isFinite(normalizedThreshold) || normalizedThreshold <= 0) return 0;
@@ -340,11 +397,14 @@ const AstervoidsConfig = (function() {
         SHARED_DEFAULTS,
         CONFIG_CONTROLS,
         DEBUG_OVERRIDABLE_KEYS,
+        DEBUG_CONFIG_STORAGE_KEY,
         SESSION_CONFIG_KEYS,
         parseBooleanLike,
         coerceConfigOverrideValue,
         applyConfigOverride,
         applyUrlConfigOverrides,
+        applyStoredDebugConfigOverrides,
+        applyLiveConfigOverride,
         countExtraLivesForScore,
         snapshotConfigValues,
         buildSessionConfigMetadata,

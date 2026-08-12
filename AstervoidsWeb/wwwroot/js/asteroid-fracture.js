@@ -625,6 +625,51 @@ const AstervoidsFracture = (function() {
         };
     }
 
+    /**
+     * Returns the aspect severity for a viewport: max(w,h)/min(w,h).
+     * Portrait and landscape reciprocals (e.g. 16:9 and 9:16) produce the
+     * same value. Square viewports return 1.
+     * @param {number} width  viewport width in any consistent unit
+     * @param {number} height viewport height in the same unit
+     * @returns {number} severity >= 1
+     */
+    function getAspectSeverity(width, height) {
+        const shortEdge = Math.max(1, Math.min(width, height));
+        const longEdge = Math.max(width, height);
+        return longEdge / shortEdge;
+    }
+
+    /**
+     * Compute asteroid radius and speed scaling factors from aspect severity,
+     * a difficulty factor, and a balance parameter in [0, 1].
+     *
+     *   combinedFactor = aspectSeverity * difficultyFactor
+     *   radiusScale = combinedFactor ** (1 - balance)
+     *   speedScale  = combinedFactor ** balance
+     *
+     * Invariant: radiusScale * speedScale === combinedFactor (within float tolerance).
+     *
+     * balance = 0 → size-only compensation (radiusScale = combinedFactor, speedScale = 1).
+     * balance = 0.5 → equal geometric split (both scales = sqrt(combinedFactor)).
+     * balance = 1 → speed-only compensation (radiusScale = 1, speedScale = combinedFactor).
+     *
+     * @param {number} aspectSeverity  result of getAspectSeverity(), >= 1
+     * @param {number} balance         value clamped to [0, 1]
+     * @param {number} difficultyFactor multiplier clamped to [0.01, 2]; defaults to 1
+     * @returns {{ radiusScale: number, speedScale: number }}
+     */
+    function getAsteroidAspectScales(aspectSeverity, balance, difficultyFactor = 1) {
+        const clampedBalance = Math.max(0, Math.min(1, Number.isFinite(balance) ? balance : 0.5));
+        const severity = Math.max(1, Number.isFinite(aspectSeverity) ? aspectSeverity : 1);
+        const difficulty = Math.max(0.01, Math.min(
+            2, Number.isFinite(difficultyFactor) ? difficultyFactor : 1));
+        const combinedFactor = severity * difficulty;
+        return {
+            radiusScale: Math.pow(combinedFactor, 1 - clampedBalance),
+            speedScale: Math.pow(combinedFactor, clampedBalance),
+        };
+    }
+
     return Object.freeze({
         polygonArea,
         polygonCentroid,
@@ -638,6 +683,8 @@ const AstervoidsFracture = (function() {
         separationAngleOffset,
         clampAsteroidMotion,
         calculateAsteroidFragments,
+        getAspectSeverity,
+        getAsteroidAspectScales,
     });
 })();
 
