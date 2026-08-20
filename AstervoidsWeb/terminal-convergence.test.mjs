@@ -106,13 +106,13 @@ test('minimum-jerk retargeting preserves C2 continuity', () => {
     approx(start.acceleration, handoff.acceleration);
 });
 
-test('ballistic-distance terminal target remains monotone while decelerating', () => {
+test('half-ballistic terminal target decelerates without speeding up', () => {
     const startTime = 0;
     const endTime = 750;
     const velocity = 0.001;
     const transition = createMinimumJerkTransition({
         start: 0.1,
-        target: 0.1 + velocity * (endTime - startTime),
+        target: 0.1 + velocity * (endTime - startTime) / 2,
         startVelocity: velocity,
         startTime,
         endTime,
@@ -123,6 +123,9 @@ test('ballistic-distance terminal target remains monotone while decelerating', (
         const current = sampleMinimumJerkTransition(transition, now);
         assert.ok(current.value >= previous.value - 1e-12);
         assert.ok(current.velocity >= -1e-12);
+        assert.ok(
+            current.velocity <= previous.velocity + 1e-12,
+            `velocity increased at ${now}ms: ${previous.velocity} -> ${current.velocity}`);
         previous = current;
     }
 });
@@ -199,7 +202,7 @@ test('late angular convergence relaxes derivatives instead of adding a full turn
     approx(sampleMinimumJerkTransition(axis.transition, 300).value, angle);
 });
 
-test('on-time convergence retains direction-preserving winding', () => {
+test('on-time convergence relaxes derivatives instead of adding a full lap', () => {
     const axis = createWrappedConvergenceTransition({
         start: 1.04,
         target: 1.04,
@@ -207,20 +210,20 @@ test('on-time convergence retains direction-preserving winding', () => {
         startVelocity: 0.00025,
         startTime: 0,
         endTime: 300,
-        relaxExtraWinding: false
+        relaxExtraWinding: true
     });
 
-    assert.equal(axis.relaxed, false);
-    approx(axis.target, 2.14);
-    approx(sampleMinimumJerkTransition(axis.transition, 0).velocity, 0.00025);
+    assert.equal(axis.relaxed, true);
+    approx(axis.target, 1.04);
+    assert.equal(sampleMinimumJerkTransition(axis.transition, 0).velocity, 0);
 });
 
-test('late convergence preserves derivatives when no extra winding is selected', () => {
+test('shortest seam crossing preserves derivatives without an extra winding', () => {
     const axis = createWrappedConvergenceTransition({
-        start: 0.2,
-        target: 0.5,
-        span: 1.1,
-        startVelocity: 0.00025,
+        start: 0.95,
+        target: 0.15,
+        span: 1,
+        startVelocity: 0.0003,
         startAcceleration: 0.000001,
         startTime: 0,
         endTime: 300,
@@ -228,13 +231,13 @@ test('late convergence preserves derivatives when no extra winding is selected',
     });
 
     assert.equal(axis.relaxed, false);
-    approx(axis.target, 0.5);
+    approx(axis.target, 1.15);
     const start = sampleMinimumJerkTransition(axis.transition, 0);
-    approx(start.velocity, 0.00025);
+    approx(start.velocity, 0.0003);
     approx(start.acceleration, 0.000001);
 });
 
-test('production relaxes only winding axes and only below the late threshold', () => {
+test('production relaxes winding axes regardless of the late threshold', () => {
     const source = extractProductionFunction(
         'createCanonicalTerminalTransition',
         'function terminalTargetMatches');
@@ -307,14 +310,52 @@ test('production relaxes only winding axes and only below the late threshold', (
     assert.equal(lateAngle.velocity, 0);
     assert.equal(lateAngle.acceleration, 0);
 
-    approx(onTime.xTransition.target, 2.14);
+    approx(onTime.xTransition.target, 1.04);
+    assert.equal(
+        sampleMinimumJerkTransition(onTime.xTransition, now).velocity, 0);
+    approx(onTime.angleTransition.target, 1.25);
+    assert.equal(
+        sampleMinimumJerkTransition(onTime.angleTransition, now).velocity, 0);
     approx(
-        sampleMinimumJerkTransition(onTime.xTransition, now).velocity,
-        current.velocityX);
-    approx(onTime.angleTransition.target, 1.25 + Math.PI * 2);
-    approx(
-        sampleMinimumJerkTransition(onTime.angleTransition, now).velocity,
-        current.angularVelocity);
+        sampleMinimumJerkTransition(onTime.yTransition, now).velocity,
+        current.velocityY);
+});
+
+test('production provisional convergence uses half-ballistic stopping distance', () => {
+    const source = extractProductionFunction(
+        'createProvisionalTerminalTransition',
+        'function createCanonicalTerminalTransition');
+    const factory = new Function(
+        'lastRenderedPose',
+        'velocityToNormalizedDeltaX',
+        'velocityToNormalizedDeltaY',
+        'CONFIG',
+        'ReplicationPresentation',
+        `${source}\nreturn createProvisionalTerminalTransition;`);
+    const create = factory(
+        obj => ({ x: obj.x, y: obj.y, angle: obj.angle }),
+        value => value,
+        value => value,
+        {
+            TARGET_FPS: 1000,
+            DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+            DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+        },
+        {
+            createMinimumJerkTransition
+        });
+    const entry = create({
+        x: 0.1,
+        y: 0.2,
+        angle: 0.3,
+        velocityX: 0.001,
+        velocityY: -0.002,
+        rotationSpeed: 0.003
+    }, { epoch: 1, terminalAt: 500 }, 0);
+
+    approx(entry.xTransition.target, 0.35);
+    approx(entry.yTransition.target, -0.3);
+    approx(entry.angleTransition.target, 1.05);
 });
 
 test('different displayed poses converge continuously to one exact terminal pose', () => {
@@ -417,16 +458,16 @@ test('production canonical retargeting carries sampled acceleration', () => {
         productionSource,
         /startAcceleration: current\.angularAcceleration/);
     assert.equal(
-        (productionSource.match(/relaxExtraWinding: lateSettle/g) || []).length,
+        (productionSource.match(/relaxExtraWinding: true/g) || []).length,
         3,
-        'late winding relaxation must cover x, y, and angle');
+        'shortest-path winding relaxation must cover x, y, and angle');
 });
 
-test('record-derived terminal fallback is tied to terminalAt, not join time', () => {
+test('terminal target uses half-ballistic distance tied to terminalAt', () => {
     const source = extractProductionFunction(
         'buildTerminalTargetPayload',
         'function publishOwnedTerminalTargets');
-    let nowServer = 10_000;
+    let nowServer = 1000;
     const factory = new Function(
         'CONFIG',
         'RemoteObjects',
@@ -463,7 +504,12 @@ test('record-derived terminal fallback is tied to terminalAt, not join time', ()
         }
     };
     const terminal = { epoch: 900, terminalAt: 1250 };
+    const owned = build(record.data, record, terminal);
     const first = build(null, record, terminal);
+    approx(owned.terminalX, 0.175);
+    approx(owned.terminalY, 0.05);
+    approx(owned.terminalAngle, 0.3375);
+    assert.deepEqual(first, owned);
     nowServer = 100_000;
     const muchLater = build(null, record, terminal);
     assert.deepEqual(muchLater, first);

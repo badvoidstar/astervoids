@@ -1208,10 +1208,11 @@
         // 0 = hard snap.
         BUFFERED_GAMEOVER_SETTLE_MS: 140,
         // Deterministic mode only: shared lead time before the immutable terminal
-        // object targets take effect. Object owners project their authoritative
-        // pose to terminalAt = gameOverAt + this delay and persist that target on
-        // the object record. Existing members converge continuously to it; late
-        // joiners initialize there before their first rendered frame.
+        // object targets take effect. Object owners project a smooth-deceleration
+        // stopping distance through terminalAt = gameOverAt + this delay and
+        // persist that target on the object record. Existing members converge
+        // continuously to it; late joiners initialize there before their first
+        // rendered frame.
         DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750,
         // If a canonical target arrives too close to or after terminalAt, extend
         // only that member's presentation transition rather than introducing a

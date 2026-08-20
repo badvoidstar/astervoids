@@ -623,9 +623,9 @@ const ReplicationPresentation = (function () {
     }
 
     /**
-     * Build a wrapped terminal transition. In a degraded late-settle path,
-     * discard incoming derivatives only when preserving their direction would
-     * select an additional full winding over the nearest equivalent target.
+     * Build a wrapped terminal transition. When requested, discard incoming
+     * derivatives only when preserving their direction would select an
+     * additional full winding over the nearest equivalent target.
      */
     function createWrappedConvergenceTransition({
         start,

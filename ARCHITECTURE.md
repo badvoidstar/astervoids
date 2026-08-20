@@ -1060,9 +1060,10 @@ member at its latency-dependent displayed pose:
 
 1. The GameState owner stamps immutable `gameOverAt` and `terminalAt` values
    when shared lives first reach zero.
-2. Each ship, asteroid, and bullet owner projects its authoritative object to
-   `terminalAt` and writes `terminalEpoch`, `terminalX`, `terminalY`, and, when
-   applicable, `terminalAngle` onto that same object record.
+2. Each ship, asteroid, and bullet owner projects its authoritative object over
+   the smooth-deceleration stopping distance (half its ballistic displacement
+   through `terminalAt`) and writes `terminalEpoch`, `terminalX`, `terminalY`,
+   and, when applicable, `terminalAngle` onto that same object record.
 3. Existing members start from the exact transform rendered on their preceding
    frame and use a quintic trajectory that preserves position, velocity, and
    acceleration while reaching the persisted target at rest.
@@ -1088,16 +1089,15 @@ an object's creation schema when it re-encodes later updates and join snapshots.
 Optional presence bits keep mode-specific and terminal fields absent from the
 body until needed.
 
-If a target arrives too late to use the shared `terminalAt` without a visible
-discontinuity, that member uses a short local settle window. Exact eventual pose
-and continuous motion take precedence over pretending it stopped at a time that
-has already passed. Within that degraded path, each position/angle axis normally
-retains its incoming derivatives; if doing so would add a complete toroidal
-winding, only that axis switches to the nearest equivalent target and drops its
-presentation velocity/acceleration. This prevents a late asteroid from crossing
-the whole screen—or a ship/asteroid from making a full extra turn—just to stop at
-an equivalent pose. Buffered adaptive-delay sessions retain their existing
-authoritative-snapshot settle behavior and do not wait for terminal targets.
+Every canonical position and angle transition selects the nearest topologically
+equivalent target. An axis normally retains its incoming derivatives; if doing
+so would add a complete toroidal winding, only that axis drops its presentation
+velocity/acceleration. If a target arrives too late to use the shared
+`terminalAt` without a visible discontinuity, that member also uses a short
+local settle window. Exact eventual pose and continuous position take precedence
+over pretending it stopped at a time that has already passed. Buffered
+adaptive-delay sessions retain their existing authoritative-snapshot settle
+behavior and do not wait for terminal targets.
 
 ## Ring Buffer Interpolation
 
