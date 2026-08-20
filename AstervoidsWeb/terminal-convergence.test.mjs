@@ -218,6 +218,32 @@ test('on-time convergence relaxes derivatives instead of adding a full lap', () 
     assert.equal(sampleMinimumJerkTransition(axis.transition, 0).velocity, 0);
 });
 
+test('shortest convergence clamps aligned velocity instead of stopping', () => {
+    const axis = createWrappedConvergenceTransition({
+        start: 0.4,
+        target: 0.45,
+        span: 1,
+        startVelocity: 0.002,
+        startAcceleration: 0.000001,
+        startTime: 0,
+        endTime: 500,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, true);
+    approx(axis.target, 0.45);
+    const start = sampleMinimumJerkTransition(axis.transition, 0);
+    approx(start.velocity, 0.00025);
+    assert.equal(start.acceleration, 0);
+    let previous = start;
+    for (let now = 5; now <= 500; now += 5) {
+        const current = sampleMinimumJerkTransition(axis.transition, now);
+        assert.ok(current.value >= previous.value - 1e-12);
+        assert.ok(current.velocity <= previous.velocity + 1e-12);
+        previous = current;
+    }
+});
+
 test('shortest seam crossing preserves derivatives without an extra winding', () => {
     const axis = createWrappedConvergenceTransition({
         start: 0.95,
@@ -235,6 +261,35 @@ test('shortest seam crossing preserves derivatives without an extra winding', ()
     const start = sampleMinimumJerkTransition(axis.transition, 0);
     approx(start.velocity, 0.0003);
     approx(start.acceleration, 0.000001);
+});
+
+test('early canonical handoff preserves provisional position and derivatives', () => {
+    const target = 0.475;
+    const provisional = createMinimumJerkTransition({
+        start: 0.1,
+        target,
+        startVelocity: 0.001,
+        startTime: 0,
+        endTime: 750
+    });
+    const current = sampleMinimumJerkTransition(provisional, 100);
+    const canonical = createWrappedConvergenceTransition({
+        start: current.value,
+        target,
+        span: 1.1,
+        startVelocity: current.velocity,
+        startAcceleration: current.acceleration,
+        startTime: 100,
+        endTime: 750,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(canonical.relaxed, false);
+    const handoff = sampleMinimumJerkTransition(canonical.transition, 100);
+    approx(handoff.value, current.value);
+    approx(handoff.velocity, current.velocity);
+    approx(handoff.acceleration, current.acceleration);
+    approx(sampleMinimumJerkTransition(canonical.transition, 750).value, target);
 });
 
 test('production relaxes winding axes regardless of the late threshold', () => {

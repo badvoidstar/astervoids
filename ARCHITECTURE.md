@@ -1065,8 +1065,8 @@ member at its latency-dependent displayed pose:
    through `terminalAt`) and writes `terminalEpoch`, `terminalX`, `terminalY`,
    and, when applicable, `terminalAngle` onto that same object record.
 3. Existing members start from the exact transform rendered on their preceding
-   frame and use a quintic trajectory that preserves position, velocity, and
-   acceleration while reaching the persisted target at rest.
+   frame and normally preserve position, velocity, and acceleration in a
+   quintic trajectory while reaching the persisted target at rest.
 4. A member joining an already-terminal session creates no ship and seeds
    replicas directly at persisted targets. Target-less snapshot or late-create
    records remain hidden until their target-bearing version arrives.
@@ -1091,13 +1091,15 @@ body until needed.
 
 Every canonical position and angle transition selects the nearest topologically
 equivalent target. An axis normally retains its incoming derivatives; if doing
-so would add a complete toroidal winding, only that axis drops its presentation
-velocity/acceleration. If a target arrives too late to use the shared
-`terminalAt` without a visible discontinuity, that member also uses a short
-local settle window. Exact eventual pose and continuous position take precedence
-over pretending it stopped at a time that has already passed. Buffered
-adaptive-delay sessions retain their existing authoritative-snapshot settle
-behavior and do not wait for terminal targets.
+so would add a complete toroidal winding, only that axis clamps its presentation
+velocity to the monotone shortest-path bound and clears its acceleration. The
+velocity can fall to zero when the target is coincident or lies in the opposite
+direction. If a target arrives too late to use the shared `terminalAt` without a
+visible discontinuity, that member also uses a short local settle window. Exact
+eventual pose and continuous position take precedence over pretending it stopped
+at a time that has already passed. Buffered adaptive-delay sessions retain their
+existing authoritative-snapshot settle behavior and do not wait for terminal
+targets.
 
 ## Ring Buffer Interpolation
 
