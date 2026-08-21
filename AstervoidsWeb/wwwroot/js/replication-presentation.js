@@ -279,6 +279,50 @@ const ReplicationPresentation = (function () {
         const smooth = new Map();
         const replayCache = new WeakMap();
         const replayContext = { replayCache, scratch: null };
+        const minimumJerkPeakSlope = 15 / 8;
+        const correctionEpsilon = 1e-12;
+
+        function rawVelocityAt(state, raw, nowPerf) {
+            const stepMs = 1000 / config.TARGET_FPS;
+            const elapsedFrames = stepMs > 0
+                ? (nowPerf - state.recvPerf) / stepMs
+                : 0;
+            if (!(elapsedFrames >= 0)
+                || elapsedFrames >= config.DEADRECKON_MAX_FRAMES) {
+                return { x: 0, y: 0, angle: 0 };
+            }
+
+            const targetMode = isRotationTarget(state);
+            const replaying = shouldReplay(state) && typeof replay === 'function';
+            return {
+                x: velocityToDeltaX(raw.velocityX || 0) / stepMs,
+                y: velocityToDeltaY(raw.velocityY || 0) / stepMs,
+                angle: raw.angle == null || (targetMode && !replaying)
+                    ? 0
+                    : (raw.rotationSpeed || 0) / stepMs
+            };
+        }
+
+        function createCorrectionTransition(
+            start,
+            startVelocity,
+            startAcceleration,
+            startTime,
+            endTime) {
+            if (Math.abs(start) <= correctionEpsilon
+                && Math.abs(startVelocity) <= correctionEpsilon
+                && Math.abs(startAcceleration) <= correctionEpsilon) {
+                return null;
+            }
+            return createMinimumJerkTransition({
+                start,
+                target: 0,
+                startVelocity,
+                startAcceleration,
+                startTime,
+                endTime
+            });
+        }
 
         const policy = {
             states,
@@ -295,7 +339,7 @@ const ReplicationPresentation = (function () {
                 stateContext = null) {
                 const now = nowMs();
                 const displayed = (!snap && states.has(id))
-                    ? policy._reckonAt(id, now)
+                    ? policy._kinematicsAt(id, now)
                     : null;
                 const recvPerf = (typeof baselinePerf === 'number'
                     && Number.isFinite(baselinePerf))
@@ -303,46 +347,82 @@ const ReplicationPresentation = (function () {
                     : now;
                 states.set(id, createState(data, recvPerf, stateContext));
 
-                let tau = config.DEADRECKON_SMOOTH_MS;
-                if (displayed && tau > 0) {
-                    const fresh = policy._reckonRaw(id, now);
+                let duration = config.DEADRECKON_SMOOTH_MS;
+                if (displayed && duration > 0) {
+                    const fresh = policy._rawKinematicsAt(id, now);
                     if (fresh) {
-                        let dx = displayed.x - fresh.x;
-                        let dy = displayed.y - fresh.y;
-                        let da = (displayed.angle != null && fresh.angle != null)
-                            ? shortestAngleDelta(displayed.angle, fresh.angle)
+                        let dx = displayed.pose.x - fresh.pose.x;
+                        let dy = displayed.pose.y - fresh.pose.y;
+                        const da = (displayed.pose.angle != null
+                            && fresh.pose.angle != null)
+                            ? shortestAngleDelta(
+                                displayed.pose.angle,
+                                fresh.pose.angle)
                             : 0;
                         const snapDist = config.DEADRECKON_SNAP_DIST;
-                        if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) {
+                        const snapPosition =
+                            Math.abs(dx) > snapDist || Math.abs(dy) > snapDist;
+                        if (snapPosition) {
                             dx = 0;
                             dy = 0;
                         }
-                        if (dx !== 0 || dy !== 0 || da !== 0) {
-                            if (preserveDirection) {
-                                const state = states.get(id);
-                                const stepMs = 1000 / config.TARGET_FPS;
-                                const motionX = velocityToDeltaX(state.velocityX || 0);
-                                const motionY = velocityToDeltaY(state.velocityY || 0);
-                                const motion = Math.hypot(motionX, motionY);
-                                if (motion > 1e-12) {
-                                    const correctionAlong =
-                                        (dx * motionX + dy * motionY) / motion;
-                                    if (correctionAlong > 0) {
-                                        tau = Math.max(
-                                            tau,
-                                            correctionAlong * stepMs / motion);
-                                    }
+                        if (preserveDirection) {
+                            const motion = Math.hypot(
+                                fresh.velocity.x,
+                                fresh.velocity.y);
+                            if (motion > 1e-12) {
+                                const correctionAlong =
+                                    (dx * fresh.velocity.x
+                                        + dy * fresh.velocity.y) / motion;
+                                if (correctionAlong > 0) {
+                                    duration = Math.max(
+                                        duration,
+                                        minimumJerkPeakSlope
+                                            * correctionAlong / motion);
                                 }
-                                const angularMotion = state.rotationSpeed || 0;
-                                if (Math.abs(angularMotion) > 1e-12
-                                    && Math.sign(da) === Math.sign(angularMotion)) {
-                                    tau = Math.max(
-                                        tau,
-                                        Math.abs(da) * stepMs / Math.abs(angularMotion));
-                                }
-                                tau *= 1.05;
                             }
-                            smooth.set(id, { dx, dy, da, t0: now, tauMs: tau });
+                            const angularMotion = fresh.velocity.angle;
+                            if (Math.abs(angularMotion) > 1e-12
+                                && Math.sign(da) === Math.sign(angularMotion)) {
+                                duration = Math.max(
+                                    duration,
+                                    minimumJerkPeakSlope
+                                        * Math.abs(da) / Math.abs(angularMotion));
+                            }
+                            duration *= 1.05;
+                        }
+
+                        const endTime = now + duration;
+                        const correction = {
+                            x: snapPosition
+                                ? null
+                                : createCorrectionTransition(
+                                    dx,
+                                    displayed.velocity.x - fresh.velocity.x,
+                                    displayed.acceleration.x - fresh.acceleration.x,
+                                    now,
+                                    endTime),
+                            y: snapPosition
+                                ? null
+                                : createCorrectionTransition(
+                                    dy,
+                                    displayed.velocity.y - fresh.velocity.y,
+                                    displayed.acceleration.y - fresh.acceleration.y,
+                                    now,
+                                    endTime),
+                            angle: displayed.pose.angle == null
+                                || fresh.pose.angle == null
+                                ? null
+                                : createCorrectionTransition(
+                                    da,
+                                    displayed.velocity.angle - fresh.velocity.angle,
+                                    displayed.acceleration.angle
+                                        - fresh.acceleration.angle,
+                                    now,
+                                    endTime)
+                        };
+                        if (correction.x || correction.y || correction.angle) {
+                            smooth.set(id, correction);
                             return;
                         }
                     }
@@ -409,26 +489,66 @@ const ReplicationPresentation = (function () {
                 }
             },
 
-            _reckonAt(id, nowPerf) {
-                const out = policy._reckonRaw(id, nowPerf);
-                if (!out) return null;
-                const correction = smooth.get(id);
-                if (correction) {
-                    const tau = correction.tauMs || config.DEADRECKON_SMOOTH_MS;
-                    const k = tau > 0
-                        ? Math.exp(-(nowPerf - correction.t0) / tau)
-                        : 0;
-                    if (k <= 1e-3) {
-                        smooth.delete(id);
-                    } else {
-                        out.x += correction.dx * k;
-                        out.y += correction.dy * k;
-                        if (out.angle !== undefined) {
-                            out.angle += correction.da * k;
-                        }
+            _rawKinematicsAt(id, nowPerf) {
+                const pose = policy._reckonRaw(id, nowPerf);
+                const state = states.get(id);
+                if (!pose || !state) return null;
+                const velocity = rawVelocityAt(state, pose, nowPerf);
+                const stepMs = 1000 / config.TARGET_FPS;
+                const probeMs = Math.min(1, stepMs / 10);
+                const futurePose = policy._reckonRaw(id, nowPerf + probeMs);
+                const futureVelocity = futurePose
+                    ? rawVelocityAt(state, futurePose, nowPerf + probeMs)
+                    : velocity;
+                return {
+                    pose,
+                    velocity,
+                    acceleration: {
+                        x: (futureVelocity.x - velocity.x) / probeMs,
+                        y: (futureVelocity.y - velocity.y) / probeMs,
+                        angle: (futureVelocity.angle - velocity.angle) / probeMs
                     }
+                };
+            },
+
+            _kinematicsAt(id, nowPerf) {
+                const result = policy._rawKinematicsAt(id, nowPerf);
+                if (!result) return null;
+                const correction = smooth.get(id);
+                if (!correction) return result;
+
+                let done = true;
+                for (const axis of ['x', 'y', 'angle']) {
+                    const transition = correction[axis];
+                    if (!transition) continue;
+                    const sample = sampleMinimumJerkTransition(
+                        transition, nowPerf);
+                    result.pose[axis] += sample.value;
+                    result.velocity[axis] += sample.velocity;
+                    result.acceleration[axis] += sample.acceleration;
+                    done = done && sample.done;
                 }
-                return out;
+                if (done) smooth.delete(id);
+                return result;
+            },
+
+            _reckonAt(id, nowPerf) {
+                const pose = policy._reckonRaw(id, nowPerf);
+                if (!pose) return null;
+                const correction = smooth.get(id);
+                if (!correction) return pose;
+
+                let done = true;
+                for (const axis of ['x', 'y', 'angle']) {
+                    const transition = correction[axis];
+                    if (!transition) continue;
+                    const sample = sampleMinimumJerkTransition(
+                        transition, nowPerf);
+                    pose[axis] += sample.value;
+                    done = done && sample.done;
+                }
+                if (done) smooth.delete(id);
+                return pose;
             },
 
             getReckoned(id) {

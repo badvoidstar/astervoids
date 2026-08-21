@@ -956,6 +956,14 @@ dead-reckoning bound. Immediate start, stop, and reversal edges still request a
 throttle-bypassing send, and ordinary shortest-angle correction absorbs
 remaining prediction error when the authoritative packet arrives.
 
+Deterministic re-anchors reconcile with a finite quintic correction trajectory.
+Each trajectory starts with the currently displayed position, velocity, and
+acceleration and reaches the new dead-reckoned path with zero residual and
+matching derivatives. A packet arriving during an active correction replans
+from that sampled state, preserving C2 motion continuity. Angular residuals use
+the shortest arc, teleports and wrap discontinuities still snap, and migration
+corrections may extend their duration to preserve forward motion.
+
 ```mermaid
 flowchart TB
     subgraph "Per-Member BUF Calculation"

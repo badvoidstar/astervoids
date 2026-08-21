@@ -1175,18 +1175,16 @@
         // normally re-anchors through correction smoothing; only explicit
         // teleports or large errors bypass that blend.
         DEADRECKON_MAX_FRAMES: 30,
-        // Deterministic mode only: projective-velocity-blending time constant
-        // (ms) for absorbing extrapolation error. When a new authoritative
-        // packet disagrees with the replica's current extrapolation — e.g. the
-        // owner STOPS rotating and the replica had projected past the true
-        // angle — the difference is decayed to zero over ~this window instead of
-        // snapping. Kills the rotation overshoot/rubberband at motion start/stop
-        // (exaggerated at low send rates, where a longer unannounced interval
-        // produces more overshoot). ~0 in steady state, so it adds no lag to
-        // smooth motion. The first real update after ownership migration can
-        // select a longer, error-derived decay to avoid reversing displayed
-        // motion; that intentionally trades temporary lag for direction
-        // continuity and has no separate hard cap. Set 0 to disable (hard snap).
+        // Deterministic mode only: finite minimum-jerk correction duration (ms).
+        // When a new authoritative packet disagrees with the current
+        // extrapolation, reconciliation starts from the displayed position,
+        // velocity, and acceleration and reaches the fresh path with matching
+        // derivatives. Re-anchoring an active correction therefore remains C2
+        // continuous instead of producing a speed pulse. The first real update
+        // after ownership migration can select a longer, error-derived duration
+        // to avoid reversing displayed motion; that intentionally trades
+        // temporary lag for direction continuity and has no separate hard cap.
+        // Set 0 to disable (hard snap).
         DEADRECKON_SMOOTH_MS: 90,
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).
@@ -1841,8 +1839,8 @@
     // side baseline while waiting for the next ordered packet. Normal live
     // packets are arrival-anchored, so this bridges the receiver's inter-arrival
     // interval rather than predicting through network transit to the owner's
-    // present. New packets usually preserve the displayed pose with a decaying
-    // correction; they do not normally snap. Extrapolation is bounded by
+    // present. New packets usually preserve the displayed motion with a finite
+    // minimum-jerk correction; they do not normally snap. Extrapolation is bounded by
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
     function createDeadReckoningState(data, recvPerf, context = null) {

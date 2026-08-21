@@ -13,6 +13,8 @@ const {
     calculateRateAngularPredictionWindow,
     integrateRateAngularPredictionFrames,
     averageRateAngularPredictionScale,
+    createMinimumJerkTransition,
+    sampleMinimumJerkTransition,
 } = require('./wwwroot/js/replication-presentation.js');
 
 // Exercises extracted policies where available and mirrors the game-layer Ship
@@ -492,10 +494,21 @@ function hybridReckon(packet, frames, { inputReplay = true, rotationTarget = tru
     return out;
 }
 
-function smoothedAngle(authoritativeAngle, previouslyDisplayedAngle, dtMs, tauMs) {
-    const k = tauMs > 0 ? Math.exp(-dtMs / tauMs) : 0;
-    const da = shortestAngleDelta(previouslyDisplayedAngle, authoritativeAngle);
-    return authoritativeAngle + da * (k <= 1e-3 ? 0 : k);
+function reconciledAngle(
+    authoritativeAngle,
+    previouslyDisplayedAngle,
+    dtMs,
+    durationMs) {
+    const transition = createMinimumJerkTransition({
+        start: shortestAngleDelta(
+            previouslyDisplayedAngle,
+            authoritativeAngle),
+        target: 0,
+        startTime: 0,
+        endTime: durationMs
+    });
+    return authoritativeAngle
+        + sampleMinimumJerkTransition(transition, dtMs).value;
 }
 
 function packetOf(ship) {
@@ -654,18 +667,29 @@ test('P3b: target-heading replay takes the short way across the angle seam', () 
         `target replay should converge across seam, got ${replayed.angle}`);
 });
 
-test('P4: authoritative-angle convergence eases without overshoot', () => {
+test('P4: authoritative-angle reconciliation finishes without overshoot', () => {
     const authoritative = 1.0;
     const previouslyDisplayed = 1.45;
-    const tau = 90;
-    assert.equal(smoothedAngle(authoritative, previouslyDisplayed, 0, tau), previouslyDisplayed);
+    const duration = 90;
+    assert.equal(
+        reconciledAngle(
+            authoritative,
+            previouslyDisplayed,
+            0,
+            duration),
+        previouslyDisplayed);
     let prior = previouslyDisplayed;
-    for (let t = 10; t <= 600; t += 10) {
-        const angle = smoothedAngle(authoritative, previouslyDisplayed, t, tau);
+    for (let t = 10; t <= duration; t += 10) {
+        const angle = reconciledAngle(
+            authoritative,
+            previouslyDisplayed,
+            t,
+            duration);
         assert.ok(angle <= prior + 1e-12, `t=${t}: should move monotonically toward target`);
         assert.ok(angle >= authoritative - 1e-12, `t=${t}: should not overshoot below target`);
         prior = angle;
     }
+    assert.equal(prior, authoritative);
 });
 
 test('P4: non-replay target controls keep authoritative angle instead of projecting stale rotation', () => {

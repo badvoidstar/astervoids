@@ -341,167 +341,223 @@ test('reckon baseline: arrival-anchoring hands off continuously when the base ad
     assert.ok(Math.abs(after - before) < Math.abs(vy) + 1e-9, `expected continuous handoff, got ${before} vs ${after}`);
 });
 
-// ── Correction-decay smoothing (projective velocity blending) ───────────────
+// ── Minimum-jerk correction reconciliation ─────────────────────────────────
 //
-// getReckoned extrapolates angle as base + rotationSpeed*frames. When the owner
-// STOPS rotating, the replica has already projected past the true angle by up to
-// rotationSpeed*sendGap (the gap — and thus the overshoot — grows with latency).
-// Without smoothing the stop packet snaps the replica back: visible rubberband.
-// DeadReckon instead seeds a decaying angular offset = (displayed − fresh) on
-// each new snapshot and bleeds it out over DEADRECKON_SMOOTH_MS, so the replica
-// eases back to truth. In steady rotation the extrapolation already agrees with
-// the next snapshot, so the offset is ~0 and adds no lag.
+// Re-anchoring starts a finite correction trajectory whose position, velocity,
+// and acceleration match the currently displayed path. It reaches the fresh
+// authoritative path with the same derivatives at the configured end time.
 
 function shortestAngleDelta(target, current) {
     const d = target - current;
     return Math.atan2(Math.sin(d), Math.cos(d));
 }
 
-// Minimal mirror of DeadReckon's angular path with correction smoothing.
-function makeReckoner(stepMs, tau, maxFrames = 30) {
-    let state = null;        // { angle, rotationSpeed, recvPerf }
-    let smooth = null;       // { da, t0 }
-    function reckonRaw(now) {
-        if (!state) return null;
-        let frames = stepMs > 0 ? (now - state.recvPerf) / stepMs : 0;
-        if (!(frames > 0)) frames = 0;
-        if (frames > maxFrames) frames = maxFrames;
-        return state.angle + state.rotationSpeed * frames;
-    }
-    function sample(now) {
-        const raw = reckonRaw(now);
-        if (raw == null) return null;
-        if (smooth) {
-            const k = tau > 0 ? Math.exp(-(now - smooth.t0) / tau) : 0;
-            if (k <= 1e-3) smooth = null;
-            else return raw + smooth.da * k;
+function makeCorrectionHarness(stepMs, durationMs, maxFrames = 1000) {
+    let now = 0;
+    const policy = createDeadReckoningPolicy({
+        config: {
+            TARGET_FPS: 1000 / stepMs,
+            DEADRECKON_MAX_FRAMES: maxFrames,
+            DEADRECKON_SMOOTH_MS: durationMs,
+            DEADRECKON_SNAP_DIST: Infinity
+        },
+        nowMs: () => now,
+        velocityToDeltaX: value => value,
+        velocityToDeltaY: value => value,
+        shortestAngleDelta,
+        createState: (data, recvPerf) => ({
+            x: data.x || 0,
+            y: data.y || 0,
+            angle: data.angle ?? null,
+            velocityX: data.velocityX || 0,
+            velocityY: data.velocityY || 0,
+            rotationSpeed: data.rotationSpeed || 0,
+            recvPerf
+        })
+    });
+    return {
+        policy,
+        update(at, data, snap = false, preserveDirection = false) {
+            now = at;
+            policy.updateState(
+                'object', data, null, snap, preserveDirection);
+        },
+        sample(at) {
+            now = at;
+            return policy.getReckoned('object');
+        },
+        motion(at) {
+            return policy._kinematicsAt('object', at);
         }
-        return raw;
-    }
-    function update(now, angle, rotationSpeed, snap) {
-        const displayed = (!snap && state) ? sample(now) : null;
-        state = { angle, rotationSpeed, recvPerf: now };
-        if (displayed != null && tau > 0) {
-            const fresh = reckonRaw(now);
-            const da = shortestAngleDelta(displayed, fresh);
-            smooth = (da !== 0) ? { da, t0: now } : null;
-        } else {
-            smooth = null;
-        }
-    }
-    return { update, sample, resting: () => (state ? state.angle : null) };
+    };
 }
 
-test('smoothing: rotation stop eases back to truth instead of snapping', () => {
+function assertMotionEqual(actual, expected, message) {
+    for (const axis of ['x', 'y', 'angle']) {
+        assert.ok(
+            Math.abs(actual.pose[axis] - expected.pose[axis]) < 1e-12,
+            `${message} ${axis} position`);
+        assert.ok(
+            Math.abs(actual.velocity[axis] - expected.velocity[axis]) < 1e-12,
+            `${message} ${axis} velocity`);
+        assert.ok(
+            Math.abs(actual.acceleration[axis] - expected.acceleration[axis])
+                < 1e-12,
+            `${message} ${axis} acceleration`);
+    }
+}
+
+test('correction: rotation stop preserves motion and reaches truth exactly', () => {
     const stepMs = 1000 / 60;
-    const tau = 90;
+    const duration = 90;
     const omega = 0.05;       // rad per frame while rotating
     const gap = 8 * stepMs;   // high-latency send gap → big pre-stop overshoot
-    const r = makeReckoner(stepMs, tau);
+    const r = makeCorrectionHarness(stepMs, duration);
 
     // Steady rotation: two snapshots whose bases advance by exactly omega*gap.
-    r.update(0, 0, omega);
-    r.update(gap, omega * (gap / stepMs), omega);
+    r.update(0, { angle: 0, rotationSpeed: omega });
+    r.update(gap, {
+        angle: omega * (gap / stepMs),
+        rotationSpeed: omega
+    });
     // Just before the stop packet, the replica has extrapolated forward assuming
     // rotation continued (base 0.4 at t=gap, +omega per frame).
     const tStop = 2 * gap;
-    const displayedBeforeStop = r.sample(tStop); // = 0.4 + omega*8 = 0.8 (overshoot)
+    const before = r.motion(tStop);
     // The owner actually stopped EARLIER than the replica predicted: it rotated a
     // little past 0.4 and halted at 0.5, so the extrapolation overshot by 0.3.
     const trueStopAngle = 0.5;
 
     // Stop packet: rotationSpeed → 0, base = true stop angle.
-    r.update(tStop, trueStopAngle, 0);
-    const atStop = r.sample(tStop);
-    // No snap: the displayed value at the stop instant equals where the replica
-    // already was (continuous), NOT the raw authoritative angle.
-    assert.ok(Math.abs(atStop - displayedBeforeStop) < 1e-9,
-        `expected continuous handoff at stop, got ${atStop} vs ${displayedBeforeStop}`);
-    assert.ok(atStop > trueStopAngle, 'replica starts beyond the true stop angle (the overshoot)');
-
-    // Over the next frames it decays monotonically toward truth, never past it.
-    let prev = atStop;
-    for (let f = 1; f <= 30; f++) {
-        const v = r.sample(tStop + f * stepMs);
-        assert.ok(v <= prev + 1e-12, `must not move further from truth at frame ${f}`);
-        assert.ok(v >= trueStopAngle - 1e-9, `must not undershoot past truth at frame ${f}`);
-        prev = v;
-    }
-    // Settled within a few tau.
-    assert.ok(Math.abs(r.sample(tStop + 6 * tau) - trueStopAngle) < 1e-3, 'settles at the true angle');
+    r.update(tStop, { angle: trueStopAngle, rotationSpeed: 0 });
+    const after = r.motion(tStop);
+    assertMotionEqual(after, before, 'rotation stop handoff');
+    assert.equal(r.sample(tStop + duration).angle, trueStopAngle);
+    assert.equal(r.policy.smooth.has('object'), false);
 });
 
-test('smoothing: steady rotation adds no offset (no lag)', () => {
+test('correction: steady rotation adds no trajectory', () => {
     const stepMs = 1000 / 60;
     const omega = 0.05;
     const gap = 4 * stepMs;
-    const r = makeReckoner(stepMs, 90);
-    r.update(0, 0, omega);
+    const r = makeCorrectionHarness(stepMs, 90);
+    r.update(0, { angle: 0, rotationSpeed: omega });
     // Each subsequent snapshot's base advanced by exactly omega*(gap/stepMs):
-    // the extrapolation already predicted it, so the seeded offset is ~0 and the
-    // sampled angle equals the pure extrapolation (latency-bounded, no rubberband).
+    // the extrapolation already predicted it, so no correction is needed.
     for (let i = 1; i <= 5; i++) {
         const base = omega * (gap / stepMs) * i;
-        r.update(i * gap, base, omega);
-        const sampled = r.sample(i * gap);
-        assert.ok(Math.abs(sampled - base) < 1e-9, `steady-state offset should be ~0 at packet ${i}`);
+        r.update(i * gap, { angle: base, rotationSpeed: omega });
+        assert.ok(
+            Math.abs(r.sample(i * gap).angle - base) < 1e-9,
+            `steady-state pose should match at packet ${i}`);
+        assert.equal(r.policy.smooth.has('object'), false);
     }
 });
 
-test('smoothing: disabled (tau=0) snaps immediately', () => {
+test('correction: repeated re-anchor preserves C2 motion', () => {
     const stepMs = 1000 / 60;
-    const omega = 0.05;
-    const gap = 8 * stepMs;
-    const r = makeReckoner(stepMs, 0); // disabled
-    r.update(0, 0, omega);
-    r.update(gap, omega * (gap / stepMs), omega);
-    const trueStopAngle = omega * (gap / stepMs) * 1.5;
-    r.update(2 * gap, trueStopAngle, 0);
-    // With smoothing off, the replica is exactly the authoritative angle (snap).
-    assert.equal(r.sample(2 * gap), trueStopAngle);
+    const r = makeCorrectionHarness(stepMs, 120);
+    r.update(0, {
+        x: 0,
+        y: 0,
+        angle: 0,
+        velocityX: 0.01,
+        velocityY: -0.004,
+        rotationSpeed: 0.02
+    });
+    r.update(100, {
+        x: 0.04,
+        y: -0.03,
+        angle: 0.08,
+        velocityX: 0.008,
+        velocityY: -0.003,
+        rotationSpeed: 0.015
+    });
+
+    const reanchorAt = 145;
+    const before = r.motion(reanchorAt);
+    r.update(reanchorAt, {
+        x: 0.09,
+        y: -0.04,
+        angle: 0.13,
+        velocityX: 0.006,
+        velocityY: -0.002,
+        rotationSpeed: 0.01
+    });
+    const after = r.motion(reanchorAt);
+    assertMotionEqual(after, before, 'mid-correction re-anchor');
 });
 
-test('snap: intentional teleport (respawn) jumps instead of blending', () => {
+test('correction: migration reconciliation preserves forward motion', () => {
     const stepMs = 1000 / 60;
-    const tau = 90;
-    const omega = 0.05;
-    const gap = 8 * stepMs;
-    const r = makeReckoner(stepMs, tau);
+    const r = makeCorrectionHarness(stepMs, 90);
+    r.update(0, { x: 0.1, velocityX: 0.01 });
+    const reanchorAt = 100;
+    r.update(
+        reanchorAt,
+        { x: 0.06, velocityX: 0.01 },
+        false,
+        /* preserveDirection */ true);
 
-    // Steady rotation builds up extrapolation overshoot, just like before a stop.
-    r.update(0, 0, omega);
-    r.update(gap, omega * (gap / stepMs), omega);
-    const tReset = 2 * gap;
-    const displayedBeforeReset = r.sample(tReset);
-
-    // Respawn pose is discontinuous (e.g. angle reset to the spawn heading) and
-    // arrives WITH the snap flag set: no decaying offset is seeded, so the very
-    // first sample is the authoritative angle — no glide from the old pose.
-    const spawnAngle = -Math.PI / 2;
-    assert.ok(Math.abs(displayedBeforeReset - spawnAngle) > 0.1, 'precondition: poses differ');
-    r.update(tReset, spawnAngle, 0, /* snap */ true);
-    assert.equal(r.sample(tReset), spawnAngle,
-        'snap must place the replica exactly at the authoritative spawn pose');
-    // And it stays put (no residual offset decaying in over the next frames).
-    assert.equal(r.sample(tReset + 5 * stepMs), spawnAngle);
+    const endTime = r.policy.smooth.get('object').x.endTime;
+    let previous = r.sample(reanchorAt).x;
+    for (let at = reanchorAt + 5; at <= endTime; at += 5) {
+        const current = r.sample(at).x;
+        assert.ok(
+            current >= previous - 1e-12,
+            `forward motion reversed at ${at}ms: ${previous} -> ${current}`);
+        previous = current;
+    }
 });
 
-test('snap: without the flag a small reset would blend (regression guard)', () => {
+test('correction: angular reconciliation takes the shortest seam path', () => {
     const stepMs = 1000 / 60;
-    const tau = 90;
+    const r = makeCorrectionHarness(stepMs, 90);
+    const displayedAngle = Math.PI * 2 - 0.05;
+    r.update(0, { angle: displayedAngle });
+    r.update(10, { angle: 0.1 });
+
+    const correction = r.policy.smooth.get('object').angle;
+    assert.ok(Math.abs(correction.coefficients[0] + 0.15) < 1e-12);
+    assert.ok(
+        Math.abs(shortestAngleDelta(
+            r.sample(10).angle,
+            displayedAngle)) < 1e-12);
+    assert.equal(r.sample(correction.endTime).angle, 0.1);
+});
+
+test('correction: disabled duration snaps immediately', () => {
+    const stepMs = 1000 / 60;
     const omega = 0.05;
     const gap = 8 * stepMs;
-    const r = makeReckoner(stepMs, tau);
-    r.update(0, 0, omega);
-    r.update(gap, omega * (gap / stepMs), omega);
+    const r = makeCorrectionHarness(stepMs, 0);
+    r.update(0, { angle: 0, rotationSpeed: omega });
+    r.update(gap, {
+        angle: omega * (gap / stepMs) / 2,
+        rotationSpeed: 0
+    });
+    assert.equal(
+        r.sample(gap).angle,
+        omega * (gap / stepMs) / 2);
+});
+
+test('snap: intentional teleport clears an in-flight correction', () => {
+    const stepMs = 1000 / 60;
+    const omega = 0.05;
+    const gap = 8 * stepMs;
+    const r = makeCorrectionHarness(stepMs, 90);
+    r.update(0, { angle: 0, rotationSpeed: omega });
+    r.update(gap, { angle: 0.2, rotationSpeed: 0 });
+    assert.equal(r.policy.smooth.has('object'), true);
+
     const tReset = 2 * gap;
-    const displayedBeforeReset = r.sample(tReset);
     const spawnAngle = -Math.PI / 2;
-    // Same reset WITHOUT snap: a decaying offset is seeded, so the first sample
-    // stays at the old displayed pose and eases over — the artifact snap fixes.
-    r.update(tReset, spawnAngle, 0, /* snap */ false);
-    assert.ok(Math.abs(r.sample(tReset) - displayedBeforeReset) < 1e-9,
-        'no-snap path blends from the old pose (continuous handoff)');
+    r.update(
+        tReset,
+        { angle: spawnAngle, rotationSpeed: 0 },
+        /* snap */ true);
+    assert.equal(r.policy.smooth.has('object'), false);
+    assert.equal(r.sample(tReset).angle, spawnAngle);
 });
 
 // ── Ownership migration: clear dead-reckon state so local sim isn't re-pinned ─

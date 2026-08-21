@@ -280,8 +280,15 @@ test('production migration handoff skips ownership-only anchors and preserves di
     assert.match(
         productionSource,
         /isTeleport,\s*facts\.preserveDirection,\s*\{\s*rateAngularPredictionWindow:/);
-    assert.match(presentationSource, /correctionAlong \* stepMs \/ motion/);
-    assert.match(presentationSource, /tauMs: tau/);
+    assert.match(
+        presentationSource,
+        /minimumJerkPeakSlope\s*\*\s*correctionAlong\s*\/\s*motion/);
+    assert.match(
+        presentationSource,
+        /displayed\.velocity\.x - fresh\.velocity\.x/);
+    assert.match(
+        presentationSource,
+        /displayed\.acceleration\.x - fresh\.acceleration\.x/);
 });
 
 test('session reset clears all transient collision state', () => {
