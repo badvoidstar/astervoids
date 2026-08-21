@@ -237,6 +237,11 @@ These methods have no corresponding hub RPC.
 | `onSessionExpired` | `OnSessionExpired` | `(reason)` — server-driven session destroy via `SessionCleanupService` |
 | `onError` | Internal | `(errorMessage)` — fired on connection or RPC errors |
 
+While a create or join RPC is pending, membership broadcasts can overtake its
+older response snapshot. `SessionClient` queues those broadcasts, folds them
+into the installed member list in arrival order, then dispatches their callbacks
+after the session callback has initialized snapshot consumers.
+
 ### ObjectSync Public API
 
 #### Lifecycle / Config
@@ -1013,8 +1018,8 @@ Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
 events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
 `UpdateObjects` samples once at flush and fans that value across the coalesced
 batch, so it is an ordering/presentation anchor rather than an exact simulation
-timestamp for every pose. Buffered interpolation and replacement projection use
-this axis; deterministic live motion normally remains arrival-anchored.
+timestamp for every pose. Buffered interpolation uses this axis; deterministic
+live updates normally remain arrival-anchored.
 
 ```mermaid
 flowchart LR
@@ -1040,8 +1045,8 @@ flowchart LR
 
 * **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Min-RTT sampling reduces transient queue bias, but persistent path asymmetry remains as clock error; projection callers gate initialization and cap elapsed time.
 * **`clock.wallToPerfDelta = performance.now() - Date.now()`** is refreshed on every accepted ping burst. The conversion `validAt → snapshot.time` runs through it so bracket-search stays on a monotonic clock while the snapshot key still encodes the global server-time agreement.
-* **No present-time spawn projection on observers.** Buffered mode keys the first snapshot at `validAt` and initially clamps/extrapolates on that delayed timeline. Deterministic mode arrival-anchors live lifecycle state instead.
-* **Local-owner replacement projection.** The shooter who invokes `replaceObject` adopts resulting children about one operation round trip later. `updateAstervoidsFromSync` forward-projects from bounded `obj.validAt` staleness because owned objects are driven by local physics, not interpolation. Clock asymmetry and pre-invocation work remain residual error.
+* **Causal deterministic replacements.** Normal deterministic updates arrival-anchor, but a replacement child inherits the parent's local presentation timeline: `min(nowPerf, parent.recvPerf + max(0, child.validAt - parent.validAt))`. The timestamp difference cancels absolute shared-clock offset and removes discontinuities from one-off replacement latency. The invoking owner records a local monotonic baseline, so adoption also works before clock bootstrap. Existing dead-reckoning and spawn-projection caps still bound stale estimates.
+* **Buffered replacement projection.** Buffered mode keys the first snapshot at `validAt` and adds a parent-pose bridge on that shared axis. Its locally owned children retain bounded `validAt` projection.
 * **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; buffered mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
 
 ### Per-batch `validAt` collapse on `OnObjectsUpdated`

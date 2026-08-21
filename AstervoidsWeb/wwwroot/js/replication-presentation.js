@@ -244,6 +244,18 @@ const ReplicationPresentation = (function () {
             / (end - start);
     }
 
+    function calculateReplacementBaselinePerf(parentState, childValidAt, nowPerf) {
+        if (!parentState
+            || !Number.isFinite(parentState.recvPerf)
+            || !Number.isFinite(parentState.validAt)
+            || !Number.isFinite(childValidAt)
+            || !Number.isFinite(nowPerf)) {
+            return undefined;
+        }
+        const authoredDeltaMs = Math.max(0, childValidAt - parentState.validAt);
+        return Math.min(nowPerf, parentState.recvPerf + authoredDeltaMs);
+    }
+
     function createDeadReckoningPolicy(options) {
         const config = options?.config;
         const nowMs = options?.nowMs;
@@ -1183,6 +1195,7 @@ const ReplicationPresentation = (function () {
         calculateRateAngularPredictionWindow,
         integrateRateAngularPredictionFrames,
         averageRateAngularPredictionScale,
+        calculateReplacementBaselinePerf,
         createMemberDelay,
         findSnapshotBracket,
         hermiteBasis,

@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { createDeadReckoningPolicy } = require(
+const {
+    createDeadReckoningPolicy,
+    calculateReplacementBaselinePerf
+} = require(
     './wwwroot/js/replication-presentation.js');
 
 // Most helpers mirror inline deterministic game-layer logic. Dead reckoning
@@ -339,6 +342,44 @@ test('reckon baseline: arrival-anchoring hands off continuously when the base ad
     // The gap between the two displayed positions is sub-frame (no lurch/sawtooth)
     // because base2 - base1 = vy*3 ≈ the motion over the (arrival2-arrival1) gap.
     assert.ok(Math.abs(after - before) < Math.abs(vy) + 1e-9, `expected continuous handoff, got ${before} vs ${after}`);
+});
+
+test('replacement baseline carries the parent timeline across differential packet delay', () => {
+    const parentState = {
+        recvPerf: 1000,
+        validAt: 50_000
+    };
+    const childValidAt = 50_120;
+    const replacementArrivalPerf = 1300;
+
+    const baseline = calculateReplacementBaselinePerf(
+        parentState, childValidAt, replacementArrivalPerf);
+
+    assert.equal(baseline, 1120);
+    assert.equal(
+        parentState.validAt + (replacementArrivalPerf - parentState.recvPerf),
+        childValidAt + (replacementArrivalPerf - baseline),
+        'parent and child resolve to the same causal presentation time');
+});
+
+test('replacement baseline is independent of absolute shared-clock offset', () => {
+    const original = calculateReplacementBaselinePerf(
+        { recvPerf: 1000, validAt: 50_000 }, 50_120, 1300);
+    const shifted = calculateReplacementBaselinePerf(
+        { recvPerf: 1000, validAt: 9_050_000 }, 9_050_120, 1300);
+
+    assert.equal(shifted, original);
+});
+
+test('replacement baseline never predicts from a future local baseline', () => {
+    assert.equal(
+        calculateReplacementBaselinePerf(
+            { recvPerf: 1000, validAt: 50_000 }, 51_000, 1300),
+        1300);
+    assert.equal(
+        calculateReplacementBaselinePerf(
+            { recvPerf: 1000, validAt: null }, 51_000, 1300),
+        undefined);
 });
 
 // ── Minimum-jerk correction reconciliation ─────────────────────────────────

@@ -263,18 +263,18 @@ test('continuity: receiver bracket-extrapolates to same x as local-owner spawn p
 // ── Adopt-branch gate: suppress spawn projection for join-snapshot orphans ──
 //
 // Mirror of the gate in asteroidReplicationDescriptor.adoptOwned (index.html):
-//   project iff record.validAt != null && !record.spawnHandled
-//            && !facts.joinSnapshot && clockReady
+//   project iff !record.spawnHandled && !facts.joinSnapshot and either a local
+//   replacement baseline exists or (record.validAt != null && clockReady)
 // Split children spawned during active membership ARE projected (they were
 // moving since validAt). Orphans present in the join snapshot are NOT — they
 // sat idle while the session was empty, so projecting them forward by up to
 // MAX_EXTRAPOLATION of velocity would teleport them on adoption.
 
 function shouldSpawnProject(obj, facts, clockReady = true) {
-    return obj.validAt != null
-        && !obj.spawnHandled
+    return !obj.spawnHandled
         && !facts.joinSnapshot
-        && clockReady;
+        && (Number.isFinite(obj.replacementBaselinePerf)
+            || (obj.validAt != null && clockReady));
 }
 
 test('adopt gate: split child spawned after join IS projected', () => {
@@ -285,6 +285,17 @@ test('adopt gate: split child spawned after join IS projected', () => {
 test('adopt gate: orphan present at join is NOT projected (no teleport)', () => {
     const orphan = { id: 'orphan-1', validAt: 1000 };
     assert.equal(shouldSpawnProject(orphan, { joinSnapshot: true }), false);
+});
+
+test('adopt gate: replacement baseline projects before shared-clock bootstrap', () => {
+    const child = {
+        id: 'child-pre-clock',
+        validAt: null,
+        replacementBaselinePerf: 1250
+    };
+    assert.equal(
+        shouldSpawnProject(child, { joinSnapshot: false }, false),
+        true);
 });
 
 test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected', () => {

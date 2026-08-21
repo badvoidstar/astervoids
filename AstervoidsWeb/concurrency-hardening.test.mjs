@@ -325,6 +325,64 @@ test('SessionClient serializes overlapping joins through an acknowledged leave',
         ['JoinSession', 'LeaveSession', 'JoinSession']);
 });
 
+test('SessionClient merges member events that overtake a pending join snapshot', async () => {
+    const connection = new FakeConnection();
+    const joinGate = deferred();
+    connection.invokers.set('JoinSession', () => joinGate.promise);
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+
+    const callbacks = [];
+    client.on('onSessionJoined', session => {
+        callbacks.push(`session:${session.members.map(member => member.id).sort().join(',')}`);
+    });
+    client.on('onMemberJoined', member => callbacks.push(`joined:${member.id}`));
+    client.on('onMemberLeft', info => callbacks.push(`left:${info.memberId}`));
+    client.on('onRoleChanged', role => callbacks.push(`role:${role}`));
+
+    const joining = client.joinSession('race');
+    await drainMicrotasks();
+    connection.emit(
+        'OnMemberJoined',
+        { id: 'late-member', role: 'Client' },
+        'late-member',
+        1,
+        1000);
+    connection.emit(
+        'OnMemberLeft',
+        {
+            memberId: 'old-server',
+            promotedMemberId: 'member-race',
+            promotedRole: 'Server',
+            deletedObjectIds: [],
+            migratedObjects: []
+        },
+        'old-server',
+        2,
+        1001);
+
+    assert.deepEqual(callbacks, [], 'member callbacks wait until the snapshot is installed');
+
+    const response = joinResponse('race');
+    response.members = [
+        { id: 'old-server', role: 'Server' },
+        { id: 'member-race', role: 'Client' }
+    ];
+    joinGate.resolve(response);
+    const result = await joining;
+
+    assert.deepEqual(
+        result.session.members.map(member => member.id).sort(),
+        ['late-member', 'member-race']);
+    assert.equal(result.member.role, 'Server');
+    assert.deepEqual(callbacks, [
+        'session:late-member,member-race',
+        'joined:late-member',
+        'left:old-server',
+        'role:Server'
+    ]);
+});
+
 test('SessionClient serializes create then join without orphaning membership', async () => {
     const connection = new FakeConnection();
     const createGate = deferred();

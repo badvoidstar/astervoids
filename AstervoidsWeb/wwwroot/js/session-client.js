@@ -63,7 +63,7 @@ const SessionClient = (function() {
 
     function beginSessionTransition(kind, clearLastSession = false, targetSessionId = null) {
         const epoch = ++sessionEpoch;
-        pendingSessionTransition = { kind, epoch, targetSessionId };
+        pendingSessionTransition = { kind, epoch, targetSessionId, memberEvents: [] };
         currentSession = null;
         currentMember = null;
         if (clearLastSession) {
@@ -123,6 +123,75 @@ const SessionClient = (function() {
                 || pendingSessionTransition.kind === 'join';
         }
         return currentSession !== null;
+    }
+
+    function applyMemberEvent(event) {
+        if (!currentSession || !event) return;
+
+        if (event.kind === 'joined') {
+            if (!Array.isArray(currentSession.members)) {
+                currentSession.members = [];
+            }
+            const existing = currentSession.members.find(
+                member => member.id === event.memberInfo.id);
+            if (existing) {
+                Object.assign(existing, event.memberInfo);
+            } else {
+                currentSession.members.push(event.memberInfo);
+            }
+            return;
+        }
+
+        const info = event.info;
+        if (!info) return;
+        if (Array.isArray(currentSession.members)) {
+            currentSession.members = currentSession.members.filter(
+                member => member.id !== info.memberId);
+        }
+        if (info.promotedMemberId && currentMember
+            && info.promotedMemberId === currentMember.id) {
+            event.roleChanged = true;
+        }
+    }
+
+    function dispatchMemberEvent(event) {
+        if (event.kind === 'joined') {
+            if (callbacks.onMemberJoined) {
+                callbacks.onMemberJoined(
+                    event.memberInfo, event.senderMemberId, event.memberSequence);
+            }
+            return;
+        }
+
+        if (callbacks.onMemberLeft) {
+            callbacks.onMemberLeft(
+                event.info, event.senderMemberId, event.memberSequence);
+        }
+        if (event.roleChanged && currentMember) {
+            currentMember.role = event.info.promotedRole;
+            const self = currentSession?.members?.find(
+                member => member.id === currentMember.id);
+            if (self) self.role = event.info.promotedRole;
+            if (callbacks.onRoleChanged) {
+                callbacks.onRoleChanged(event.info.promotedRole);
+            }
+        }
+    }
+
+    function handleMemberEvent(event) {
+        if (!currentSession && pendingSessionTransition?.memberEvents) {
+            pendingSessionTransition.memberEvents.push(event);
+            return;
+        }
+        applyMemberEvent(event);
+        dispatchMemberEvent(event);
+    }
+
+    function applyPendingMemberEvents(epoch) {
+        if (pendingSessionTransition?.epoch !== epoch) return [];
+        const events = pendingSessionTransition.memberEvents.splice(0);
+        for (const event of events) applyMemberEvent(event);
+        return events;
     }
 
     function acceptsExpirationForSession(expiredSessionId) {
@@ -418,44 +487,24 @@ const SessionClient = (function() {
         thisConnection.on('OnMemberJoined', guard((memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
             // console.log('[SessionClient] Member joined:', memberInfo);
             WireEnum.translateMember(memberInfo);
-            // Add member to local session state
-            if (currentSession && currentSession.members) {
-                currentSession.members.push(memberInfo);
-            }
-            if (callbacks.onMemberJoined) {
-                callbacks.onMemberJoined(memberInfo, senderMemberId, memberSequence);
-            }
+            handleMemberEvent({
+                kind: 'joined',
+                memberInfo,
+                senderMemberId,
+                memberSequence
+            });
         }, true));
 
         thisConnection.on('OnMemberLeft', guard((info, senderMemberId, memberSequence, serverTimestamp) => {
             // console.log('[SessionClient] Member left:', info);
             if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
-
-            // Remove member from local session state
-            if (currentSession && currentSession.members) {
-                currentSession.members = currentSession.members.filter(m => m.id !== info.memberId);
-            }
-
-            // Handle object cleanup/migration FIRST (before role change, so promoted member sees correct ownership)
-            if (callbacks.onMemberLeft) {
-                callbacks.onMemberLeft(info, senderMemberId, memberSequence);
-            }
-
-            // Check if we were promoted (after migration so ownership is correct for handleServerPromotion)
-            if (info.promotedMemberId && currentMember && 
-                info.promotedMemberId === currentMember.id) {
-                currentMember.role = info.promotedRole;
-                // Update local member in session members list
-                if (currentSession && currentSession.members) {
-                    const self = currentSession.members.find(m => m.id === currentMember.id);
-                    if (self) {
-                        self.role = info.promotedRole;
-                    }
-                }
-                if (callbacks.onRoleChanged) {
-                    callbacks.onRoleChanged(info.promotedRole);
-                }
-            }
+            handleMemberEvent({
+                kind: 'left',
+                info,
+                senderMemberId,
+                memberSequence,
+                roleChanged: false
+            });
         }, true));
 
         // Object events
@@ -627,6 +676,7 @@ const SessionClient = (function() {
             currentMember = createdMember;
             currentSession = createdSession;
             reconnectIdentity = nextReconnectIdentity;
+            const pendingMemberEvents = applyPendingMemberEvents(thisSessionEpoch);
 
             // console.log('[SessionClient] Session created:', currentSession.name);
             lastSessionId = currentSession.id;
@@ -634,6 +684,10 @@ const SessionClient = (function() {
 
             if (callbacks.onSessionCreated) {
                 callbacks.onSessionCreated(currentSession, currentMember);
+            }
+            for (const event of pendingMemberEvents) {
+                if (!isSessionContextCurrent(context)) break;
+                dispatchMemberEvent(event);
             }
 
             if (!isSessionContextCurrent(context)) {
@@ -728,6 +782,7 @@ const SessionClient = (function() {
             currentSession = joinedSession;
             currentMember = joinedMember;
             reconnectIdentity = nextReconnectIdentity;
+            const pendingMemberEvents = applyPendingMemberEvents(thisSessionEpoch);
 
             _log('[SessionClient] Joined session:', currentSession.name, 'as', currentMember.role);
             lastSessionId = currentSession.id;
@@ -735,6 +790,10 @@ const SessionClient = (function() {
 
             if (callbacks.onSessionJoined) {
                 callbacks.onSessionJoined(currentSession, currentMember);
+            }
+            for (const event of pendingMemberEvents) {
+                if (!isSessionContextCurrent(context)) break;
+                dispatchMemberEvent(event);
             }
 
             if (!isSessionContextCurrent(context)) {

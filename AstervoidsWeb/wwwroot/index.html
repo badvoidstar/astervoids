@@ -1839,8 +1839,10 @@
     // side baseline while waiting for the next ordered packet. Normal live
     // packets are arrival-anchored, so this bridges the receiver's inter-arrival
     // interval rather than predicting through network transit to the owner's
-    // present. New packets usually preserve the displayed motion with a finite
-    // minimum-jerk correction; they do not normally snap. Extrapolation is bounded by
+    // present. Replacement children inherit the parent's receiver-side timeline
+    // so a one-off latency change cannot rewind them to a fresh arrival anchor.
+    // New packets usually preserve the displayed motion with a finite minimum-jerk
+    // correction; they do not normally snap. Extrapolation is bounded by
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
     function createDeadReckoningState(data, recvPerf, context = null) {
@@ -1871,6 +1873,7 @@
             turnBias: Number.isFinite(data.turnBias) ? data.turnBias : 0,
             rateAngularPredictionWindow:
                 context?.rateAngularPredictionWindow || null,
+            validAt: Number.isFinite(context?.validAt) ? context.validAt : null,
             recvPerf
         };
     }
@@ -5028,6 +5031,15 @@
         return performance.now() - ageMs;
     }
 
+    function getDeterministicIngestBaselinePerf(record, facts) {
+        if (Number.isFinite(record?.replacementBaselinePerf)) {
+            const baselinePerf = record.replacementBaselinePerf;
+            delete record.replacementBaselinePerf;
+            return baselinePerf;
+        }
+        return getDeterministicJoinBaselinePerf(record, facts);
+    }
+
     function getKinematicInstance(type, id) {
         if (type === OBJECT_TYPES.SHIP) {
             if (game.multiplayer.myShipObjectId === id) return game.ship;
@@ -5115,15 +5127,17 @@
                             && typeof prevInvuln === 'number'
                             && (data.invulnerable || 0) > prevInvuln;
                     }
-                    // Arrival-anchored: render authoritative truth, dead-reckon
-                    // only the inter-packet gap (no spawn-ahead / over-travel).
+                    // Normal updates are arrival-anchored. Replacement children
+                    // carry a one-shot parent-timeline baseline instead so
+                    // differential packet delay cannot introduce a discontinuity.
                     DeadReckon.updateState(
                         id,
                         data,
-                        getDeterministicJoinBaselinePerf(record, facts),
+                        getDeterministicIngestBaselinePerf(record, facts),
                         isTeleport,
                         facts.preserveDirection,
                         {
+                            validAt: record.validAt,
                             rateAngularPredictionWindow:
                                 facts.type === OBJECT_TYPES.SHIP
                                     ? calculateShipRateAngularPredictionWindow(
@@ -5236,22 +5250,28 @@
             // behalf, e.g. an OnObjectReplaced split we just shot).
             const asteroid = Asteroid.fromSyncData(record.data);
             asteroid.syncObjectId = record.id;
-            // Forward-project the LOCAL game asteroid for locally-owned
-            // children of a replacement event. record.validAt approximates
-            // the replacement invocation/collision moment; we adopt the child
-            // here about one operation round trip later. Without projection
-            // the local asteroid would lag forever by RTT * velocity vs the
-            // simulator. (Remote observers don't need projection — the
-            // interpolator handles that automatically via snap[0] anchored at
-            // validAt on the unified axis.)
-            if (record.validAt != null && !record.spawnHandled && !facts.joinSnapshot
-                && RemoteObjects.isClockOffsetInitialized()) {
-                const stalenessSec = RemoteObjects.computeSpawnStaleness(
-                    RemoteObjects.serverNowMs(), record.validAt);
-                const projected = RemoteObjects.projectSpawnData(record.data, stalenessSec);
-                asteroid.x = projected.x;
-                asteroid.y = projected.y;
-                asteroid.angle = projected.angle;
+            // Forward-project a locally-owned replacement child from its
+            // parent-timeline baseline. This monotonic baseline works before
+            // shared-clock bootstrap. The validAt clock projection remains a
+            // bounded fallback for other live creates.
+            if (!record.spawnHandled && !facts.joinSnapshot) {
+                let stalenessSec;
+                if (Number.isFinite(record.replacementBaselinePerf)) {
+                    stalenessSec = Math.min(
+                        CONFIG.MAX_EXTRAPOLATION,
+                        Math.max(0, (performance.now() - record.replacementBaselinePerf) / 1000));
+                    delete record.replacementBaselinePerf;
+                } else if (record.validAt != null
+                    && RemoteObjects.isClockOffsetInitialized()) {
+                    stalenessSec = RemoteObjects.computeSpawnStaleness(
+                        RemoteObjects.serverNowMs(), record.validAt);
+                }
+                if (stalenessSec !== undefined) {
+                    const projected = RemoteObjects.projectSpawnData(record.data, stalenessSec);
+                    asteroid.x = projected.x;
+                    asteroid.y = projected.y;
+                    asteroid.angle = projected.angle;
+                }
             }
             record.spawnHandled = true;
             game.astervoids.push(asteroid);
@@ -6525,12 +6545,16 @@
      */
     async function replaceSyncedAsteroid(parentAsteroid, childAsteroids, ownerMemberId = null) {
         if (!isSessionMode() || !parentAsteroid.syncObjectId) return;
-        
+        const replacementStartedPerf = performance.now();
+        parentAsteroid.replacementStartedPerf = replacementStartedPerf;
         try {
             const replacements = childAsteroids.map(child => child.toSyncData());
             await ObjectSync.replaceObject(
                 parentAsteroid.syncObjectId, replacements, 'Session', ownerMemberId);
         } catch (err) {
+            if (parentAsteroid.replacementStartedPerf === replacementStartedPerf) {
+                delete parentAsteroid.replacementStartedPerf;
+            }
             _error('[Multiplayer] Failed to replace asteroid:', err);
         }
     }
@@ -9345,9 +9369,9 @@
                         updatePickerButtons();
                     }
                 });
-                // Replacement always resolves target-bound cosmetic cues. The
-                // remaining synthetic bridge is consumed only by buffered remote
-                // interpolation; deterministic remotes use DeadReckon.
+                // Replacement always resolves target-bound cosmetic cues.
+                // Deterministic children inherit the parent's receiver-side
+                // baseline; buffered remotes use the synthetic bridge below.
                 //
                 // A new child otherwise has one sample at the authoritative
                 // collision time, while the parent was displayed on a delayed
@@ -9364,11 +9388,33 @@
                 // current delay and would create positive feedback.
                 ObjectSync.on('onObjectReplaced', (deletedObjectId, createdObjects, batchValidAt) => {
                     CollisionEffects.resolveTarget(deletedObjectId);
-                    if (isDeterministicMode()) return;
+                    const renderTime = performance.now();
+                    if (isDeterministicMode()) {
+                        const parentState = DeadReckon.states.get(deletedObjectId);
+                        const parentAsteroid = game.astervoids.find(
+                            asteroid => asteroid.syncObjectId === deletedObjectId);
+                        const localBaselinePerf = parentAsteroid?.replacementStartedPerf;
+                        if (parentAsteroid) {
+                            delete parentAsteroid.replacementStartedPerf;
+                        }
+                        const replacementBaselinePerf =
+                            localBaselinePerf
+                            ?? ReplicationPresentation.calculateReplacementBaselinePerf(
+                                parentState, batchValidAt, renderTime);
+                        if (Number.isFinite(replacementBaselinePerf)) {
+                            for (const child of createdObjects) {
+                                const record = ObjectSync.getObject(child.id);
+                                if (record) {
+                                    record.replacementBaselinePerf =
+                                        Math.min(renderTime, replacementBaselinePerf);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if (!RemoteObjects.isClockOffsetInitialized()) return;
                     if (batchValidAt == null) return;
                     const myMemberId = SessionClient.getCurrentMember()?.id;
-                    const renderTime = performance.now();
                     const parentInterp = RemoteObjects.getInterpolated(deletedObjectId, renderTime);
                     if (!parentInterp) return;
 

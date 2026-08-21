@@ -279,7 +279,7 @@ test('production migration handoff skips ownership-only anchors and preserves di
     assert.match(runtimeSource, /preserveDirection = !!transition\?\.pending && !ownershipVersion;/);
     assert.match(
         productionSource,
-        /isTeleport,\s*facts\.preserveDirection,\s*\{\s*rateAngularPredictionWindow:/);
+        /isTeleport,\s*facts\.preserveDirection,\s*\{\s*validAt: record\.validAt,\s*rateAngularPredictionWindow:/);
     assert.match(
         presentationSource,
         /function directionPreservingDuration\(/);
