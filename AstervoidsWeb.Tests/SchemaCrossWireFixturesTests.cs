@@ -27,7 +27,7 @@ public class SchemaCrossWireFixturesTests
     private static PositionalSchemaCodec.Schema ShipSchema() => Schema(1,
         ("type", "str"),
         ("x", "q16w"), ("y", "q16w"), ("angle", "q16_2pi"),
-        ("velocityX", "q16s"), ("velocityY", "q16s"), ("rotationSpeed", "q16s"),
+        ("velocityX", "f32"), ("velocityY", "f32"), ("rotationSpeed", "q16s"),
         ("thrusting", "bool"), ("invulnerable", "u16"),
         ("colorIndex", "u8"), ("memberId", "guid"),
         ("score", "u32"), ("hitCount", "u16"),
@@ -40,7 +40,7 @@ public class SchemaCrossWireFixturesTests
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
         ("x", "q16w"), ("y", "q16w"), ("angle", "q16_2pi"), ("radius", "q16"),
-        ("velocityX", "q16s"), ("velocityY", "q16s"), ("rotationSpeed", "q16s"),
+        ("velocityX", "f32"), ("velocityY", "f32"), ("rotationSpeed", "f32"),
         ("seed", "f64"), ("vertices", "bytes"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"));
@@ -98,8 +98,8 @@ public class SchemaCrossWireFixturesTests
             "fe0100" +
             "0080" +
             "0080" +
-            "0000" +
-            "0000" +
+            "00000000" +
+            "00000000" +
             "0000" +
             "0000" +
             "00" +
@@ -107,16 +107,19 @@ public class SchemaCrossWireFixturesTests
     }
 
     [Fact]
-    public void Fixture_ShipUpdate_FullAnalogThrustRange()
+    public void Fixture_ShipUpdate_ValuesBeyondUnitInterval()
     {
         var schema = ShipSchema();
         var bytes = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
         {
+            ["velocityX"] = 1.5,
             ["thrustInput"] = 1.5
         });
 
-        Hex(bytes).Should().Be("002000" + "0000c03f");
-        PositionalSchemaCodec.Decode(schema, bytes)["thrustInput"].Should().Be(1.5);
+        Hex(bytes).Should().Be("102000" + "0000c03f" + "0000c03f");
+        var decoded = PositionalSchemaCodec.Decode(schema, bytes);
+        decoded["velocityX"].Should().Be(1.5);
+        decoded["thrustInput"].Should().Be(1.5);
     }
 
     [Fact]

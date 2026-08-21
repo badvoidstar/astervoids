@@ -72,6 +72,41 @@ test('ship schema preserves analog thrust above the unit interval', () => {
     assert.equal(decoded.thrustInput, 1.5);
 });
 
+test('kinematic schemas preserve supported motion beyond the unit interval', () => {
+    registerProductionSchemas();
+    const shipSchema = SchemaCodec.get(1);
+    const asteroidSchema = SchemaCodec.get(2);
+
+    for (const field of ['velocityX', 'velocityY']) {
+        assert.equal(
+            shipSchema.fields.find(candidate => candidate.name === field)?.type,
+            'f32');
+        assert.equal(
+            asteroidSchema.fields.find(candidate => candidate.name === field)?.type,
+            'f32');
+    }
+    assert.equal(
+        asteroidSchema.fields.find(field => field.name === 'rotationSpeed')?.type,
+        'f32');
+
+    const ship = SchemaCodec.decode(
+        shipSchema,
+        SchemaCodec.encode(shipSchema, { velocityX: 4.5, velocityY: -3.25 }));
+    assert.ok(Math.abs(ship.velocityX - 4.5) < 1e-6);
+    assert.ok(Math.abs(ship.velocityY + 3.25) < 1e-6);
+
+    const asteroid = SchemaCodec.decode(
+        asteroidSchema,
+        SchemaCodec.encode(asteroidSchema, {
+            velocityX: 1.5,
+            velocityY: -1.25,
+            rotationSpeed: 1.2,
+        }));
+    assert.ok(Math.abs(asteroid.velocityX - 1.5) < 1e-6);
+    assert.ok(Math.abs(asteroid.velocityY + 1.25) < 1e-6);
+    assert.ok(Math.abs(asteroid.rotationSpeed - 1.2) < 1e-6);
+});
+
 test('asteroid schema omits reproducible vertices and packs fracture vertices', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(2);

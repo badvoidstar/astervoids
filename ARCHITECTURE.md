@@ -1479,8 +1479,10 @@ terminal slots when a mode does not produce them. This prevents a later update
 from introducing fields that the object's retained creation schema cannot
 encode.
 
-`thrustInput` is `f32` because the configured analog range extends to 1.5;
-unit-range brake and turn magnitudes remain `q8`. Asteroid owners apply their
+`thrustInput` is `f32` because the configured analog range extends past 1.
+Ship velocity and asteroid velocity/spin also use `f32`: their supported caps
+can exceed the unit interval, and setting a cap to zero permits larger values.
+Unit-range brake and turn magnitudes remain `q8`. Asteroid owners apply their
 linear/angular limits before create, replacement, and update capture, and
 asteroid update deltas include velocity and spin whenever those values change.
 
@@ -1508,8 +1510,8 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 
 | Payload | Current compact size |
 | --- | ---: |
-| ship create body | 47 B |
-| seeded asteroid create body | 34 B |
+| ship create body | 51 B |
+| seeded asteroid create body | 40 B |
 | bullet create body | 37 B |
 | GameState create body | 48 B |
 | asteroid x/y/angle update DTO | 29–35 B |

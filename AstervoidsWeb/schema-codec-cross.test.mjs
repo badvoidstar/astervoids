@@ -22,7 +22,7 @@ function freshRegistry() {
 const SHIP_SCHEMA_FIELDS = [
     ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'], ['rotationSpeed', 'q16s'],
+    ['velocityX', 'f32'], ['velocityY', 'f32'], ['rotationSpeed', 'q16s'],
     ['thrusting', 'bool'], ['invulnerable', 'u16'],
     ['colorIndex', 'u8'], ['memberId', 'guid'],
     ['score', 'u32'], ['hitCount', 'u16'],
@@ -35,7 +35,7 @@ const SHIP_SCHEMA_FIELDS = [
 const ASTEROID_SCHEMA_FIELDS = [
     ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'], ['radius', 'q16'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'], ['rotationSpeed', 'q16s'],
+    ['velocityX', 'f32'], ['velocityY', 'f32'], ['rotationSpeed', 'f32'],
     ['seed', 'f64'], ['vertices', 'bytes'],
     ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
     ['terminalY', 'f64'], ['terminalAngle', 'f64'],
@@ -78,8 +78,8 @@ test('cross-wire: ship update — mixed types', () => {
         'fe0100' +
         '0080' +
         '0080' +
-        '0000' +
-        '0000' +
+        '00000000' +
+        '00000000' +
         '0000' +
         '0000' +
         '00' +
@@ -96,11 +96,12 @@ test('cross-wire: ship update — mixed types', () => {
     assert.equal(decoded.invulnerable, 120);
 });
 
-test('cross-wire: ship update — full analog thrust range', () => {
+test('cross-wire: ship update — values beyond the unit interval', () => {
     freshRegistry();
     const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
-    const bytes = hexToBytes('002000' + '0000c03f');
+    const bytes = hexToBytes('102000' + '0000c03f' + '0000c03f');
     const decoded = SchemaCodec.decode(schema, bytes);
+    assert.equal(decoded.velocityX, 1.5);
     assert.equal(decoded.thrustInput, 1.5);
 });
 

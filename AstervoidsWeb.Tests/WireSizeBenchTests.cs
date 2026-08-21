@@ -119,8 +119,8 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("x", "q16w"),
             new PositionalSchemaCodec.FieldSpec("y", "q16w"),
             new PositionalSchemaCodec.FieldSpec("angle", "q16_2pi"),
-            new PositionalSchemaCodec.FieldSpec("velocityX", "q16s"),
-            new PositionalSchemaCodec.FieldSpec("velocityY", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("velocityX", "f32"),
+            new PositionalSchemaCodec.FieldSpec("velocityY", "f32"),
             new PositionalSchemaCodec.FieldSpec("rotationSpeed", "q16s"),
             new PositionalSchemaCodec.FieldSpec("thrusting", "bool"),
             new PositionalSchemaCodec.FieldSpec("invulnerable", "u16"),
@@ -148,9 +148,9 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("y", "q16w"),
             new PositionalSchemaCodec.FieldSpec("angle", "q16_2pi"),
             new PositionalSchemaCodec.FieldSpec("radius", "q16"),
-            new PositionalSchemaCodec.FieldSpec("velocityX", "q16s"),
-            new PositionalSchemaCodec.FieldSpec("velocityY", "q16s"),
-            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "q16s"),
+            new PositionalSchemaCodec.FieldSpec("velocityX", "f32"),
+            new PositionalSchemaCodec.FieldSpec("velocityY", "f32"),
+            new PositionalSchemaCodec.FieldSpec("rotationSpeed", "f32"),
             new PositionalSchemaCodec.FieldSpec("seed", "f64"),
             new PositionalSchemaCodec.FieldSpec("vertices", "bytes"),
             new PositionalSchemaCodec.FieldSpec("terminalEpoch", "f64"),
@@ -497,8 +497,8 @@ public class WireSizeBenchTests
             ["scoreLifeAwardCount"] = 0
         });
 
-        shipCreate.Length.Should().Be(47);
-        asteroidCreate.Length.Should().Be(34);
+        shipCreate.Length.Should().Be(51);
+        asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
         gameStateCreate.Length.Should().Be(52);
     }
