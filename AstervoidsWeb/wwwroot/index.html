@@ -1208,10 +1208,11 @@
         // 0 = hard snap.
         BUFFERED_GAMEOVER_SETTLE_MS: 140,
         // Deterministic mode only: shared lead time before the immutable terminal
-        // object targets take effect. Object owners project their authoritative
-        // pose to terminalAt = gameOverAt + this delay and persist that target on
-        // the object record. Existing members converge continuously to it; late
-        // joiners initialize there before their first rendered frame.
+        // object targets take effect. Object owners project a smooth-deceleration
+        // stopping distance through terminalAt = gameOverAt + this delay and
+        // persist that target on the object record. Existing members converge
+        // continuously to it; late joiners initialize there before their first
+        // rendered frame.
         DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750,
         // If a canonical target arrives too close to or after terminalAt, extend
         // only that member's presentation transition rather than introducing a
@@ -5655,6 +5656,10 @@
             frames = Math.max(0, (terminal.terminalAt - validAt) / stepMs);
             frames = Math.min(CONFIG.DEADRECKON_MAX_FRAMES, frames);
         }
+        // A zero-end-velocity minimum-jerk stop travels half the ballistic
+        // distance while decelerating monotonically. Projecting all `frames`
+        // would force the trajectory to accelerate before it could stop.
+        const stoppingFrames = frames / 2;
 
         const radius = instance
             ? wrapRadiusFor(instance)
@@ -5664,14 +5669,14 @@
         const velocityX = data.velocityX || 0;
         const velocityY = data.velocityY || 0;
         const terminalX = wrapNormalizedMod(
-            data.x + velocityToNormalizedDeltaX(velocityX) * frames,
+            data.x + velocityToNormalizedDeltaX(velocityX) * stoppingFrames,
             marginX);
         const terminalY = wrapNormalizedMod(
-            data.y + velocityToNormalizedDeltaY(velocityY) * frames,
+            data.y + velocityToNormalizedDeltaY(velocityY) * stoppingFrames,
             marginY);
         const terminalAngle = Number.isFinite(data.angle)
             ? normalizeTerminalAngle(
-                data.angle + (data.rotationSpeed || 0) * frames)
+                data.angle + (data.rotationSpeed || 0) * stoppingFrames)
             : null;
         const payload = {
             x: data.x,
@@ -7450,6 +7455,7 @@
             ? terminal.terminalAt
             : nowServer + CONFIG.DEADRECKON_GAMEOVER_LATE_SETTLE_MS;
         const duration = endTime - nowServer;
+        const stoppingDuration = duration / 2;
         const velocityX = velocityToNormalizedDeltaX(obj.velocityX || 0) / stepMs;
         const velocityY = velocityToNormalizedDeltaY(obj.velocityY || 0) / stepMs;
         const angularVelocity = (obj.rotationSpeed || 0) / stepMs;
@@ -7459,14 +7465,14 @@
             canonical: false,
             xTransition: ReplicationPresentation.createMinimumJerkTransition({
                 start: displayed.x,
-                target: displayed.x + velocityX * duration,
+                target: displayed.x + velocityX * stoppingDuration,
                 startVelocity: velocityX,
                 startTime: nowServer,
                 endTime
             }),
             yTransition: ReplicationPresentation.createMinimumJerkTransition({
                 start: displayed.y,
-                target: displayed.y + velocityY * duration,
+                target: displayed.y + velocityY * stoppingDuration,
                 startVelocity: velocityY,
                 startTime: nowServer,
                 endTime
@@ -7474,7 +7480,7 @@
             angleTransition: displayed.angle != null
                 ? ReplicationPresentation.createMinimumJerkTransition({
                     start: displayed.angle,
-                    target: displayed.angle + angularVelocity * duration,
+                    target: displayed.angle + angularVelocity * stoppingDuration,
                     startVelocity: angularVelocity,
                     startTime: nowServer,
                     endTime
@@ -7527,9 +7533,9 @@
                 angularAcceleration: 0
             };
         const remaining = terminal.terminalAt - nowServer;
-        // A late target gets a local grace interval. If preserving an axis's
-        // incoming derivative would force a whole extra position/angle winding,
-        // the wrapped-transition helper relaxes only that degraded axis.
+        // A late target gets a local grace interval. Always prefer the nearest
+        // topological target; if preserving an axis's incoming derivative would
+        // force a whole extra position/angle winding, relax only that axis.
         const lateSettle =
             remaining < CONFIG.DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS;
         const endTime = !lateSettle
@@ -7546,7 +7552,7 @@
             startAcceleration: current.accelerationX,
             startTime: nowServer,
             endTime,
-            relaxExtraWinding: lateSettle
+            relaxExtraWinding: true
         });
         const yAxis = ReplicationPresentation.createWrappedConvergenceTransition({
             start: current.y,
@@ -7556,7 +7562,7 @@
             startAcceleration: current.accelerationY,
             startTime: nowServer,
             endTime,
-            relaxExtraWinding: lateSettle
+            relaxExtraWinding: true
         });
         let angleTransition = null;
         if (current.angle != null && Number.isFinite(data.terminalAngle)) {
@@ -7569,7 +7575,7 @@
                     startAcceleration: current.angularAcceleration,
                     startTime: nowServer,
                     endTime,
-                    relaxExtraWinding: lateSettle
+                    relaxExtraWinding: true
                 }).transition;
         }
 

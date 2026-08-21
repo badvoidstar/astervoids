@@ -575,6 +575,8 @@ const ReplicationPresentation = (function () {
         return Object.freeze({ value, velocity, acceleration, done: false });
     }
 
+    const MINIMUM_JERK_MONOTONE_TRAVEL_RATIO = 0.4;
+
     /**
      * Select a congruent target on a wrapping axis. When already moving, keep
      * the target far enough in that direction for the zero-end-velocity
@@ -586,7 +588,7 @@ const ReplicationPresentation = (function () {
         span,
         velocity = 0,
         duration = 0,
-        minimumTravelRatio = 0.4
+        minimumTravelRatio = MINIMUM_JERK_MONOTONE_TRAVEL_RATIO
     }) {
         for (const [name, value] of Object.entries({
             start,
@@ -623,9 +625,9 @@ const ReplicationPresentation = (function () {
     }
 
     /**
-     * Build a wrapped terminal transition. In a degraded late-settle path,
-     * discard incoming derivatives only when preserving their direction would
-     * select an additional full winding over the nearest equivalent target.
+     * Build a wrapped terminal transition. When preserving the incoming
+     * derivatives would select an additional full winding, clamp velocity to
+     * the monotone shortest-path bound and clear acceleration.
      */
     function createWrappedConvergenceTransition({
         start,
@@ -657,7 +659,14 @@ const ReplicationPresentation = (function () {
             });
             if (Math.abs(selectedTarget - nearestTarget) > span / 2) {
                 selectedTarget = nearestTarget;
-                effectiveVelocity = 0;
+                const nearestDelta = nearestTarget - start;
+                const direction = Math.sign(nearestDelta);
+                const directedVelocity = direction * startVelocity;
+                const maximumVelocity = Math.abs(nearestDelta)
+                    / (MINIMUM_JERK_MONOTONE_TRAVEL_RATIO * duration);
+                effectiveVelocity = direction !== 0 && directedVelocity > 0
+                    ? direction * Math.min(directedVelocity, maximumVelocity)
+                    : 0;
                 effectiveAcceleration = 0;
                 relaxed = true;
             }
