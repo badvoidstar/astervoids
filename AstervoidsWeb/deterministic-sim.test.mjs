@@ -513,6 +513,29 @@ test('correction: migration reconciliation preserves forward motion', () => {
     }
 });
 
+test('correction: direction safety can shorten an acceleration-bound window', () => {
+    const stepMs = 1000 / 60;
+    const r = makeCorrectionHarness(stepMs, 90);
+    r.update(0, { x: 0, velocityX: 0.005 });
+    r.update(80, { x: -0.025, velocityX: 0.03 });
+    r.update(
+        140,
+        { x: 0.075, velocityX: 0.006 },
+        false,
+        /* preserveDirection */ true);
+
+    const transition = r.policy.smooth.get('object').x;
+    assert.ok(transition.duration < 90);
+    let previous = r.sample(140).x;
+    for (let at = 141; at <= transition.endTime; at += 1) {
+        const current = r.sample(at).x;
+        assert.ok(
+            current >= previous - 1e-12,
+            `short correction reversed at ${at}ms`);
+        previous = current;
+    }
+});
+
 test('correction: angular reconciliation takes the shortest seam path', () => {
     const stepMs = 1000 / 60;
     const r = makeCorrectionHarness(stepMs, 90);

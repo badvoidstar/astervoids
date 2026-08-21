@@ -423,14 +423,11 @@ const ReplicationPresentation = (function () {
                 maximum = Math.min(maximum, interval.maximum);
             }
             const safety = preserveDirection ? 1.05 : 1.01;
-            const floor = Math.max(
-                baseDuration * (preserveDirection ? 1.05 : 1),
-                minimum);
-            if (floor > maximum) return baseDuration;
+            if (minimum > maximum) return baseDuration;
             return Math.min(
                 maximum,
                 Math.max(
-                    floor,
+                    baseDuration * (preserveDirection ? 1.05 : 1),
                     minimum * safety));
         }
 
