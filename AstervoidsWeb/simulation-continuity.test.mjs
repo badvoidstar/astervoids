@@ -12,8 +12,11 @@ const replicationClockSource = readFileSync(
     resolve(here, 'wwwroot/js/replication-clock.js'),
     'utf8');
 const { createRuntime } = require('./wwwroot/js/replication-runtime.js');
-const { integrateRateAngularPredictionFrames } = require(
-    './wwwroot/js/replication-presentation.js');
+const {
+    createMinimumJerkTransition,
+    integrateRateAngularPredictionFrames,
+    sampleMinimumJerkTransition,
+} = require('./wwwroot/js/replication-presentation.js');
 
 function extractProductionFunction(name, nextName) {
     const start = productionSource.indexOf(`    function ${name}(`);
@@ -101,8 +104,20 @@ function motionAlong(poseA, poseB, velocityX, velocityY) {
     return (((poseB.x - poseA.x) * velocityX) + ((poseB.y - poseA.y) * velocityY)) / speed;
 }
 
-function expDecay(tMs, tauMs) {
-    return tauMs > 0 ? Math.exp(-tMs / tauMs) : 0;
+function createResidualTransition(value, startTimeMs, durationMs) {
+    if (Math.abs(value) <= EPS) return null;
+    return createMinimumJerkTransition({
+        start: value,
+        target: 0,
+        startTime: startTimeMs,
+        endTime: startTimeMs + durationMs,
+    });
+}
+
+function sampleResidual(transition, nowMs) {
+    return transition
+        ? sampleMinimumJerkTransition(transition, nowMs).value
+        : 0;
 }
 
 function cloneData(data) {
@@ -372,12 +387,26 @@ function sampleConvergence(replica, arrivalTimeMs, frameCount, axis = null) {
 function sampleEventTrajectory(kind, event, dtMs) {
     const raw = projectKind(kind, event.installed, dtMs);
     if (!event.displayedBefore) return raw;
-    const k = expDecay(dtMs, SMOOTH_MS);
+    const startTimeMs = 0;
+    const x = createResidualTransition(
+        event.displayedBefore.x - event.fresh.x,
+        startTimeMs,
+        SMOOTH_MS);
+    const y = createResidualTransition(
+        event.displayedBefore.y - event.fresh.y,
+        startTimeMs,
+        SMOOTH_MS);
+    const angle = createResidualTransition(
+        shortestAngleDelta(
+            event.displayedBefore.angle || 0,
+            event.fresh.angle || 0),
+        startTimeMs,
+        SMOOTH_MS);
     return {
         ...raw,
-        x: raw.x + ((event.displayedBefore.x - event.fresh.x) * k),
-        y: raw.y + ((event.displayedBefore.y - event.fresh.y) * k),
-        angle: (raw.angle || 0) + (shortestAngleDelta(event.displayedBefore.angle || 0, event.fresh.angle || 0) * k),
+        x: raw.x + sampleResidual(x, dtMs),
+        y: raw.y + sampleResidual(y, dtMs),
+        angle: (raw.angle || 0) + sampleResidual(angle, dtMs),
     };
 }
 
@@ -404,13 +433,24 @@ class Replica {
     sample(nowMs) {
         const raw = this.sampleRaw(nowMs);
         if (!raw || !this.smooth) return raw;
-        const k = expDecay(nowMs - this.smooth.t0Ms, this.smooth.tauMs);
-        if (k <= 1e-6) return raw;
+        const x = this.smooth.x
+            ? sampleMinimumJerkTransition(this.smooth.x, nowMs)
+            : null;
+        const y = this.smooth.y
+            ? sampleMinimumJerkTransition(this.smooth.y, nowMs)
+            : null;
+        const angle = this.smooth.angle
+            ? sampleMinimumJerkTransition(this.smooth.angle, nowMs)
+            : null;
+        if ((!x || x.done) && (!y || y.done) && (!angle || angle.done)) {
+            this.smooth = null;
+            return raw;
+        }
         return {
             ...raw,
-            x: raw.x + (this.smooth.dx * k),
-            y: raw.y + (this.smooth.dy * k),
-            angle: (raw.angle || 0) + (this.smooth.da * k),
+            x: raw.x + (x?.value || 0),
+            y: raw.y + (y?.value || 0),
+            angle: (raw.angle || 0) + (angle?.value || 0),
         };
     }
 
@@ -433,7 +473,21 @@ class Replica {
             const dy = displayedBefore.y - fresh.y;
             const da = shortestAngleDelta(displayedBefore.angle || 0, fresh.angle || 0);
             if (Math.abs(dx) > EPS || Math.abs(dy) > EPS || Math.abs(da) > EPS) {
-                this.smooth = { dx, dy, da, t0Ms: arrivalTimeMs, tauMs: smoothMs };
+                const durationMs = Math.max(
+                    smoothMs,
+                    directionPreservingSmoothMs(
+                        displayedBefore,
+                        fresh,
+                        installData,
+                        1.01));
+                this.smooth = {
+                    x: createResidualTransition(
+                        dx, arrivalTimeMs, durationMs),
+                    y: createResidualTransition(
+                        dy, arrivalTimeMs, durationMs),
+                    angle: createResidualTransition(
+                        da, arrivalTimeMs, durationMs),
+                };
             } else {
                 this.smooth = null;
             }
@@ -457,7 +511,7 @@ class Replica {
     }
 }
 
-function directionPreservingSmoothMs(displayed, fresh, data) {
+function directionPreservingSmoothMs(displayed, fresh, data, safety = 1.01) {
     let requiredMs = SMOOTH_MS;
     const vx = data.velocityX || 0;
     const vy = data.velocityY || 0;
@@ -470,7 +524,7 @@ function directionPreservingSmoothMs(displayed, fresh, data) {
         if (correctionAlong > 0) {
             requiredMs = Math.max(
                 requiredMs,
-                correctionAlong * FRAME_MS / speedPerFrame);
+                (15 / 8) * correctionAlong * FRAME_MS / speedPerFrame);
         }
     }
     const rotationPerFrame = data.rotationSpeed || 0;
@@ -479,9 +533,10 @@ function directionPreservingSmoothMs(displayed, fresh, data) {
         && Math.sign(angularCorrection) === Math.sign(rotationPerFrame)) {
         requiredMs = Math.max(
             requiredMs,
-            Math.abs(angularCorrection) * FRAME_MS / Math.abs(rotationPerFrame));
+            (15 / 8) * Math.abs(angularCorrection)
+                * FRAME_MS / Math.abs(rotationPerFrame));
     }
-    return requiredMs * 1.05;
+    return requiredMs * safety;
 }
 
 function assertContinuous(event, label) {
@@ -882,7 +937,8 @@ function runMigrationCase(networkCase) {
         protectedSmoothMs = directionPreservingSmoothMs(
             protectedDisplayed,
             protectedFresh,
-            payload.data);
+            payload.data,
+            1.05);
         protectedFirstUpdate = protectedObserver.ingest(
             payload,
             meta.dueMs,
@@ -1258,18 +1314,18 @@ test('asteroid parent-to-child replacement continuity stays bounded across the R
 
 test('ownership migration retains the displayed puppet pose across the RTT/jitter matrix', async (t) => {
     let ownershipReanchorReverseCases = 0;
-    let fixedSmoothingReverseCases = 0;
+    let skippedReanchorReverseCases = 0;
     for (const networkCase of NETWORK_CASES) {
         await t.test(networkCase.name, () => {
             const result = runMigrationCase(networkCase);
             if (result.reanchorMinimumStep < -1e-6) ownershipReanchorReverseCases++;
-            if (result.skippedMinimumStep < -1e-6) fixedSmoothingReverseCases++;
+            if (result.skippedMinimumStep < -1e-6) skippedReanchorReverseCases++;
         });
     }
-    assert.ok(ownershipReanchorReverseCases > 0,
-        'the baseline must expose ownership-only re-anchor reversal for the skip to be evidence-based');
-    assert.ok(fixedSmoothingReverseCases > 0,
-        'the baseline must expose high-latency first-owner-update reversal for adaptive smoothing');
+    assert.equal(ownershipReanchorReverseCases, 0,
+        'finite correction trajectories must not reverse an ownership re-anchor');
+    assert.equal(skippedReanchorReverseCases, 0,
+        'skipping the metadata-only anchor must preserve forward motion');
 });
 
 test('production migration gating skips ownership-only versions only after replica initialization', () => {

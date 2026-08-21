@@ -961,8 +961,9 @@ Each trajectory starts with the currently displayed position, velocity, and
 acceleration and reaches the new dead-reckoned path with zero residual and
 matching derivatives. A packet arriving during an active correction replans
 from that sampled state, preserving C2 motion continuity. Angular residuals use
-the shortest arc, teleports and wrap discontinuities still snap, and migration
-corrections may extend their duration to preserve forward motion.
+the shortest arc, while derivative-aware duration bounds keep steady motion
+from reversing. Teleports and wrap discontinuities still snap, and migration
+corrections add an extra direction-preservation margin.
 
 ```mermaid
 flowchart TB

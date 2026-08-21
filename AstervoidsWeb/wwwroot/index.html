@@ -1180,11 +1180,11 @@
         // extrapolation, reconciliation starts from the displayed position,
         // velocity, and acceleration and reaches the fresh path with matching
         // derivatives. Re-anchoring an active correction therefore remains C2
-        // continuous instead of producing a speed pulse. The first real update
-        // after ownership migration can select a longer, error-derived duration
-        // to avoid reversing displayed motion; that intentionally trades
-        // temporary lag for direction continuity and has no separate hard cap.
-        // Set 0 to disable (hard snap).
+        // continuous instead of producing a speed pulse. Corrections that would
+        // reverse steady motion select a longer, derivative-aware duration;
+        // ownership migration adds an extra safety margin. That intentionally
+        // trades temporary lag for direction continuity and has no separate
+        // hard cap. Set 0 to disable (hard snap).
         DEADRECKON_SMOOTH_MS: 90,
         // Normalized positional correction beyond which we SNAP instead of
         // sweeping (wrap-seam crossing or respawn teleport guard).

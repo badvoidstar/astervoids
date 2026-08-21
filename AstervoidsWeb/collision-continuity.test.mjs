@@ -282,7 +282,10 @@ test('production migration handoff skips ownership-only anchors and preserves di
         /isTeleport,\s*facts\.preserveDirection,\s*\{\s*rateAngularPredictionWindow:/);
     assert.match(
         presentationSource,
-        /minimumJerkPeakSlope\s*\*\s*correctionAlong\s*\/\s*motion/);
+        /function directionPreservingDuration\(/);
+    assert.match(
+        presentationSource,
+        /minimumJerkPeakSlope \* Math\.max\(0, error\)/);
     assert.match(
         presentationSource,
         /displayed\.velocity\.x - fresh\.velocity\.x/);

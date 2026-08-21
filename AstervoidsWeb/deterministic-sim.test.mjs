@@ -491,17 +491,20 @@ test('correction: repeated re-anchor preserves C2 motion', () => {
 test('correction: migration reconciliation preserves forward motion', () => {
     const stepMs = 1000 / 60;
     const r = makeCorrectionHarness(stepMs, 90);
-    r.update(0, { x: 0.1, velocityX: 0.01 });
-    const reanchorAt = 100;
+    r.update(0, { x: 0, velocityX: 0.01 });
+    r.update(100, { x: 0, velocityX: 0.005 });
+    assert.equal(r.policy.smooth.has('object'), true);
+
+    const migrationAt = 120;
     r.update(
-        reanchorAt,
-        { x: 0.06, velocityX: 0.01 },
+        migrationAt,
+        { x: 0, velocityX: 0.005 },
         false,
         /* preserveDirection */ true);
 
     const endTime = r.policy.smooth.get('object').x.endTime;
-    let previous = r.sample(reanchorAt).x;
-    for (let at = reanchorAt + 5; at <= endTime; at += 5) {
+    let previous = r.sample(migrationAt).x;
+    for (let at = migrationAt + 5; at <= endTime; at += 5) {
         const current = r.sample(at).x;
         assert.ok(
             current >= previous - 1e-12,
@@ -524,6 +527,70 @@ test('correction: angular reconciliation takes the shortest seam path', () => {
             r.sample(10).angle,
             displayedAngle)) < 1e-12);
     assert.equal(r.sample(correction.endTime).angle, 0.1);
+});
+
+test('correction: clamp-boundary acceleration probe stays finite', () => {
+    const stepMs = 1000 / 60;
+    const r = makeCorrectionHarness(stepMs, 90, 30);
+    r.update(0, { x: 0, velocityX: 0.01 });
+
+    const motion = r.motion(30 * stepMs - 0.1);
+    assert.ok(Math.abs(motion.acceleration.x) < 1e-12);
+});
+
+test('correction: tapered angular prediction keeps visual velocity continuous', () => {
+    const stepMs = 1000 / 60;
+    let now = 0;
+    const window = { fullFrames: 2, taperFrames: 2 };
+    const policy = createDeadReckoningPolicy({
+        config: {
+            TARGET_FPS: 60,
+            DEADRECKON_MAX_FRAMES: 30,
+            DEADRECKON_SMOOTH_MS: 90,
+            DEADRECKON_SNAP_DIST: Infinity
+        },
+        nowMs: () => now,
+        velocityToDeltaX: () => 0,
+        velocityToDeltaY: () => 0,
+        shortestAngleDelta,
+        createState: (data, recvPerf) => ({
+            x: 0,
+            y: 0,
+            angle: data.angle,
+            velocityX: 0,
+            velocityY: 0,
+            rotationSpeed: data.rotationSpeed,
+            clampAngular: true,
+            rateAngularPredictionWindow: window,
+            recvPerf
+        }),
+        getAngularPredictionWindow:
+            state => state.rateAngularPredictionWindow
+    });
+    policy.updateState(
+        'object',
+        { angle: 0, rotationSpeed: 0.1 },
+        null,
+        false);
+
+    const reanchorAt = 2.5 * stepMs;
+    const epsilon = 0.001;
+    now = reanchorAt - epsilon;
+    const before = policy.getReckoned('object').angle;
+    now = reanchorAt;
+    const at = policy.getReckoned('object').angle;
+    const incomingVelocity = shortestAngleDelta(at, before) / epsilon;
+    policy.updateState(
+        'object',
+        { angle: at - 0.05, rotationSpeed: 0.1 },
+        null,
+        false);
+    now = reanchorAt + epsilon;
+    const after = policy.getReckoned('object').angle;
+    const outgoingVelocity = shortestAngleDelta(after, at) / epsilon;
+    assert.ok(
+        Math.abs(outgoingVelocity - incomingVelocity) < 1e-6,
+        `angular velocity jumped: ${incomingVelocity} -> ${outgoingVelocity}`);
 });
 
 test('correction: disabled duration snaps immediately', () => {

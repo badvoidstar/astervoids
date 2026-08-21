@@ -280,6 +280,8 @@ const ReplicationPresentation = (function () {
         const replayCache = new WeakMap();
         const replayContext = { replayCache, scratch: null };
         const minimumJerkPeakSlope = 15 / 8;
+        const minimumJerkVelocityCarry = 0.512;
+        const minimumJerkAccelerationCarry = 0.068;
         const correctionEpsilon = 1e-12;
 
         function rawVelocityAt(state, raw, nowPerf) {
@@ -294,12 +296,26 @@ const ReplicationPresentation = (function () {
 
             const targetMode = isRotationTarget(state);
             const replaying = shouldReplay(state) && typeof replay === 'function';
+            let angularVelocity = 0;
+            if (raw.angle != null && !(targetMode && !replaying)) {
+                angularVelocity = (raw.rotationSpeed || 0) / stepMs;
+                const predictionWindow = !replaying && state.clampAngular
+                    ? getAngularPredictionWindow(state)
+                    : null;
+                if (predictionWindow) {
+                    const probeFrames = 1e-6;
+                    angularVelocity = state.rotationSpeed
+                        * averageRateAngularPredictionScale(
+                            elapsedFrames,
+                            elapsedFrames + probeFrames,
+                            predictionWindow)
+                        / stepMs;
+                }
+            }
             return {
                 x: velocityToDeltaX(raw.velocityX || 0) / stepMs,
                 y: velocityToDeltaY(raw.velocityY || 0) / stepMs,
-                angle: raw.angle == null || (targetMode && !replaying)
-                    ? 0
-                    : (raw.rotationSpeed || 0) / stepMs
+                angle: angularVelocity
             };
         }
 
@@ -322,6 +338,100 @@ const ReplicationPresentation = (function () {
                 startTime,
                 endTime
             });
+        }
+
+        function directionDurationInterval(
+            rawSpeed,
+            error,
+            velocityError,
+            accelerationError) {
+            if (!(rawSpeed > correctionEpsilon)
+                || rawSpeed + velocityError < -correctionEpsilon) {
+                return null;
+            }
+
+            // These are conservative extrema of the three start-condition
+            // basis derivatives in the quintic correction velocity.
+            const carriedVelocity = velocityError >= 0
+                ? -minimumJerkVelocityCarry * velocityError
+                : velocityError;
+            const availableSpeed = rawSpeed + carriedVelocity;
+            if (!(availableSpeed > correctionEpsilon)) return null;
+
+            const errorCost = minimumJerkPeakSlope * Math.max(0, error);
+            const accelerationCost =
+                minimumJerkAccelerationCarry * Math.abs(accelerationError);
+            if (!(accelerationCost > correctionEpsilon)) {
+                return {
+                    minimum: errorCost / availableSpeed,
+                    maximum: Infinity
+                };
+            }
+
+            const discriminant = availableSpeed * availableSpeed
+                - 4 * accelerationCost * errorCost;
+            if (!(discriminant >= 0)) return null;
+            const root = Math.sqrt(discriminant);
+            return {
+                minimum:
+                    (availableSpeed - root) / (2 * accelerationCost),
+                maximum:
+                    (availableSpeed + root) / (2 * accelerationCost)
+            };
+        }
+
+        function directionPreservingDuration(
+            baseDuration,
+            fresh,
+            correction,
+            snapPosition,
+            preserveDirection) {
+            const intervals = [];
+            const motion = Math.hypot(
+                fresh.velocity.x,
+                fresh.velocity.y);
+            if (!snapPosition && motion > correctionEpsilon) {
+                const directionX = fresh.velocity.x / motion;
+                const directionY = fresh.velocity.y / motion;
+                const interval = directionDurationInterval(
+                    motion,
+                    correction.x * directionX
+                        + correction.y * directionY,
+                    correction.velocityX * directionX
+                        + correction.velocityY * directionY,
+                    correction.accelerationX * directionX
+                        + correction.accelerationY * directionY);
+                if (interval) intervals.push(interval);
+            }
+
+            const angularMotion = fresh.velocity.angle;
+            if (fresh.pose.angle != null
+                && Math.abs(angularMotion) > correctionEpsilon) {
+                const direction = Math.sign(angularMotion);
+                const interval = directionDurationInterval(
+                    Math.abs(angularMotion),
+                    correction.angle * direction,
+                    correction.angularVelocity * direction,
+                    correction.angularAcceleration * direction);
+                if (interval) intervals.push(interval);
+            }
+
+            let minimum = 0;
+            let maximum = Infinity;
+            for (const interval of intervals) {
+                minimum = Math.max(minimum, interval.minimum);
+                maximum = Math.min(maximum, interval.maximum);
+            }
+            const safety = preserveDirection ? 1.05 : 1.01;
+            const floor = Math.max(
+                baseDuration * (preserveDirection ? 1.05 : 1),
+                minimum);
+            if (floor > maximum) return baseDuration;
+            return Math.min(
+                maximum,
+                Math.max(
+                    floor,
+                    minimum * safety));
         }
 
         const policy = {
@@ -366,31 +476,30 @@ const ReplicationPresentation = (function () {
                             dx = 0;
                             dy = 0;
                         }
-                        if (preserveDirection) {
-                            const motion = Math.hypot(
-                                fresh.velocity.x,
-                                fresh.velocity.y);
-                            if (motion > 1e-12) {
-                                const correctionAlong =
-                                    (dx * fresh.velocity.x
-                                        + dy * fresh.velocity.y) / motion;
-                                if (correctionAlong > 0) {
-                                    duration = Math.max(
-                                        duration,
-                                        minimumJerkPeakSlope
-                                            * correctionAlong / motion);
-                                }
-                            }
-                            const angularMotion = fresh.velocity.angle;
-                            if (Math.abs(angularMotion) > 1e-12
-                                && Math.sign(da) === Math.sign(angularMotion)) {
-                                duration = Math.max(
-                                    duration,
-                                    minimumJerkPeakSlope
-                                        * Math.abs(da) / Math.abs(angularMotion));
-                            }
-                            duration *= 1.05;
-                        }
+                        const correctionMotion = {
+                            x: dx,
+                            y: dy,
+                            angle: da,
+                            velocityX:
+                                displayed.velocity.x - fresh.velocity.x,
+                            velocityY:
+                                displayed.velocity.y - fresh.velocity.y,
+                            angularVelocity:
+                                displayed.velocity.angle - fresh.velocity.angle,
+                            accelerationX:
+                                displayed.acceleration.x - fresh.acceleration.x,
+                            accelerationY:
+                                displayed.acceleration.y - fresh.acceleration.y,
+                            angularAcceleration:
+                                displayed.acceleration.angle
+                                    - fresh.acceleration.angle
+                        };
+                        duration = directionPreservingDuration(
+                            duration,
+                            fresh,
+                            correctionMotion,
+                            snapPosition,
+                            preserveDirection);
 
                         const endTime = now + duration;
                         const correction = {
@@ -398,16 +507,16 @@ const ReplicationPresentation = (function () {
                                 ? null
                                 : createCorrectionTransition(
                                     dx,
-                                    displayed.velocity.x - fresh.velocity.x,
-                                    displayed.acceleration.x - fresh.acceleration.x,
+                                    correctionMotion.velocityX,
+                                    correctionMotion.accelerationX,
                                     now,
                                     endTime),
                             y: snapPosition
                                 ? null
                                 : createCorrectionTransition(
                                     dy,
-                                    displayed.velocity.y - fresh.velocity.y,
-                                    displayed.acceleration.y - fresh.acceleration.y,
+                                    correctionMotion.velocityY,
+                                    correctionMotion.accelerationY,
                                     now,
                                     endTime),
                             angle: displayed.pose.angle == null
@@ -415,9 +524,8 @@ const ReplicationPresentation = (function () {
                                 ? null
                                 : createCorrectionTransition(
                                     da,
-                                    displayed.velocity.angle - fresh.velocity.angle,
-                                    displayed.acceleration.angle
-                                        - fresh.acceleration.angle,
+                                    correctionMotion.angularVelocity,
+                                    correctionMotion.angularAcceleration,
                                     now,
                                     endTime)
                         };
@@ -496,17 +604,28 @@ const ReplicationPresentation = (function () {
                 const velocity = rawVelocityAt(state, pose, nowPerf);
                 const stepMs = 1000 / config.TARGET_FPS;
                 const probeMs = Math.min(1, stepMs / 10);
-                const futurePose = policy._reckonRaw(id, nowPerf + probeMs);
-                const futureVelocity = futurePose
-                    ? rawVelocityAt(state, futurePose, nowPerf + probeMs)
+                const elapsedFrames = (nowPerf - state.recvPerf) / stepMs;
+                const crossesClamp = elapsedFrames < config.DEADRECKON_MAX_FRAMES
+                    && elapsedFrames + probeMs / stepMs
+                        >= config.DEADRECKON_MAX_FRAMES;
+                const velocityProbeTime = crossesClamp
+                    ? nowPerf - probeMs
+                    : nowPerf + probeMs;
+                const probedPose = policy._reckonRaw(id, velocityProbeTime);
+                const probedVelocity = probedPose
+                    ? rawVelocityAt(state, probedPose, velocityProbeTime)
                     : velocity;
+                const accelerationScale = crossesClamp ? -1 : 1;
                 return {
                     pose,
                     velocity,
                     acceleration: {
-                        x: (futureVelocity.x - velocity.x) / probeMs,
-                        y: (futureVelocity.y - velocity.y) / probeMs,
-                        angle: (futureVelocity.angle - velocity.angle) / probeMs
+                        x: accelerationScale
+                            * (probedVelocity.x - velocity.x) / probeMs,
+                        y: accelerationScale
+                            * (probedVelocity.y - velocity.y) / probeMs,
+                        angle: accelerationScale
+                            * (probedVelocity.angle - velocity.angle) / probeMs
                     }
                 };
             },
