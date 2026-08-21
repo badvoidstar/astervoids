@@ -31,7 +31,7 @@ public class SchemaCrossWireFixturesTests
         ("thrusting", "bool"), ("invulnerable", "u16"),
         ("colorIndex", "u8"), ("memberId", "guid"),
         ("score", "u32"), ("hitCount", "u16"),
-        ("thrustInput", "q8"), ("brakeInput", "q8"),
+        ("thrustInput", "f32"), ("brakeInput", "q8"),
         ("turnControlMode", "u8"), ("turnTarget", "q16s"),
         ("turnTargetAngle", "q16_2pi"), ("turnMagnitude", "q8"), ("turnBias", "q16s"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
@@ -104,6 +104,19 @@ public class SchemaCrossWireFixturesTests
             "0000" +
             "00" +
             "7800");
+    }
+
+    [Fact]
+    public void Fixture_ShipUpdate_FullAnalogThrustRange()
+    {
+        var schema = ShipSchema();
+        var bytes = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
+        {
+            ["thrustInput"] = 1.5
+        });
+
+        Hex(bytes).Should().Be("002000" + "0000c03f");
+        PositionalSchemaCodec.Decode(schema, bytes)["thrustInput"].Should().Be(1.5);
     }
 
     [Fact]

@@ -128,7 +128,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("memberId", "guid"),
             new PositionalSchemaCodec.FieldSpec("score", "u32"),
             new PositionalSchemaCodec.FieldSpec("hitCount", "u16"),
-            new PositionalSchemaCodec.FieldSpec("thrustInput", "q8"),
+            new PositionalSchemaCodec.FieldSpec("thrustInput", "f32"),
             new PositionalSchemaCodec.FieldSpec("brakeInput", "q8"),
             new PositionalSchemaCodec.FieldSpec("turnControlMode", "u8"),
             new PositionalSchemaCodec.FieldSpec("turnTarget", "q16s"),

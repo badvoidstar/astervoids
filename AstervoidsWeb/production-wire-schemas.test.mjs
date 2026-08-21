@@ -60,6 +60,18 @@ test('unified ship schema carries adaptive, replay, identity, and terminal subse
         terminal);
 });
 
+test('ship schema preserves analog thrust above the unit interval', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(1);
+    const thrustField = schema.fields.find(field => field.name === 'thrustInput');
+    assert.equal(thrustField?.type, 'f32');
+
+    const decoded = SchemaCodec.decode(
+        schema,
+        SchemaCodec.encode(schema, { thrustInput: 1.5 }));
+    assert.equal(decoded.thrustInput, 1.5);
+});
+
 test('asteroid schema omits reproducible vertices and packs fracture vertices', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(2);

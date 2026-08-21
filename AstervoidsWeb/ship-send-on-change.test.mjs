@@ -236,8 +236,8 @@ test('baselines are per-ship; one ship changing does not flush another', () => {
     assert.equal(gate.shouldSend('b', coastingShip(), false), false);
 });
 
-// ── q8 wire round-trip for the unsigned inputs ──────────────────────────────
-// The unified ship schema stores thrustInput / brakeInput / turnMagnitude as q8.
+// ── q8 wire round-trip for unit-range unsigned inputs ───────────────────────
+// The unified ship schema stores brakeInput / turnMagnitude as q8.
 // q8 maps [0,1] -> round(v*255) -> /255. Confirm the endpoints and that the
 // 1/255 resolution comfortably covers control-input fidelity needs.
 function q8RoundTrip(v) {
@@ -245,7 +245,7 @@ function q8RoundTrip(v) {
     return q / 255;
 }
 
-test('q8 round-trips unsigned control inputs across [0,1] within 1/510', () => {
+test('q8 round-trips unit-range unsigned controls within 1/510', () => {
     for (const v of [0, 0.25, 0.5, 0.75, 1]) {
         assert.ok(Math.abs(q8RoundTrip(v) - v) <= 1 / 510, `v=${v}`);
     }

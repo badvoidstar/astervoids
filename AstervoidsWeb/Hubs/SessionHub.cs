@@ -773,7 +773,7 @@ public class SessionHub : Hub
     /// Owner's NTP-aligned server-time estimate of the simulation tick that
     /// produced this batch of updates. Forwarded to receivers as the
     /// broadcast's <c>validAt</c> trailing argument after a ±2s sanity clamp +
-    /// per-object monotonic cap so they can place every snapshot on the unified
+    /// batch-level monotonic cap so they can place every snapshot on the unified
     /// server-time interpolation axis. Null when the owner's clock isn't yet
     /// initialized; server falls back to its hub-entry timestamp.
     /// </param>
@@ -819,10 +819,9 @@ public class SessionHub : Hub
                 .Select(o => new ObjectUpdateInfo(o.Id, requestPayloadByObjectId[o.Id], o.Version))
                 .ToList();
 
-            // ValidAt is a single batch-level trailing argument: every object in
-            // this batch was sampled at the same owner tick and shares the same
-            // server-validated value. Read it from any updated object — they're
-            // all equal after ValidAtPolicy collapses to the call-level input.
+            // ValidAt is a single batch-level trailing argument. ObjectService
+            // resolves it against the newest prior timestamp in the accepted
+            // batch, so the value remains monotonic for every updated object.
             var batchValidAt = updatedObjects[0].ValidAt;
 
             await BroadcastToOthersAsync(session, member.Id, "OnObjectsUpdated",

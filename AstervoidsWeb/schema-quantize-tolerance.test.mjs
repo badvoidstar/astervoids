@@ -22,7 +22,7 @@ const SHIP_UPDATE_FIELDS = [
     ['thrusting', 'bool'], ['invulnerable', 'u16'],
     ['colorIndex', 'u8'], ['memberId', 'guid'],
     ['score', 'u32'], ['hitCount', 'u16'],
-    ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+    ['thrustInput', 'f32'], ['brakeInput', 'q8'],
     ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
     ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
     ['turnBias', 'q16s'],

@@ -26,8 +26,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 
 // Mirror of the production WIREOPT_SCHEMAS id=2 asteroid superset.
@@ -70,6 +75,26 @@ function extrapolatedX(state, renderTime) {
     const dtSec = (renderTime - latest.time) / 1000;
     return latest.data.x + latest.velocity.x * dtSec;
 }
+
+test('production asteroid update serializer includes changing kinematics', () => {
+    const classStart = html.indexOf('class Asteroid {');
+    const classEnd = html.indexOf('class Bullet {', classStart);
+    assert.notEqual(classStart, -1);
+    assert.notEqual(classEnd, -1);
+    const classSource = html.slice(classStart, classEnd);
+    const updateStart = classSource.indexOf('toUpdateData()');
+    const updateEnd = classSource.indexOf('fromSyncData(data)', updateStart);
+    assert.notEqual(updateStart, -1);
+    assert.notEqual(updateEnd, -1);
+    const updateSource = classSource.slice(updateStart, updateEnd);
+
+    for (const field of ['velocityX', 'velocityY', 'rotationSpeed']) {
+        assert.match(
+            updateSource,
+            new RegExp(`${field}:\\s*this\\.${field}\\b`),
+            `${field} must be captured after owner-side motion limiting`);
+    }
+});
 
 test('asteroid update schema carries velocity through encode/decode round trip', () => {
     const schema = freshSchema();

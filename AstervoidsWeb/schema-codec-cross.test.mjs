@@ -26,7 +26,7 @@ const SHIP_SCHEMA_FIELDS = [
     ['thrusting', 'bool'], ['invulnerable', 'u16'],
     ['colorIndex', 'u8'], ['memberId', 'guid'],
     ['score', 'u32'], ['hitCount', 'u16'],
-    ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+    ['thrustInput', 'f32'], ['brakeInput', 'q8'],
     ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
     ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'], ['turnBias', 'q16s'],
     ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
@@ -94,6 +94,14 @@ test('cross-wire: ship update — mixed types', () => {
     assert.equal(decoded.rotationSpeed, 0);
     assert.equal(decoded.thrusting, false);
     assert.equal(decoded.invulnerable, 120);
+});
+
+test('cross-wire: ship update — full analog thrust range', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
+    const bytes = hexToBytes('002000' + '0000c03f');
+    const decoded = SchemaCodec.decode(schema, bytes);
+    assert.equal(decoded.thrustInput, 1.5);
 });
 
 test('cross-wire: bullet update — guid field', () => {

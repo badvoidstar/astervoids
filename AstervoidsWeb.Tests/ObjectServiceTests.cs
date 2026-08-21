@@ -513,11 +513,8 @@ public class ObjectServiceTests : TestBase
     }
 
     [Fact]
-    public void UpdateObjects_AllObjectsShareCallLevelValidAt()
+    public void UpdateObjects_UsesSharedMonotonicValidAtAcrossBatch()
     {
-        // Per-object ValidAt was removed in favor of a single per-batch validAt.
-        // All objects in a single UpdateObjects call must receive the same
-        // validated call-level stamp.
         var (session, creator) = CreateTestSession();
         var receiveCreate = 1_000_000_000_000L;
         var obj1 = ObjectService.CreateObject(
@@ -530,6 +527,16 @@ public class ObjectServiceTests : TestBase
             new Dictionary<string, object?> { ["x"] = 2.0 },
             clientValidAt: receiveCreate,
             serverReceiveTimeMs: receiveCreate)!;
+
+        // Give the second object a newer prior timestamp than the next batch.
+        // The shared batch stamp must advance both objects to this value rather
+        // than allowing per-object monotonic clamps to diverge.
+        var newestPreviousStamp = receiveCreate + 700;
+        ObjectService.UpdateObject(
+            session.Id, obj2.Id,
+            new Dictionary<string, object?> { ["x"] = 3.0 },
+            clientValidAt: newestPreviousStamp,
+            serverReceiveTimeMs: newestPreviousStamp);
 
         var receiveUpdate = receiveCreate + 1000;
         var callLevelStamp = receiveCreate + 500;
@@ -545,10 +552,10 @@ public class ObjectServiceTests : TestBase
             serverReceiveTimeMs: receiveUpdate).ToList();
 
         updated.Should().HaveCount(2);
-        updated.First(o => o.Id == obj1.Id).ValidAt.Should().Be(callLevelStamp,
-            "all objects in a batch must share the call-level validAt");
-        updated.First(o => o.Id == obj2.Id).ValidAt.Should().Be(callLevelStamp,
-            "all objects in a batch must share the call-level validAt");
+        updated.First(o => o.Id == obj1.Id).ValidAt.Should().Be(newestPreviousStamp,
+            "the batch timestamp must honor every accepted object's monotonic floor");
+        updated.First(o => o.Id == obj2.Id).ValidAt.Should().Be(newestPreviousStamp,
+            "all objects in a broadcast batch must share one validated timestamp");
     }
 
 }

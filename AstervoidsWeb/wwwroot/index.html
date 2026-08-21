@@ -1412,7 +1412,7 @@
         ASTEROID_BASE_COUNT: 1,     // Starting astervoids in wave 1
         ASTEROID_BASE_SPEED: 0.15,  // Base asteroid speed (ref-dim/s)
         ASTEROID_SPEED_VARIANCE: 0.1, // Random speed addition (ref-dim/s)
-        // Caps enforced on locally-owned asteroids in Asteroid.update().
+        // Caps enforced on locally-owned asteroids before simulation and sync capture.
         // ASTEROID_MAX_SPEED uses the same units as SHIP_MAX_SPEED (normalized
         // reference-dim per second). ASTEROID_MAX_SPIN uses the same units as
         // ship turn speed (radians per 60fps frame); the default π/6 corresponds
@@ -3966,14 +3966,18 @@
 
         /**
          * Return only dynamic fields for per-frame updates.
-         * Static fields (type, radius, velocityX/Y, rotationSpeed, seed) are sent in creation data.
+         * Static fields (type, radius, seed) are sent in creation data.
+         * Kinematics remain dynamic because collisions and motion limits can change them.
          * 'type' is omitted for the same reason as Ship.toUpdateData.
          */
         toUpdateData() {
             return {
                 x: this.x,
                 y: this.y,
-                angle: this.angle
+                angle: this.angle,
+                velocityX: this.velocityX,
+                velocityY: this.velocityY,
+                rotationSpeed: this.rotationSpeed
             };
         }
 
@@ -4081,11 +4085,9 @@
         }
 
         /**
-         * Update asteroid position and rotation
-         * Velocity is in reference-dimension per second, converted with aspect ratio
-         * @param {number} dt - Delta time multiplier (1.0 = 60fps)
+         * Apply the authoritative asteroid motion limits before simulation or capture.
          */
-        update(dt = 1) {
+        clampMotion() {
             const cappedMotion = AstervoidsFracture.clampAsteroidMotion(
                 this.velocityX,
                 this.velocityY,
@@ -4095,6 +4097,15 @@
             this.velocityX = cappedMotion.velocityX;
             this.velocityY = cappedMotion.velocityY;
             this.rotationSpeed = cappedMotion.rotationSpeed;
+        }
+
+        /**
+         * Update asteroid position and rotation
+         * Velocity is in reference-dimension per second, converted with aspect ratio
+         * @param {number} dt - Delta time multiplier (1.0 = 60fps)
+         */
+        update(dt = 1) {
+            this.clampMotion();
 
             // Move asteroid using aspect-ratio-aware conversion
             this.x += velocityToNormalizedDeltaX(this.velocityX) * dt;
@@ -5556,6 +5567,7 @@
         if (!isSessionMode()) return;
         
         try {
+            asteroid.clampMotion();
             const objectInfo = await ObjectSync.createObject(
                 asteroid.toSyncData(), 'Session', ownerMemberId);
             if (!objectInfo) return;
@@ -5578,6 +5590,8 @@
             if (asteroid.syncObjectId) {
                 const syncObj = ObjectSync.getObject(asteroid.syncObjectId);
                 if (syncObj && syncObj.ownerMemberId === myMemberId) {
+                    // Capture exactly the limited kinematics the owner will simulate.
+                    asteroid.clampMotion();
                     // Send-on-change: remotes predict a ballistic asteroid from
                     // its transmitted constant kinematics, so deterministic mode
                     // suppresses redundant per-frame re-anchors. Buffered mode remains
@@ -6550,7 +6564,10 @@
         const replacementStartedPerf = performance.now();
         parentAsteroid.replacementStartedPerf = replacementStartedPerf;
         try {
-            const replacements = childAsteroids.map(child => child.toSyncData());
+            const replacements = childAsteroids.map(child => {
+                child.clampMotion();
+                return child.toSyncData();
+            });
             await ObjectSync.replaceObject(
                 parentAsteroid.syncObjectId, replacements, 'Session', ownerMemberId);
         } catch (err) {
@@ -9597,7 +9614,7 @@
                     // client->server upload from the timestamp but does not
                     // retain exact per-pose simulation time for coalesced state.
                     // Persistent path asymmetry can bias the estimate; the server
-                    // clamps stamps to +/-2s and enforces per-object monotonicity.
+                    // clamps stamps to +/-2s and enforces batch-level monotonicity.
                     clockSource: {
                         nowMs: () => RemoteObjects.serverNowMs(),
                         initialized: () => RemoteObjects.isClockOffsetInitialized()

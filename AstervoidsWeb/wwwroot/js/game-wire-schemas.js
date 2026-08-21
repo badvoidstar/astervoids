@@ -12,7 +12,7 @@ const AstervoidsWireSchemas = (function() {
             ['colorIndex', 'u8'],
             ['memberId', 'guid'],
             ['score', 'u32'], ['hitCount', 'u16'],
-            ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+            ['thrustInput', 'f32'], ['brakeInput', 'q8'],
             ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
             ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
             ['turnBias', 'q16s'],
