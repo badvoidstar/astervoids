@@ -685,7 +685,10 @@ const SessionClient = (function() {
             if (callbacks.onSessionCreated) {
                 callbacks.onSessionCreated(currentSession, currentMember);
             }
-            for (const event of pendingMemberEvents) dispatchMemberEvent(event);
+            for (const event of pendingMemberEvents) {
+                if (!isSessionContextCurrent(context)) break;
+                dispatchMemberEvent(event);
+            }
 
             if (!isSessionContextCurrent(context)) {
                 return null;
@@ -788,7 +791,10 @@ const SessionClient = (function() {
             if (callbacks.onSessionJoined) {
                 callbacks.onSessionJoined(currentSession, currentMember);
             }
-            for (const event of pendingMemberEvents) dispatchMemberEvent(event);
+            for (const event of pendingMemberEvents) {
+                if (!isSessionContextCurrent(context)) break;
+                dispatchMemberEvent(event);
+            }
 
             if (!isSessionContextCurrent(context)) {
                 return null;
