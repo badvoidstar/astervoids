@@ -99,14 +99,14 @@ const AstervoidsConfig = (function() {
             label: 'Asteroid max linear speed (ref-dim/s)',
             min: 0, max: 2, step: 0.025,
             fmt: value => `${value.toFixed(3)} ref-dim/s`,
-            help: 'Reference-dimension-per-second cap enforced on locally-owned asteroids each update. 0 disables the cap.',
+            help: 'Reference-dimension-per-second cap enforced before locally-owned asteroids update or synchronize. 0 disables the cap.',
         }),
         control({
             key: 'ASTEROID_MAX_SPIN',
             label: 'Asteroid max spin (rad/60 Hz tick)',
             min: 0, max: 1, step: 0.005,
             fmt: value => `${value.toFixed(3)} (${(value * 60 / (2 * Math.PI)).toFixed(2)} rot/s)`,
-            help: 'Per-nominal-60 Hz-tick cap on locally-owned asteroid rotation speed. 0 disables the cap.',
+            help: 'Per-nominal-60 Hz-tick cap enforced before locally-owned asteroids update or synchronize. 0 disables the cap.',
         }),
         control({
             key: 'DEFLECTION_KICK',

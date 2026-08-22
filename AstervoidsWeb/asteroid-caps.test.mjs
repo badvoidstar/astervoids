@@ -5,8 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
 const {
     SHARED_DEFAULTS,
     CONFIG_CONTROLS,
@@ -25,6 +30,22 @@ function clampSpeed(vx, vy, maxSpeed) {
 
 function clampSpin(rs, maxSpin) {
     return clampAsteroidMotion(0, 0, rs, 0, maxSpin).rotationSpeed;
+}
+
+function sourceBetween(startMarker, endMarker) {
+    const start = html.indexOf(startMarker);
+    assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
+    const end = html.indexOf(endMarker, start + startMarker.length);
+    assert.notEqual(end, -1, `missing source marker: ${endMarker}`);
+    return html.slice(start, end);
+}
+
+function assertBefore(source, first, second) {
+    const firstIndex = source.indexOf(first);
+    const secondIndex = source.indexOf(second);
+    assert.notEqual(firstIndex, -1, `missing source fragment: ${first}`);
+    assert.notEqual(secondIndex, -1, `missing source fragment: ${second}`);
+    assert.ok(firstIndex < secondIndex, `${first} must run before ${second}`);
 }
 
 test('CONFIG.ASTEROID_MAX_SPEED defaults to 0.4 (same units as SHIP_MAX_SPEED)', () => {
@@ -73,6 +94,24 @@ test('clampSpin: over-cap rotationSpeed is clamped, sign preserved', () => {
 test('clampSpin: cap of 0 disables (no clamp)', () => {
     assert.equal(clampSpin(99, 0), 99);
     assert.equal(clampSpin(-99, 0), -99);
+});
+
+test('synced asteroid captures apply motion limits before serialization', () => {
+    const createSource = sourceBetween(
+        'async function createSyncedAsteroid',
+        'function syncLocalAstervoids');
+    assertBefore(createSource, 'asteroid.clampMotion()', 'asteroid.toSyncData()');
+
+    const updateSource = sourceBetween(
+        'function syncLocalAstervoids',
+        'async function deleteSyncedAsteroid');
+    assertBefore(updateSource, 'asteroid.clampMotion()', 'SendGate.shouldSend(');
+    assertBefore(updateSource, 'asteroid.clampMotion()', 'asteroid.toUpdateData()');
+
+    const replaceSource = sourceBetween(
+        'async function replaceSyncedAsteroid',
+        'function togglePause');
+    assertBefore(replaceSource, 'child.clampMotion()', 'child.toSyncData()');
 });
 
 test('debug controls register both asteroid caps', () => {

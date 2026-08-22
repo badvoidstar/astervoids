@@ -1021,7 +1021,7 @@ flowchart LR
     end
 
     subgraph "Server hub"
-        CLAMP["validAt =<br/>±2s clamp(clientValidAt) ?? hub-entry ServerTimestamp"]
+        CLAMP["validAt =<br/>±2s clamp(clientValidAt) ?? hub-entry ServerTimestamp<br/>then max prior ValidAt in batch"]
     end
 
     subgraph "Receiver"
@@ -1040,18 +1040,19 @@ flowchart LR
 * **Buffered replacement projection.** Buffered mode keys the first snapshot at `validAt` and adds a parent-pose bridge on that shared axis. Its locally owned children retain bounded `validAt` projection.
 * **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; buffered mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
 
-### Per-batch `validAt` collapse on `OnObjectsUpdated`
+### Shared batch `validAt` on `OnObjectsUpdated`
 
 The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole
-batch (rather than one per object) — `updatedObjects[0].ValidAt` — saving 8 B
-per object. This bandwidth tradeoff relies on the following:
+batch (rather than one per object), saving 8 B per object:
 
 * **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries begin with the same operation timestamp. It does not retain each pose's original simulation time.
-* **Server-side caps can still differ.** `ObjectService.ValidateValidAt` clamps a regressing value to each object's previous `ValidAt`. If objects had different prior values, their validated values can diverge even though the wire broadcast selects the first entry's value.
-* **Receiver insertion is monotonic.** The snapshot presentation policy
-  prevents regressing keys, and its near-coincident-key cushion avoids an
-  immediate Hermite jump. This protects bracket ordering; it does not restore
-  discarded per-object timestamps.
+* **One server monotonic floor.** `ObjectService.UpdateObjects` validates that
+  stamp once against the newest previous `ValidAt` among accepted objects, then
+  stores the resolved value on every object. The broadcast timestamp therefore
+  includes the effect of server-side monotonic clamping for the entire batch.
+* **Receiver insertion remains monotonic.** The snapshot presentation policy
+  still prevents regressing keys, and its near-coincident-key cushion avoids an
+  immediate Hermite jump.
 
 Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
 `SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
@@ -1478,6 +1479,13 @@ terminal slots when a mode does not produce them. This prevents a later update
 from introducing fields that the object's retained creation schema cannot
 encode.
 
+`thrustInput` is `f32` because the configured analog range extends past 1.
+Ship velocity and asteroid velocity/spin also use `f32`: their supported caps
+can exceed the unit interval, and setting a cap to zero permits larger values.
+Unit-range brake and turn magnitudes remain `q8`. Asteroid owners apply their
+linear/angular limits before create, replacement, and update capture, and
+asteroid update deltas include velocity and spin whenever those values change.
+
 Schema 0 remains reserved as the generic extension/fallback path. Its body is a
 MessagePack map and can preserve nested maps, arrays, nulls, binary values, and
 unknown fields. No current Astervoids gameplay object selects it, but JS and C#
@@ -1502,8 +1510,8 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 
 | Payload | Current compact size |
 | --- | ---: |
-| ship create body | 47 B |
-| seeded asteroid create body | 34 B |
+| ship create body | 51 B |
+| seeded asteroid create body | 40 B |
 | bullet create body | 37 B |
 | GameState create body | 48 B |
 | asteroid x/y/angle update DTO | 29–35 B |

@@ -26,8 +26,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 
 // Mirror of the production WIREOPT_SCHEMAS id=2 asteroid superset.
@@ -37,8 +42,8 @@ const ASTEROID_UPDATE_SCHEMA_FIELDS = [
     ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
     ['radius', 'q16'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-    ['rotationSpeed', 'q16s'],
+    ['velocityX', 'f32'], ['velocityY', 'f32'],
+    ['rotationSpeed', 'f32'],
     ['seed', 'f64'], ['vertices', 'bytes'],
     ['terminalEpoch', 'f64'],
     ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
@@ -71,12 +76,32 @@ function extrapolatedX(state, renderTime) {
     return latest.data.x + latest.velocity.x * dtSec;
 }
 
+test('production asteroid update serializer includes changing kinematics', () => {
+    const classStart = html.indexOf('class Asteroid {');
+    const classEnd = html.indexOf('class Bullet {', classStart);
+    assert.notEqual(classStart, -1);
+    assert.notEqual(classEnd, -1);
+    const classSource = html.slice(classStart, classEnd);
+    const updateStart = classSource.indexOf('toUpdateData()');
+    const updateEnd = classSource.indexOf('fromSyncData(data)', updateStart);
+    assert.notEqual(updateStart, -1);
+    assert.notEqual(updateEnd, -1);
+    const updateSource = classSource.slice(updateStart, updateEnd);
+
+    for (const field of ['velocityX', 'velocityY', 'rotationSpeed']) {
+        assert.match(
+            updateSource,
+            new RegExp(`${field}:\\s*this\\.${field}\\b`),
+            `${field} must be captured after owner-side motion limiting`);
+    }
+});
+
 test('asteroid update schema carries velocity through encode/decode round trip', () => {
     const schema = freshSchema();
     const sent = {
         x: 0.5, y: 0.5, angle: 1.0,
-        velocityX: 0.3, velocityY: -0.2,
-        rotationSpeed: 0.05,
+        velocityX: 1.5, velocityY: -1.25,
+        rotationSpeed: 1.2,
     };
     const bytes = SchemaCodec.encode(schema, sent);
     const decoded = SchemaCodec.decode(schema, bytes);
@@ -84,13 +109,13 @@ test('asteroid update schema carries velocity through encode/decode round trip',
     // The ship schema already had these fields; the regression was that the
     // asteroid schema was minimised to {x, y, angle}. Pin that the
     // current schema preserves velocity — both the keys and the values
-    // (within q16s ~3e-5 quantization).
+    // (within f32 precision).
     assert.ok('velocityX' in decoded, 'velocityX must survive decode (Phase 4D regression)');
     assert.ok('velocityY' in decoded, 'velocityY must survive decode (Phase 4D regression)');
     assert.ok('rotationSpeed' in decoded, 'rotationSpeed must survive decode (Phase 4D regression)');
-    assert.ok(Math.abs(decoded.velocityX - 0.3) < 1e-4, `velocityX preserved: got ${decoded.velocityX}`);
-    assert.ok(Math.abs(decoded.velocityY - -0.2) < 1e-4, `velocityY preserved: got ${decoded.velocityY}`);
-    assert.ok(Math.abs(decoded.rotationSpeed - 0.05) < 1e-4, `rotationSpeed preserved: got ${decoded.rotationSpeed}`);
+    assert.ok(Math.abs(decoded.velocityX - 1.5) < 1e-6, `velocityX preserved: got ${decoded.velocityX}`);
+    assert.ok(Math.abs(decoded.velocityY + 1.25) < 1e-6, `velocityY preserved: got ${decoded.velocityY}`);
+    assert.ok(Math.abs(decoded.rotationSpeed - 1.2) < 1e-6, `rotationSpeed preserved: got ${decoded.rotationSpeed}`);
 });
 
 test('extrapolation past latest snapshot advances by velocity (no freeze on LAN)', () => {

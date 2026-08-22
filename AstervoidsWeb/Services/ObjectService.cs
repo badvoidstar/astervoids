@@ -96,9 +96,10 @@ public class ObjectService : IObjectService
     /// Batch-updates multiple objects owned by <paramref name="ownerMemberId"/>.
     ///
     /// Objects not owned by the caller are silently skipped.  Successfully updated
-    /// objects are returned. Each update's <see cref="ObjectUpdate.ValidAt"/>
-    /// (if present) takes precedence over <paramref name="callLevelClientValidAt"/>;
-    /// both go through the same ±2 s-vs-server / monotonic-vs-previous validator.
+    /// objects are returned. The call-level timestamp goes through the ±2 s
+    /// server-time sanity check, then is clamped against the newest previous
+    /// timestamp in the accepted batch so every updated object shares one
+    /// monotonic <c>ValidAt</c>.
     /// </summary>
     public IEnumerable<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null)
     {
@@ -116,6 +117,7 @@ public class ObjectService : IObjectService
             if (!session.Members.ContainsKey(ownerMemberId))
                 return results;
 
+            var acceptedUpdates = new List<(SessionObject Object, ObjectUpdate Update)>();
             foreach (var update in updates)
             {
                 if (!session.Objects.TryGetValue(update.ObjectId, out var obj))
@@ -125,8 +127,19 @@ public class ObjectService : IObjectService
                 if (obj.OwnerMemberId != ownerMemberId)
                     continue;
 
-                var validAt = ValidAtPolicy.Resolve(callLevelClientValidAt, receive, obj.ValidAt);
-                ApplyUpdate(obj, update.Data, validAt);
+                acceptedUpdates.Add((obj, update));
+            }
+
+            if (acceptedUpdates.Count == 0)
+                return results;
+
+            var newestPreviousValidAt = acceptedUpdates.Max(item => item.Object.ValidAt);
+            var batchValidAt = ValidAtPolicy.Resolve(
+                callLevelClientValidAt, receive, newestPreviousValidAt);
+
+            foreach (var (obj, update) in acceptedUpdates)
+            {
+                ApplyUpdate(obj, update.Data, batchValidAt);
                 results.Add(Snapshot(obj));
             }
         }

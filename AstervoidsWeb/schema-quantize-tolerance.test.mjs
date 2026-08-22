@@ -17,12 +17,12 @@ const TWO_PI = Math.PI * 2;
 const SHIP_UPDATE_FIELDS = [
     ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
+    ['velocityX', 'f32'], ['velocityY', 'f32'],
     ['rotationSpeed', 'q16s'],
     ['thrusting', 'bool'], ['invulnerable', 'u16'],
     ['colorIndex', 'u8'], ['memberId', 'guid'],
     ['score', 'u32'], ['hitCount', 'u16'],
-    ['thrustInput', 'q8'], ['brakeInput', 'q8'],
+    ['thrustInput', 'f32'], ['brakeInput', 'q8'],
     ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
     ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'],
     ['turnBias', 'q16s'],
@@ -33,8 +33,8 @@ const ASTEROID_UPDATE_FIELDS = [
     ['type', 'str'],
     ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
     ['radius', 'q16'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-    ['rotationSpeed', 'q16s'],
+    ['velocityX', 'f32'], ['velocityY', 'f32'],
+    ['rotationSpeed', 'f32'],
     ['seed', 'f64'], ['vertices', 'bytes'],
     ['terminalEpoch', 'f64'],
     ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
@@ -72,14 +72,14 @@ test('asteroid angle error within 0.01° (much finer than human perception)', ()
     assert.ok(maxErr <= TOLERANCE_RAD, `max angle error ${maxErr} exceeds ${TOLERANCE_RAD} rad`);
 });
 
-test('ship velocity (q16s) error within 1/32767 across [-1, 1]', () => {
+test('ship velocity (f32) preserves supported values above the unit interval', () => {
     fresh();
     const s = SchemaCodec.register(1, SHIP_UPDATE_FIELDS);
-    const QUANTUM = 1 / 32767;
+    const TOLERANCE = 1e-6;
     let maxErr = 0;
     for (let i = 0; i < 1000; i++) {
-        const vx = (Math.random() * 2 - 1) * 0.8; // realistic velocity range
-        const vy = (Math.random() * 2 - 1) * 0.8;
+        const vx = (Math.random() * 2 - 1) * 6;
+        const vy = (Math.random() * 2 - 1) * 6;
         const back = SchemaCodec.decode(s, SchemaCodec.encode(s, {
             x: 0.5, y: 0.5, angle: 0,
             velocityX: vx, velocityY: vy, rotationSpeed: 0,
@@ -87,7 +87,7 @@ test('ship velocity (q16s) error within 1/32767 across [-1, 1]', () => {
         }));
         maxErr = Math.max(maxErr, Math.abs(back.velocityX - vx), Math.abs(back.velocityY - vy));
     }
-    assert.ok(maxErr <= QUANTUM, `max velocity error ${maxErr} exceeds 1 quantum (${QUANTUM})`);
+    assert.ok(maxErr <= TOLERANCE, `max velocity error ${maxErr} exceeds ${TOLERANCE}`);
 });
 
 test('Hazard L11: extrapolation does NOT accumulate quantization drift', () => {
@@ -129,9 +129,8 @@ test('Hazard L11: extrapolation does NOT accumulate quantization drift', () => {
             maxRenderError = Math.max(maxRenderError, wrapped);
         }
     }
-    // Bound: snapshot.x error (≤1 q16 quantum) + lag×snapshot.vx error
-    // (≤ ~3*dt × 1 q16s quantum) ≤ 1/65535 + 0.05 × 1/32767 ≈ 1.6e-5 + 1.5e-6.
-    const bound = QUANTUM + (3 * dt) * (1 / 32767);
+    // Bound: snapshot.x error (≤1 q16 quantum) plus negligible f32 velocity error.
+    const bound = QUANTUM + (3 * dt) * 1e-7;
     assert.ok(maxRenderError <= bound + 1e-9,
         `extrapolation error ${maxRenderError} exceeds non-cumulative bound ${bound}`);
 });

@@ -216,7 +216,7 @@ const ObjectSync = (function() {
     // create/replace/event calls stamp their invocation time, while update
     // batches stamp flush time. A coalesced update's underlying simulation pose
     // can therefore predate validAt by its queue wait. The server clamps client
-    // stamps and applies its per-object monotonic rules.
+    // stamps and applies a shared monotonic floor to each update batch.
     let clockSource = null;
     
     // Delta-enabled flush opportunities between periodic forced-full payloads
@@ -1296,7 +1296,7 @@ const ObjectSync = (function() {
         // this batch shares the resulting validAt. Because pending updates are
         // coalesced without per-write timestamps, this is an ordering/presentation
         // anchor rather than an exact timestamp for each simulation pose.
-        // Server clamps to ±2s and applies per-object monotonicity.
+        // Server clamps to ±2s and applies batch-level monotonicity.
         // Math.round is required (see replaceObject for MessagePack int64 contract).
         const clientValidAt = getClientValidAt();
         // Compress field names for the wire — game logic stays readable.
