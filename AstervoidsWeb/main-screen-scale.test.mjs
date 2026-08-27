@@ -15,3 +15,15 @@ test('main-screen content is scaled without shrinking its backdrop', () => {
         source,
         /<div id="start-screen">\s*<div id="start-screen-content">\s*<h1>ASTERVOIDS<\/h1>/);
 });
+
+test('main-screen vertical spacing is compressed without reducing font sizes', () => {
+    assert.match(
+        source,
+        /#start-screen h1 \{[\s\S]*?font-size: clamp\(24px, 5vmin, 38px\);[\s\S]*?margin-bottom: clamp\(14px, 2\.7vmin, 27px\);/);
+    assert.match(
+        source,
+        /#session-list \{[\s\S]*?max-height: 135px;[\s\S]*?margin-bottom: 18px;/);
+    assert.match(
+        source,
+        /\.picker-btn \{[\s\S]*?font-size: 14px;[\s\S]*?padding: 8px 18px;/);
+});

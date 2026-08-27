@@ -19,7 +19,8 @@ function getAnalogAnchorScale(
     width,
     height,
     calibrationReference = 390,
-    referenceSeverity = 844 / 390
+    referenceSeverity = 844 / 390,
+    baseScale = 1.1
 ) {
     // eslint-disable-next-line no-new-func
     const createScale = new Function(
@@ -40,26 +41,28 @@ function getAnalogAnchorScale(
         {
             ANALOG_ANCHOR_REFERENCE_DIMENSION_PX: calibrationReference,
             ANALOG_ANCHOR_REFERENCE_ASPECT_SEVERITY: referenceSeverity,
+            ANALOG_ANCHOR_BASE_SCALE: baseScale,
         }
     )();
 }
 
 test('analog anchor scale preserves the nominal mobile baseline in either orientation', () => {
-    assert.equal(getAnalogAnchorScale(390, 844), 1);
-    assert.equal(getAnalogAnchorScale(844, 390), 1);
-    assert.equal(getAnalogAnchorScale(195, 422), 0.5);
+    assert.equal(getAnalogAnchorScale(390, 844), 1.1);
+    assert.equal(getAnalogAnchorScale(844, 390), 1.1);
+    assert.equal(getAnalogAnchorScale(195, 422), 0.55);
     assert.match(html, /ANALOG_ANCHOR_REFERENCE_DIMENSION_PX: 390/);
     assert.match(html, /ANALOG_ANCHOR_REFERENCE_ASPECT_SEVERITY: 844 \/ 390/);
+    assert.match(html, /ANALOG_ANCHOR_BASE_SCALE: 1\.1/);
     assert.match(
         html,
         /function getReferenceDimension\(\) \{\s*return Math\.min\(getGameWidth\(\), getGameHeight\(\)\);/);
 });
 
 test('aspect severity shrinks square controls and clamps growth at the short edge', () => {
-    assert.ok(Math.abs(getAnalogAnchorScale(390, 390) - 390 / 844) < 1e-12);
-    assert.ok(Math.abs(getAnalogAnchorScale(780, 780) - 780 / 844) < 1e-12);
-    assert.equal(getAnalogAnchorScale(390, 1688), 1);
-    assert.equal(getAnalogAnchorScale(1688, 390), 1);
+    assert.ok(Math.abs(getAnalogAnchorScale(390, 390) - 390 / 844 * 1.1) < 1e-12);
+    assert.ok(Math.abs(getAnalogAnchorScale(780, 780) - 780 / 844 * 1.1) < 1e-12);
+    assert.equal(getAnalogAnchorScale(390, 1688), 1.1);
+    assert.equal(getAnalogAnchorScale(1688, 390), 1.1);
     assert.match(
         scaleFnMatch[0],
         /Math\.min\(shortEdge, severityScaledDimension\) \/ calibrationReference/);
