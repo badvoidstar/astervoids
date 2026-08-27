@@ -65,7 +65,7 @@ test('aspect severity shrinks square controls and clamps growth at the short edg
     assert.equal(getAnalogAnchorScale(1688, 390), 1.1);
     assert.match(
         scaleFnMatch[0],
-        /Math\.min\(shortEdge, severityScaledDimension\) \/\s*calibrationReference \* CONFIG\.ANALOG_ANCHOR_BASE_SCALE/);
+        /\(Math\.min\(shortEdge, severityScaledDimension\) \/ calibrationReference\) \*\s*CONFIG\.ANALOG_ANCHOR_BASE_SCALE/);
 });
 
 test('rectilinear and polar analog anchors apply scale to input and overlay geometry', () => {

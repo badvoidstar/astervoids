@@ -2824,8 +2824,8 @@
             getGameWidth(), getGameHeight());
         const severityScaledDimension =
             shortEdge * severity / referenceSeverity;
-        return Math.min(shortEdge, severityScaledDimension) /
-            calibrationReference * CONFIG.ANALOG_ANCHOR_BASE_SCALE;
+        return (Math.min(shortEdge, severityScaledDimension) / calibrationReference) *
+            CONFIG.ANALOG_ANCHOR_BASE_SCALE;
     }
 
     /**
