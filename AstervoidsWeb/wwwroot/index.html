@@ -8119,6 +8119,35 @@
     }
 
     /**
+     * Draw only viewport edges that are inside the canvas.
+     */
+    function drawViewportBorder(ctx, viewport, canvasWidth, canvasHeight) {
+        const left = viewport.x;
+        const top = viewport.y;
+        const right = viewport.x + viewport.width;
+        const bottom = viewport.y + viewport.height;
+
+        ctx.beginPath();
+        if (top > 0) {
+            ctx.moveTo(left, top);
+            ctx.lineTo(right, top);
+        }
+        if (right < canvasWidth) {
+            ctx.moveTo(right, top);
+            ctx.lineTo(right, bottom);
+        }
+        if (bottom < canvasHeight) {
+            ctx.moveTo(right, bottom);
+            ctx.lineTo(left, bottom);
+        }
+        if (left > 0) {
+            ctx.moveTo(left, bottom);
+            ctx.lineTo(left, top);
+        }
+        ctx.stroke();
+    }
+
+    /**
      * Render the current scene.
      * @param {number} alpha - Render interpolation factor in [0,1]; in
      *   deterministic mode renderables blend prev→curr transforms by this, in
@@ -8201,10 +8230,10 @@
         if (hasViewportOffset) {
             ctx.restore();
             
-            // Draw white border around viewport (outside the clipping region)
+            // Draw only viewport edges that are not coincident with the window.
             ctx.strokeStyle = '#fff';
             ctx.lineWidth = 2;
-            ctx.strokeRect(game.viewport.x, game.viewport.y, game.viewport.width, game.viewport.height);
+            drawViewportBorder(ctx, game.viewport, canvas.width, canvas.height);
         }
 
         // Touch overlay (virtual-stick anchor). Drawn last and in full-canvas
