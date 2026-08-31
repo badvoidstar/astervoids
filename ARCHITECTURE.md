@@ -112,7 +112,9 @@ replication update:
    `updateBulletsFromSync`, and `updateGameStateFromSync` reconcile their type
    at their original game-owned pivots.
 4. Collision detection observes the same local and sampled remote state as
-   before extraction.
+   before extraction. Bullet hits sweep each local bullet's step-relative path
+   against the current asteroid polygon, including translational asteroid
+   motion and wrap-aware broad-phase rejection.
 5. Rendering remains outside the runtime.
 
 The hidden-tab fallback keeps its own established order: outbound tick, local
