@@ -109,6 +109,11 @@ test('wrap-aware sweep stays at the screen edge instead of crossing the field', 
         true);
 });
 
+test('wrap delta uses half of the margin-extended range', () => {
+    assert.equal(wrappedDelta(0, 0.55, 0.1), 0.55);
+    assert.ok(Math.abs(wrappedDelta(0, 0.65, 0.1) + 0.55) < 1e-12);
+});
+
 test('production tracks step poses and applies swept broad and narrow phases', () => {
     assert.match(productionSource, /bullet\._collisionPrevX = bullet\.x;/);
     assert.match(productionSource, /asteroid\._collisionPrevX = asteroid\.x;/);

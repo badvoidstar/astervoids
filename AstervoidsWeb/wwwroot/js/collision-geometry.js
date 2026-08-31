@@ -121,8 +121,8 @@ const AstervoidsCollision = (function() {
     function wrappedDelta(previous, current, margin = 0) {
         let delta = current - previous;
         const range = 1 + 2 * margin;
-        if (delta > 0.5) delta -= range;
-        else if (delta < -0.5) delta += range;
+        if (delta > range / 2) delta -= range;
+        else if (delta < -range / 2) delta += range;
         return delta;
     }
 
