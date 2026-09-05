@@ -761,6 +761,8 @@
     <script src="/js/game-config.js"></script>
     <!-- Pure asteroid fracture geometry and kinematics -->
     <script src="/js/asteroid-fracture.js"></script>
+    <!-- Pure swept-collision geometry for fast projectiles -->
+    <script src="/js/collision-geometry.js"></script>
     <!-- Canonical Astervoids positional schemas and selector -->
     <script src="/js/game-wire-schemas.js"></script>
     <!-- Wire enum translation (server sends MemberRole/ObjectScope as bytes; this converts to strings) -->
@@ -3920,6 +3922,8 @@
         constructor(x, y, radius, velocityX, velocityY, seed = null, vertices = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
+            this._collisionPrevX = x;      // Previous simulation-step position
+            this._collisionPrevY = y;
             this.radius = radius;          // Normalized size (relative to ref dimension)
             this.velocityX = velocityX;    // Velocity in reference-dimension per second
             this.velocityY = velocityY;    // Velocity in reference-dimension per second
@@ -4168,6 +4172,8 @@
         constructor(x, y, velocityX, velocityY, colorIndex = 0, ownerMemberId = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
+            this._collisionPrevX = x;      // Previous simulation-step position
+            this._collisionPrevY = y;
             this.velocityX = velocityX;    // Velocity in reference-dimension per second
             this.velocityY = velocityY;    // Velocity in reference-dimension per second
             this.lifetime = CONFIG.BULLET_LIFETIME;  // Frames until expiry
@@ -6766,11 +6772,30 @@
             for (let j = game.astervoids.length - 1; j >= 0; j--) {
                 const asteroid = game.astervoids[j];
                 
-                const bulletPxX = fromNormalizedX(bullet.x);
-                const bulletPxY = fromNormalizedY(bullet.y);
                 const bulletPxRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
+                const bulletDeltaX = AstervoidsCollision.wrappedDelta(
+                    bullet._collisionPrevX, bullet.x, wrapMarginX(CONFIG.BULLET_RADIUS));
+                const bulletDeltaY = AstervoidsCollision.wrappedDelta(
+                    bullet._collisionPrevY, bullet.y, wrapMarginY(CONFIG.BULLET_RADIUS));
+                const asteroidDeltaX = AstervoidsCollision.wrappedDelta(
+                    asteroid._collisionPrevX, asteroid.x, wrapMarginX(asteroid.boundRadius));
+                const asteroidDeltaY = AstervoidsCollision.wrappedDelta(
+                    asteroid._collisionPrevY, asteroid.y, wrapMarginY(asteroid.boundRadius));
+                const bulletEnd = {
+                    x: fromNormalizedX(bullet.x),
+                    y: fromNormalizedY(bullet.y),
+                    radius: bulletPxRadius
+                };
+                // Express the previous bullet pose in the asteroid's current
+                // translational frame. This sweeps their relative motion while
+                // keeping wrap jumps out of the segment.
+                const bulletStart = {
+                    x: fromNormalizedX(bullet.x - bulletDeltaX + asteroidDeltaX),
+                    y: fromNormalizedY(bullet.y - bulletDeltaY + asteroidDeltaY),
+                    radius: bulletPxRadius
+                };
 
-                // Broad phase: circle-vs-circle on bounding radii. Use the
+                // Broad phase: swept circle-vs-circle on bounding radii. Use the
                 // asteroid's true `boundRadius` (max vertex distance) so
                 // fracture shards — where `radius` is an area-equivalent disk
                 // radius and the polygon may extend much farther — aren't
@@ -6778,18 +6803,15 @@
                 const asteroidPxX = fromNormalizedX(asteroid.x);
                 const asteroidPxY = fromNormalizedY(asteroid.y);
                 const asteroidPxBound = fromNormalizedSize(asteroid.boundRadius);
-                const dx = bulletPxX - asteroidPxX;
-                const dy = bulletPxY - asteroidPxY;
-                const reach = bulletPxRadius + asteroidPxBound;
-                if (dx * dx + dy * dy > reach * reach) continue;
+                if (!AstervoidsCollision.sweptCircleIntersectsCircle(
+                    bulletStart,
+                    bulletEnd,
+                    { x: asteroidPxX, y: asteroidPxY, radius: asteroidPxBound })) {
+                    continue;
+                }
 
-                const bulletCircle = {
-                    x: bulletPxX,
-                    y: bulletPxY,
-                    radius: bulletPxRadius
-                };
-
-                if (circlePolygonCollision(bulletCircle, asteroid.getWorldVertices())) {
+                if (AstervoidsCollision.sweptCirclePolygonCollision(
+                    bulletStart, bulletEnd, asteroid.getWorldVertices())) {
                     if (isSessionMode()) {
                         // Check if we own this asteroid
                         const asteroidSyncObj = asteroid.syncObjectId ? ObjectSync.getObject(asteroid.syncObjectId) : null;
@@ -7949,6 +7971,17 @@
      * @param {boolean} frozenForReconnect - When true, gameplay is frozen.
      */
     function runSimulationStep(dt, frozenForReconnect) {
+        // Capture collision poses independently of render interpolation. These
+        // are also needed in buffered mode and for relative asteroid motion.
+        for (const asteroid of game.astervoids) {
+            asteroid._collisionPrevX = asteroid.x;
+            asteroid._collisionPrevY = asteroid.y;
+        }
+        for (const bullet of game.bullets) {
+            bullet._collisionPrevX = bullet.x;
+            bullet._collisionPrevY = bullet.y;
+        }
+
         // Deterministic mode: capture pre-step poses so the renderer can blend
         // toward the post-step poses for smooth motion between fixed ticks.
         if (isDeterministicMode()) {
