@@ -3,7 +3,6 @@
 azd_env_value() {
   local key="$1"
   local values="${2-}"
-  local line value
 
   case "$key" in
     ''|*[!A-Z0-9_]*)
@@ -13,20 +12,11 @@ azd_env_value() {
   esac
 
   if [ "$#" -lt 2 ]; then
-    values=$(azd env get-values) || return
+    values=$(azd env get-values --output json) || return
   fi
-  line=$(printf '%s\n' "$values" | grep -m1 "^${key}=" || true)
-  [ -n "$line" ] || return 0
-
-  value="${line#*=}"
-  value="${value%$'\r'}"
-  case "$value" in
-    \"*\")
-      value="${value#\"}"
-      value="${value%\"}"
-      ;;
-  esac
-  printf '%s\n' "$value"
+  # azd's default dotenv output escapes JSON-valued settings. Read its JSON
+  # object instead, letting jq decode strings exactly once.
+  jq -r --arg key "$key" '.[$key] // empty' <<< "$values"
 }
 
 require_azd_env_value() {
@@ -155,11 +145,12 @@ deployment_mode() {
 # supplied by the caller. Optional certificate/domain values remain private.
 load_deployment_settings() {
   local -n settings="$1"
-  local values
-  values=$(azd env get-values) || return
+  local values regions
+  values=$(azd env get-values --output json) || return
   settings[environmentName]=$(require_azd_env_value AZURE_ENV_NAME "$values") || return
   settings[location]=$(require_azd_env_value AZURE_LOCATION "$values") || return
-  settings[regions]=$(normalize_deployment_regions "$(azd_env_value REGIONS_JSON "$values")") || return
+  regions=$(azd_env_value REGIONS_JSON "$values") || return
+  settings[regions]=$(normalize_deployment_regions "$regions") || return
   settings[useSharedInfra]=$(azd_env_value USE_SHARED_INFRA "$values")
   settings[useSharedInfra]="${settings[useSharedInfra]:-false}"
   settings[customDomainName]=$(azd_env_value CUSTOM_DOMAIN_NAME "$values")
@@ -226,7 +217,7 @@ deploy_single_region_production() {
   local -n result="$2"
   local values
   azd up --no-prompt || return
-  values=$(azd env get-values) || return
+  values=$(azd env get-values --output json) || return
   read_deployment_outputs azd "$values" "$2" || return
   result[IS_MULTI_REGION]=false
 }
@@ -302,7 +293,7 @@ deploy_shared_infra_branch() {
   azd provision --no-prompt || return
   if az containerapp show --name "$expected_app" \
     --resource-group "${settings[resourceGroup]}" &>/dev/null; then
-    values=$(azd env get-values) || return
+    values=$(azd env get-values --output json) || return
     read_deployment_outputs azd "$values" "$2" || return
   else
     # azd can report "no changes" after a truncated environment-name collision.
@@ -347,8 +338,14 @@ bootstrap_shared_certificate() {
 write_deployment_outputs() {
   local -n result="$1"
   local output_file="$2" environment_file="$3" key
+  local public_url="${result[WEB_URI]}"
+  # Bicep's static-apex WEB_URI is the private custom hostname. Publish the
+  # default static host instead without changing the private deployment state.
+  if [ "${result[IS_MULTI_REGION]}" = true ] && [ -n "${result[STATIC_WEB_APP_DEFAULT_HOSTNAME]}" ]; then
+    public_url="https://${result[STATIC_WEB_APP_DEFAULT_HOSTNAME]}"
+  fi
   # Fail closed rather than letting custom-domain output become environment.url.
-  if ! [[ "${result[WEB_URI]}" =~ ^https://[a-zA-Z0-9.-]+\.azure(containerapps\.io|staticapps\.net)/?$ ]]; then
+  if ! [[ "$public_url" =~ ^https://[a-zA-Z0-9.-]+\.azure(containerapps\.io|staticapps\.net)/?$ ]]; then
     echo "::error::Deployment URL must be a default Azure hostname." >&2
     return 1
   fi
@@ -358,7 +355,7 @@ write_deployment_outputs() {
     return 1
   fi
   {
-    printf 'url=%s\n' "${result[WEB_URI]}"
+    printf 'url=%s\n' "$public_url"
     printf 'static_web_app_default_hostname=%s\n' "${result[STATIC_WEB_APP_DEFAULT_HOSTNAME]}"
     printf 'static_deploy_dir=%s\n' "${result[STATIC_DEPLOY_DIR]:-}"
   } >> "$output_file" || return

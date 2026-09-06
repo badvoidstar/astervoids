@@ -21,10 +21,11 @@ if is_protected_deployment_suffix orphan "feature-a feature-b"; then
   fail "unknown suffix must not be protected"
 fi
 
-AZD_VALUES=$(printf 'FOO="bar=baz"\nEMPTY=""\nPLAIN=value\n')
+AZD_VALUES='{"FOO":"bar=baz","EMPTY":"","PLAIN":"value","ESCAPED":"quotes \"and\" backslash \\"}'
 assert_equal "$(azd_env_value FOO "$AZD_VALUES")" "bar=baz"
 assert_equal "$(azd_env_value EMPTY "$AZD_VALUES")" ""
 assert_equal "$(azd_env_value PLAIN "$AZD_VALUES")" "value"
+assert_equal "$(azd_env_value ESCAPED "$AZD_VALUES")" 'quotes "and" backslash \'
 assert_equal "$(azd_env_value MISSING "$AZD_VALUES")" ""
 assert_equal "$(require_azd_env_value PLAIN "$AZD_VALUES")" "value"
 if require_azd_env_value MISSING "$AZD_VALUES" >/dev/null 2>&1; then
@@ -94,7 +95,15 @@ has_argument() {
 azd() {
   record_call azd "$@"
   case "$1 ${2:-}" in
-    'env get-values') [ "$AZD_READ_RC" -eq 0 ] || return "$AZD_READ_RC"; printf '%s\n' "$MOCK_AZD_VALUES" ;;
+    'env get-values')
+      [ "$AZD_READ_RC" -eq 0 ] || return "$AZD_READ_RC"
+      if [ "${3:-} ${4:-}" = '--output json' ]; then
+        printf '%s\n' "$MOCK_AZD_VALUES"
+      else
+        # Real default output is dotenv, with embedded JSON quotes escaped.
+        jq -r 'to_entries[] | "\(.key)=\(.value | @json)"' <<< "$MOCK_AZD_VALUES"
+      fi
+      ;;
     'up --no-prompt') return "$AZD_UP_RC" ;;
     'provision --no-prompt') return "$AZD_PROVISION_RC" ;;
     *) fail "Unexpected azd call: $*" ;;
@@ -159,25 +168,27 @@ reset_deployment() {
   ACR_LOGIN_RC=0 DOCKER_BUILD_RC=0 DOCKER_PUSH_RC=0
   APP_STATE=present CAE_EXISTS=true EXISTING_CERT='' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
   VERIFICATION_SOURCE=ca-web-production-north EXISTING_VERIFICATION_ID=existing-verification RETRY_VERIFICATION_ID=''
-  MOCK_AZD_VALUES="AZURE_ENV_NAME=\"production\"
-AZURE_LOCATION=\"westus2\"
-REGIONS_JSON=\"$REGIONS\"
-USE_SHARED_INFRA=\"false\"
-CUSTOM_DOMAIN_NAME=\"example.com\"
-CUSTOM_SUBDOMAIN=\"app\"
-CERT_KEY_VAULT_SECRET_URL=\"https://example.vault.azure.net/secrets/wildcard-example-com\"
-CERT_KEY_VAULT_CERT_NAME=\"wildcard-example-com\"
-CERT_READER_IDENTITY_ID=\"\"
-DOMAIN_VERIFICATION_ID=\"seeded-verification\"
-WEB_URI=\"https://primary.azurecontainerapps.io\"
-CONTAINER_APP_NAME=\"ca-web-production\"
-CONTAINER_APPS_ENVIRONMENT=\"cae-production\"
-RESOURCE_GROUP=\"rg-production\"
-CUSTOM_DOMAIN=\"app.example.com\"
-AZURE_CONTAINER_REGISTRY_NAME=\"registry\"
-AZURE_CONTAINER_REGISTRY_ENDPOINT=\"registry.azurecr.io\""
+  MOCK_AZD_VALUES=$(jq -cn --arg regions "$REGIONS" '{
+    AZURE_ENV_NAME: "production",
+    AZURE_LOCATION: "westus2",
+    REGIONS_JSON: $regions,
+    USE_SHARED_INFRA: "false",
+    CUSTOM_DOMAIN_NAME: "example.com",
+    CUSTOM_SUBDOMAIN: "app",
+    CERT_KEY_VAULT_SECRET_URL: "https://example.vault.azure.net/secrets/wildcard-example-com",
+    CERT_KEY_VAULT_CERT_NAME: "wildcard-example-com",
+    CERT_READER_IDENTITY_ID: "",
+    DOMAIN_VERIFICATION_ID: "seeded-verification",
+    WEB_URI: "https://primary.azurecontainerapps.io",
+    CONTAINER_APP_NAME: "ca-web-production",
+    CONTAINER_APPS_ENVIRONMENT: "cae-production",
+    RESOURCE_GROUP: "rg-production",
+    CUSTOM_DOMAIN: "app.example.com",
+    AZURE_CONTAINER_REGISTRY_NAME: "registry",
+    AZURE_CONTAINER_REGISTRY_ENDPOINT: "registry.azurecr.io"
+  }')
   ARM_OUTPUTS='{
-    "weB_URI":{"value":"https://north.azurecontainerapps.io"},
+    "weB_URI":{"value":"https://app.example.com"},
     "containeR_APP_NAME":{"value":"ca-web-production-north"},
     "containeR_APPS_ENVIRONMENT":{"value":"cae-production-north"},
     "resourcE_GROUP":{"value":"rg-production"},
@@ -214,6 +225,20 @@ expect_failure() {
 }
 
 reset_deployment
+assert_calls 1 azd env get-values --output json
+assert_equal "${deployment[regions]}" "$REGIONS"
+assert_equal "$(deployment_mode true "${deployment[regions]}")" multi-region
+DOTENV_VALUES=$(azd env get-values)
+grep -Fq 'REGIONS_JSON="[{\"name\":\"north\"' <<< "$DOTENV_VALUES" || fail "dotenv fixture must escape JSON"
+assert_equal "$(azd_env_value REGIONS_JSON)" "$REGIONS"
+assert_equal "$(azd_env_value CERT_KEY_VAULT_SECRET_URL)" https://example.vault.azure.net/secrets/wildcard-example-com
+QUOTED_REGIONS='[{"name":"north","location":"northeurope","displayName":"Europe \"North\""}]'
+MOCK_AZD_VALUES=$(jq --arg regions "$QUOTED_REGIONS" '.REGIONS_JSON = $regions' <<< "$MOCK_AZD_VALUES")
+load_deployment_settings deployment
+assert_equal "${deployment[regions]}" "$QUOTED_REGIONS"
+assert_equal "$(deployment_mode true "${deployment[regions]}")" multi-region
+
+reset_deployment
 AZD_READ_RC=7
 expect_failure 7 load_deployment_settings deployment
 MOCK_AZD_VALUES=''
@@ -226,11 +251,13 @@ assert_calls 1 azd up --no-prompt
 assert_calls 0 az
 assert_equal "${outputs[WEB_URI]}" https://primary.azurecontainerapps.io
 assert_equal "${outputs[IS_MULTI_REGION]}" false
+write_deployment_outputs outputs "$TEST_DIR/single-public" "$TEST_DIR/single-private"
+grep -qx 'url=https://primary.azurecontainerapps.io' "$TEST_DIR/single-public" || fail "single-region default URL missing"
 AZD_UP_RC=9
 expect_failure 9 deploy_single_region_production deployment outputs
 assert_calls 2 azd env get-values
 AZD_UP_RC=0
-MOCK_AZD_VALUES="${MOCK_AZD_VALUES/WEB_URI=/MISSING_URI=}"
+MOCK_AZD_VALUES=$(jq 'del(.WEB_URI)' <<< "$MOCK_AZD_VALUES")
 expect_failure 1 deploy_single_region_production deployment outputs
 
 reset_deployment
@@ -257,13 +284,14 @@ assert_equal "$(jq -c '.regions' <<< "$BOOTSTRAP")" "${outputs[STATIC_APEX_REGIO
 assert_equal "$(jq '.regionId, .displayName' <<< "$BOOTSTRAP")" $'null\nnull'
 
 write_deployment_outputs outputs "$TEST_DIR/public" "$TEST_DIR/private"
-grep -qx 'url=https://north.azurecontainerapps.io' "$TEST_DIR/public" || fail "default URL missing"
+assert_equal "${outputs[WEB_URI]}" https://app.example.com
+grep -qx 'url=https://public.azurestaticapps.net' "$TEST_DIR/public" || fail "default static URL missing"
 grep -qx 'STATIC_WEB_APP_NAME=swa-app-private' "$TEST_DIR/private" || fail "private SWA state missing"
 grep -qx 'CUSTOM_DOMAIN=app.example.com' "$TEST_DIR/private" || fail "private domain missing"
 if grep -Eq 'example.com|swa-app-private|STATIC_WEB_APP_NAME|static_web_app_name|apiBaseUrl' "$TEST_DIR/public"; then
   fail "custom-domain data leaked into public outputs"
 fi
-outputs[WEB_URI]=https://app.example.com
+outputs[STATIC_WEB_APP_DEFAULT_HOSTNAME]=''
 expect_failure 1 write_deployment_outputs outputs "$TEST_DIR/rejected" "$TEST_DIR/rejected-env"
 test ! -e "$TEST_DIR/rejected" || fail "unsafe URL was written"
 outputs[WEB_URI]=https://north.azurecontainerapps.io
@@ -313,11 +341,14 @@ done
 reset_deployment
 deployment[customDomainName]='' deployment[customSubdomain]=''
 deployment[certKeyVaultSecretUrl]='' deployment[certKeyVaultCertName]=''
-ARM_OUTPUTS=$(jq 'del(.statiC_WEB_APP_NAME, .statiC_WEB_APP_DEFAULT_HOSTNAME,
+ARM_OUTPUTS=$(jq '.weB_URI.value = "https://north.azurecontainerapps.io" |
+  del(.statiC_WEB_APP_NAME, .statiC_WEB_APP_DEFAULT_HOSTNAME,
   .statiC_APEX_REGION_MANIFEST, .custoM_DOMAIN)' <<< "$ARM_OUTPUTS")
 deploy_multi_region_production deployment outputs >/dev/null
 assert_equal "${outputs[STATIC_WEB_APP_NAME]}" ''
 assert_equal "${outputs[STATIC_APEX_REGION_MANIFEST]}" '[]'
+write_deployment_outputs outputs "$TEST_DIR/regional-public" "$TEST_DIR/regional-private"
+grep -qx 'url=https://north.azurecontainerapps.io' "$TEST_DIR/regional-public" || fail "regional default URL missing"
 
 for failure_case in acr build push update missing-registry; do
   reset_deployment
