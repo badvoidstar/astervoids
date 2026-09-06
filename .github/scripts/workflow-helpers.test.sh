@@ -43,6 +43,15 @@ REGIONS='[{"name":"north","location":"northeurope","displayName":"Europe"},{"nam
 assert_equal "$(normalize_deployment_regions '')" '[]'
 assert_equal "$(normalize_deployment_regions '[]')" '[]'
 assert_equal "$(normalize_deployment_regions "$REGIONS")" "$REGIONS"
+for optional_label in '{}' '{"displayName":null}' '{"displayName":""}'; do
+  optional_regions=$(jq -cn --argjson label "$optional_label" \
+    '[{name:"north",location:"northeurope"} + $label]')
+  normalized=$(normalize_deployment_regions "$optional_regions")
+  assert_equal "$normalized" "$optional_regions"
+  assert_equal "$(deployment_mode true "$normalized")" multi-region
+  assert_equal "$(deployment_mode false "$normalized")" branch
+  assert_equal "$(shared_container_environment "$normalized" cae-production)" cae-production-north
+done
 for invalid in 'invalid' '{}' 'null' '"north"' '[{"name":"north"}]'; do
   assert_equal "$(normalize_deployment_regions "$invalid" 2>/dev/null)" '[]'
 done
@@ -53,10 +62,9 @@ assert_equal "$(shared_container_environment '[]' cae-production)" cae-productio
 assert_equal "$(shared_container_environment "$REGIONS" cae-production)" cae-production-north
 
 # The CLI mocks record argument arrays across command-substitution subshells.
-# All artifacts stay under this checkout and are removed even on test failure.
+# All artifacts are temporary and removed even on test failure.
 cd "$SCRIPT_DIR/../.."
-TEST_DIR=".workflow-helper-tests-$$"
-mkdir "$TEST_DIR"
+TEST_DIR=$(mktemp -d)
 trap 'rm -rf "$TEST_DIR"' EXIT
 CALL_LOG="$TEST_DIR/calls.jsonl"
 
@@ -135,6 +143,10 @@ azd() {
         jq -r 'to_entries[] | "\(.key)=\(.value | @json)"' <<< "$MOCK_AZD_VALUES"
       fi
       ;;
+    'env set')
+      [ "$AZD_WRITE_RC" -eq 0 ] || return "$AZD_WRITE_RC"
+      MOCK_AZD_VALUES=$(jq --arg key "$3" --arg value "$4" '.[$key] = $value' <<< "$MOCK_AZD_VALUES")
+      ;;
     'up --no-prompt') return "$AZD_UP_RC" ;;
     'provision --no-prompt') return "$AZD_PROVISION_RC" ;;
     *) fail "Unexpected azd call: $*" ;;
@@ -195,7 +207,7 @@ docker() {
 declare -A deployment=() outputs=()
 reset_deployment() {
   : > "$CALL_LOG"
-  AZD_READ_RC=0 AZD_UP_RC=0 AZD_PROVISION_RC=0 BICEP_FAILURES=0 UPDATE_FAILURE_AT=0
+  AZD_READ_RC=0 AZD_WRITE_RC=0 AZD_UP_RC=0 AZD_PROVISION_RC=0 BICEP_FAILURES=0 UPDATE_FAILURE_AT=0
   ACR_LOGIN_RC=0 DOCKER_BUILD_RC=0 DOCKER_PUSH_RC=0
   APP_STATE=present CAE_EXISTS=true EXISTING_CERT='' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
   VERIFICATION_SOURCE=ca-web-production-north EXISTING_VERIFICATION_ID=existing-verification RETRY_VERIFICATION_ID=''
@@ -229,7 +241,7 @@ reset_deployment() {
     "statiC_WEB_APP_NAME":{"value":"swa-app-private"},
     "statiC_WEB_APP_DEFAULT_HOSTNAME":{"value":"public.azurestaticapps.net"},
     "regioN_ENDPOINTS":{"value":[{"id":"north","displayName":"Europe","containerAppName":"ca-web-production-north","fqdn":"north.azurecontainerapps.io","customDomain":"app-north.example.com"}]},
-    "statiC_APEX_REGION_MANIFEST":{"value":[{"id":"north","displayName":"Europe","apiBaseUrl":"https://app-north.example.com"}]}
+    "statiC_APEX_REGION_MANIFEST":{"value":[{"id":"north","displayName":"Europe","hostname":"https://app-north.example.com"}]}
   }'
   deployment=(
     [runId]=123 [imageTag]=test-sha [resourceGroup]=rg-production
@@ -254,6 +266,27 @@ expect_failure() {
   "$@" >/dev/null 2>&1 || actual=$?
   assert_equal "$actual" "$expected"
 }
+
+# Execute the actual workflow certificate setup, including its conditionals.
+certificate_setup=$(sed -n '/^          # BYO TLS cert (optional)/,/^      - name: Bootstrap BYO cert/{
+  /^      - name: Bootstrap BYO cert/d
+  s/^          //
+  p
+}' "$SCRIPT_DIR/../workflows/azure-deploy.yml")
+test -n "$certificate_setup" || fail "workflow certificate setup not found"
+for cert_url in '' 'https://example.vault.azure.net/secrets/replacement'; do
+  reset_deployment
+  MOCK_AZD_VALUES=$(jq '.CERT_READER_IDENTITY_ID = "old-identity"' <<< "$MOCK_AZD_VALUES")
+  CERT_KEY_VAULT_SECRET_URL="$cert_url"
+  CERT_KEY_VAULT_CERT_NAME="${cert_url:+replacement}"
+  CERT_READER_IDENTITY_ID=''
+  source /dev/stdin <<< "$certificate_setup"
+  load_deployment_settings deployment
+  assert_equal "${deployment[certKeyVaultSecretUrl]}" "$cert_url"
+  assert_equal "${deployment[certKeyVaultCertName]}" "${cert_url:+replacement}"
+  assert_equal "${deployment[certReaderIdentityId]}" ''
+  assert_calls 3 azd env set
+done
 
 reset_deployment
 assert_calls 1 azd env get-values --output json
@@ -292,6 +325,8 @@ MOCK_AZD_VALUES=$(jq 'del(.WEB_URI)' <<< "$MOCK_AZD_VALUES")
 expect_failure 1 deploy_single_region_production deployment outputs
 
 reset_deployment
+MOCK_AZD_VALUES=$(jq '.WEB_URI = "https://old.azurecontainerapps.io" |
+  .CUSTOM_DOMAIN = "old.example.com" | .RESOURCE_GROUP = "old-group"' <<< "$MOCK_AZD_VALUES")
 deploy_multi_region_production deployment outputs
 assert_calls 1 az deployment sub create
 assert_calls 1 az deployment sub show
@@ -309,17 +344,45 @@ assert_call_argument ca-web-production-west az containerapp update
 assert_call_argument armregistry.azurecr.io/astervoids-web:test-sha az containerapp update
 assert_equal "${outputs[IS_MULTI_REGION]}" true
 assert_equal "${outputs[CONTAINER_APPS_ENVIRONMENT]}" cae-production-north
+for key in WEB_URI CONTAINER_APP_NAME CONTAINER_APPS_ENVIRONMENT RESOURCE_GROUP CUSTOM_DOMAIN; do
+  assert_calls 1 azd env set "$key"
+  assert_equal "$(azd_env_value "$key")" "${outputs[$key]}"
+done
 cmp AstervoidsWeb/wwwroot/index.html "$TEST_DIR/static/index.html" || fail "static shell not copied"
 BOOTSTRAP=$(sed 's/^window.ASTERVOIDS_REGION_BOOTSTRAP = //; s/;$//' "$TEST_DIR/static/region-bootstrap.js")
 assert_equal "$(jq -c '.regions' <<< "$BOOTSTRAP")" "${outputs[STATIC_APEX_REGION_MANIFEST]}"
 assert_equal "$(jq '.regionId, .displayName' <<< "$BOOTSTRAP")" $'null\nnull'
+node --input-type=module - "$TEST_DIR/static/region-bootstrap.js" <<'NODE'
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { runInNewContext } from 'node:vm';
+const requests = [];
+const browser = {
+  window: { location: { origin: 'https://public.azurestaticapps.net' } },
+  performance, AbortController, setTimeout, clearTimeout,
+  fetch: async url => { requests.push(url); return { ok: true, text: async () => '' }; },
+};
+runInNewContext(readFileSync(process.argv[2], 'utf8'), browser);
+runInNewContext(readFileSync(join(dirname(process.argv[2]), 'js/region-service.js'), 'utf8'), browser);
+const service = browser.window.RegionService;
+await service.load();
+assert.equal(requests.length, 0, 'static bootstrap must not fetch a same-origin API manifest');
+const regions = service.getRegions();
+assert.equal(regions.length, 1);
+assert.equal(regions[0].id, 'north');
+assert.equal(regions[0].hostname, 'https://app-north.example.com');
+await service._internals.pingOnce(regions[0].hostname, 1000);
+assert.equal(requests.length, 1);
+assert.match(requests[0], /^https:\/\/app-north\.example\.com\/api\/ping\?/);
+NODE
 
 write_deployment_outputs outputs "$TEST_DIR/public" "$TEST_DIR/private"
 assert_equal "${outputs[WEB_URI]}" https://app.example.com
 grep -qx 'url=https://public.azurestaticapps.net' "$TEST_DIR/public" || fail "default static URL missing"
 grep -qx 'STATIC_WEB_APP_NAME=swa-app-private' "$TEST_DIR/private" || fail "private SWA state missing"
 grep -qx 'CUSTOM_DOMAIN=app.example.com' "$TEST_DIR/private" || fail "private domain missing"
-if grep -Eq 'example.com|swa-app-private|STATIC_WEB_APP_NAME|static_web_app_name|apiBaseUrl' "$TEST_DIR/public"; then
+if grep -Eq 'example.com|swa-app-private|STATIC_WEB_APP_NAME|static_web_app_name|STATIC_APEX_REGION_MANIFEST' "$TEST_DIR/public"; then
   fail "custom-domain data leaked into public outputs"
 fi
 outputs[STATIC_WEB_APP_DEFAULT_HOSTNAME]=''
@@ -378,6 +441,7 @@ ARM_OUTPUTS=$(jq '.weB_URI.value = "https://north.azurecontainerapps.io" |
 deploy_multi_region_production deployment outputs >/dev/null
 assert_equal "${outputs[STATIC_WEB_APP_NAME]}" ''
 assert_equal "${outputs[STATIC_APEX_REGION_MANIFEST]}" '[]'
+assert_equal "$(azd_env_value CUSTOM_DOMAIN)" ''
 write_deployment_outputs outputs "$TEST_DIR/regional-public" "$TEST_DIR/regional-private"
 grep -qx 'url=https://north.azurecontainerapps.io' "$TEST_DIR/regional-public" || fail "regional default URL missing"
 
@@ -397,6 +461,11 @@ for failure_case in acr build push update missing-registry; do
   if [ "$failure_case" = build ] || [ "$failure_case" = acr ]; then assert_calls 0 docker push; fi
   test ! -d "$TEST_DIR/static" || fail "static payload prepared after failed deployment"
 done
+
+reset_deployment
+AZD_WRITE_RC=8
+expect_failure 8 deploy_multi_region_production deployment outputs
+test ! -d "$TEST_DIR/static" || fail "static payload prepared after failed azd persistence"
 
 for regions in '[]' "$REGIONS"; do
   reset_deployment

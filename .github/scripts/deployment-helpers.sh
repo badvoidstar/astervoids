@@ -111,7 +111,8 @@ normalize_deployment_regions() {
   if ! jq -ce '
     if type == "array" and all(.[];
       type == "object" and
-      all(.name, .location, .displayName; type == "string" and length > 0))
+      all(.name, .location; type == "string" and length > 0) and
+      (.displayName == null or (.displayName | type == "string")))
     then . else error("invalid regions") end
   ' <<< "$regions" 2>/dev/null; then
     echo "::warning::REGIONS_JSON is not a region array. Falling back to single-region." >&2
@@ -261,7 +262,7 @@ prepare_static_apex() {
 
 deploy_multi_region_production() {
   local -n settings="$1" result="$2"
-  local deployment_name="production-multi-${settings[runId]}" region_names region app
+  local deployment_name="production-multi-${settings[runId]}" region_names region app key
   if [ -n "${settings[customDomainName]}" ] && {
     [ -z "${settings[certKeyVaultSecretUrl]}" ] || [ -z "${settings[certKeyVaultCertName]}" ];
   }; then
@@ -280,6 +281,12 @@ deploy_multi_region_production() {
     az containerapp update --name "$app" --resource-group "${settings[resourceGroup]}" \
       --image "$PUBLISHED_IMAGE" --output none || return
   done <<< "$region_names"
+
+  # Direct ARM deployments do not refresh azd's environment outputs. Preserve
+  # the private values for subsequent azd commands, independently of public URLs.
+  for key in WEB_URI CONTAINER_APP_NAME CONTAINER_APPS_ENVIRONMENT RESOURCE_GROUP CUSTOM_DOMAIN; do
+    azd env set "$key" "${result[$key]}" || return
+  done
 
   prepare_static_apex "${settings[staticDir]}" "${result[STATIC_APEX_REGION_MANIFEST]}" || return
   result[STATIC_DEPLOY_DIR]="${settings[staticDir]}"

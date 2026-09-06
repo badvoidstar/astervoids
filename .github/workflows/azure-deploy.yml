@@ -247,12 +247,11 @@ jobs:
 
           # BYO TLS cert (optional) — passed through to bicep when all three
           # vars are set. azd reads these via main.parameters.json env-var
-          # substitution (see infra/main.parameters.json).
-          if [ -n "$CERT_KEY_VAULT_SECRET_URL" ]; then
-            azd env set CERT_KEY_VAULT_SECRET_URL "$CERT_KEY_VAULT_SECRET_URL"
-            azd env set CERT_KEY_VAULT_CERT_NAME "$CERT_KEY_VAULT_CERT_NAME"
-            azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
-          fi
+          # substitution (see infra/main.parameters.json). Write empty values too
+          # so a restored azd environment cannot retain removed CI certificate inputs.
+          azd env set CERT_KEY_VAULT_SECRET_URL "$CERT_KEY_VAULT_SECRET_URL"
+          azd env set CERT_KEY_VAULT_CERT_NAME "$CERT_KEY_VAULT_CERT_NAME"
+          azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
 
       - name: Bootstrap BYO cert on shared CAE (branches only)
         # Production owns the CAE in Bicep. Branches reference it as existing,

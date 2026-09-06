@@ -112,10 +112,25 @@ Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
 remains the infrastructure source of truth. The multi-region first-deploy retry
 changes only the domain verification ID.
 
+Region entries require `name` and `location`; `displayName` remains optional,
+with missing/null labels defaulted by Bicep to the region name. Optional labels
+do not change production topology or a preview's shared CAE selection.
+
+CI writes all three certificate inputs into the selected azd environment,
+including empty values, so removed repository variables cannot leave stale BYO
+settings in a restored environment. Local standalone azd inputs are unchanged.
+After a multi-region rollout, the workflow refreshes azd's `WEB_URI`,
+`CONTAINER_APP_NAME`, `CONTAINER_APPS_ENVIRONMENT`, `RESOURCE_GROUP`, and
+`CUSTOM_DOMAIN` from ARM outputs. These remain private azd state; the public URL
+continues to use only a default Azure hostname.
+
 Run `bash .github/scripts/workflow-helpers.test.sh` to compile/check the Bicep
 origin wiring and exercise these procedures with mocked Azure/Docker commands,
-including provisioning failures, retries, branch fallback, certificate bootstrap,
-and public-output privacy. Custom
+including provisioning failures, retries, branch fallback, restored azd state,
+certificate bootstrap, and public-output privacy. The generated static bootstrap
+is also loaded by the production region client to check regional request routing.
+These checks do not establish live DNS/certificate readiness, permissions
+propagation, or successful Azure deployment. Custom
 hostnames, region manifests, and secret-derived Static Web App names stay in
 runner-local state; only default Azure hostnames are published in URL outputs.
 For multi-region static-apex deployments, the public link uses the default
