@@ -3,20 +3,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
-// Extract computeStickInput from the index.html script section so the test
-// always exercises the live source (mirrors ship-input-ramp.test.mjs).
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
-const fnMatch = html.match(
-    /function computeStickInput\(dx, dy, params\) \{[\s\S]*?\n {4}\}/
-);
-assert.ok(fnMatch, 'computeStickInput must be defined in index.html');
-// eslint-disable-next-line no-eval
-const computeStickInput = eval(`(${fnMatch[0].replace('function computeStickInput', 'function')})`);
+const { computeStickInput } = loadInlineGameFunctions(['computeStickInput']);
 
 // Reference parameter set: 100 px stick radius, 10 px deadzone on both axes,
 // unit gain and clamps. Keeps the arithmetic readable: 100 px of finger

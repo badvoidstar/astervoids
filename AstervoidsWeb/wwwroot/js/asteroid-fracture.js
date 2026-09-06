@@ -284,7 +284,40 @@ const AstervoidsFracture = (function() {
         return { velocityX, velocityY, rotationSpeed };
     }
 
-    function calculateAsteroidFragments(asteroid, impact, config) {
+    function calculateParentGeometry(asteroid, config) {
+        const radius = asteroid.radius;
+        const density = Math.max(1e-6, config.ASTEROID_DENSITY);
+        // Area calibration cancels out of parent mass; effectivePi is still
+        // needed to convert each fragment's area into its equivalent radius.
+        const mass = density * radius * radius;
+        let polygon = null;
+        let area = 0;
+        let effectivePi = Math.PI;
+        const rawVerts = asteroid.vertices;
+        if (config.FRACTURE_ENABLED
+                && Array.isArray(rawVerts)
+                && rawVerts.length >= 3) {
+            // World-aligned offsets from the parent origin, not world positions.
+            polygon = rawVerts.map(vertex => ({
+                x: Math.cos(vertex.angle + asteroid.angle) * vertex.distance,
+                y: Math.sin(vertex.angle + asteroid.angle) * vertex.distance,
+            }));
+            area = Math.abs(polygonArea(polygon));
+            if (area > 0) {
+                effectivePi = area / (radius * radius);
+            } else {
+                polygon = null;
+            }
+        }
+
+        const inertia = polygon
+            ? polygonMomentOfInertia(polygon, mass, radius)
+            : 0.5 * mass * radius * radius;
+        return { polygon, area, effectivePi, radius, mass, inertia };
+    }
+
+    function calculateImpactResponse(asteroid, impact, parent, config) {
+        const { polygon, radius, mass, inertia } = parent;
         const offsetN = Math.max(-1, Math.min(1, impact?.offsetN ?? 0));
         let bulletAngle = impact?.bulletAngle;
         if (!Number.isFinite(bulletAngle)) {
@@ -298,78 +331,20 @@ const AstervoidsFracture = (function() {
         const directionY = Math.sin(bulletAngle);
         const normalX = -directionY;
         const normalY = directionX;
-        const radius = asteroid.radius;
-        const density = Math.max(1e-6, config.ASTEROID_DENSITY);
-
-        // ── Goal 1: geometry-based parent mass ──────────────────────────────
-        // Build the parent polygon in world-space once; it is needed for mass,
-        // inertia, impact-point, and fracture calculations below.
-        // If vertices are missing or degenerate we fall back to the disk proxy.
-        let parentPolygon = null;
-        let parentArea = 0;
-        let effectivePi = Math.PI;
-        const rawVerts = asteroid.vertices;
-        if (config.FRACTURE_ENABLED
-                && Array.isArray(rawVerts)
-                && rawVerts.length >= 3) {
-            parentPolygon = rawVerts.map(vertex => ({
-                x: Math.cos(vertex.angle + asteroid.angle) * vertex.distance,
-                y: Math.sin(vertex.angle + asteroid.angle) * vertex.distance,
-            }));
-            parentArea = Math.abs(polygonArea(parentPolygon));
-            if (parentArea > 0) {
-                // Calibrate so that a perfectly circular asteroid's mass equals
-                // the legacy disk value: mass = density * area / effectivePi * π
-                // = density * R².  For a circle effectivePi = π, so:
-                //   mass = density * parentArea / effectivePi
-                // = density * (π R²) / π = density * R²  ✓
-                effectivePi = parentArea / (radius * radius);
-            } else {
-                parentPolygon = null; // degenerate – treat as no polygon
-            }
-        }
-
-        // mass is calibrated so that a "round" asteroid matches the legacy
-        // disk value (density * R²), while irregular shapes reflect their
-        // actual area via the effectivePi calibration.
-        const mass = parentPolygon
-            ? density * parentArea / effectivePi   // = density * R² * (A / (π_eff * R²)) * (π_eff / 1)
-                                                    //   which simplifies to density * A / (A/R²)
-                                                    //   = density * R²  (by definition of effectivePi)
-            : density * radius * radius;
-
-        // ── Goal 2: true centroidal polygon moment of inertia ───────────────
-        const inertia = parentPolygon
-            ? polygonMomentOfInertia(parentPolygon, mass, radius)
-            : 0.5 * mass * radius * radius;
-
         const impactOffset = offsetN * radius;
 
-        // ── Goal 3: actual polygon-boundary impact point ─────────────────────
-        // The ray origin is the impact offset point perpendicular to the bullet;
-        // we shoot along the bullet direction and find the entry intersection.
-        let impactX, impactY;
-        if (parentPolygon) {
-            // Ray origin: the impact offset applied perpendicular to bullet direction.
-            const rayOx = impactOffset * normalX;
-            const rayOy = impactOffset * normalY;
-            const hit = polygonRayIntersect(
-                parentPolygon, rayOx, rayOy, directionX, directionY);
-            if (hit) {
-                impactX = hit.x;
-                impactY = hit.y;
-            } else {
-                // Fallback to circular approximation.
-                const impactAlongDirection = -Math.sqrt(
-                    Math.max(0, radius * radius - impactOffset * impactOffset));
-                impactX = impactAlongDirection * directionX + impactOffset * normalX;
-                impactY = impactAlongDirection * directionY + impactOffset * normalY;
-            }
-        } else {
+        // Use the entry face along the bullet ray, or a circular contact if
+        // geometry is missing or the ray misses the polygon.
+        let contact = polygon && polygonRayIntersect(
+            polygon, impactOffset * normalX, impactOffset * normalY,
+            directionX, directionY);
+        if (!contact) {
             const impactAlongDirection = -Math.sqrt(
                 Math.max(0, radius * radius - impactOffset * impactOffset));
-            impactX = impactAlongDirection * directionX + impactOffset * normalX;
-            impactY = impactAlongDirection * directionY + impactOffset * normalY;
+            contact = {
+                x: impactAlongDirection * directionX + impactOffset * normalX,
+                y: impactAlongDirection * directionY + impactOffset * normalY,
+            };
         }
 
         const impulseMagnitude = mass * Math.max(0, config.DEFLECTION_KICK);
@@ -377,7 +352,7 @@ const AstervoidsFracture = (function() {
         const impulseY = impulseMagnitude * directionY;
         const velocityX = asteroid.velocityX + impulseX / mass;
         const velocityY = asteroid.velocityY + impulseY / mass;
-        const torque = impactX * impulseY - impactY * impulseX;
+        const torque = contact.x * impulseY - contact.y * impulseX;
         const angularVelocity = (asteroid.rotationSpeed || 0) + torque / inertia;
         const separationEnergy = effectiveSeparationEnergy(radius, config);
         const sideSign = offsetN >= 0 ? 1 : -1;
@@ -392,236 +367,177 @@ const AstervoidsFracture = (function() {
         const momentumSeparationY =
             separationX * separationSin + separationY * separationCos;
 
-        let children = null;
-        let fracture = null;
-        if (config.FRACTURE_ENABLED && parentPolygon) {
-            const probe = fractureSplitPolygon(
-                parentPolygon, { x: normalX, y: normalY }, impactOffset, []);
-            if (probe) {
-                const chordLength = Math.hypot(
-                    probe.exit.x - probe.entry.x,
-                    probe.exit.y - probe.entry.y);
-                const parentSpacing =
-                    (2 * Math.PI * radius) / Math.max(1, parentPolygon.length);
-                const fractureDensity = Math.max(0, config.FRACTURE_VERTEX_DENSITY);
-                const jagCount = parentSpacing > 0
-                    ? Math.max(0, Math.floor(
-                        (chordLength / parentSpacing) * fractureDensity))
-                    : 0;
-                const jagAmplitude =
-                    Math.max(0, config.FRACTURE_JAGGEDNESS) * radius;
-                const seedFraction = ((asteroid.seed || 0) * 0x100000000) >>> 0;
-                const jagSeed = (seedFraction
-                    ^ (Math.floor((bulletAngle + 10) * 1e6) >>> 0)
-                    ^ (Math.floor((offsetN + 10) * 1e6) >>> 0)) >>> 0;
-                const jagPath = buildFracturePolyline(
-                    probe.entry,
-                    probe.exit,
-                    jagCount,
-                    jagAmplitude,
-                    makeSeededRandom(jagSeed));
-                const split = fractureSplitPolygon(
-                    parentPolygon,
-                    { x: normalX, y: normalY },
-                    impactOffset,
-                    jagPath);
-                if (split) {
-                    const positiveArea = Math.abs(polygonArea(split.positive));
-                    const negativeArea = Math.abs(polygonArea(split.negative));
-                    if (positiveArea > 0 && negativeArea > 0 && parentArea > 0) {
-                        fracture = {
-                            parentArea,
-                            positiveArea,
-                            negativeArea,
-                            effectivePi,
-                        };
-                        const smallSide = positiveArea <= negativeArea
-                            ? { polygon: split.positive, area: positiveArea }
-                            : { polygon: split.negative, area: negativeArea };
-                        const largeSide = positiveArea <= negativeArea
-                            ? { polygon: split.negative, area: negativeArea }
-                            : { polygon: split.positive, area: positiveArea };
-                        const smallCenter = polygonCentroid(smallSide.polygon);
-                        const largeCenter = polygonCentroid(largeSide.polygon);
-                        const smallRadius = Math.sqrt(smallSide.area / effectivePi);
-                        const largeRadius = Math.sqrt(largeSide.area / effectivePi);
-                        const smallMass = (smallSide.area / parentArea) * mass;
-                        const largeMass = (largeSide.area / parentArea) * mass;
-                         const recenter = (polygon, center) => verticesFromXY(
-                            polygon.map(point => ({
-                                x: point.x - center.x,
-                                y: point.y - center.y,
-                            })));
-                        const smallVertices = recenter(
-                            smallSide.polygon, smallCenter);
-                        const largeVertices = recenter(
-                            largeSide.polygon, largeCenter);
-
-                        // ── Goal 4: fragment-specific inertia ─────────────
-                        // Compute each fragment's centroidal polygon inertia
-                        // from its recentered vertices so subsequent hits use
-                        // the correct (non-disk) moment of inertia.
-                        const smallInertia = polygonMomentOfInertia(
-                            smallSide.polygon.map(p => ({
-                                x: p.x - smallCenter.x,
-                                y: p.y - smallCenter.y,
-                            })), smallMass, smallRadius);
-                        const largeInertia = polygonMomentOfInertia(
-                            largeSide.polygon.map(p => ({
-                                x: p.x - largeCenter.x,
-                                y: p.y - largeCenter.y,
-                            })), largeMass, largeRadius);
-
-                        if (smallRadius < config.MIN_ASTEROID_RADIUS) {
-                            children = [{
-                                r: largeRadius,
-                                m: largeMass,
-                                inertia: largeInertia,
-                                cx: largeCenter.x,
-                                cy: largeCenter.y,
-                                vx: velocityX - angularVelocity * largeCenter.y,
-                                vy: velocityY + angularVelocity * largeCenter.x,
-                                omega: angularVelocity,
-                                vertices: largeVertices,
-                            }];
-                        } else {
-                            const smallRigidVelocity = {
-                                x: velocityX - angularVelocity * smallCenter.y,
-                                y: velocityY + angularVelocity * smallCenter.x,
-                            };
-                            const largeRigidVelocity = {
-                                x: velocityX - angularVelocity * largeCenter.y,
-                                y: velocityY + angularVelocity * largeCenter.x,
-                            };
-                            const separationSpeed = separationEnergy > 0
-                                ? Math.sqrt(
-                                    2 * separationEnergy * largeMass
-                                    / (smallMass * mass))
-                                : 0;
-                            const projection =
-                                smallCenter.x * separationX
-                                + smallCenter.y * separationY;
-                            const separationDirection = projection >= 0 ? 1 : -1;
-                            const fragmentSeparationX =
-                                separationDirection * momentumSeparationX;
-                            const fragmentSeparationY =
-                                separationDirection * momentumSeparationY;
-                            children = [
-                                {
-                                    r: smallRadius,
-                                    m: smallMass,
-                                    inertia: smallInertia,
-                                    cx: smallCenter.x,
-                                    cy: smallCenter.y,
-                                    vx: smallRigidVelocity.x
-                                        + fragmentSeparationX * separationSpeed,
-                                    vy: smallRigidVelocity.y
-                                        + fragmentSeparationY * separationSpeed,
-                                    omega: angularVelocity,
-                                    vertices: smallVertices,
-                                },
-                                {
-                                    r: largeRadius,
-                                    m: largeMass,
-                                    inertia: largeInertia,
-                                    cx: largeCenter.x,
-                                    cy: largeCenter.y,
-                                    vx: largeRigidVelocity.x
-                                        - fragmentSeparationX * separationSpeed
-                                        * (smallMass / largeMass),
-                                    vy: largeRigidVelocity.y
-                                        - fragmentSeparationY * separationSpeed
-                                        * (smallMass / largeMass),
-                                    omega: angularVelocity,
-                                    vertices: largeVertices,
-                                },
-                            ];
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!children) {
-            const minimumRatio = Math.max(
-                0.01, Math.min(0.5, config.MIN_SPLIT_RATIO));
-            const massBias = Math.max(
-                0, Math.min(1, config.MASS_SPLIT_BIAS));
-            const smallFraction = Math.max(
-                minimumRatio,
-                0.5 * (1 - massBias * Math.abs(offsetN)));
-            const largeFraction = 1 - smallFraction;
-            const smallRadius = radius * Math.sqrt(smallFraction);
-            const largeRadius = radius * Math.sqrt(largeFraction);
-            const smallMass = smallFraction * mass;
-            const largeMass = largeFraction * mass;
-
-            if (smallRadius < config.MIN_ASTEROID_RADIUS) {
-                children = [{
-                    r: largeRadius,
-                    m: largeMass,
-                    cx: 0,
-                    cy: 0,
-                    vx: velocityX,
-                    vy: velocityY,
-                    omega: angularVelocity,
-                    vertices: null,
-                }];
-            } else {
-                const smallDistance = radius * largeFraction;
-                const largeDistance = -radius * smallFraction;
-                const rigidVelocityAt = distance => ({
-                    x: velocityX - angularVelocity * distance * separationY,
-                    y: velocityY + angularVelocity * distance * separationX,
-                });
-                const smallRigidVelocity = rigidVelocityAt(smallDistance);
-                const largeRigidVelocity = rigidVelocityAt(largeDistance);
-                const separationSpeed = separationEnergy > 0
-                    ? Math.sqrt(
-                        2 * separationEnergy * largeMass / (smallMass * mass))
-                    : 0;
-                children = [
-                    {
-                        r: smallRadius,
-                        m: smallMass,
-                        cx: smallDistance * separationX,
-                        cy: smallDistance * separationY,
-                        vx: smallRigidVelocity.x
-                            + separationSpeed * momentumSeparationX,
-                        vy: smallRigidVelocity.y
-                            + separationSpeed * momentumSeparationY,
-                        omega: angularVelocity,
-                        vertices: null,
-                    },
-                    {
-                        r: largeRadius,
-                        m: largeMass,
-                        cx: largeDistance * separationX,
-                        cy: largeDistance * separationY,
-                        vx: largeRigidVelocity.x
-                            - separationSpeed * momentumSeparationX
-                            * (smallMass / largeMass),
-                        vy: largeRigidVelocity.y
-                            - separationSpeed * momentumSeparationY
-                            * (smallMass / largeMass),
-                        omega: angularVelocity,
-                        vertices: null,
-                    },
-                ];
-            }
-        }
-
         return {
-            children,
-            mass,
-            inertia,
+            bulletAngle, offsetN, normalX, normalY, impactOffset,
+            separationX, separationY, momentumSeparationX, momentumSeparationY,
+            separationEnergy, velocityX, velocityY, angularVelocity,
             impulse: { x: impulseX, y: impulseY },
-            postImpulse: {
-                velocityX,
-                velocityY,
-                angularVelocity,
+        };
+    }
+
+    function calculatePolygonFragment(polygon, area, parent, response) {
+        const center = polygonCentroid(polygon);
+        const radius = Math.sqrt(area / parent.effectivePi);
+        const mass = (area / parent.area) * parent.mass;
+        const centeredPolygon = polygon.map(point => ({
+            x: point.x - center.x,
+            y: point.y - center.y,
+        }));
+        return {
+            r: radius,
+            m: mass,
+            inertia: polygonMomentOfInertia(centeredPolygon, mass, radius),
+            cx: center.x,
+            cy: center.y,
+            vx: response.velocityX - response.angularVelocity * center.y,
+            vy: response.velocityY + response.angularVelocity * center.x,
+            omega: response.angularVelocity,
+            vertices: verticesFromXY(centeredPolygon),
+        };
+    }
+
+    function calculatePolygonChildren(asteroid, parent, response, config) {
+        if (!parent.polygon) return null;
+        const { polygon, area: parentArea, effectivePi, radius, mass } = parent;
+        const {
+            bulletAngle, offsetN, normalX, normalY, impactOffset,
+            separationX, separationY, momentumSeparationX, momentumSeparationY,
+            separationEnergy,
+        } = response;
+        const normal = { x: normalX, y: normalY };
+        const probe = fractureSplitPolygon(polygon, normal, impactOffset, []);
+        if (!probe) return null;
+
+        const chordLength = Math.hypot(
+            probe.exit.x - probe.entry.x, probe.exit.y - probe.entry.y);
+        const parentSpacing = (2 * Math.PI * radius) / Math.max(1, polygon.length);
+        const fractureDensity = Math.max(0, config.FRACTURE_VERTEX_DENSITY);
+        const jagCount = parentSpacing > 0
+            ? Math.max(0, Math.floor((chordLength / parentSpacing) * fractureDensity))
+            : 0;
+        const jagAmplitude = Math.max(0, config.FRACTURE_JAGGEDNESS) * radius;
+        const seedFraction = ((asteroid.seed || 0) * 0x100000000) >>> 0;
+        const jagSeed = (seedFraction
+            ^ (Math.floor((bulletAngle + 10) * 1e6) >>> 0)
+            ^ (Math.floor((offsetN + 10) * 1e6) >>> 0)) >>> 0;
+        const jagPath = buildFracturePolyline(
+            probe.entry, probe.exit, jagCount, jagAmplitude, makeSeededRandom(jagSeed));
+        const split = fractureSplitPolygon(polygon, normal, impactOffset, jagPath);
+        if (!split) return null;
+
+        const positiveArea = Math.abs(polygonArea(split.positive));
+        const negativeArea = Math.abs(polygonArea(split.negative));
+        if (!(positiveArea > 0 && negativeArea > 0 && parentArea > 0)) return null;
+
+        const positiveIsSmall = positiveArea <= negativeArea;
+        const small = calculatePolygonFragment(
+            positiveIsSmall ? split.positive : split.negative,
+            positiveIsSmall ? positiveArea : negativeArea, parent, response);
+        const large = calculatePolygonFragment(
+            positiveIsSmall ? split.negative : split.positive,
+            positiveIsSmall ? negativeArea : positiveArea, parent, response);
+        const fracture = { parentArea, positiveArea, negativeArea, effectivePi };
+        if (small.r < config.MIN_ASTEROID_RADIUS) {
+            return { children: [large], fracture };
+        }
+
+        const separationSpeed = separationEnergy > 0
+            ? Math.sqrt(2 * separationEnergy * large.m / (small.m * mass))
+            : 0;
+        const projection = small.cx * separationX + small.cy * separationY;
+        const separationDirection = projection >= 0 ? 1 : -1;
+        const fragmentSeparationX = separationDirection * momentumSeparationX;
+        const fragmentSeparationY = separationDirection * momentumSeparationY;
+        small.vx += fragmentSeparationX * separationSpeed;
+        small.vy += fragmentSeparationY * separationSpeed;
+        large.vx -= fragmentSeparationX * separationSpeed * (small.m / large.m);
+        large.vy -= fragmentSeparationY * separationSpeed * (small.m / large.m);
+        return { children: [small, large], fracture };
+    }
+
+    function calculateDiskChildren(parent, response, config) {
+        const { radius, mass } = parent;
+        const {
+            offsetN, separationX, separationY, momentumSeparationX, momentumSeparationY,
+            separationEnergy, velocityX, velocityY, angularVelocity,
+        } = response;
+        const minimumRatio = Math.max(0.01, Math.min(0.5, config.MIN_SPLIT_RATIO));
+        const massBias = Math.max(0, Math.min(1, config.MASS_SPLIT_BIAS));
+        const smallFraction = Math.max(
+            minimumRatio, 0.5 * (1 - massBias * Math.abs(offsetN)));
+        const largeFraction = 1 - smallFraction;
+        const smallRadius = radius * Math.sqrt(smallFraction);
+        const largeRadius = radius * Math.sqrt(largeFraction);
+        const smallMass = smallFraction * mass;
+        const largeMass = largeFraction * mass;
+
+        if (smallRadius < config.MIN_ASTEROID_RADIUS) {
+            return [{
+                r: largeRadius,
+                m: largeMass,
+                cx: 0,
+                cy: 0,
+                vx: velocityX,
+                vy: velocityY,
+                omega: angularVelocity,
+                vertices: null,
+            }];
+        }
+
+        const smallDistance = radius * largeFraction;
+        const largeDistance = -radius * smallFraction;
+        const rigidVelocityAt = distance => ({
+            x: velocityX - angularVelocity * distance * separationY,
+            y: velocityY + angularVelocity * distance * separationX,
+        });
+        const smallRigidVelocity = rigidVelocityAt(smallDistance);
+        const largeRigidVelocity = rigidVelocityAt(largeDistance);
+        const separationSpeed = separationEnergy > 0
+            ? Math.sqrt(2 * separationEnergy * largeMass / (smallMass * mass))
+            : 0;
+        return [
+            {
+                r: smallRadius,
+                m: smallMass,
+                cx: smallDistance * separationX,
+                cy: smallDistance * separationY,
+                vx: smallRigidVelocity.x + separationSpeed * momentumSeparationX,
+                vy: smallRigidVelocity.y + separationSpeed * momentumSeparationY,
+                omega: angularVelocity,
+                vertices: null,
             },
-            fracture,
+            {
+                r: largeRadius,
+                m: largeMass,
+                cx: largeDistance * separationX,
+                cy: largeDistance * separationY,
+                vx: largeRigidVelocity.x
+                    - separationSpeed * momentumSeparationX * (smallMass / largeMass),
+                vy: largeRigidVelocity.y
+                    - separationSpeed * momentumSeparationY * (smallMass / largeMass),
+                omega: angularVelocity,
+                vertices: null,
+            },
+        ];
+    }
+
+    function calculateAsteroidFragments(asteroid, impact, config) {
+        const parent = calculateParentGeometry(asteroid, config);
+        const response = calculateImpactResponse(asteroid, impact, parent, config);
+        const polygonResult = calculatePolygonChildren(asteroid, parent, response, config);
+        return {
+            children: polygonResult
+                ? polygonResult.children
+                : calculateDiskChildren(parent, response, config),
+            mass: parent.mass,
+            inertia: parent.inertia,
+            impulse: response.impulse,
+            postImpulse: {
+                velocityX: response.velocityX,
+                velocityY: response.velocityY,
+                angularVelocity: response.angularVelocity,
+            },
+            fracture: polygonResult ? polygonResult.fracture : null,
         };
     }
 

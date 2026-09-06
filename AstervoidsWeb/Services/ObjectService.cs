@@ -1,6 +1,4 @@
-using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Models;
-using Microsoft.Extensions.Options;
 
 namespace AstervoidsWeb.Services;
 
@@ -26,12 +24,6 @@ public class ObjectService : IObjectService
     public ObjectService(ISessionService sessionService)
     {
         _sessionService = sessionService;
-    }
-
-    public ObjectService(ISessionService sessionService, IOptions<SessionSettings> settings)
-    {
-        _sessionService = sessionService;
-        // DistributeOrphanedObjects is now used by SessionService directly; no field needed here.
     }
 
     /// <summary>

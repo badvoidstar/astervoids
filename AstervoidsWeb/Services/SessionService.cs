@@ -4,6 +4,7 @@ using System.Text;
 using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Models;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace AstervoidsWeb.Services;
@@ -57,12 +58,8 @@ public class SessionService : ISessionService
     }
 
     public SessionService(ISessionNameGenerator nameGenerator)
+        : this(Options.Create(new SessionSettings()), NullLogger<SessionService>.Instance, nameGenerator)
     {
-        _nameGenerator = nameGenerator;
-        _maxSessions = 6;
-        _maxMembersPerSession = 4;
-        _distributeOrphanedObjects = true;
-        _regionId = "local";
     }
 
     public SessionService(
@@ -76,10 +73,7 @@ public class SessionService : ISessionService
         _maxMembersPerSession = settings.Value.MaxMembersPerSession;
         _distributeOrphanedObjects = settings.Value.DistributeOrphanedObjects;
         _logger = logger;
-        // RegionSettings is optional so legacy tests that only register
-        // SessionSettings continue to work; default "local" matches the
-        // parameter-less constructor's behaviour.
-        _regionId = regionSettings?.Value.Id ?? "local";
+        _regionId = regionSettings?.Value.Id ?? new RegionSettings().Id;
     }
 
     /// <summary>Creates a failed CreateSessionResult with the specified error message.</summary>

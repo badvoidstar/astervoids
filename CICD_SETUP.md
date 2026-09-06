@@ -102,6 +102,22 @@ If the custom domain secrets are configured, the workflow will automatically set
 
 ## Testing the Workflow
 
+Deployment orchestration lives in `.github/scripts/deployment-helpers.sh`, with
+separate procedures for single-region production (`azd up`), multi-region
+production (Bicep, one image publish, regional updates, static payload), and
+shared-infrastructure branches (`azd provision`, verified Bicep fallback, app
+update). The workflow selects a procedure rather than implementing those paths.
+The procedures share named settings from the selected azd environment, one
+Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
+remains the infrastructure source of truth. The multi-region first-deploy retry
+changes only the domain verification ID.
+
+Run `bash .github/scripts/workflow-helpers.test.sh` to exercise these procedures
+with mocked Azure/Docker commands, including provisioning failures, retries,
+branch fallback, certificate bootstrap, and public-output privacy. Custom
+hostnames, region manifests, and secret-derived Static Web App names stay in
+runner-local state; only default Azure hostnames are published in URL outputs.
+
 ### Automatic Trigger
 
 The workflow will automatically run when:
