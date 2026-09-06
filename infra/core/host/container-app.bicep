@@ -58,6 +58,9 @@ param regionsManifest array = []
 @description('Externally reachable URL of the apex (Traffic-Manager-routed) entry point, e.g. `https://asteroids.example.com`. Stamped as Region__ApexHostname so Program.cs adds it to CORS allowed-origins on this app. Required for multi-region: visitor browsers land on the apex first and then issue cross-origin requests (RTT pings, session list, SignalR negotiate) to every per-region hostname; without the apex in allowed-origins, the picker stalls in "warming" and Create fails. Empty for single-region and local-dev.')
 param apexHostname string = ''
 
+@description('Additional exact origins allowed to call regional APIs, including the public Static Web App default host. Does not replace the custom apex or peer-region manifest.')
+param additionalAllowedOrigins array = []
+
 @description('Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.\n\nIMPORTANT — implicit coupling with SessionSettings.EmptyTimeoutSeconds (appsettings.json, default 60s):\n  When the last member leaves a session, SessionService keeps the session in memory for EmptyTimeoutSeconds so a returning member can rejoin. The container scale-down also runs in parallel using this `cooldownPeriodSeconds` timer. If `cooldownPeriodSeconds < EmptyTimeoutSeconds`, the container scales to zero BEFORE the empty session would have expired — annihilating the in-memory session and silently breaking the rejoin window. Keep cooldownPeriodSeconds >= EmptyTimeoutSeconds. Today both default to 60s, so they expire together (returning rejoin past 60s gets "session not found" either way).')
 param cooldownPeriodSeconds int = 60
 
@@ -90,13 +93,17 @@ var regionalEnv = empty(regionId) ? [] : [
 var apexEnv = empty(apexHostname) ? [] : [
   { name: 'Region__ApexHostname', value: apexHostname }
 ]
+var additionalOriginEnv = [for (origin, i) in additionalAllowedOrigins: {
+  name: 'Region__AdditionalAllowedOrigins__${i}'
+  value: origin
+}]
 var manifestEnvNested = [for (r, i) in regionsManifest: [
   { name: 'Region__Regions__${i}__Id', value: r.id }
   { name: 'Region__Regions__${i}__DisplayName', value: r.displayName }
   { name: 'Region__Regions__${i}__Hostname', value: r.hostname }
 ]]
 var manifestEnv = flatten(manifestEnvNested)
-var effectiveEnv = concat(env, regionalEnv, apexEnv, manifestEnv)
+var effectiveEnv = concat(env, regionalEnv, apexEnv, manifestEnv, additionalOriginEnv)
 
 // Container App.
 //

@@ -60,6 +60,37 @@ mkdir "$TEST_DIR"
 trap 'rm -rf "$TEST_DIR"' EXIT
 CALL_LOG="$TEST_DIR/calls.jsonl"
 
+# Compile before installing the CLI mocks: validate the real module wiring and
+# the one-way static-apex -> regional-app dependency without contacting Azure.
+az bicep build --file infra/main.bicep --outfile "$TEST_DIR/main.compiled.json"
+jq -e \
+  --arg origin_count "[length(parameters('additionalAllowedOrigins'))]" \
+  --arg origin_name "[format('Region__AdditionalAllowedOrigins__{0}', copyIndex('additionalOriginEnv'))]" \
+  --arg origin_value "[parameters('additionalAllowedOrigins')[copyIndex('additionalOriginEnv')]]" \
+  '
+  [.resources[] | select(.copy.name == "webRegional")][0] as $regional |
+  [.resources[] | select(.name == "static-apex")][0] as $static |
+  $regional.properties.template as $module |
+  $regional.properties.parameters.additionalAllowedOrigins as $origins |
+  [$module.variables.copy[] | select(.name == "additionalOriginEnv")][0] as $env |
+  ($module.parameters.additionalAllowedOrigins.type == "array") and
+  ($module.parameters.additionalAllowedOrigins.defaultValue == []) and
+  ($origins | contains("staticApexEnabled") and contains("https://{0}") and
+    contains("static-apex") and contains(".outputs.defaultHostname.value") and
+    endswith("createArray()))]") and (contains("*") | not)) and
+  ($env.count == $origin_count) and
+  ($env.input.name == $origin_name) and
+  ($env.input.value == $origin_value) and
+  ($module.variables.effectiveEnv | contains("additionalOriginEnv") and
+    contains("apexEnv") and contains("manifestEnv")) and
+  any($module.resources[]; .type == "Microsoft.App/containerApps" and
+    .properties.template.containers[0].env == "[variables('\''effectiveEnv'\'')]") and
+  ($regional.properties.parameters.apexHostname | contains("fullCustomDomain")) and
+  ($regional.properties.parameters.regionsManifest.value | contains("regionsManifest")) and
+  any($regional.dependsOn[]; contains("static-apex")) and
+  all($static.dependsOn[]; (contains("webRegional") or contains("web-production")) | not)
+  ' "$TEST_DIR/main.compiled.json" >/dev/null || fail "compiled regional CORS origin wiring is incorrect"
+
 record_call() {
   jq -cn --args '$ARGS.positional' -- "$@" >> "$CALL_LOG"
 }

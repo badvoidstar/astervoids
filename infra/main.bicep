@@ -349,6 +349,7 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     // requests to per-region hostnames — apex MUST be in CORS allowed-
     // origins or the picker stalls in "warming" and Create fails.
     apexHostname: useCustomDomain ? 'https://${fullCustomDomain}' : ''
+    additionalAllowedOrigins: staticApexEnabled ? ['https://${staticApex!.outputs.defaultHostname}'] : []
   }
   // dependsOn dnsRecordsPerRegion so the per-region CNAMEs exist before
   // Azure validates the additionalCustomDomain binding on this app.

@@ -112,11 +112,17 @@ Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
 remains the infrastructure source of truth. The multi-region first-deploy retry
 changes only the domain verification ID.
 
-Run `bash .github/scripts/workflow-helpers.test.sh` to exercise these procedures
-with mocked Azure/Docker commands, including provisioning failures, retries,
-branch fallback, certificate bootstrap, and public-output privacy. Custom
+Run `bash .github/scripts/workflow-helpers.test.sh` to compile/check the Bicep
+origin wiring and exercise these procedures with mocked Azure/Docker commands,
+including provisioning failures, retries, branch fallback, certificate bootstrap,
+and public-output privacy. Custom
 hostnames, region manifests, and secret-derived Static Web App names stay in
 runner-local state; only default Azure hostnames are published in URL outputs.
+For multi-region static-apex deployments, the public link uses the default
+`*.azurestaticapps.net` host. Bicep adds that exact HTTPS origin to each regional
+app's `Region__AdditionalAllowedOrigins` settings so its picker/API/SignalR
+requests work, while retaining the custom apex and peer-region origins. No
+wildcard origin is allowed.
 
 ### Automatic Trigger
 

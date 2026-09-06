@@ -1683,8 +1683,13 @@ this honestly:
 ### Configuration
 
 - **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
-  Manifest in `appsettings.json` under `Region:Regions`. Empty manifest
-  triggers permissive same-origin CORS for local dev.
+  Manifest in `appsettings.json` under `Region:Regions`. CORS permits the
+  configured region hosts, `Region:ApexHostname`, and exact origins in
+  `Region:AdditionalAllowedOrigins`. Bicep supplies the default Static Web App
+  origin in that additional list so the public deployment URL can reach
+  regional HTTP and SignalR endpoints without publishing private hostnames.
+  Only when no origins are configured does the local-development permissive
+  fallback apply; deployed origins do not use wildcard host matching.
 - **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
   single-region; non-empty = multi-region). Primary region (index 0)
   owns the shared ACR + DNS zone.
