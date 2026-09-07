@@ -58,8 +58,8 @@ var sessionSettings = builder.Configuration.GetSection(SessionSettings.SectionNa
 // — wildcard origin + credentials is rejected by browsers.
 //
 // Same-origin requests are unaffected by this policy. Allowed origins are
-// the hostnames listed in the Region manifest — they are static at
-// deployment time, so there is no broad wildcard.
+// the region manifest, apex, and additional configured frontend origins —
+// they are static at deployment time, so there is no broad wildcard.
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("RegionalApi", policy =>
@@ -76,8 +76,13 @@ builder.Services.AddCors(options =>
         // stalls in "warming" (RTT measurements blocked) and Create fails
         // (hub negotiate blocked).
         var apexOrigin = regions.ApexHostname.TrimEnd('/');
+        var additionalOrigins = regions.AdditionalAllowedOrigins
+            .Where(origin => !string.IsNullOrWhiteSpace(origin))
+            .Select(origin => origin.Trim().TrimEnd('/'))
+            .Where(origin => !string.IsNullOrEmpty(origin));
         var origins = regionOrigins
             .Concat(string.IsNullOrEmpty(apexOrigin) ? Array.Empty<string>() : new[] { apexOrigin })
+            .Concat(additionalOrigins)
             .Distinct()
             .ToArray();
         if (origins.Length > 0)
@@ -86,7 +91,7 @@ builder.Services.AddCors(options =>
         }
         else
         {
-            // No regions configured (local dev / single-region). SetIsOriginAllowed
+            // No origins configured (local dev / single-region). SetIsOriginAllowed
             // is compatible with AllowCredentials (unlike AllowAnyOrigin) and lets
             // dev setups (e.g. multiple instances on localhost ports) work.
             policy.SetIsOriginAllowed(_ => true);

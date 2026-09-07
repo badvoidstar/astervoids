@@ -9,6 +9,8 @@ const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
 const {
+    pointInPolygon,
+    circlePolygonCollision,
     sweptCircleIntersectsCircle,
     sweptCirclePolygonCollision,
     wrappedDelta,
@@ -17,6 +19,54 @@ const {
 function circle(x, y, radius = 1) {
     return { x, y, radius };
 }
+
+const square = [
+    { x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 },
+];
+
+test('shared polygon test handles interior, exterior, and concave shapes', () => {
+    assert.equal(pointInPolygon({ x: 5, y: 5 }, square), true);
+    assert.equal(pointInPolygon({ x: 11, y: 5 }, square), false);
+    assert.equal(pointInPolygon({ x: 0, y: 0 }, []), false);
+    const concave = [
+        { x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 4 },
+        { x: 4, y: 4 }, { x: 4, y: 10 }, { x: 0, y: 10 },
+    ];
+    assert.equal(pointInPolygon({ x: 2, y: 8 }, concave), true);
+    assert.equal(pointInPolygon({ x: 8, y: 8 }, concave), false);
+});
+
+test('stationary circle collision includes edges and corner tangencies, not near misses', () => {
+    assert.equal(circlePolygonCollision(circle(5, 5, 0), square), true);
+    assert.equal(circlePolygonCollision(circle(-1, 5), square), true);
+    assert.equal(circlePolygonCollision(circle(-1.001, 5), square), false);
+    assert.equal(circlePolygonCollision(circle(-3, -4, 5), square), true);
+    assert.equal(circlePolygonCollision(circle(-3, -4, 4.999), square), false);
+    for (const vertex of square) {
+        assert.equal(circlePolygonCollision(circle(vertex.x, vertex.y, 0), square), true);
+    }
+});
+
+test('stationary collision handles empty polygons and repeated zero-length edges', () => {
+    assert.equal(circlePolygonCollision(circle(0, 0), []), false);
+    const repeated = [square[0], ...square, square[0]];
+    assert.equal(circlePolygonCollision(circle(-1, 5), repeated), true);
+    assert.equal(circlePolygonCollision(circle(-2, 5), repeated), false);
+    assert.equal(circlePolygonCollision(circle(-3, -4, 5), [{ x: 0, y: 0 }]), true);
+    assert.equal(circlePolygonCollision(circle(-3, -4, 4), [{ x: 0, y: 0 }]), false);
+});
+
+test('zero-length sweeps agree with stationary circle collisions', () => {
+    for (const point of [circle(5, 5), circle(-1, 5), circle(-2, 5),
+        circle(-3, -4, 5), circle(10, 10, 0)]) {
+        assert.equal(
+            circlePolygonCollision(point, square.slice().reverse()),
+            circlePolygonCollision(point, square));
+        assert.equal(
+            sweptCirclePolygonCollision(point, point, square),
+            circlePolygonCollision(point, square));
+    }
+});
 
 test('fast bullets sweep through asteroids between frame endpoints', () => {
     const asteroid = [

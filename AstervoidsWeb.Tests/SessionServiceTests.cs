@@ -10,7 +10,7 @@ public class SessionServiceTests
 
     public SessionServiceTests()
     {
-        _sessionService = new SessionService();
+        _sessionService = TestServiceFactory.CreateSessionService();
     }
 
     [Fact]
@@ -148,9 +148,10 @@ public class SessionServiceTests
         // that don't bind RegionSettings. It must stamp a stable default so the
         // client can still merge sessions across "local" and other regions
         // without crashing on a null id.
-        _sessionService.CreateSession("connection-1");
+        var service = new SessionService();
+        service.CreateSession("connection-1");
 
-        var sessions = _sessionService.GetActiveSessions().Sessions.ToList();
+        var sessions = service.GetActiveSessions().Sessions.ToList();
 
         sessions.Should().AllSatisfy(s => s.RegionId.Should().Be("local"));
     }

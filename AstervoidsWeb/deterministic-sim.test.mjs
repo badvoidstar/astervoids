@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const {
@@ -9,56 +10,38 @@ const {
 } = require(
     './wwwroot/js/replication-presentation.js');
 
-// Most helpers mirror inline deterministic game-layer logic. Dead reckoning
-// exercises the importable production presentation policy directly.
-
-// ── Mode normalization (mirrors normalizeSimMode) ───────────────────────────
+const { makeSeededRandom } = require('./wwwroot/js/asteroid-fracture.js');
 const SIM_MODES = { BUFFERED: 'buffered', DETERMINISTIC: 'deterministic' };
 const VALID_SIM_MODES = new Set(Object.values(SIM_MODES));
-function normalizeSimMode(raw) {
-    if (typeof raw === 'string') {
-        const n = raw.toLowerCase();
-        if (VALID_SIM_MODES.has(n)) return n;
-    }
-    return SIM_MODES.BUFFERED;
-}
+const { normalizeSimMode, interpNormalized, interpAngle, shortestAngleDelta } =
+    loadInlineGameFunctions(
+        ['normalizeSimMode', 'interpNormalized', 'interpAngle', 'shortestAngleDelta'],
+        { SIM_MODES, VALID_SIM_MODES });
 
-// ── Seeded RNG (mirrors makeSeededRandom + simRng) ──────────────────────────
-function makeSeededRandom(seed) {
-    let s = (seed >>> 0) || 1;
-    return () => {
-        s = (s + 0x6D2B79F5) >>> 0;
-        let t = s;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-}
-
-// ── Render interpolation (mirrors interpNormalized / interpAngle) ───────────
-function interpNormalized(prev, curr, alpha, range = 1) {
-    let d = curr - prev;
-    if (d > 0.5) d -= range;
-    else if (d < -0.5) d += range;
-    return prev + d * alpha;
-}
-function interpAngle(prev, curr, alpha) {
-    let d = curr - prev;
-    d = Math.atan2(Math.sin(d), Math.cos(d));
-    return prev + d * alpha;
-}
-
-// ── Fixed-timestep accumulator (mirrors gameLoop's deterministic branch) ────
+// Exercise the production frame scheduler with simulation/rendering observed
+// rather than duplicating its fixed-step accumulator.
 function stepFixed(accumulatorMs, elapsed, stepMs, maxSteps, maxAccum) {
-    accumulatorMs = Math.min(accumulatorMs + elapsed, maxAccum);
+    const game = { lastFrameTime: -elapsed || -1 };
+    const fixedStep = { accumulatorMs, alpha: 0 };
     let steps = 0;
-    while (accumulatorMs >= stepMs && steps < maxSteps) {
-        accumulatorMs -= stepMs;
-        steps++;
-    }
-    if (steps === maxSteps) accumulatorMs = 0;
-    const alpha = stepMs > 0 ? Math.min(accumulatorMs / stepMs, 1) : 1;
-    return { steps, accumulatorMs, alpha };
+    const { gameLoop } = loadInlineGameFunctions(['gameLoop'], {
+        game,
+        fixedStep,
+        CONFIG: { TARGET_FPS: 1000 / stepMs },
+        MAX_SIM_STEPS_PER_FRAME: maxSteps,
+        MAX_ACCUMULATED_MS: maxAccum,
+        fpsTracker: { sample() {} },
+        isSessionMode: () => false,
+        isDeterministicMode: () => true,
+        runSimulationStep: dt => {
+            assert.equal(dt, 1);
+            steps++;
+        },
+        renderScene: alpha => assert.equal(alpha, fixedStep.alpha),
+        requestAnimationFrame() {},
+    });
+    gameLoop(game.lastFrameTime + elapsed);
+    return { steps, accumulatorMs: fixedStep.accumulatorMs, alpha: fixedStep.alpha };
 }
 
 // ── Production dead-reckoning integrator ────────────────────────────────────
@@ -393,44 +376,35 @@ test('replacement baseline never predicts from a future local baseline', () => {
 // eases back to truth. In steady rotation the extrapolation already agrees with
 // the next snapshot, so the offset is ~0 and adds no lag.
 
-function shortestAngleDelta(target, current) {
-    const d = target - current;
-    return Math.atan2(Math.sin(d), Math.cos(d));
-}
-
-// Minimal mirror of DeadReckon's angular path with correction smoothing.
+// Adapt the production policy to the angular-only scenarios below.
 function makeReckoner(stepMs, tau, maxFrames = 30) {
-    let state = null;        // { angle, rotationSpeed, recvPerf }
-    let smooth = null;       // { da, t0 }
-    function reckonRaw(now) {
-        if (!state) return null;
-        let frames = stepMs > 0 ? (now - state.recvPerf) / stepMs : 0;
-        if (!(frames > 0)) frames = 0;
-        if (frames > maxFrames) frames = maxFrames;
-        return state.angle + state.rotationSpeed * frames;
-    }
-    function sample(now) {
-        const raw = reckonRaw(now);
-        if (raw == null) return null;
-        if (smooth) {
-            const k = tau > 0 ? Math.exp(-(now - smooth.t0) / tau) : 0;
-            if (k <= 1e-3) smooth = null;
-            else return raw + smooth.da * k;
-        }
-        return raw;
-    }
-    function update(now, angle, rotationSpeed, snap) {
-        const displayed = (!snap && state) ? sample(now) : null;
-        state = { angle, rotationSpeed, recvPerf: now };
-        if (displayed != null && tau > 0) {
-            const fresh = reckonRaw(now);
-            const da = shortestAngleDelta(displayed, fresh);
-            smooth = (da !== 0) ? { da, t0: now } : null;
-        } else {
-            smooth = null;
-        }
-    }
-    return { update, sample, resting: () => (state ? state.angle : null) };
+    let nowPerf = 0;
+    const policy = createDeadReckoningPolicy({
+        config: {
+            TARGET_FPS: 1000 / stepMs,
+            DEADRECKON_SMOOTH_MS: tau,
+            DEADRECKON_MAX_FRAMES: maxFrames,
+            DEADRECKON_SNAP_DIST: Infinity,
+        },
+        nowMs: () => nowPerf,
+        velocityToDeltaX: () => 0,
+        velocityToDeltaY: () => 0,
+        shortestAngleDelta,
+        createState: (data, recvPerf) => ({ ...data, recvPerf }),
+    });
+    return {
+        update(now, angle, rotationSpeed, snap) {
+            nowPerf = now;
+            policy.updateState('object', {
+                x: 0, y: 0, velocityX: 0, velocityY: 0, angle, rotationSpeed,
+            }, now, snap);
+        },
+        sample(now) {
+            nowPerf = now;
+            return policy.getReckoned('object')?.angle ?? null;
+        },
+        resting: () => policy.getResting('object')?.angle ?? null,
+    };
 }
 
 test('smoothing: rotation stop eases back to truth instead of snapping', () => {

@@ -50,6 +50,12 @@ public class RegionSettings
     /// the serving hostname.
     /// </summary>
     public string ApexHostname { get; set; } = "";
+
+    /// <summary>
+    /// Additional exact origins allowed to call regional APIs and SignalR with
+    /// credentials, such as the default hostname of the static frontend.
+    /// </summary>
+    public List<string> AdditionalAllowedOrigins { get; set; } = new();
 }
 
 /// <summary>

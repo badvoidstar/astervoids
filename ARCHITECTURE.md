@@ -155,6 +155,41 @@ still the in-memory, per-session state protected by `Session.SyncRoot` inside
 one application instance; the runtime does not add cross-process or
 cross-region session replication.
 
+### Inline Gameplay Workflows and Test Boundaries
+
+The game continues to own orchestration in `wwwroot/index.html`:
+
+- Session entry shares snapshot initialization and membership/configuration
+  bookkeeping. Create, join, and auto-rejoin retain explicit cancellation
+  checks and viewport/picker updates. Rejoin resets old state **before** the
+  join RPC installs its snapshot. Voluntary leave establishes its synchronous
+  guard before asynchronous cleanup.
+- Visible and hidden simulation share owned-asteroid updates, local-bullet
+  expiration, and wave progression. Their orchestration and remote-ship
+  reconciliation points remain separate; hidden-tab timing is not the
+  deterministic foreground accumulator.
+- `calculateGameState` computes score awards, damage, and historical
+  player-count bonuses from explicit inputs without mutating them.
+  `calculateGameStateTerminal` computes immutable terminal anchors from an
+  explicit server time. `syncGameState` retains ledger validation, local
+  effects, game-specific serialization, and publication through `ObjectSync`.
+- Debug snapshot publication is separate from HUD rendering, with the same
+  listener gating and update cadence. Entity collections remain ordered arrays;
+  indexing and reduced diagnostic fidelity require representative profiling.
+
+Stationary and swept collision tests share polygon containment and
+squared-distance primitives in `collision-geometry.js`, including degenerate
+edges and inclusive tangency. Fracture calculation stays in
+`asteroid-fracture.js`: parent geometry, impulse response, polygon construction,
+and disk fallback are separate stages. Parent mass is density times radius
+squared; polygon-area calibration still determines child radii.
+
+Tests import production modules directly where possible. For declarations that
+remain inline, `AstervoidsWeb/test-support/inline-game.mjs` loads selected
+functions/classes using Node's parser and explicitly supplied dependencies,
+without starting the browser runtime. Expected results and deliberate
+architecture/order assertions remain independent of the implementation.
+
 ### Future Native Client Contract
 
 The JavaScript callbacks and `Map` usage are implementation details, not the
@@ -677,6 +712,15 @@ flowchart LR
 ```
 
 ## SessionHub: Method Signatures & Broadcast Patterns
+
+`SessionService` convenience constructors delegate to its configured constructor
+using `SessionSettings` defaults. `ObjectService` depends only on the session
+service. Hubs and cleanup require an explicitly supplied
+`ISessionOperationCoordinator`; production DI shares one singleton rather than
+allowing either consumer to create a private fallback. Backend fixtures use
+`TestServiceFactory` for defaults and share the coordinator across collaborating
+hubs and cleanup services. Coordination across awaits does not replace session
+locks.
 
 ```mermaid
 flowchart TB
@@ -1639,8 +1683,13 @@ this honestly:
 ### Configuration
 
 - **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
-  Manifest in `appsettings.json` under `Region:Regions`. Empty manifest
-  triggers permissive same-origin CORS for local dev.
+  Manifest in `appsettings.json` under `Region:Regions`. CORS permits the
+  configured region hosts, `Region:ApexHostname`, and exact origins in
+  `Region:AdditionalAllowedOrigins`. Bicep supplies the default Static Web App
+  origin in that additional list so the public deployment URL can reach
+  regional HTTP and SignalR endpoints without publishing private hostnames.
+  Only when no origins are configured does the local-development permissive
+  fallback apply; deployed origins do not use wildcard host matching.
 - **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
   single-region; non-empty = multi-region). Primary region (index 0)
   owns the shared ACR + DNS zone.
@@ -1897,6 +1946,8 @@ astervoids/
 │   ├── AstervoidsWeb.csproj    # .NET 10.0 Web SDK project
 │   ├── *.test.mjs              # Node behavior, policy, runtime, cadence, continuity,
 │   │                           # codec, and source-order contract tests
+│   ├── test-support/
+│   │   └── inline-game.mjs     # Production inline declarations with injected dependencies
 │   ├── Program.cs              # App startup, DI, middleware, SignalR mapping,
 │   │                           # MessagePack protocol, /api/srvmon endpoint
 │   ├── Dockerfile              # Multi-stage Docker build (SDK → aspnet runtime)

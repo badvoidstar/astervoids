@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(here, 'wwwroot/index.html'), 'utf8');
@@ -464,4 +465,111 @@ test('visibility resume includes the lobby of an active session', () => {
         startSource,
         /if \(startScreen\.classList\.contains\('hidden'\)\) return;[\s\S]*?multiRegionActive = true;[\s\S]*?if \(document\.hidden\) return;/
     );
+});
+
+test('successful membership helpers keep snapshot epochs and identity separate from path-specific state', () => {
+    for (const role of ['Server', 'Client']) {
+        const calls = [];
+        const game = { state: 'waveDelay', connectionLost: true };
+        const sessionPicker = { gameStarted: false };
+        const result = {
+            session: {
+                id: 's', name: 'Test session', metadata: { seed: 7 },
+                objects: [{ id: 'existing' }],
+            },
+            member: { id: 'm', role },
+        };
+        const { beginSessionSnapshot, applySessionMembership } = loadInlineGameFunctions(
+            ['beginSessionSnapshot', 'applySessionMembership'], {
+                game, sessionPicker,
+                SessionClient: { getSessionEpoch: () => 42 },
+                replicationRuntime: { beginSession: context => calls.push(context) },
+                adoptSessionConfig: metadata => calls.push(metadata),
+            });
+        beginSessionSnapshot(result);
+        applySessionMembership(result);
+        assert.deepEqual(calls, [
+            { epoch: 42, snapshotObjectIds: ['existing'] }, result.session.metadata,
+        ]);
+        assert.deepEqual(game.sessionInfo, {
+            id: 's', name: 'Test session', memberId: 'm', role, metadata: result.session.metadata,
+        });
+        assert.equal(game.mode, 'session');
+        assert.equal(game.state, 'waveDelay', 'rejoin controls its own transition');
+        assert.equal(game.connectionLost, true, 'membership must not unfreeze rejoin');
+        assert.equal(sessionPicker.currentSessionId, 's');
+        assert.equal(sessionPicker.isServer, role === 'Server');
+        assert.equal(sessionPicker.gameStarted, false, 'create and join retain explicit game-start policy');
+    }
+});
+
+test('voluntary leave bookkeeping blocks rejoin synchronously without clearing picker selection', async () => {
+    const sessionPicker = {
+        currentSessionId: 's', isServer: true, gameStarted: true, selectedSessionId: 's',
+    };
+    const logs = [];
+    const { beginVoluntarySessionLeave, attemptAutoRejoin } = loadInlineGameFunctions([
+        'clearPickerMembership', 'beginVoluntarySessionLeave', 'attemptAutoRejoin',
+    ], {
+        sessionPicker, leavingSession: false, rejoinInProgress: false,
+        isSessionMode: () => true,
+        _log: (...args) => logs.push(args),
+    });
+    beginVoluntarySessionLeave();
+    assert.deepEqual(sessionPicker, {
+        currentSessionId: null, isServer: false, gameStarted: false, selectedSessionId: 's',
+    });
+    await attemptAutoRejoin('s');
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0][2], 'leavingSession:');
+    assert.equal(logs[0][3], true);
+});
+
+test('shared solo-mode reset restores local configuration after clearing session identity', () => {
+    const game = { mode: 'session', sessionInfo: { id: 's' }, state: 'lobby' };
+    let restored = false;
+    const { restoreSoloMode } = loadInlineGameFunctions(['restoreSoloMode'], {
+        game,
+        restoreLocalConfigBaseline: () => {
+            assert.equal(game.mode, 'solo');
+            assert.equal(game.sessionInfo, null);
+            restored = true;
+        },
+    });
+    restoreSoloMode();
+    assert.equal(restored, true);
+    assert.equal(game.state, 'lobby', 'caller retains state-transition ordering');
+});
+
+test('leave and rejoin paths keep guards and reset-before-snapshot ordering explicit', () => {
+    for (const name of ['handleLeaveLobby', 'returnToStartScreen']) {
+        const source = extractFunctionSource(name);
+        assert.ok(source.indexOf('beginVoluntarySessionLeave();') < source.indexOf('await '));
+        assert.ok(source.indexOf('resetMultiplayerState();') < source.indexOf('restoreSoloMode();'));
+        assert.match(source, /finally \{\s*leavingSession = false;/);
+    }
+    const rejoin = extractFunctionSource('attemptAutoRejoin');
+    const markers = [
+        'ObjectSync.suspendReconciliation();',
+        'resetMultiplayerState();',
+        'await SessionClient.joinSession(sessionId)',
+        'if (leavingSession || !isSessionMode())',
+        'beginSessionSnapshot(result);',
+        'applySessionMembership(result);',
+        'await startGameFromPicker();',
+        'game.connectionLost = false;',
+        'ObjectSync.resumeReconciliation();',
+    ];
+    let offset = 0;
+    for (const marker of markers) {
+        const next = rejoin.indexOf(marker, offset);
+        assert.ok(next >= offset, `rejoin preserves ${marker}`);
+        offset = next + marker.length;
+    }
+    for (const name of ['handleSelectSession', 'handleCreateSession']) {
+        const source = extractFunctionSource(name);
+        assert.match(source, /if \(!isCurrentOperation\(\)\) \{[\s\S]*?return;[\s\S]*?beginSessionSnapshot\(result\);/);
+        assert.ok(source.indexOf('beginSessionSnapshot(result);')
+            < source.indexOf('applySessionMembership(result);'));
+    }
 });

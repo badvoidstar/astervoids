@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using AstervoidsWeb.Configuration;
 using FluentAssertions;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
@@ -17,6 +18,8 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
 {
+    private const string StaticOrigin = "https://example-static.azurestaticapps.net";
+
     public sealed class Factory : AstervoidsWebFactory
     {
         protected override void ConfigureAstervoidsWeb(IWebHostBuilder builder)
@@ -31,6 +34,10 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
                     ["Region:Id"] = "westus2",
                     ["Region:DisplayName"] = "US West",
                     ["Region:ApexHostname"] = "https://astervoids.example.com",
+                    ["Region:AdditionalAllowedOrigins:0"] = $"  {StaticOrigin}/  ",
+                    ["Region:AdditionalAllowedOrigins:1"] = "",
+                    ["Region:AdditionalAllowedOrigins:2"] = "   ",
+                    ["Region:AdditionalAllowedOrigins:3"] = null,
                     ["Region:Regions:0:Id"] = "westus2",
                     ["Region:Regions:0:DisplayName"] = "US West",
                     ["Region:Regions:0:Hostname"] = "https://astervoids-westus2.example.com",
@@ -273,5 +280,161 @@ public class RegionEndpointsTests : IClassFixture<RegionEndpointsTests.Factory>
         response.Headers.GetValues("Access-Control-Allow-Origin")
             .Should().Contain("https://astervoids.example.com",
                 "the static apex hosts srvmon in a multi-region deployment");
+    }
+
+    [Theory]
+    [InlineData("/api/ping")]
+    [InlineData("/api/regions")]
+    [InlineData("/api/srvmon")]
+    [InlineData("/api/sessions")]
+    public async Task RegionalEndpoints_AllowConfiguredStaticOrigin(string path)
+    {
+        using var client = _factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, path);
+        request.Headers.Add("Origin", StaticOrigin);
+
+        using var response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(StaticOrigin);
+        response.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+    }
+
+    [Theory]
+    [InlineData("/api/sessions", "GET", StaticOrigin)]
+    [InlineData("/sessionHub/negotiate?negotiateVersion=1", "POST", StaticOrigin)]
+    [InlineData("/sessionHub/negotiate?negotiateVersion=1", "POST", "https://astervoids.example.com")]
+    public async Task RegionalApi_CredentialedPreflight_AllowsConfiguredOrigins(
+        string path, string method, string origin)
+    {
+        using var client = _factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Options, path);
+        request.Headers.Add("Origin", origin);
+        request.Headers.Add("Access-Control-Request-Method", method);
+        request.Headers.Add("Access-Control-Request-Headers", "content-type,x-signalr-user-agent");
+
+        using var response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        response.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(origin);
+        response.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+        response.Headers.GetValues("Access-Control-Allow-Methods").Should().Contain(method);
+        response.Headers.GetValues("Access-Control-Allow-Headers")
+            .SelectMany(value => value.Split(',', StringSplitOptions.TrimEntries))
+            .Should().Contain("content-type").And.Contain("x-signalr-user-agent");
+    }
+
+    [Theory]
+    [InlineData(StaticOrigin)]
+    [InlineData("https://astervoids.example.com")]
+    [InlineData("https://astervoids-eastus.example.com")]
+    public async Task SignalR_Negotiation_AllowsConfiguredOrigins(string origin)
+    {
+        using var client = _factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/sessionHub/negotiate?negotiateVersion=1");
+        request.Headers.Add("Origin", origin);
+
+        using var response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(origin);
+        response.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        body.GetProperty("connectionToken").GetString().Should().NotBeNullOrEmpty();
+        body.GetProperty("availableTransports").GetArrayLength().Should().BeGreaterThan(0);
+    }
+
+    [Theory]
+    [InlineData("https://other-static.azurestaticapps.net")]
+    [InlineData("https://other-app.azurecontainerapps.io")]
+    [InlineData("https://nested.example-static.azurestaticapps.net")]
+    [InlineData("http://example-static.azurestaticapps.net")]
+    [InlineData("https://example-static.azurestaticapps.net:444")]
+    public async Task RegionalApi_RejectsUnconfiguredAzureOrigins(string origin)
+    {
+        using var client = _factory.CreateClient();
+        using var restRequest = new HttpRequestMessage(HttpMethod.Get, "/api/sessions");
+        restRequest.Headers.Add("Origin", origin);
+        using var restResponse = await client.SendAsync(restRequest);
+        restResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        restResponse.Headers.Contains("Access-Control-Allow-Origin").Should().BeFalse();
+        restResponse.Headers.Contains("Access-Control-Allow-Credentials").Should().BeFalse();
+
+        using var preflight = new HttpRequestMessage(HttpMethod.Options, "/sessionHub/negotiate?negotiateVersion=1");
+        preflight.Headers.Add("Origin", origin);
+        preflight.Headers.Add("Access-Control-Request-Method", "POST");
+        using var preflightResponse = await client.SendAsync(preflight);
+        preflightResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        preflightResponse.Headers.Contains("Access-Control-Allow-Origin").Should().BeFalse();
+        preflightResponse.Headers.Contains("Access-Control-Allow-Credentials").Should().BeFalse();
+
+        using var negotiate = new HttpRequestMessage(HttpMethod.Post, "/sessionHub/negotiate?negotiateVersion=1");
+        negotiate.Headers.Add("Origin", origin);
+        using var negotiateResponse = await client.SendAsync(negotiate);
+        negotiateResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        negotiateResponse.Headers.Contains("Access-Control-Allow-Origin").Should().BeFalse();
+        negotiateResponse.Headers.Contains("Access-Control-Allow-Credentials").Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LocalCors_WithoutConfiguredOrigins_PreservesCredentialedDevelopmentRequests(bool blankAdditionalOrigins)
+    {
+        new RegionSettings().AdditionalAllowedOrigins.Should().BeEmpty();
+        using var factory = new AstervoidsWebFactory().WithWebHostBuilder(builder =>
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                if (blankAdditionalOrigins)
+                    config.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["Region:AdditionalAllowedOrigins:0"] = "   ",
+                        ["Region:AdditionalAllowedOrigins:1"] = "/"
+                    });
+            }));
+        using var client = factory.CreateClient();
+        const string origin = "http://localhost:5001";
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/sessions");
+        request.Headers.Add("Origin", origin);
+        using var response = await client.SendAsync(request);
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(origin);
+        response.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+
+        using var preflight = new HttpRequestMessage(HttpMethod.Options, "/sessionHub/negotiate?negotiateVersion=1");
+        preflight.Headers.Add("Origin", origin);
+        preflight.Headers.Add("Access-Control-Request-Method", "POST");
+        using var preflightResponse = await client.SendAsync(preflight);
+        preflightResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        preflightResponse.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(origin);
+        preflightResponse.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+    }
+
+    [Theory]
+    [InlineData("Region:AdditionalAllowedOrigins:0", StaticOrigin)]
+    [InlineData("Region:Regions:0:Hostname", "https://example-app.azurecontainerapps.io")]
+    public async Task SingleRegionCors_WithManifestOrAdditionalOrigin_UsesExactAllowList(
+        string configurationKey, string origin)
+    {
+        using var factory = new AstervoidsWebFactory().WithWebHostBuilder(builder =>
+            builder.ConfigureAppConfiguration((_, config) =>
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [configurationKey] = origin
+                })));
+        using var client = factory.CreateClient();
+        using var allowed = new HttpRequestMessage(HttpMethod.Get, "/api/sessions");
+        allowed.Headers.Add("Origin", origin);
+        using var allowedResponse = await client.SendAsync(allowed);
+        allowedResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        allowedResponse.Headers.GetValues("Access-Control-Allow-Origin").Should().Equal(origin);
+        allowedResponse.Headers.GetValues("Access-Control-Allow-Credentials").Should().Equal("true");
+
+        using var rejected = new HttpRequestMessage(HttpMethod.Get, "/api/sessions");
+        rejected.Headers.Add("Origin", "https://other-static.azurestaticapps.net");
+        using var rejectedResponse = await client.SendAsync(rejected);
+        rejectedResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        rejectedResponse.Headers.Contains("Access-Control-Allow-Origin").Should().BeFalse();
+        rejectedResponse.Headers.Contains("Access-Control-Allow-Credentials").Should().BeFalse();
     }
 }
