@@ -83,6 +83,12 @@ assert_equal "$(shared_container_environment '[]' cae-production)" cae-productio
 assert_equal "$(shared_container_environment "$REGIONS" cae-production)" cae-production-north
 assert_equal "$(primary_region_location "$REGIONS")" northeurope
 
+SHORT_SANITIZED=$("$SCRIPT_DIR/sanitize-branch-name.sh" feature/login)
+assert_equal "-$SHORT_SANITIZED" -feature-login
+LONG_SANITIZED=$("$SCRIPT_DIR/sanitize-branch-name.sh" feature/this-is-a-deliberately-long-branch-name)
+[[ "-$LONG_SANITIZED" =~ ^-[a-z0-9-]+-[0-9a-f]{4}$ ]] \
+  || fail "long branch custom-subdomain suffix must retain its leading dash and hash"
+
 # The CLI mocks record argument arrays across command-substitution subshells.
 # All artifacts are temporary and removed even on test failure.
 cd "$SCRIPT_DIR/../.."
@@ -148,6 +154,14 @@ grep -Fq 'primary_region_location "$REGIONS_JSON"' .github/workflows/azure-deplo
   || fail "workflow must derive the regional deployment location from REGIONS_JSON"
 grep -Fq 'azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"' .github/workflows/azure-deploy.yml \
   || fail "workflow must clear or set CUSTOM_DOMAIN_NAME deterministically"
+grep -Fq 'custom_subdomain_suffix: ${{ steps.vars.outputs.custom_subdomain_suffix }}' .github/workflows/azure-deploy.yml \
+  || fail "workflow must expose the public custom-subdomain suffix as a job output"
+grep -Fq 'CUSTOM_SUBDOMAIN_SUFFIX="-$SANITIZED"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must preserve the leading dash on a branch custom-subdomain suffix"
+grep -Fq 'CUSTOM_URL_TEMPLATE="https://<CUSTOM_SUBDOMAIN>${CUSTOM_SUBDOMAIN_SUFFIX}.<CUSTOM_DOMAIN_NAME>"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must use literal placeholders in the public custom URL template"
+grep -Fq 'name: Report custom-domain format' .github/workflows/azure-deploy.yml \
+  || fail "workflow must report the safe custom-domain format in the job summary"
 grep -Fq 'id: managed_domain' .github/workflows/azure-deploy.yml \
   || fail "managed custom-domain step must expose its status"
 grep -Fq 'Custom-domain activation pending' .github/workflows/azure-deploy.yml \

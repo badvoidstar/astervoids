@@ -123,6 +123,9 @@ jobs:
     environment:
       name: production
       url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      custom_subdomain_suffix: ${{ steps.vars.outputs.custom_subdomain_suffix }}
+      custom_url_template: ${{ steps.vars.outputs.custom_url_template }}
     
     steps:
       - name: Checkout code
@@ -147,6 +150,33 @@ jobs:
             echo "is_production=false" >> $GITHUB_OUTPUT
             echo "env_name=$SANITIZED" >> $GITHUB_OUTPUT
           fi
+
+          # These values derive solely from the public branch name. Keep the
+          # secret base subdomain and domain as literal placeholders because
+          # job outputs and summaries are public.
+          if [ "$BRANCH_NAME" = "main" ]; then
+            CUSTOM_SUBDOMAIN_SUFFIX=""
+          else
+            CUSTOM_SUBDOMAIN_SUFFIX="-$SANITIZED"
+          fi
+          CUSTOM_URL_TEMPLATE="https://<CUSTOM_SUBDOMAIN>${CUSTOM_SUBDOMAIN_SUFFIX}.<CUSTOM_DOMAIN_NAME>"
+          echo "custom_subdomain_suffix=$CUSTOM_SUBDOMAIN_SUFFIX" >> "$GITHUB_OUTPUT"
+          echo "custom_url_template=$CUSTOM_URL_TEMPLATE" >> "$GITHUB_OUTPUT"
+
+      - name: Report custom-domain format
+        env:
+          CUSTOM_SUBDOMAIN_SUFFIX: ${{ steps.vars.outputs.custom_subdomain_suffix }}
+          CUSTOM_URL_TEMPLATE: ${{ steps.vars.outputs.custom_url_template }}
+        run: |
+          echo "### Custom-domain format (safe template)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$CUSTOM_SUBDOMAIN_SUFFIX" ]; then
+            echo "**Custom subdomain suffix:** \`$CUSTOM_SUBDOMAIN_SUFFIX\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Custom subdomain suffix:** none (production uses the base subdomain)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "**Custom URL format:** \`$CUSTOM_URL_TEMPLATE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Replace the two literal placeholder tokens only in a private administrative environment; this is not a live endpoint." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Azure Developer CLI
         run: |

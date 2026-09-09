@@ -232,6 +232,20 @@ hostname — it embeds the secret `CUSTOM_SUBDOMAIN`/`CUSTOM_DOMAIN_NAME`. The
 branch name and its derived `{name}-{hash}` segment are public; only the
 subdomain and domain stay secret.
 
+Each deploy job instead publishes two non-secret values in its job summary and
+`deploy` job outputs:
+
+- `custom_subdomain_suffix` is the public branch-derived suffix, including its
+  leading hyphen (for example, `-feature-login` or
+  `-feature-super-long-b-71b3`). Production has no suffix because it uses the
+  base subdomain.
+- `custom_url_template` is a literal format such as
+  `https://<CUSTOM_SUBDOMAIN>-feature-login.<CUSTOM_DOMAIN_NAME>`. The
+  placeholder tokens are never replaced in CI and are not a live endpoint.
+
+An administrator can copy those values to determine the expected custom URL
+format, then replace the two placeholder tokens only in a private environment.
+
 To resolve the full URL yourself, use either method below.
 
 **Option A — local helper (offline, needs the secrets):**
