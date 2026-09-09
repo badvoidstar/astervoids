@@ -83,9 +83,9 @@ assert_equal "$(shared_container_environment '[]' cae-production)" cae-productio
 assert_equal "$(shared_container_environment "$REGIONS" cae-production)" cae-production-north
 assert_equal "$(primary_region_location "$REGIONS")" northeurope
 
-SHORT_SANITIZED=$("$SCRIPT_DIR/sanitize-branch-name.sh" feature/login)
+SHORT_SANITIZED=$(bash "$SCRIPT_DIR/sanitize-branch-name.sh" feature/login)
 assert_equal "-$SHORT_SANITIZED" -feature-login
-LONG_SANITIZED=$("$SCRIPT_DIR/sanitize-branch-name.sh" feature/this-is-a-deliberately-long-branch-name)
+LONG_SANITIZED=$(bash "$SCRIPT_DIR/sanitize-branch-name.sh" feature/this-is-a-deliberately-long-branch-name)
 [[ "-$LONG_SANITIZED" =~ ^-[a-z0-9-]+-[0-9a-f]{4}$ ]] \
   || fail "long branch custom-subdomain suffix must retain its leading dash and hash"
 
