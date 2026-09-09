@@ -49,8 +49,10 @@ env:
   # where per-region ACA hostnames are bound with one shared wildcard cert.
   # See ARCHITECTURE.md "BYO wildcard cert for regional hostnames".
   #
-  # When ANY is empty, falls back to the legacy DigiCert managed-cert flow
-  # (works in single-region only; multi-region apex TLS will fail).
+  # Single-region production and branch previews fall back to the legacy
+  # DigiCert managed-cert flow when the BYO values are empty. Multi-region
+  # production requires the BYO URL/name pair and is rejected before Azure
+  # resources are created when it is absent.
   #
   # Set via repo variables (Settings → Secrets and variables → Actions → Variables):
   #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com
@@ -65,6 +67,9 @@ env:
   CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
   CERT_KEY_VAULT_CERT_NAME: ${{ vars.CERT_KEY_VAULT_CERT_NAME }}
   CERT_READER_IDENTITY_ID: ${{ vars.CERT_READER_IDENTITY_ID }}
+  # Optional. Defaults to true when unset, but is consulted only by a
+  # production BYO deployment that omits CERT_READER_IDENTITY_ID.
+  MANAGE_ACMEBOT_PERMISSIONS: ${{ vars.MANAGE_ACMEBOT_PERMISSIONS }}
 
 jobs:
   build:
@@ -178,15 +183,57 @@ jobs:
         run: |
           source .github/scripts/deployment-helpers.sh
           ENV_NAME="${{ steps.vars.outputs.env_name }}"
-          REGIONS_JSON=$(normalize_deployment_regions "$REGIONS_JSON")
+          if ! REGIONS_JSON=$(normalize_deployment_regions "$REGIONS_JSON"); then
+            echo "::error::Refusing to select an Azure topology from invalid REGIONS_JSON."
+            exit 1
+          fi
           echo "REGIONS_JSON=$REGIONS_JSON" >> "$GITHUB_ENV"
+
+          if { [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -z "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; } ||
+            { [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; }; then
+            echo "::error::CUSTOM_DOMAIN_NAME and CUSTOM_SUBDOMAIN must either both be configured or both be empty."
+            exit 1
+          fi
+          if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+            echo "HAS_CUSTOM_DOMAIN=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_CUSTOM_DOMAIN=false" >> "$GITHUB_ENV"
+          fi
+          if { [ -n "$CERT_KEY_VAULT_SECRET_URL" ] && [ -z "$CERT_KEY_VAULT_CERT_NAME" ]; } ||
+            { [ -z "$CERT_KEY_VAULT_SECRET_URL" ] && [ -n "$CERT_KEY_VAULT_CERT_NAME" ]; }; then
+            echo "::error::CERT_KEY_VAULT_SECRET_URL and CERT_KEY_VAULT_CERT_NAME must either both be configured or both be empty."
+            exit 1
+          fi
+          if [ "${{ steps.vars.outputs.is_production }}" != "true" ] &&
+            [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] &&
+            [ -n "$CERT_KEY_VAULT_SECRET_URL" ] &&
+            [ -n "$CERT_KEY_VAULT_CERT_NAME" ] &&
+            [ -z "$CERT_READER_IDENTITY_ID" ]; then
+            echo "::error::Branch BYO certificate deployments require CERT_READER_IDENTITY_ID."
+            exit 1
+          fi
+          if [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] &&
+            [ -n "$CERT_KEY_VAULT_SECRET_URL" ] &&
+            [ -n "$CERT_KEY_VAULT_CERT_NAME" ]; then
+            echo "::warning::BYO certificate inputs are ignored because no custom domain is configured."
+            echo "### ⚠️ BYO certificate inputs ignored" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No custom domain is configured, so the supplied BYO certificate inputs will not create certificate or ACMEbot resources." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          DEPLOYMENT_LOCATION=westus2
+          if [ "$(jq 'length' <<< "$REGIONS_JSON")" -gt 0 ] &&
+            [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+            DEPLOYMENT_LOCATION=$(primary_region_location "$REGIONS_JSON")
+          fi
           
           # Create or select azd environment
-          azd env new "$ENV_NAME" --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }} --location westus2 || true
+          azd env new "$ENV_NAME" --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }} --location "$DEPLOYMENT_LOCATION" || true
           azd env select "$ENV_NAME"
           
-          # Set location
-          azd env set AZURE_LOCATION westus2
+          # Branch previews use the existing primary CAE's location whenever
+          # a regional production topology is configured.
+          azd env set AZURE_LOCATION "$DEPLOYMENT_LOCATION"
           # Pass through region matrix so non-production shared-infra deploys
           # can resolve the primary shared CAE deterministically.
           azd env set REGIONS_JSON "${REGIONS_JSON:-[]}"
@@ -198,26 +245,28 @@ jobs:
             azd env set USE_SHARED_INFRA "true"
             # Tell azd which container app to deploy to (avoids tag collision with production)
             azd env set SERVICE_WEB_RESOURCE_NAME "${{ env.CONTAINER_APP_PREFIX }}-${{ steps.vars.outputs.sanitized_branch }}"
+          else
+            azd env set USE_SHARED_INFRA "false"
           fi
           
-          # Set custom domain from secrets (if provided)
-          if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
-            azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"
-          fi
+          # Write both values even when empty so restored azd environments
+          # cannot retain a removed custom-domain configuration.
+          azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"
           
           # Set subdomain (with branch suffix for non-production)
-          if [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
-            if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
-              azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}"
-            else
-              azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}"
-            fi
+          if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
+            azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}"
+          elif [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
+            azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}"
+          else
+            azd env set CUSTOM_SUBDOMAIN ""
           fi
 
           # Seed DOMAIN_VERIFICATION_ID so bicep can emit asuid TXT before
           # branch custom hostname binding is attempted. Azure validates
           # ownership during app create; missing asuid causes
           # InvalidCustomHostNameValidation failures.
+          azd env set DOMAIN_VERIFICATION_ID ""
           if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
             PRIMARY_REGION_NAME=$(primary_region_name "$REGIONS_JSON")
             SHARED_CAE_NAME=$(shared_container_environment "$REGIONS_JSON" "$CONTAINER_ENV_NAME")
@@ -252,11 +301,12 @@ jobs:
           azd env set CERT_KEY_VAULT_SECRET_URL "$CERT_KEY_VAULT_SECRET_URL"
           azd env set CERT_KEY_VAULT_CERT_NAME "$CERT_KEY_VAULT_CERT_NAME"
           azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
+          azd env set MANAGE_ACMEBOT_PERMISSIONS "${MANAGE_ACMEBOT_PERMISSIONS:-true}"
 
       - name: Bootstrap BYO cert on shared CAE (branches only)
         # Production owns the CAE in Bicep. Branches reference it as existing,
         # so attach the identity and ensure its KV-backed certificate separately.
-        if: steps.vars.outputs.is_production != 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
+        if: steps.vars.outputs.is_production != 'true' && env.HAS_CUSTOM_DOMAIN == 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
         run: |
           source .github/scripts/deployment-helpers.sh
           CAE_NAME=$(shared_container_environment "$REGIONS_JSON" "$CONTAINER_ENV_NAME")
@@ -351,6 +401,7 @@ jobs:
           exit 1
 
       - name: Configure Custom Domain (if enabled)
+        id: managed_domain
         # Runs ONLY for single-region production WITHOUT BYO cert vars.
         # All other cases are handled in-band by bicep + the bootstrap step:
         #   - Single-region production WITH BYO    → bicep binds via SNI.
@@ -371,6 +422,16 @@ jobs:
         run: bash .github/scripts/configure-managed-domain.sh
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Report managed custom-domain activation
+        if: always() && env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && env.CERT_KEY_VAULT_SECRET_URL == ''
+        run: |
+          if [ "${{ steps.managed_domain.outputs.custom_domain_ready }}" != "true" ]; then
+            echo "### ⚠️ Custom-domain activation pending" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The Azure deployment is available at its default Azure hostname, but managed-certificate binding is not ready yet." >> $GITHUB_STEP_SUMMARY
+            echo "Review the Configure Custom Domain step and rerun after DNS propagation completes." >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Deployment Summary
         run: |

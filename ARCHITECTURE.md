@@ -1691,17 +1691,23 @@ this honestly:
   Only when no origins are configured does the local-development permissive
   fallback apply; deployed origins do not use wildcard host matching.
 - **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
-  single-region; non-empty = multi-region). Primary region (index 0)
-  owns the shared ACR + DNS zone.
+  single-region; a non-empty validated array plus custom-domain and BYO
+  certificate inputs = multi-region). Primary region (index 0) owns the
+  shared ACR + DNS zone.
 - **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
-  (empty by default). Set to a JSON array to enable multi-region prod.
+  (empty by default). Set it to a validated JSON array, with the required
+  custom-domain and BYO certificate inputs, to enable multi-region prod.
 
   ### Deployment permutation contract
 
   The deployment paths are expected to remain reproducible from IaC inputs:
 
   - **`main` + empty `REGIONS_JSON`** → production single-region (greenfield-capable).
-  - **`main` + non-empty `REGIONS_JSON`** → production multi-region static-apex path (greenfield-capable).
+  - **`main` + valid non-empty `REGIONS_JSON` + custom domain + BYO cert** →
+    production multi-region static-apex path (greenfield-capable).
+  - **Incomplete multi-region input** → CI fails before Azure mutation; direct
+    Bicep/azd calls use the safe single-region path and emit
+    `DEPLOYMENT_WARNING`.
   - **non-`main` + shared infra** → branch preview deploys from scratch against shared production infra.
   - **non-`main` + standalone** → isolated env in its own resource group.
 
@@ -1731,12 +1737,17 @@ apex hostname is bound on the Static Web App entrypoint.
 #### One-time setup (~10 min)
 
 Steps 1 and 3 below are manual (one-time external setup that doesn't fit
-bicep). Steps 2, 4, and 5 are now bicep-managed — when you deploy `main`
-with `manageAcmebotPermissions: true` (the default), bicep provisions
-`id-acme-cert-reader` in `rg-production`, grants ACMEbot DNS Zone
-Contributor on the production DNS zone, and grants the cert reader Key
-Vault Certificate User on the ACMEbot KV. They're listed here for
-reference / disaster recovery; you don't normally run them.
+bicep). Steps 2, 4, and 5 are bicep-managed only when a production BYO
+deployment supplies the custom-domain pair and certificate URL/name, omits
+`CERT_READER_IDENTITY_ID`, and leaves `MANAGE_ACMEBOT_PERMISSIONS=true` (the
+default). That explicit ACMEbot path provisions `id-acme-cert-reader` in
+`rg-production`, grants ACMEbot DNS Zone Contributor on the production DNS
+zone, and grants the cert reader Key Vault Certificate User on the ACMEbot KV.
+Production deployments without BYO certificate inputs do not reference
+ACMEbot resources. The deployment identity needs User Access Administrator or
+Owner at the production and certificate-Key-Vault scopes for this opt-in path,
+because it creates role assignments; use an externally managed reader identity
+instead when the normal Contributor role should remain sufficient.
 
 ```bash
 # 1. [MANUAL, ONE-TIME] Deploy ACMEbot via its ARM template (use the README button):
@@ -1830,24 +1841,26 @@ CERT_NAME=wildcard-<sanitised-domain>  # whatever you named it in step 3
 CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
 
 # 7. [REQUIRED, ONE-TIME] Set GitHub repo variables so the workflow knows where to find everything.
-#    CERT_READER_IDENTITY_ID is OPTIONAL when manageAcmebotPermissions=true (production deploys
-#    look up the identity from bicep output). It IS required for branch deploys (the workflow's
-#    bootstrap step still reads the var). Set it for safety until all production deploys have
-#    run with the new bicep:
+#    CERT_READER_IDENTITY_ID is OPTIONAL only for the explicit production
+#    ACMEbot path (MANAGE_ACMEBOT_PERMISSIONS=true). It IS required for branch
+#    deploys because the bootstrap step must attach the identity to the shared
+#    CAE before it creates the certificate:
 CERT_READER_IDENTITY_ID=$(az identity show \
   --resource-group rg-production --name id-acme-cert-reader \
   --query id -o tsv)
 gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
 gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
 gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
+gh variable set MANAGE_ACMEBOT_PERMISSIONS --body true
 ```
 
 ##### Opting out of bicep-managed ACMEbot permissions
 
 If you'd rather manage the cert reader identity and role assignments
 yourself (e.g. they live in a different subscription or you have a
-stricter least-privilege flow), pass `manageAcmebotPermissions=false`
-when deploying. Bicep then expects:
+stricter least-privilege flow), set
+`MANAGE_ACMEBOT_PERMISSIONS=false` in the selected azd environment or GitHub
+repository variable. Bicep then expects:
   - `certReaderIdentityId` param (or `CERT_READER_IDENTITY_ID` env var
     that the workflow forwards) to be set to an existing identity's
     resource ID.
@@ -2071,7 +2084,7 @@ flowchart TB
     subgraph "Deployment Forms (IaC Matrix)"
         direction TB
         PROD1["Production single-region<br/>environmentName = 'production'<br/>REGIONS_JSON empty<br/>rg-production + single CAE/app path"]
-        PRODN["Production multi-region<br/>environmentName = 'production'<br/>REGIONS_JSON non-empty<br/>static apex + per-region CAE/apps"]
+        PRODN["Production multi-region<br/>environmentName = 'production'<br/>Validated REGIONS_JSON + custom domain + BYO cert<br/>static apex + per-region CAE/apps"]
         BRANCH["Branch (CI/CD preview)<br/>useSharedInfra = true<br/>Shares production RG/ACR/primary CAE<br/>Creates one Container App per branch"]
         STANDALONE["Standalone (local azd)<br/>Creates own resource group: rg-{env}<br/>Own ACR + CAE + Container App"]
     end
@@ -2082,7 +2095,7 @@ flowchart TB
         BUILD["Build & Test"]
         DOCKER["Container build + push"]
         DEPLOY["Deploy path selected by branch + REGIONS_JSON"]
-        CLEANUP["cleanup-orphans.yml:<br/>Remove Container Apps for<br/>deleted/merged branches"]
+        CLEANUP["cleanup-orphans.yml:<br/>Daily/manual removal of<br/>orphaned branch resources"]
     end
 
     subgraph "Runtime"

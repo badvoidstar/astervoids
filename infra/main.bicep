@@ -2,7 +2,7 @@ targetScope = 'subscription'
 
 @minLength(1)
 @maxLength(64)
-@description('Name of the environment (used to generate resource names)')
+@description('Name of the azd environment. Standalone resource names are derived safely from this value so normal azd labels such as "my-dev" cannot create invalid Azure resource names.')
 param environmentName string
 
 @minLength(1)
@@ -32,28 +32,30 @@ so the picker can serve the correct manifest.
 
 Entry shape:
   {
-    name: 'westus2'              // stable id; used as Region__Id and as the resource-name suffix
+    name: 'westus2'              // stable ID (lowercase alphanumeric, max 14 chars); used as Region__Id and resource-name suffix
     location: 'westus2'          // Azure region (CAE is region-bound)
     displayName: 'US West'       // shown to the user in the picker
   }
 
 When the array is empty (default), the legacy single-region production path
 runs — backward-compatible with existing deployments. When the array is
-non-empty, the FIRST entry is treated as the "primary" region (it owns the
-shared ACR + DNS zone) and any branch deployments target its CAE.
+non-empty, a custom domain plus a complete BYO certificate configuration are
+required to activate the multi-region topology. The FIRST entry is then
+treated as the "primary" region (it owns the shared ACR + DNS zone) and any
+branch deployments target its CAE.
 
 Only applied when isProduction; branch and standalone deployments stay
 single-region for cost reasons.
 ''')
 param regions array = []
 
-@description('BYO cert (optional). Full Key Vault secret URL pointing at the wildcard cert that covers <customSubdomain>.<customDomainName> AND all per-region/per-branch subdomains. Required to enable the BYO cert path; when empty, the legacy managed-cert workflow flow is used.')
+@description('BYO cert (optional). Full Key Vault secret URL pointing at the wildcard cert that covers <customSubdomain>.<customDomainName> AND all per-region/per-branch subdomains. Required together with a complete custom-domain configuration to enable the BYO cert path; when empty, the legacy managed-cert workflow is used for single-region production and branch previews.')
 param certKeyVaultSecretUrl string = ''
 
 @description('BYO cert (optional). Name to give the certificate resource on every CAE that will host this cert. Stable name (typically `wildcard-<sanitised-domain>`) so production multi-region + branch deploys all reference the same identifier.')
 param certKeyVaultCertName string = ''
 
-@description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Required when certKeyVaultSecretUrl is set. In production, this can be left empty when manageAcmebotPermissions is true (default) — main.bicep will create id-acme-cert-reader and use its resource ID. Branch deploys MUST set this (via the workflow\'s CERT_READER_IDENTITY_ID GitHub variable) because their bicep run doesn\'t exercise the production path that creates the identity.')
+@description('BYO cert (optional). Resource ID of a user-assigned managed identity that has Key Vault Certificate User role on the KV holding the cert. Required when certKeyVaultSecretUrl is set, except that a production BYO deployment can omit it when manageAcmebotPermissions is true; in that explicit ACMEbot path main.bicep creates id-acme-cert-reader. Branch and standalone BYO deploys must supply it.')
 param certReaderIdentityId string = ''
 
 // ─── ACMEbot integration (production only) ─────────────────────────────────
@@ -66,7 +68,7 @@ param certReaderIdentityId string = ''
 // Set to false if ACMEbot is not deployed or you're managing these
 // permissions outside bicep. Has no effect on non-production deploys.
 
-@description('Whether bicep should provision the ACMEbot integration permissions (cert reader identity, KV role, DNS Zone Contributor). Production-only — ignored for branch and standalone deploys. Default true keeps the documented end-to-end IaC path; set false to opt out and manage manually.')
+@description('Whether bicep should provision ACMEbot integration permissions when a production BYO deployment supplies a certificate URL/name but no certReaderIdentityId. Production-only — ignored for branch and standalone deploys, and does not touch ACMEbot for no-domain or managed-certificate deployments. Default true keeps the documented end-to-end ACMEbot path; set false to opt out and supply/manage a reader identity manually.')
 param manageAcmebotPermissions bool = true
 
 @description('ACMEbot Function App name. Used to look up the system-assigned principal ID for the DNS Zone Contributor role assignment. Default matches the upstream ARM template\'s suggested name.')
@@ -89,43 +91,84 @@ var isProduction = environmentName == 'production'
 var isBranch = !isProduction && useSharedInfra
 var isStandalone = !isProduction && !useSharedInfra
 
-// BYO cert enabled iff the two cert params are supplied AND a cert reader
-// identity is available — either passed in by the caller, or about to be
-// provisioned by the acmebotPermissions module on the production path.
-// Resolved against the EFFECTIVE identity rather than the raw param so
-// production deploys can omit certReaderIdentityId entirely and still
-// enable BYO. Single switch consumed by every container-apps/container-app
-// module invocation below so it isn't possible to half-configure.
-var byoCertEnabled = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertName) && (!empty(certReaderIdentityId) || (isProduction && manageAcmebotPermissions))
+// A custom domain is all-or-nothing: a partial pair must never produce a
+// malformed hostname. The workflow rejects partial input before deployment;
+// these values also let direct azd/Bicep calls expose a safe warning output.
+var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
+var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}' : ''
+var hasPartialCustomDomainConfiguration = (!empty(customDomainName) && empty(customSubdomain)) || (!empty(customSubdomain) && empty(customDomainName))
 
-// Multi-region opt-in: production-only and only when the caller passed a
-// non-empty regions array. When false, the legacy single-region production
-// blocks below execute unchanged.
-var isMultiRegion = isProduction && length(regions) > 0
-var primaryRegion = isMultiRegion ? regions[0] : { name: '', location: location, displayName: '' }
-var sharedInfraPrimaryRegionName = length(regions) > 0 ? regions[0].name : ''
+// BYO certs likewise require a URL/name pair. ACMEbot is only referenced when
+// an actual production BYO cert needs an automatically created reader identity;
+// a plain production deployment no longer depends on external ACMEbot resources.
+var byoCertificateInputsComplete = !empty(certKeyVaultSecretUrl) && !empty(certKeyVaultCertName)
+var hasPartialByoCertificateConfiguration = (!empty(certKeyVaultSecretUrl) && empty(certKeyVaultCertName)) || (!empty(certKeyVaultCertName) && empty(certKeyVaultSecretUrl))
+var shouldManageAcmebotPermissions = isProduction && useCustomDomain && manageAcmebotPermissions && byoCertificateInputsComplete && empty(certReaderIdentityId)
+var byoCertEnabled = useCustomDomain && byoCertificateInputsComplete && (!empty(certReaderIdentityId) || shouldManageAcmebotPermissions)
+var byoCertificateMissingReader = useCustomDomain && byoCertificateInputsComplete && empty(certReaderIdentityId) && !shouldManageAcmebotPermissions
+var byoCertificateProvidedWithoutCustomDomain = byoCertificateInputsComplete && !useCustomDomain
+var effectiveCertKeyVaultSecretUrl = byoCertEnabled ? certKeyVaultSecretUrl : ''
+var effectiveCertKeyVaultCertName = byoCertEnabled ? certKeyVaultCertName : ''
+
+// A routed multi-region game needs both the static custom-domain entrypoint
+// and a wildcard-capable BYO cert for its per-region hosts. The CI helper
+// rejects an incomplete request before Azure calls; direct azd/Bicep calls
+// safely remain single-region and receive DEPLOYMENT_WARNING instead.
+var requestedProductionMultiRegion = isProduction && length(regions) > 0
+var regionalProductionTopologyConfigured = length(regions) > 0 && useCustomDomain
+var isMultiRegion = requestedProductionMultiRegion && byoCertEnabled && useCustomDomain
+var unsupportedProductionMultiRegion = requestedProductionMultiRegion && !isMultiRegion
+var primaryRegion = regionalProductionTopologyConfigured ? regions[0] : { name: '', location: location, displayName: '' }
+var sharedInfraPrimaryRegionName = isBranch && regionalProductionTopologyConfigured ? primaryRegion.name : ''
 
 // For branch deployments, use production's shared infrastructure
 var sharedResourceGroupName = 'rg-production'
 
 // Resource naming per deployment path
+// azd environment names may contain hyphens and be up to 64 characters, while
+// ACR accepts only lowercase alphanumerics and Container Apps caps names at 32
+// characters. Keep safe short labels recognizable; otherwise use a stable hash
+// keyed by the subscription and original environment name.
+var standaloneEnvironmentName = toLower(environmentName)
+var standaloneEnvironmentHash = uniqueString(subscription().subscriptionId, 'rg-${environmentName}')
+var standaloneResourceSuffix = length(standaloneEnvironmentName) <= 25 && !startsWith(standaloneEnvironmentName, '-') && !endsWith(standaloneEnvironmentName, '-') && !contains(standaloneEnvironmentName, '--')
+  ? standaloneEnvironmentName
+  : 'env-${standaloneEnvironmentHash}'
+var standaloneRegistryStem = take(replace(standaloneEnvironmentName, '-', ''), 35)
+var standaloneContainerRegistryName = 'cr${standaloneRegistryStem}${standaloneEnvironmentHash}'
+var standaloneContainerAppsEnvironmentName = 'cae-${standaloneResourceSuffix}'
+var standaloneContainerAppName = !empty(webServiceName) ? webServiceName : 'ca-web-${standaloneResourceSuffix}'
+var standaloneResourceGroupName = 'rg-${environmentName}'
 var containerRegistryName = isStandalone
-  ? 'cr${environmentName}${uniqueString(subscription().subscriptionId, 'rg-${environmentName}')}'
+  ? standaloneContainerRegistryName
   : 'crproduction${uniqueString(subscription().subscriptionId, sharedResourceGroupName)}'
 // Multi-region: the legacy single CAE is replaced by per-region CAEs named
 // cae-production-<regionName>. Branches target the primary region's CAE so
 // existing branch deploy flows still find a valid environment.
 var containerAppsEnvironmentName = isStandalone
-  ? 'cae-${environmentName}'
+  ? standaloneContainerAppsEnvironmentName
   : (isProduction
     ? (isMultiRegion ? 'cae-production-${primaryRegion.name}' : 'cae-production')
     : (isBranch && !empty(sharedInfraPrimaryRegionName) ? 'cae-production-${sharedInfraPrimaryRegionName}' : 'cae-production'))
 
-// Determine if custom domain should be configured
-var useCustomDomain = !empty(customDomainName) && !empty(customSubdomain)
-var fullCustomDomain = useCustomDomain ? '${customSubdomain}.${customDomainName}' : ''
 var staticApexEnabled = isMultiRegion && useCustomDomain
 var staticApexName = take('swa-${customSubdomain}-${uniqueString(subscription().subscriptionId, customDomainName)}', 40)
+var deploymentMode = isProduction
+  ? (isMultiRegion ? 'production-multi-region' : 'production-single-region')
+  : (isStandalone ? 'standalone' : 'branch-shared-infra')
+var deploymentWarning = hasPartialCustomDomainConfiguration
+  ? 'Custom-domain configuration requires both customDomainName and customSubdomain. No custom hostname was configured.'
+  : (hasPartialByoCertificateConfiguration
+    ? 'BYO certificate configuration requires both certKeyVaultSecretUrl and certKeyVaultCertName. No BYO certificate was configured.'
+    : (byoCertificateProvidedWithoutCustomDomain
+      ? 'BYO certificate inputs were supplied without a complete custom-domain configuration and were ignored.'
+      : (requestedProductionMultiRegion && !useCustomDomain
+        ? 'Multi-region production requires a custom domain and BYO certificate. This deployment safely used the single-region production path.'
+        : (unsupportedProductionMultiRegion
+          ? 'Multi-region production requires a complete BYO certificate configuration. This deployment safely used the single-region production path.'
+          : (byoCertificateMissingReader
+            ? 'BYO certificate configuration requires certReaderIdentityId or production manageAcmebotPermissions=true. No BYO certificate was configured.'
+            : '')))))
 
 // Tags for all resources
 var tags = {
@@ -143,7 +186,7 @@ resource productionRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isPr
   tags: tags
 }
 
-// ── ACMEbot integration permissions (production + opt-in) ───────────────────
+// ── ACMEbot integration permissions (production BYO + explicit opt-in) ──────
 // Provisions id-acme-cert-reader + DNS Zone Contributor + KV Cert User so
 // the rest of the BYO cert path "just works" end-to-end without manual
 // role assignments. See infra/core/security/acmebot-permissions.bicep for
@@ -154,13 +197,13 @@ resource productionRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isPr
 // compile time; the conditional gating happens on the modules themselves
 // via the `if (...)` clause.
 
-resource acmebotFunctionApp 'Microsoft.Web/sites@2023-12-01' existing = if (isProduction && manageAcmebotPermissions) {
+resource acmebotFunctionApp 'Microsoft.Web/sites@2023-12-01' existing = if (shouldManageAcmebotPermissions) {
   name: acmebotFunctionAppName
   scope: resourceGroup(acmebotFunctionAppResourceGroup)
 }
 
 #disable-next-line BCP318
-module acmebotPermissions 'core/security/acmebot-permissions.bicep' = if (isProduction && manageAcmebotPermissions) {
+module acmebotPermissions 'core/security/acmebot-permissions.bicep' = if (shouldManageAcmebotPermissions) {
   name: 'acmebot-permissions'
   scope: productionRg
   params: {
@@ -173,7 +216,7 @@ module acmebotPermissions 'core/security/acmebot-permissions.bicep' = if (isProd
 }
 
 #disable-next-line BCP318
-module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (isProduction && manageAcmebotPermissions) {
+module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (shouldManageAcmebotPermissions) {
   name: 'acmebot-kv-cert-user'
   scope: resourceGroup(acmebotKeyVaultResourceGroup)
   params: {
@@ -189,13 +232,13 @@ module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (isProduct
 //   1. Caller-supplied `certReaderIdentityId` param (e.g. from the
 //      workflow's CERT_READER_IDENTITY_ID GitHub variable) — preserves
 //      backward compatibility for non-production deploys.
-//   2. The identity bicep just created via acmebotPermissions module
-//      (production-only, when manageAcmebotPermissions is true).
+//   2. The identity bicep just created via acmebotPermissions module when a
+//      production BYO cert explicitly takes the ACMEbot-managed path.
 //   3. Empty string — BYO cert path stays disabled.
 var effectiveCertReaderIdentityId = !empty(certReaderIdentityId)
   ? certReaderIdentityId
   #disable-next-line BCP318
-  : ((isProduction && manageAcmebotPermissions) ? acmebotPermissions.outputs.certReaderIdentityId : '')
+  : (shouldManageAcmebotPermissions ? acmebotPermissions.outputs.certReaderIdentityId : '')
 
 // ── Single-region production (legacy path; runs when regions array is empty) ──
 // Container Apps Environment with Azure Container Registry (production only)
@@ -207,9 +250,9 @@ module containerAppsProduction 'core/host/container-apps.bicep' = if (isProducti
     location: location
     tags: tags
     containerRegistryName: containerRegistryName
-    certKeyVaultSecretUrl: certKeyVaultSecretUrl
-    certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: effectiveCertReaderIdentityId
+    certKeyVaultSecretUrl: effectiveCertKeyVaultSecretUrl
+    certKeyVaultCertName: effectiveCertKeyVaultCertName
+    certReaderIdentityId: byoCertEnabled ? effectiveCertReaderIdentityId : ''
   }
 }
 
@@ -254,9 +297,9 @@ module containerAppsRegional 'core/host/container-apps.bicep' = [for (r, i) in (
     createRegistry: i == 0
     // BYO cert: every region's CAE pulls the same wildcard cert from KV
     // so the user-facing custom subdomain has SNI everywhere.
-    certKeyVaultSecretUrl: certKeyVaultSecretUrl
-    certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: effectiveCertReaderIdentityId
+    certKeyVaultSecretUrl: effectiveCertKeyVaultSecretUrl
+    certKeyVaultCertName: effectiveCertKeyVaultCertName
+    certReaderIdentityId: byoCertEnabled ? effectiveCertReaderIdentityId : ''
   }
 }]
 
@@ -333,9 +376,9 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     //     the picker to measure RTT and open SignalR connections to a
     //     specific region. Wildcard cert covers both. Ownership validated
     //     via the CNAME emitted by dnsRecordsPerRegion above.
-    // The apex custom domain is now served by the Static Web App entrypoint.
-    // When BYO is not configured, this stays empty and the workflow's
-    // legacy managed-cert flow runs per-region instead.
+    // The apex custom domain is served by the Static Web App entrypoint.
+    // isMultiRegion only activates with a complete BYO configuration; an
+    // incomplete direct request safely follows single-region production.
     customDomainName: ''
     additionalCustomDomain: byoCertEnabled && useCustomDomain ? '${customSubdomain}-${r.name}.${customDomainName}' : ''
     #disable-next-line BCP318
@@ -418,7 +461,7 @@ module dnsRecordsProductionMultiRegion 'core/dns/dns-records.bicep' = if (static
 
 // Resource group for standalone deployments
 resource standaloneRg 'Microsoft.Resources/resourceGroups@2022-09-01' = if (isStandalone) {
-  name: 'rg-${environmentName}'
+  name: standaloneResourceGroupName
   location: location
   tags: tags
 }
@@ -434,9 +477,9 @@ module containerAppsStandalone 'core/host/container-apps.bicep' = if (isStandalo
     location: location
     tags: tags
     containerRegistryName: containerRegistryName
-    certKeyVaultSecretUrl: certKeyVaultSecretUrl
-    certKeyVaultCertName: certKeyVaultCertName
-    certReaderIdentityId: effectiveCertReaderIdentityId
+    certKeyVaultSecretUrl: effectiveCertKeyVaultSecretUrl
+    certKeyVaultCertName: effectiveCertKeyVaultCertName
+    certReaderIdentityId: byoCertEnabled ? effectiveCertReaderIdentityId : ''
   }
 }
 
@@ -445,7 +488,7 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
   name: 'web-standalone'
   scope: standaloneRg
   params: {
-    name: !empty(webServiceName) ? webServiceName : 'ca-web-${environmentName}'
+    name: standaloneContainerAppName
     location: location
     tags: union(tags, { 'azd-service-name': 'web' })
     containerAppsEnvironmentName: containerAppsEnvironmentName
@@ -521,7 +564,11 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
   scope: sharedRg
   params: {
     name: branchContainerAppName
-    location: location
+    // Container Apps requires an app and its managed environment to share a
+    // location. Read the existing CAE directly so branch provisioning remains
+    // correct even when a stored azd location is stale.
+    #disable-next-line BCP318
+    location: branchContainerAppsEnvironment!.location
     tags: union(tags, { 'azd-service-name': 'web-${environmentName}' })  // Unique tag per branch
     containerAppsEnvironmentName: containerAppsEnvironmentName
     containerRegistryName: containerRegistryName
@@ -583,12 +630,16 @@ output WEB_AZURE_URI string = webUri
 output DNS_NAME_SERVERS array = (isProduction && useCustomDomain) ? dnsZone!.outputs.nameServers : []
 output CONTAINER_APP_NAME string = webName
 output CONTAINER_APPS_ENVIRONMENT string = containerAppsEnvironmentName
-output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? 'rg-${environmentName}' : sharedResourceGroupName)
+output RESOURCE_GROUP string = isProduction ? 'rg-production' : (isStandalone ? standaloneResourceGroupName : sharedResourceGroupName)
 output CUSTOM_DOMAIN string = fullCustomDomain
 output DOMAIN_VERIFICATION_ID string = webVerificationId
+@description('Resolved deployment topology. Direct azd/Bicep calls can use this with DEPLOYMENT_WARNING to identify a safe fallback.')
+output DEPLOYMENT_MODE string = deploymentMode
+@description('Nonempty only when invalid or unsupported optional deployment inputs were safely ignored. CI rejects these configurations before Azure resources are created.')
+output DEPLOYMENT_WARNING string = deploymentWarning
 
 // Effective cert reader identity resource ID actually consumed by container-apps modules.
-// In production with manageAcmebotPermissions=true, this is the bicep-created
+// In the production BYO ACMEbot path, this is the bicep-created
 // id-acme-cert-reader; otherwise it echoes the caller-supplied param. Empty
 // string when BYO is not configured. Useful for the workflow to assert that
 // the identity it expects to use is the one bicep is wiring up, and for the

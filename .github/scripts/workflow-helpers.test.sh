@@ -5,6 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/deployment-helpers.sh"
 . "$SCRIPT_DIR/orphan-safety.sh"
 
+# jq.exe emits CRLF on Windows, while GitHub Actions and the assertions below
+# use LF. Normalize only the test harness command boundary.
+jq() {
+  command jq "$@" | tr -d '\r'
+}
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -43,7 +49,7 @@ REGIONS='[{"name":"north","location":"northeurope","displayName":"Europe"},{"nam
 assert_equal "$(normalize_deployment_regions '')" '[]'
 assert_equal "$(normalize_deployment_regions '[]')" '[]'
 assert_equal "$(normalize_deployment_regions "$REGIONS")" "$REGIONS"
-for optional_label in '{}' '{"displayName":null}' '{"displayName":""}'; do
+for optional_label in '{}' '{"displayName":null}'; do
   optional_regions=$(jq -cn --argjson label "$optional_label" \
     '[{name:"north",location:"northeurope"} + $label]')
   normalized=$(normalize_deployment_regions "$optional_regions")
@@ -52,14 +58,30 @@ for optional_label in '{}' '{"displayName":null}' '{"displayName":""}'; do
   assert_equal "$(deployment_mode false "$normalized")" branch
   assert_equal "$(shared_container_environment "$normalized" cae-production)" cae-production-north
 done
-for invalid in 'invalid' '{}' 'null' '"north"' '[{"name":"north"}]'; do
-  assert_equal "$(normalize_deployment_regions "$invalid" 2>/dev/null)" '[]'
+for invalid in \
+  'invalid' \
+  '{}' \
+  'null' \
+  '"north"' \
+  '[{"name":"north"}]' \
+  '[{"name":"north","location":"northeurope","displayName":""}]' \
+  '[{"name":"north","location":"northeurope"},{"name":"north","location":"westus2"}]' \
+  '[{"name":"North","location":"northeurope"}]' \
+  '[{"name":"australiacentral2","location":"australiacentral2"}]' \
+  '[{"name":"north","location":"North Europe"}]' \
+  '[{"name":"north","location":"northeurope","unexpected":true}]'; do
+  if normalize_deployment_regions "$invalid" >/dev/null 2>&1; then
+    fail "invalid REGIONS_JSON must be rejected: $invalid"
+  else
+    assert_equal "$?" 2
+  fi
 done
 assert_equal "$(deployment_mode true '[]')" single-region
 assert_equal "$(deployment_mode true "$REGIONS")" multi-region
 assert_equal "$(deployment_mode false "$REGIONS")" branch
 assert_equal "$(shared_container_environment '[]' cae-production)" cae-production
 assert_equal "$(shared_container_environment "$REGIONS" cae-production)" cae-production-north
+assert_equal "$(primary_region_location "$REGIONS")" northeurope
 
 # The CLI mocks record argument arrays across command-substitution subshells.
 # All artifacts are temporary and removed even on test failure.
@@ -98,6 +120,46 @@ jq -e \
   any($regional.dependsOn[]; contains("static-apex")) and
   all($static.dependsOn[]; (contains("webRegional") or contains("web-production")) | not)
   ' "$TEST_DIR/main.compiled.json" >/dev/null || fail "compiled regional CORS origin wiring is incorrect"
+
+jq -e '
+  [.resources[] | select(.name == "web-standalone")][0] as $standalone |
+  [.resources[] | select(.name == "acmebot-permissions")][0] as $acmebot |
+  [.resources[] | select(try (.properties.parameters.name.value == "[variables('\''branchContainerAppName'\'')]") catch false)][0] as $branch |
+  (.variables.standaloneEnvironmentHash | contains("uniqueString")) and
+  (.variables.standaloneContainerRegistryName | contains("standaloneRegistryStem")) and
+  (.variables.standaloneResourceSuffix | contains("standaloneEnvironmentHash")) and
+  (.variables.shouldManageAcmebotPermissions | contains("byoCertificateInputsComplete")) and
+  (.variables.shouldManageAcmebotPermissions | contains("useCustomDomain")) and
+  (.variables.effectiveCertKeyVaultSecretUrl | contains("byoCertEnabled")) and
+  (.variables.isMultiRegion | contains("byoCertEnabled")) and
+  ($standalone.properties.parameters.name.value | contains("standaloneContainerAppName")) and
+  ($standalone.properties.parameters.containerAppsEnvironmentName.value | contains("containerAppsEnvironmentName")) and
+  ($standalone.properties.parameters.containerRegistryName.value | contains("containerRegistryName")) and
+  ($acmebot.condition | contains("shouldManageAcmebotPermissions")) and
+  ($branch.properties.parameters.location.value | contains("Microsoft.App/managedEnvironments")) and
+  ($branch.properties.parameters.location.value | contains("containerAppsEnvironmentName")) and
+  (.outputs.DEPLOYMENT_MODE.type == "string") and
+  (.outputs.DEPLOYMENT_WARNING.type == "string")
+  ' "$TEST_DIR/main.compiled.json" >/dev/null || fail "compiled deployment safety wiring is incorrect"
+
+jq -e '.parameters.manageAcmebotPermissions.value == "${MANAGE_ACMEBOT_PERMISSIONS=true}"' \
+  infra/main.parameters.json >/dev/null || fail "azd parameter mapping for MANAGE_ACMEBOT_PERMISSIONS is missing"
+grep -Fq 'primary_region_location "$REGIONS_JSON"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must derive the regional deployment location from REGIONS_JSON"
+grep -Fq 'azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must clear or set CUSTOM_DOMAIN_NAME deterministically"
+grep -Fq 'id: managed_domain' .github/workflows/azure-deploy.yml \
+  || fail "managed custom-domain step must expose its status"
+grep -Fq 'Custom-domain activation pending' .github/workflows/azure-deploy.yml \
+  || fail "workflow must summarize a pending managed certificate"
+grep -Fq "env.HAS_CUSTOM_DOMAIN == 'true' && env.CERT_KEY_VAULT_SECRET_URL != ''" .github/workflows/azure-deploy.yml \
+  || fail "branch certificate bootstrap must require a custom domain"
+grep -Fq "printf 'custom_domain_ready=%s" .github/scripts/configure-managed-domain.sh \
+  || fail "managed custom-domain script must write its status output"
+grep -Fq 'set_custom_domain_ready true' .github/scripts/configure-managed-domain.sh \
+  || fail "managed custom-domain script must report readiness"
+grep -Fq 'set_custom_domain_ready false' .github/scripts/configure-managed-domain.sh \
+  || fail "managed custom-domain script must report pending status"
 
 record_call() {
   jq -cn --args '$ARGS.positional' -- "$@" >> "$CALL_LOG"
@@ -156,6 +218,9 @@ azd() {
 az() {
   record_call az "$@"
   case "$1 ${2:-} ${3:-}" in
+    'account list-locations --query')
+      printf '%s\n' "$SUPPORTED_LOCATIONS"
+      ;;
     'deployment sub create')
       if [ "$(call_count az deployment sub create)" -le "$BICEP_FAILURES" ]; then return 42; fi
       ;;
@@ -210,6 +275,7 @@ reset_deployment() {
   AZD_READ_RC=0 AZD_WRITE_RC=0 AZD_UP_RC=0 AZD_PROVISION_RC=0 BICEP_FAILURES=0 UPDATE_FAILURE_AT=0
   ACR_LOGIN_RC=0 DOCKER_BUILD_RC=0 DOCKER_PUSH_RC=0
   APP_STATE=present CAE_EXISTS=true EXISTING_CERT='' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
+  SUPPORTED_LOCATIONS=$'northeurope\nwestus2'
   VERIFICATION_SOURCE=ca-web-production-north EXISTING_VERIFICATION_ID=existing-verification RETRY_VERIFICATION_ID=''
   MOCK_AZD_VALUES=$(jq -cn --arg regions "$REGIONS" '{
     AZURE_ENV_NAME: "production",
@@ -221,6 +287,7 @@ reset_deployment() {
     CERT_KEY_VAULT_SECRET_URL: "https://example.vault.azure.net/secrets/wildcard-example-com",
     CERT_KEY_VAULT_CERT_NAME: "wildcard-example-com",
     CERT_READER_IDENTITY_ID: "",
+    MANAGE_ACMEBOT_PERMISSIONS: "true",
     DOMAIN_VERIFICATION_ID: "seeded-verification",
     WEB_URI: "https://primary.azurecontainerapps.io",
     CONTAINER_APP_NAME: "ca-web-production",
@@ -285,7 +352,8 @@ for cert_url in '' 'https://example.vault.azure.net/secrets/replacement'; do
   assert_equal "${deployment[certKeyVaultSecretUrl]}" "$cert_url"
   assert_equal "${deployment[certKeyVaultCertName]}" "${cert_url:+replacement}"
   assert_equal "${deployment[certReaderIdentityId]}" ''
-  assert_calls 3 azd env set
+  assert_equal "${deployment[manageAcmebotPermissions]}" true
+  assert_calls 4 azd env set
 done
 
 reset_deployment
@@ -296,6 +364,7 @@ DOTENV_VALUES=$(azd env get-values)
 grep -Fq 'REGIONS_JSON="[{\"name\":\"north\"' <<< "$DOTENV_VALUES" || fail "dotenv fixture must escape JSON"
 assert_equal "$(azd_env_value REGIONS_JSON)" "$REGIONS"
 assert_equal "$(azd_env_value CERT_KEY_VAULT_SECRET_URL)" https://example.vault.azure.net/secrets/wildcard-example-com
+assert_equal "$(azd_env_value MANAGE_ACMEBOT_PERMISSIONS)" true
 QUOTED_REGIONS='[{"name":"north","location":"northeurope","displayName":"Europe \"North\""}]'
 MOCK_AZD_VALUES=$(jq --arg regions "$QUOTED_REGIONS" '.REGIONS_JSON = $regions' <<< "$MOCK_AZD_VALUES")
 load_deployment_settings deployment
@@ -308,6 +377,30 @@ expect_failure 7 load_deployment_settings deployment
 MOCK_AZD_VALUES=''
 AZD_READ_RC=0
 expect_failure 1 load_deployment_settings deployment
+
+for invalid_setting in custom-domain cert-pair acmebot-flag production-reader branch-reader; do
+  reset_deployment
+  case "$invalid_setting" in
+    custom-domain) deployment[customSubdomain]='' ;;
+    cert-pair) deployment[certKeyVaultCertName]='' ;;
+    acmebot-flag) deployment[manageAcmebotPermissions]=invalid ;;
+    production-reader)
+      deployment[certReaderIdentityId]=''
+      deployment[manageAcmebotPermissions]=false
+      ;;
+    branch-reader)
+      deployment[environmentName]=feature-login
+      deployment[certReaderIdentityId]=''
+      ;;
+  esac
+  expect_failure 2 validate_deployment_settings deployment
+done
+
+reset_deployment
+deployment[customDomainName]='' deployment[customSubdomain]=''
+deployment[certReaderIdentityId]='' deployment[manageAcmebotPermissions]=false
+deployment[regions]='[]'
+validate_deployment_settings deployment
 
 reset_deployment
 deploy_single_region_production deployment outputs
@@ -328,6 +421,7 @@ reset_deployment
 MOCK_AZD_VALUES=$(jq '.WEB_URI = "https://old.azurecontainerapps.io" |
   .CUSTOM_DOMAIN = "old.example.com" | .RESOURCE_GROUP = "old-group"' <<< "$MOCK_AZD_VALUES")
 deploy_multi_region_production deployment outputs
+assert_calls 1 az account list-locations --query
 assert_calls 1 az deployment sub create
 assert_calls 1 az deployment sub show
 assert_calls 1 docker build
@@ -338,6 +432,7 @@ assert_call_argument location=northeurope az deployment sub create
 assert_call_argument useSharedInfra=false az deployment sub create
 assert_call_argument "regions=$REGIONS" az deployment sub create
 assert_call_argument certReaderIdentityId= az deployment sub create
+assert_call_argument manageAcmebotPermissions=true az deployment sub create
 assert_call_argument domainVerificationId=existing-verification az deployment sub create
 assert_call_argument ca-web-production-north az containerapp update
 assert_call_argument ca-web-production-west az containerapp update
@@ -410,14 +505,13 @@ assert_call_argument domainVerificationId=retry-verification az deployment sub c
 assert_equal "$(jq -sc '[.[] | select(.[0:4] == ["az","deployment","sub","create"]) |
   map(select(startswith("domainVerificationId=") | not))] | .[0] == .[1]' "$CALL_LOG")" true
 
-for failure_case in existing-token no-retry-token retry-fails no-domain; do
+for failure_case in existing-token no-retry-token retry-fails; do
   reset_deployment
   BICEP_FAILURES=2
   case "$failure_case" in
     existing-token) ;;
     no-retry-token) EXISTING_VERIFICATION_ID='' ;;
     retry-fails) EXISTING_VERIFICATION_ID='' RETRY_VERIFICATION_ID=retry-verification ;;
-    no-domain) EXISTING_VERIFICATION_ID=''; deployment[customDomainName]='' ;;
   esac
   expect_failure 42 deploy_multi_region_production deployment outputs
   if [ "$failure_case" = retry-fails ]; then assert_calls 2 az deployment sub create
@@ -435,15 +529,16 @@ done
 reset_deployment
 deployment[customDomainName]='' deployment[customSubdomain]=''
 deployment[certKeyVaultSecretUrl]='' deployment[certKeyVaultCertName]=''
-ARM_OUTPUTS=$(jq '.weB_URI.value = "https://north.azurecontainerapps.io" |
-  del(.statiC_WEB_APP_NAME, .statiC_WEB_APP_DEFAULT_HOSTNAME,
-  .statiC_APEX_REGION_MANIFEST, .custoM_DOMAIN)' <<< "$ARM_OUTPUTS")
-deploy_multi_region_production deployment outputs >/dev/null
-assert_equal "${outputs[STATIC_WEB_APP_NAME]}" ''
-assert_equal "${outputs[STATIC_APEX_REGION_MANIFEST]}" '[]'
-assert_equal "$(azd_env_value CUSTOM_DOMAIN)" ''
-write_deployment_outputs outputs "$TEST_DIR/regional-public" "$TEST_DIR/regional-private"
-grep -qx 'url=https://north.azurecontainerapps.io' "$TEST_DIR/regional-public" || fail "regional default URL missing"
+expect_failure 2 deploy_multi_region_production deployment outputs
+assert_calls 0 az
+assert_calls 0 docker
+
+reset_deployment
+deployment[regions]='[{"name":"mars","location":"moonbase"}]'
+expect_failure 2 deploy_multi_region_production deployment outputs
+assert_calls 1 az account list-locations --query
+assert_calls 0 az deployment
+assert_calls 0 docker
 
 for failure_case in acr build push update missing-registry; do
   reset_deployment
@@ -492,7 +587,7 @@ assert_calls 2 az containerapp show
 assert_call_argument fallback-feature-login-123 az deployment sub create
 assert_call_argument environmentName=feature-login az deployment sub create
 assert_call_argument useSharedInfra=true az deployment sub create
-assert_call_argument location=westus2 az deployment sub create
+assert_call_argument location=northeurope az deployment sub create
 assert_call_argument customSubdomain=app-feature-login az deployment sub create
 assert_call_argument certReaderIdentityId=example-identity az deployment sub create
 assert_call_argument domainVerificationId=seeded-verification az deployment sub create

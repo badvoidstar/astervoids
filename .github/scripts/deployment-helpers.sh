@@ -16,7 +16,7 @@ azd_env_value() {
   fi
   # azd's default dotenv output escapes JSON-valued settings. Read its JSON
   # object instead, letting jq decode strings exactly once.
-  jq -r --arg key "$key" '.[$key] // empty' <<< "$values"
+  jq -r --arg key "$key" '.[$key] // empty' <<< "$values" | tr -d '\r'
 }
 
 require_azd_env_value() {
@@ -61,6 +61,7 @@ resolve_domain_verification_id() {
         --query 'properties.customDomainConfiguration.customDomainVerificationId' \
         -o tsv 2>/dev/null || true)
     fi
+    value="${value%$'\r'}"
 
     if [ -n "$value" ]; then
       echo "Using customDomainVerificationId from $candidate (length: ${#value})" >&2
@@ -77,7 +78,8 @@ deployment_output() {
   printf '%s\n' "$outputs_json" \
     | jq -r --arg key "$key_lc" \
       'to_entries[] | select((.key | ascii_downcase) == $key) | .value.value // empty' \
-    | head -1
+    | head -1 \
+    | tr -d '\r'
 }
 
 deployment_output_json() {
@@ -86,7 +88,8 @@ deployment_output_json() {
   key_lc=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
   printf '%s\n' "$outputs_json" \
     | jq -c --arg key "$key_lc" \
-      'to_entries[] | select((.key | ascii_downcase) == $key) | .value.value // empty'
+      'to_entries[] | select((.key | ascii_downcase) == $key) | .value.value // empty' \
+    | tr -d '\r'
 }
 
 publish_astervoids_image() {
@@ -108,20 +111,41 @@ publish_astervoids_image() {
 
 normalize_deployment_regions() {
   local regions="${1:-[]}"
-  if ! jq -ce '
-    if type == "array" and all(.[];
-      type == "object" and
-      all(.name, .location; type == "string" and length > 0) and
-      (.displayName == null or (.displayName | type == "string")))
-    then . else error("invalid regions") end
-  ' <<< "$regions" 2>/dev/null; then
-    echo "::warning::REGIONS_JSON is not a region array. Falling back to single-region." >&2
+  if [[ ! "$regions" =~ [^[:space:]] ]]; then
     printf '[]\n'
+    return 0
+  fi
+  if ! jq -ce '
+    if type == "array" and
+      all(.[];
+        if type == "object" then
+          ([keys[] | select(. != "name" and . != "location" and . != "displayName")] | length == 0) and
+          (.name | type == "string" and test("^[a-z0-9]{1,14}$")) and
+          (.location | type == "string" and test("^[a-z0-9]+$")) and
+          (.displayName == null or (.displayName | type == "string" and test("\\S")))
+        else
+          false
+        end
+      ) and
+      ([.[].name] | length) == ([.[].name] | unique | length)
+    then
+      .
+    else
+      error("invalid regions")
+    end
+  ' <<< "$regions" 2>/dev/null; then
+    echo "::error::REGIONS_JSON must be empty or a JSON array of unique region objects with lowercase alphanumeric name values of at most 14 characters, lowercase alphanumeric Azure location values, and optional nonblank displayName values." >&2
+    echo "::error::Use a short deployment ID in name (for example \"euwest\") when an Azure location name is longer than 14 characters." >&2
+    return 2
   fi
 }
 
 primary_region_name() {
-  jq -r '.[0].name // empty' <<< "${1:-[]}"
+  jq -r '.[0].name // empty' <<< "${1:-[]}" | tr -d '\r'
+}
+
+primary_region_location() {
+  jq -r '.[0].location // empty' <<< "${1:-[]}" | tr -d '\r'
 }
 
 shared_container_environment() {
@@ -138,6 +162,106 @@ deployment_mode() {
   else
     printf 'single-region\n'
   fi
+}
+
+validate_deployment_settings() {
+  local -n settings="$1"
+  local environment_name="${settings[environmentName]}"
+  local regions="${settings[regions]}"
+  local custom_domain_name="${settings[customDomainName]}"
+  local custom_subdomain="${settings[customSubdomain]}"
+  local cert_secret_url="${settings[certKeyVaultSecretUrl]}"
+  local cert_name="${settings[certKeyVaultCertName]}"
+  local cert_reader_identity_id="${settings[certReaderIdentityId]}"
+  local manage_acmebot_permissions="${settings[manageAcmebotPermissions]}"
+  local region_count
+
+  if { [ -n "$custom_domain_name" ] && [ -z "$custom_subdomain" ]; } ||
+    { [ -z "$custom_domain_name" ] && [ -n "$custom_subdomain" ]; }; then
+    echo "::error::CUSTOM_DOMAIN_NAME and CUSTOM_SUBDOMAIN must either both be set or both be empty. Deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+
+  if { [ -n "$cert_secret_url" ] && [ -z "$cert_name" ]; } ||
+    { [ -z "$cert_secret_url" ] && [ -n "$cert_name" ]; }; then
+    echo "::error::CERT_KEY_VAULT_SECRET_URL and CERT_KEY_VAULT_CERT_NAME must either both be set or both be empty. Deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+
+  case "$manage_acmebot_permissions" in
+    true|false) ;;
+    *)
+      echo "::error::MANAGE_ACMEBOT_PERMISSIONS must be exactly true or false. Deployment was aborted before Azure resources were created." >&2
+      return 2
+      ;;
+  esac
+
+  if [ "$environment_name" != production ] &&
+    [ -n "$custom_domain_name" ] &&
+    [ -n "$custom_subdomain" ] &&
+    [ -n "$cert_secret_url" ] &&
+    [ -n "$cert_name" ] &&
+    [ -z "$cert_reader_identity_id" ]; then
+    echo "::error::Standalone and branch BYO certificate deployments require CERT_READER_IDENTITY_ID. Deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+
+  if [ "$environment_name" = production ] &&
+    [ -n "$custom_domain_name" ] &&
+    [ -n "$custom_subdomain" ] &&
+    [ -n "$cert_secret_url" ] &&
+    [ -n "$cert_name" ] &&
+    [ -z "$cert_reader_identity_id" ] &&
+    [ "$manage_acmebot_permissions" != true ]; then
+    echo "::error::Production BYO certificate deployments require CERT_READER_IDENTITY_ID or MANAGE_ACMEBOT_PERMISSIONS=true for the ACMEbot-managed identity path. Deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+
+  region_count=$(jq 'length' <<< "$regions") || return
+  if [ "$environment_name" = production ] &&
+    [ "$region_count" -gt 0 ] &&
+    { [ -z "$custom_domain_name" ] || [ -z "$custom_subdomain" ]; }; then
+    echo "::error::Multi-region production requires CUSTOM_DOMAIN_NAME and CUSTOM_SUBDOMAIN so the static apex and peer-region routing can be created. Deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+}
+
+validate_azure_region_locations() {
+  local regions="$1"
+  local available_locations region_name region_location
+
+  available_locations=$(az account list-locations --query '[].name' --output tsv) || {
+    echo "::error::Unable to list Azure locations for this subscription; cannot safely validate REGIONS_JSON before deployment." >&2
+    return 1
+  }
+  available_locations="${available_locations//$'\r'/}"
+  if [ -z "$available_locations" ]; then
+    echo "::error::Azure returned no available locations for this subscription; cannot safely validate REGIONS_JSON before deployment." >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r region_name region_location; do
+    region_location="${region_location%$'\r'}"
+    if ! grep -Fxq -- "$region_location" <<< "$available_locations"; then
+      echo "::error::REGIONS_JSON region '$region_name' uses Azure location '$region_location', which is not enabled for this subscription. Choose a value from 'az account list-locations --query \"[].name\" -o tsv'. No Azure resources were created." >&2
+      return 2
+    fi
+  done < <(jq -r '.[] | [.name, .location] | @tsv' <<< "$regions")
+}
+
+validate_multi_region_topology() {
+  local -n settings="$1"
+
+  validate_deployment_settings "$1" || return
+  if [ -z "${settings[customDomainName]}" ] || [ -z "${settings[customSubdomain]}" ]; then
+    echo "::error::Multi-region production requires a custom domain; the deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+  if [ -z "${settings[certKeyVaultSecretUrl]}" ] || [ -z "${settings[certKeyVaultCertName]}" ]; then
+    echo "::error::Multi-region production requires a BYO certificate URL and name; the deployment was aborted before Azure resources were created." >&2
+    return 2
+  fi
+  validate_azure_region_locations "${settings[regions]}"
 }
 
 # Procedures take a named associative settings array and fill a named output
@@ -159,7 +283,10 @@ load_deployment_settings() {
   settings[certKeyVaultSecretUrl]=$(azd_env_value CERT_KEY_VAULT_SECRET_URL "$values")
   settings[certKeyVaultCertName]=$(azd_env_value CERT_KEY_VAULT_CERT_NAME "$values")
   settings[certReaderIdentityId]=$(azd_env_value CERT_READER_IDENTITY_ID "$values")
+  settings[manageAcmebotPermissions]=$(azd_env_value MANAGE_ACMEBOT_PERMISSIONS "$values")
+  settings[manageAcmebotPermissions]="${settings[manageAcmebotPermissions]:-true}"
   settings[domainVerificationId]=$(azd_env_value DOMAIN_VERIFICATION_ID "$values")
+  validate_deployment_settings "$1"
 }
 
 deploy_bicep() {
@@ -167,7 +294,7 @@ deploy_bicep() {
   local deployment_name="$2" verification_id="$3" key
   local -a parameters=()
   for key in environmentName location useSharedInfra regions customDomainName customSubdomain \
-    certKeyVaultSecretUrl certKeyVaultCertName certReaderIdentityId; do
+    certKeyVaultSecretUrl certKeyVaultCertName certReaderIdentityId manageAcmebotPermissions; do
     parameters+=("$key=${settings[$key]}")
   done
   parameters+=("domainVerificationId=$verification_id")
@@ -263,20 +390,16 @@ prepare_static_apex() {
 deploy_multi_region_production() {
   local -n settings="$1" result="$2"
   local deployment_name="production-multi-${settings[runId]}" region_names region app key
-  if [ -n "${settings[customDomainName]}" ] && {
-    [ -z "${settings[certKeyVaultSecretUrl]}" ] || [ -z "${settings[certKeyVaultCertName]}" ];
-  }; then
-    echo "::error::Multi-region custom domains require a BYO certificate URL and name." >&2
-    return 2
-  fi
+  validate_multi_region_topology "$1" || return
   # Production Bicep may create the cert-reader identity; an explicit ID is optional.
-  settings[location]=$(jq -r '.[0].location' <<< "${settings[regions]}") || return
+  settings[location]=$(primary_region_location "${settings[regions]}") || return
   provision_multi_region "$1" "$deployment_name" || return
   read_bicep_deployment_outputs "$deployment_name" "$2" || return
   publish_astervoids_image "${result[AZURE_CONTAINER_REGISTRY_NAME]}" \
     "${result[AZURE_CONTAINER_REGISTRY_ENDPOINT]}" "${settings[imageTag]}" || return
   region_names=$(jq -r '.[].name' <<< "${settings[regions]}") || return
   while IFS= read -r region; do
+    region="${region%$'\r'}"
     app="${settings[appPrefix]}-production-$region"
     az containerapp update --name "$app" --resource-group "${settings[resourceGroup]}" \
       --image "$PUBLISHED_IMAGE" --output none || return
@@ -297,6 +420,11 @@ deploy_shared_infra_branch() {
   local -n settings="$1" result="$2"
   local values expected_app="${settings[appPrefix]}-${settings[environmentName]}"
   local deployment_name="fallback-${settings[environmentName]}-${settings[runId]}"
+  if [ "$(jq 'length' <<< "${settings[regions]}")" -gt 0 ] &&
+    [ -n "${settings[customDomainName]}" ] &&
+    [ -n "${settings[customSubdomain]}" ]; then
+    settings[location]=$(primary_region_location "${settings[regions]}") || return
+  fi
   azd provision --no-prompt || return
   if az containerapp show --name "$expected_app" \
     --resource-group "${settings[resourceGroup]}" &>/dev/null; then
@@ -333,9 +461,11 @@ bootstrap_shared_certificate() {
     --name "$environment_name" --user-assigned "$identity_id" --output none || return
   existing=$(az containerapp env certificate list --resource-group "$resource_group" \
     --name "$environment_name" --query "[?name=='$cert_name'].name" -o tsv) || return
+  existing="${existing%$'\r'}"
   [ -z "$existing" ] || return 0
   location=$(az containerapp env show --resource-group "$resource_group" \
     --name "$environment_name" --query location -o tsv) || return
+  location="${location%$'\r'}"
   body=$(jq -n --arg loc "$location" --arg identity "$identity_id" --arg kvurl "$secret_url" \
     '{location: $loc, properties: {certificateKeyVaultProperties: {identity: $identity, keyVaultUrl: $kvurl}}}') || return
   uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$resource_group/providers/Microsoft.App/managedEnvironments/$environment_name/certificates/$cert_name?api-version=2024-10-02-preview"
