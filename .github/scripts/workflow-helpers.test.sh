@@ -511,7 +511,10 @@ done
 
 reset_deployment
 EXISTING_VERIFICATION_ID='' RETRY_VERIFICATION_ID=retry-verification BICEP_FAILURES=1
-deploy_multi_region_production deployment outputs
+retry_log="$TEST_DIR/multi-region-retry.log"
+deploy_multi_region_production deployment outputs >"$retry_log" 2>&1
+grep -Fq '::warning::First multi-region pass failed without domainVerificationId. Retrying once using the new primary CAE.' "$retry_log" \
+  || fail "multi-region retry warning was not emitted"
 assert_calls 2 az deployment sub create
 assert_call_argument domainVerificationId= az deployment sub create
 assert_call_argument domainVerificationId=retry-verification az deployment sub create
@@ -595,7 +598,10 @@ APP_STATE=after-bicep
 ARM_OUTPUTS=$(jq '.weB_URI.value="https://preview.azurecontainerapps.io" |
   .containeR_APP_NAME.value="ca-web-feature-login" |
   .custoM_DOMAIN.value="app-feature-login.example.com"' <<< "$ARM_OUTPUTS")
-deploy_shared_infra_branch deployment outputs
+fallback_log="$TEST_DIR/branch-fallback.log"
+deploy_shared_infra_branch deployment outputs >"$fallback_log" 2>&1
+grep -Fq '::warning::Expected branch app missing after azd provision; provisioning directly with Bicep.' "$fallback_log" \
+  || fail "branch fallback warning was not emitted"
 assert_calls 1 az deployment sub create
 assert_calls 2 az containerapp show
 assert_call_argument fallback-feature-login-123 az deployment sub create
