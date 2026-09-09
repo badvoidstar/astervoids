@@ -8,8 +8,8 @@ The CI/CD pipeline automatically:
 - **Builds** the .NET application on every push and pull request
 - **Tests** the application to ensure code quality
 - **Deploys** to Azure Container Apps when code is pushed to any branch
-- **Creates preview environments** with custom subdomains for feature branches
-- **Cleans up** branch resources automatically when branches are deleted
+- **Creates preview environments** with custom subdomains when configured
+- **Cleans up** orphaned branch resources on a daily schedule or manual run
 
 ## Prerequisites
 
@@ -102,12 +102,74 @@ If the custom domain secrets are configured, the workflow will automatically set
 
 ## Testing the Workflow
 
+Deployment orchestration lives in `.github/scripts/deployment-helpers.sh`, with
+separate procedures for single-region production (`azd up`), multi-region
+production (Bicep, one image publish, regional updates, static payload), and
+shared-infrastructure branches (`azd provision`, verified Bicep fallback, app
+update). The workflow selects a procedure rather than implementing those paths.
+The procedures share named settings from the selected azd environment, one
+Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
+remains the infrastructure source of truth. The multi-region first-deploy retry
+changes only the domain verification ID.
+
+Region entries require unique `name` and `location` values; `name` is a
+lowercase alphanumeric deployment ID of at most 14 characters, while
+`location` is the lowercase Azure location identifier. Use a short ID such as
+`euwest` when the Azure location name is longer. `displayName` remains
+optional, with missing/null labels defaulted by Bicep to the region name;
+provided labels must not be blank. CI verifies each location is enabled for
+the subscription before Bicep runs, so typos and resource-name collisions stop
+before Azure resources or images are created.
+
+Production multi-region requires all of the following: a nonempty
+`REGIONS_JSON`, both custom-domain secrets, and the BYO certificate URL/name
+pair. The workflow rejects an incomplete request before it mutates Azure. A
+direct Bicep/azd invocation with an incomplete regional request safely uses
+the single-region production path and emits `DEPLOYMENT_WARNING` rather than
+creating an unroutable regional deployment.
+
+Complete BYO certificate inputs without a complete custom-domain configuration
+are intentionally ignored. CI records that decision in the job summary; a
+direct Bicep/azd invocation exposes the same reason through
+`DEPLOYMENT_WARNING`.
+
+CI writes custom-domain values, all three certificate inputs, the ACMEbot
+management flag, and the domain verification ID into the selected azd
+environment even when values are empty. This prevents restored environments
+from retaining removed domain or certificate configuration. Local standalone
+azd inputs are unchanged.
+After a multi-region rollout, the workflow refreshes azd's `WEB_URI`,
+`CONTAINER_APP_NAME`, `CONTAINER_APPS_ENVIRONMENT`, `RESOURCE_GROUP`, and
+`CUSTOM_DOMAIN` from ARM outputs. These remain private azd state; the public URL
+continues to use only a default Azure hostname.
+
+Run `bash .github/scripts/workflow-helpers.test.sh` to compile/check the Bicep
+origin wiring and exercise these procedures with mocked Azure/Docker commands,
+including provisioning failures, retries, branch fallback, restored azd state,
+certificate bootstrap, and public-output privacy. The generated static bootstrap
+is also loaded by the production region client to check regional request routing.
+These checks do not establish live DNS/certificate readiness, permissions
+propagation, or successful Azure deployment. Custom
+hostnames, region manifests, and secret-derived Static Web App names stay in
+runner-local state; only default Azure hostnames are published in URL outputs.
+For multi-region static-apex deployments, the public link uses the default
+`*.azurestaticapps.net` host. Bicep adds that exact HTTPS origin to each regional
+app's `Region__AdditionalAllowedOrigins` settings so its picker/API/SignalR
+requests work, while retaining the custom apex and peer-region origins. No
+wildcard origin is allowed.
+
+For a managed-certificate path, the deployment summary reports
+**Custom-domain activation pending** if DNS or certificate binding is not yet
+ready. The app remains available through its default Azure hostname; review
+the custom-domain step and rerun after DNS propagation instead of treating the
+app deployment as failed.
+
 ### Automatic Trigger
 
 The workflow will automatically run when:
 - Code is pushed to **any branch** (builds, tests, and deploys)
 - A pull request is opened against `main` (builds and tests only)
-- A branch is deleted (cleanup workflow removes resources)
+- The orphan cleanup schedule runs daily
 
 ### Manual Trigger
 
@@ -157,7 +219,10 @@ Branch names are sanitized for DNS compatibility:
 ### Prerequisites for Branch Deployments
 
 1. **Production must be deployed first** - Branch deployments use the shared Container Apps Environment created by the production deployment
-2. **Custom domain secrets configured** - `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must be set
+2. **Custom domain is optional** - When configured,
+   `CUSTOM_DOMAIN_NAME` and `CUSTOM_SUBDOMAIN` must both be set. With a
+   regional production topology, previews inherit the configured primary
+   region's Container Apps Environment and location.
 
 ### Finding a branch's custom URL (privately)
 
@@ -166,6 +231,20 @@ This repository is public, and **GitHub does not mask secrets in job summaries**
 hostname — it embeds the secret `CUSTOM_SUBDOMAIN`/`CUSTOM_DOMAIN_NAME`. The
 branch name and its derived `{name}-{hash}` segment are public; only the
 subdomain and domain stay secret.
+
+Each deploy job instead publishes two non-secret values in its job summary and
+`deploy` job outputs:
+
+- `custom_subdomain_suffix` is the public branch-derived suffix, including its
+  leading hyphen (for example, `-feature-login` or
+  `-feature-super-long-b-71b3`). Production has no suffix because it uses the
+  base subdomain.
+- `custom_url_template` is a literal format such as
+  `https://<CUSTOM_SUBDOMAIN>-feature-login.<CUSTOM_DOMAIN_NAME>`. The
+  placeholder tokens are never replaced in CI and are not a live endpoint.
+
+An administrator can copy those values to determine the expected custom URL
+format, then replace the two placeholder tokens only in a private environment.
 
 To resolve the full URL yourself, use either method below.
 
@@ -206,13 +285,24 @@ az containerapp show -g rg-production \
 ### Greenfield expectations
 
 - `main` deploys are expected to work from a clean app-stack state (no pre-existing app resource groups) when required inputs are supplied.
-- Branch deploys are expected to provision from scratch against shared production infra and clean up completely when the branch is removed.
+- Branch deploys are expected to provision from scratch against shared production infra and clean up on the next orphan-cleanup run after the branch is removed.
 
 ### Optional ACMEbot behavior
 
-- ACMEbot integration is optional. Deployments do not require ACMEbot itself when BYO cert inputs are supplied.
-- In production, `manageAcmebotPermissions=true` lets IaC provision the cert-reader identity and ACMEbot-related role assignments.
-- If you set `manageAcmebotPermissions=false`, supply/maintain equivalent permissions manually.
+- ACMEbot integration is optional. Production deployments without a BYO
+  certificate do not reference ACMEbot, its Function App, or its Key Vault.
+- In production, `MANAGE_ACMEBOT_PERMISSIONS=true` is consulted only when the
+  custom-domain pair and BYO certificate URL/name are supplied and
+  `CERT_READER_IDENTITY_ID` is empty. In that explicit path, IaC creates the
+  cert-reader identity and ACMEbot-related role assignments.
+- Set `MANAGE_ACMEBOT_PERMISSIONS=false` and provide
+  `CERT_READER_IDENTITY_ID` when the cert reader and permissions are managed
+  outside of this template.
+- The deployment identity needs **User Access Administrator** or **Owner** at
+  the relevant production and certificate-Key-Vault scopes when
+  `MANAGE_ACMEBOT_PERMISSIONS=true`, because that path creates Azure role
+  assignments. The normal Contributor role is sufficient when using an
+  externally managed reader identity.
 
 ### Legacy hygiene and protected resources
 
@@ -222,11 +312,10 @@ az containerapp show -g rg-production \
 
 ### Automatic Cleanup
 
-When a branch is deleted from GitHub:
-1. The cleanup workflow triggers automatically
-2. Deletes the branch's Container App
-3. Removes DNS records (CNAME and TXT)
-4. Leaves shared production certificate resources intact
+The cleanup workflow runs daily and can be started manually. It:
+1. Deletes orphaned branch Container Apps
+2. Removes matching DNS records (CNAME and TXT)
+3. Leaves shared production certificate resources intact
 
 **Note:** The main branch cleanup is blocked to prevent accidental deletion of production.
 
@@ -262,9 +351,9 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 | Deployment form | Trigger | Infra shape |
 |---|---|---|
 | Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path (greenfield-capable) |
-| Production multi-region | `main` push/manual with non-empty `REGIONS_JSON` | `rg-production`, per-region CAE/apps + Static Web App apex (greenfield-capable) |
-| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared CAE, creates branch app + DNS from scratch |
-| Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own ACR/CAE/app |
+| Production multi-region | `main` push/manual with valid nonempty `REGIONS_JSON`, custom domain, and BYO cert URL/name | `rg-production`, per-region CAE/apps + Static Web App apex (greenfield-capable) |
+| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared primary CAE, creates branch app and optional DNS from scratch |
+| Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own safely derived ACR/CAE/app names |
 
 ## Customization
 
@@ -272,7 +361,7 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 
 Primary CI/CD customization points are configured in GitHub repository settings:
 
-- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`
+- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`, `MANAGE_ACMEBOT_PERMISSIONS`
 - Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`
 
 ### Infrastructure

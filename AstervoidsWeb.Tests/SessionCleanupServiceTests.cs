@@ -26,6 +26,8 @@ namespace AstervoidsWeb.Tests;
 /// </summary>
 public class SessionCleanupServiceTests
 {
+    private readonly SessionOperationCoordinator _operationCoordinator = new();
+
     private static IHubContext<SessionHub> CreateHubContextMock(
         Action<string, object?[]>? onClientSend = null)
     {
@@ -56,7 +58,7 @@ public class SessionCleanupServiceTests
         return hubContext.Object;
     }
 
-    private static SessionCleanupService CreateCleanupService(
+    private SessionCleanupService CreateCleanupService(
         ISessionService sessionService,
         SyncSchemaRegistry registry,
         int emptyTimeoutSeconds = 0,
@@ -73,11 +75,24 @@ public class SessionCleanupServiceTests
             CreateHubContextMock(onClientSend),
             registry,
             settings,
-            Mock.Of<ILogger<SessionCleanupService>>());
+            Mock.Of<ILogger<SessionCleanupService>>(),
+            _operationCoordinator);
     }
 
     private static PositionalSchemaCodec.Schema MakeSchema(byte id) =>
         new(id, new[] { new PositionalSchemaCodec.FieldSpec("x", "f64") });
+
+    [Fact]
+    public void Constructor_NullCoordinator_IsRejected()
+    {
+        var create = () => new SessionCleanupService(
+            TestServiceFactory.CreateSessionService(), CreateHubContextMock(),
+            new SyncSchemaRegistry(), Options.Create(new SessionSettings()),
+            Mock.Of<ILogger<SessionCleanupService>>(), null!);
+
+        create.Should().Throw<ArgumentNullException>()
+            .WithParameterName("operationCoordinator");
+    }
 
     /// <summary>
     /// Pre-fix regression: the last member leaving a session called
@@ -89,7 +104,7 @@ public class SessionCleanupServiceTests
     public void LastMemberLeave_KeepsSchemaRegistryIntact_ForRejoinPath()
     {
         // Arrange
-        var sessionService = new SessionService();
+        var sessionService = TestServiceFactory.CreateSessionService();
         var registry = new SyncSchemaRegistry();
         var createResult = sessionService.CreateSession("connection-1");
         var session = createResult.Session!;
@@ -123,7 +138,7 @@ public class SessionCleanupServiceTests
     public async Task CleanupExpiredSessions_DestroysEmptySession_AndClearsSchemaRegistry()
     {
         // Arrange: session with schemas, all members gone, empty-timeout = 0
-        var sessionService = new SessionService();
+        var sessionService = TestServiceFactory.CreateSessionService();
         var registry = new SyncSchemaRegistry();
         var session = sessionService.CreateSession("connection-1").Session!;
         registry.SetSessionSchemas(session.Id, new[] { MakeSchema(1) });
@@ -150,7 +165,7 @@ public class SessionCleanupServiceTests
     [Fact]
     public async Task CleanupExpiredSessions_LeavesActiveSessionsAlone()
     {
-        var sessionService = new SessionService();
+        var sessionService = TestServiceFactory.CreateSessionService();
         var registry = new SyncSchemaRegistry();
         var session = sessionService.CreateSession("connection-1").Session!;
         registry.SetSessionSchemas(session.Id, new[] { MakeSchema(1) });
@@ -171,7 +186,7 @@ public class SessionCleanupServiceTests
     [Fact]
     public void RejoinAfterLastLeave_FindsSchemasStillRegistered()
     {
-        var sessionService = new SessionService();
+        var sessionService = TestServiceFactory.CreateSessionService();
         var registry = new SyncSchemaRegistry();
         var session = sessionService.CreateSession("connection-1").Session!;
         registry.SetSessionSchemas(session.Id, new[] { MakeSchema(7) });
@@ -190,7 +205,7 @@ public class SessionCleanupServiceTests
     [Fact]
     public async Task AbsoluteExpiration_IdentifiesSessionInClientNotification()
     {
-        var sessionService = new SessionService();
+        var sessionService = TestServiceFactory.CreateSessionService();
         var registry = new SyncSchemaRegistry();
         var session = sessionService.CreateSession("connection-1").Session!;
         var notifications = new List<(string Method, object?[] Args)>();

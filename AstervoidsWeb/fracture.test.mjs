@@ -208,6 +208,246 @@ function fragmentPolygon(parentVerts, R, vx, vy, omega, offsetN, bulletAngle, cf
 const FRACTURE_ON_CONFIG = { ...CONFIG, FRACTURE_ENABLED: true };
 const FRACTURE_OFF_CONFIG = { ...CONFIG, FRACTURE_ENABLED: false };
 
+// Full results captured before the stage refactor; no expected physics is
+// recalculated through production helpers. Keep these inputs independent of defaults.
+const GOLDEN_CONFIG = {
+    FRACTURE_ENABLED: true,
+    ASTEROID_DENSITY: 2.5,
+    INITIAL_ASTEROID_RADIUS: 0.1,
+    MIN_ASTEROID_RADIUS: 0.01,
+    DEFLECTION_KICK: 0.04,
+    SEPARATION_ENERGY: 0.00002,
+    SEPARATION_ENERGY_SIZE_BLEND: 0.35,
+    SEPARATION_ANGLE_VARIANCE: 0.3,
+    FRACTURE_VERTEX_DENSITY: 1.3,
+    FRACTURE_JAGGEDNESS: 0.08,
+    MIN_SPLIT_RATIO: 0.12,
+    MASS_SPLIT_BIAS: 0.7,
+};
+const GOLDEN_PARENT = {
+    radius: 0.083,
+    velocityX: 0.13,
+    velocityY: -0.07,
+    rotationSpeed: 0.025,
+    angle: 0.37,
+    seed: 0.314159,
+    vertices: [
+        { angle: 0.05, distance: 0.09 },
+        { angle: 1.1, distance: 0.07 },
+        { angle: 2.15, distance: 0.085 },
+        { angle: 3.2, distance: 0.075 },
+        { angle: 4.25, distance: 0.095 },
+        { angle: 5.3, distance: 0.08 },
+    ],
+};
+const GOLDEN_IMPACT = { offsetN: -0.28, bulletAngle: 0.71 };
+const GOLDEN_POLYGON = {
+    children: [
+        {
+            r: 0.050196984451300906,
+            m: 0.0062993431200103625,
+            inertia: 0.00001039608937711642,
+            cx: 0.0270800308595345,
+            cy: -0.03587195253128296,
+            vx: 0.21936583328321266,
+            vy: -0.0722609220944321,
+            omega: 0.3507733617664371,
+            vertices: [
+                { angle: -2.7423577640850114, distance: 0.07068837654354325 },
+                { angle: -2.118828453523843, distance: 0.06879829998450215 },
+                { angle: -0.25915589404898737, distance: 0.03967021949457324 },
+                { angle: 0.9214110467766294, distance: 0.09111667628970795 },
+                { angle: 0.9511530974901063, distance: 0.0905090535687141 },
+                { angle: 1.2798490821909443, distance: 0.04294532862450338 },
+                { angle: 2.849601829585159, distance: 0.028909840363183368 },
+            ],
+        },
+        {
+            r: 0.06610039903053426,
+            m: 0.010923156879989637,
+            inertia: 0.000022706866737504883,
+            cx: -0.012346896698775587,
+            cy: 0.013733415122748801,
+            vx: 0.12873052388632486,
+            vy: -0.026439333533280932,
+            omega: 0.3507733617664371,
+            vertices: [
+                { angle: 0.255991132242067, distance: 0.09508824425421994 },
+                { angle: 1.236964543306055, distance: 0.05917830217574391 },
+                { angle: 2.5792841549421572, distance: 0.06708302747958841 },
+                { angle: -2.4647826232436363, distance: 0.07167401758180149 },
+                { angle: -1.8926417189447957, distance: 0.08125507462701577 },
+                { angle: -1.2937174745802404, distance: 0.04292044506672367 },
+                { angle: -0.16214910605410116, distance: 0.0524340127086279 },
+            ],
+        },
+    ],
+    mass: 0.0172225,
+    inertia: 0.00004914470573403844,
+    impulse: { x: 0.0005224354963698611, y: 0.00044904828485673663 },
+    postImpulse: {
+        velocityX: 0.16033447503962034,
+        velocityY: -0.04392664915913854,
+        angularVelocity: 0.3507733617664371,
+    },
+    fracture: {
+        parentArea: 0.017556446463115962,
+        positiveArea: 0.011134958279678028,
+        negativeArea: 0.006421488183437933,
+        effectivePi: 2.548475317624613,
+    },
+};
+const GOLDEN_FALLBACK_IMPACT = { offsetN: -1.4, bulletAngle: NaN };
+const GOLDEN_DISK = {
+    children: [
+        {
+            r: 0.03214576177352156,
+            m: 0.0025833750000000006,
+            cx: -0.033447742515120484,
+            cy: -0.06211723609950946,
+            vx: 0.18060650426475536,
+            vy: -0.22006244395043606,
+            omega: 0.988855421686747,
+            vertices: null,
+        },
+        {
+            r: 0.07652221899553097,
+            m: 0.014639125000000001,
+            cx: 0.005902542796785969,
+            cy: 0.010961865194031084,
+            vx: 0.1625033745378514,
+            vy: -0.06582897215157094,
+            omega: 0.988855421686747,
+            vertices: null,
+        },
+    ],
+    mass: 0.0172225,
+    inertia: 0.00005932290125000001,
+    impulse: { x: 0.0006065565407363866, y: -0.0003266073680888236 },
+    postImpulse: {
+        velocityX: 0.16521884399688702,
+        velocityY: -0.08896399292140071,
+        angularVelocity: 0.988855421686747,
+    },
+    fracture: null,
+};
+
+function assertFragmentGolden(actual, expected, path = 'result') {
+    if (typeof expected === 'number') {
+        assert.equal(typeof actual, 'number', path);
+        assert.ok(Math.abs(actual - expected) < 1e-12,
+            `${path}: ${actual} != ${expected}`);
+    } else if (expected === null) {
+        assert.equal(actual, null, path);
+    } else {
+        assert.equal(Array.isArray(actual), Array.isArray(expected), path);
+        assert.deepEqual(Object.keys(actual).sort(), Object.keys(expected).sort(), `${path} keys`);
+        for (const key of Object.keys(expected)) {
+            assertFragmentGolden(actual[key], expected[key], `${path}.${key}`);
+        }
+    }
+}
+
+test('golden: rotated irregular polygon preserves full seeded fracture and impulse results', () => {
+    const result = calculateAsteroidFragments(GOLDEN_PARENT, GOLDEN_IMPACT, GOLDEN_CONFIG);
+    assertFragmentGolden(result, GOLDEN_POLYGON);
+});
+
+test('golden: polygon chip keeps recentered geometry and rigid motion without separation', () => {
+    const result = calculateAsteroidFragments(GOLDEN_PARENT, GOLDEN_IMPACT, {
+        ...GOLDEN_CONFIG, MIN_ASTEROID_RADIUS: 0.06,
+    });
+    assertFragmentGolden(result, {
+        ...GOLDEN_POLYGON,
+        children: [{
+            ...GOLDEN_POLYGON.children[1],
+            vx: 0.15551715884847972,
+            vy: -0.048257611621550976,
+        }],
+    });
+});
+
+for (const [name, vertices, enabled] of [
+    ['missing', undefined, true],
+    ['null', null, true],
+    ['empty', [], true],
+    ['too few', GOLDEN_PARENT.vertices.slice(0, 2), true],
+    ['zero area', Array(3).fill({ angle: 0.5, distance: 0.02 }), true],
+    ['disabled', GOLDEN_PARENT.vertices, false],
+]) {
+    test(`golden: ${name} geometry uses disk fallback with clamped offset and inferred angle`, () => {
+        const result = calculateAsteroidFragments(
+            { ...GOLDEN_PARENT, vertices },
+            GOLDEN_FALLBACK_IMPACT,
+            { ...GOLDEN_CONFIG, FRACTURE_ENABLED: enabled });
+        assertFragmentGolden(result, GOLDEN_DISK);
+    });
+}
+
+test('golden: missed polygon clip falls back to disk children but retains polygon inertia', () => {
+    const result = calculateAsteroidFragments(
+        GOLDEN_PARENT, { offsetN: 1.4, bulletAngle: 0.71 }, GOLDEN_CONFIG);
+    assertFragmentGolden(result, {
+        ...GOLDEN_POLYGON,
+        children: [
+            {
+                r: 0.03214576177352156,
+                m: 0.0025833750000000006,
+                cx: -0.04598687254556941,
+                cy: 0.05350243035113036,
+                vx: 0.13155371654477255,
+                vy: 0.06911915400319113,
+                omega: -1.1384762920229898,
+                vertices: null,
+            },
+            {
+                r: 0.07652221899553097,
+                m: 0.014639125000000001,
+                cx: 0.008115330449218132,
+                cy: -0.00944160535608183,
+                vx: 0.16541343242106407,
+                vy: -0.06387590854072614,
+                omega: -1.1384762920229898,
+                vertices: null,
+            },
+        ],
+        postImpulse: {
+            ...GOLDEN_POLYGON.postImpulse,
+            angularVelocity: -1.1384762920229898,
+        },
+        fracture: null,
+    });
+});
+
+test('golden: disk chip stays at the parent center and inherits post-impulse motion', () => {
+    const result = calculateAsteroidFragments(
+        { ...GOLDEN_PARENT, vertices: null },
+        GOLDEN_FALLBACK_IMPACT,
+        { ...GOLDEN_CONFIG, MIN_ASTEROID_RADIUS: 0.06 });
+    assertFragmentGolden(result, {
+        ...GOLDEN_DISK,
+        children: [{
+            ...GOLDEN_DISK.children[1],
+            cx: 0,
+            cy: 0,
+            vx: 0.16521884399688702,
+            vy: -0.08896399292140071,
+        }],
+    });
+});
+
+test('golden: fragments exactly at the minimum radius survive in both paths', () => {
+    const polygon = calculateAsteroidFragments(GOLDEN_PARENT, GOLDEN_IMPACT, {
+        ...GOLDEN_CONFIG, MIN_ASTEROID_RADIUS: GOLDEN_POLYGON.children[0].r,
+    });
+    const disk = calculateAsteroidFragments(
+        { ...GOLDEN_PARENT, vertices: null },
+        GOLDEN_FALLBACK_IMPACT,
+        { ...GOLDEN_CONFIG, MIN_ASTEROID_RADIUS: GOLDEN_DISK.children[0].r });
+    assertFragmentGolden(polygon, GOLDEN_POLYGON);
+    assertFragmentGolden(disk, GOLDEN_DISK);
+});
+
 test('fracture split master flag defaults to enabled', () => {
     assert.equal(CONFIG.FRACTURE_ENABLED, true);
 });

@@ -30,14 +30,14 @@ public class SessionHub : Hub
         ILogger<SessionHub> logger,
         ServerMetricsService metrics,
         SyncSchemaRegistry schemaRegistry,
-        ISessionOperationCoordinator? operationCoordinator = null)
+        ISessionOperationCoordinator operationCoordinator)
     {
         _sessionService = sessionService;
         _objectService = objectService;
         _logger = logger;
         _metrics = metrics;
         _schemaRegistry = schemaRegistry;
-        _operationCoordinator = operationCoordinator ?? new SessionOperationCoordinator();
+        _operationCoordinator = operationCoordinator ?? throw new ArgumentNullException(nameof(operationCoordinator));
     }
 
     private sealed class CallerSessionOperation : IDisposable

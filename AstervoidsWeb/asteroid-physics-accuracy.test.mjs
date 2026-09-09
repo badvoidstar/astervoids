@@ -1,6 +1,6 @@
 /**
  * Tests for the four asteroid-physics accuracy improvements:
- *   1. Geometry-based parent mass (area-calibrated, baseline-preserving)
+ *   1. Radius-calibrated parent mass (baseline-preserving)
  *   2. True centroidal polygon moment of inertia
  *   3. Actual polygon-boundary impact point and resulting torque/spin
  *   4. Fragment-specific inertia and mass conservation
@@ -52,12 +52,11 @@ function makeAsteroid(verts, R, vx = 0, vy = 0, omega = 0) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GOAL 1: Geometry-based parent mass
+// GOAL 1: Radius-calibrated parent mass
 // ─────────────────────────────────────────────────────────────────────────────
 
 test('Goal1: regular-polygon mass equals legacy disk mass (baseline calibration)', () => {
-    // For a regular n-gon with circumradius R the effectivePi calibration
-    // ensures mass = density * R² exactly.
+    // Parent mass is density * R² regardless of polygon area.
     const R = 0.083;
     const density = CONFIG.ASTEROID_DENSITY;
     const legacyMass = density * R * R;
@@ -69,10 +68,9 @@ test('Goal1: regular-polygon mass equals legacy disk mass (baseline calibration)
         `mass=${result.mass} legacyMass=${legacyMass}`);
 });
 
-test('Goal1: irregular polygon mass proportional to actual area, not R²', () => {
+test('Goal1: irregular polygon mass uses radius rather than actual area', () => {
     // Build a rectangle (width=2R, height=R/2) — area = R² vs circle ~π R².
-    // Its effectivePi calibration should give mass = density * R² despite
-    // having a very different area from a circle.
+    // It still has mass = density * R² despite the different area.
     const R = 0.083;
     const density = CONFIG.ASTEROID_DENSITY;
     const legacyMass = density * R * R;

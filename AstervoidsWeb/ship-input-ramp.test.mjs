@@ -3,19 +3,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
-// Extract the rampInputToward function from the index.html script section.
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
-const fnMatch = html.match(
-    /function rampInputToward\(current, target, accelTime, decelTime, dtSec\) \{[\s\S]*?\n {4}\}/
-);
-assert.ok(fnMatch, 'rampInputToward must be defined in index.html');
-// eslint-disable-next-line no-eval
-const rampInputToward = eval(`(${fnMatch[0].replace('function rampInputToward', 'function')})`);
+const { rampInputToward } = loadInlineGameFunctions(['rampInputToward']);
 
 const FRAME_60 = 1 / 60; // dtSec for one frame at 60fps
 

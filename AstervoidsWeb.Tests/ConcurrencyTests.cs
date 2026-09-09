@@ -553,7 +553,7 @@ public class ConcurrencyTests : TestBase
         // We run 10 independent trials; in each the first joiner must be promoted.
         for (int trial = 0; trial < 10; trial++)
         {
-            var svc = new SessionService();
+            var svc = TestServiceFactory.CreateSessionService();
             svc.CreateSession("server");
             var session = svc.GetAllSessions().First();
 
@@ -588,7 +588,7 @@ public class ConcurrencyTests : TestBase
         // Repeat the promotion scenario many times and verify exactly one server every time
         for (int trial = 0; trial < 20; trial++)
         {
-            var svc = new SessionService();
+            var svc = TestServiceFactory.CreateSessionService();
             svc.CreateSession("server");
             var session = svc.GetAllSessions().First();
             svc.JoinSession(session.Id, "c1");

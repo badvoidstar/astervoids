@@ -10,12 +10,26 @@ namespace AstervoidsWeb.Tests;
 
 public class SessionHubTests
 {
-    private readonly SessionService _sessionService = new();
+    private readonly SessionService _sessionService = TestServiceFactory.CreateSessionService();
     private readonly ObjectService _objectService;
+    private readonly SessionOperationCoordinator _operationCoordinator = new();
+    private readonly SyncSchemaRegistry _schemaRegistry = new();
 
     public SessionHubTests()
     {
         _objectService = new ObjectService(_sessionService);
+    }
+
+    [Fact]
+    public void Constructor_NullCoordinator_IsRejected()
+    {
+        using var metrics = new ServerMetricsService();
+        var create = () => new SessionHub(
+            _sessionService, _objectService, Mock.Of<ILogger<SessionHub>>(),
+            metrics, _schemaRegistry, null!);
+
+        create.Should().Throw<ArgumentNullException>()
+            .WithParameterName("operationCoordinator");
     }
 
     [Fact]
@@ -205,7 +219,8 @@ public class SessionHubTests
             Mock.Of<IObjectService>(),
             Mock.Of<ILogger<SessionHub>>(),
             new ServerMetricsService(),
-            registry);
+            registry,
+            _operationCoordinator);
         var context = new Mock<HubCallerContext>();
         context.SetupGet(value => value.ConnectionId)
             .Returns("connection-new");
@@ -343,16 +358,15 @@ public class SessionHubTests
     private SessionHub CreateHub(
         string connectionId,
         Mock<IGroupManager>? groupsMock = null,
-        Mock<IClientProxy>? clientProxyMock = null,
-        ISessionOperationCoordinator? coordinator = null)
+        Mock<IClientProxy>? clientProxyMock = null)
     {
         var hub = new SessionHub(
             _sessionService,
             _objectService,
             Mock.Of<ILogger<SessionHub>>(),
             new ServerMetricsService(),
-            new SyncSchemaRegistry(),
-            coordinator);
+            _schemaRegistry,
+            _operationCoordinator);
 
         var context = new Mock<HubCallerContext>();
         context.SetupGet(c => c.ConnectionId).Returns(connectionId);
@@ -919,7 +933,6 @@ public class SessionHubTests
         var createResult = _sessionService.CreateSession("connection-1");
         var session = createResult.Session!;
         _sessionService.JoinSession(session.Id, "connection-2");
-        var coordinator = new SessionOperationCoordinator();
         var firstSendEntered = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseFirstSend = new TaskCompletionSource(
@@ -942,9 +955,9 @@ public class SessionHubTests
             .Returns(Task.CompletedTask);
 
         var firstHub = CreateHubWithProxy(
-            "connection-1", firstProxy, coordinator);
+            "connection-1", firstProxy);
         var secondHub = CreateHubWithProxy(
-            "connection-2", secondProxy, coordinator);
+            "connection-2", secondProxy);
 
         var first = firstHub.CreateObject(
             SyncPayloadCodec.EncodeDict(
@@ -968,10 +981,8 @@ public class SessionHubTests
 
     private SessionHub CreateHubWithProxy(
         string connectionId,
-        Mock<IClientProxy> proxy,
-        ISessionOperationCoordinator? coordinator = null)
+        Mock<IClientProxy> proxy)
         => CreateHub(
             connectionId,
-            clientProxyMock: proxy,
-            coordinator: coordinator);
+            clientProxyMock: proxy);
 }

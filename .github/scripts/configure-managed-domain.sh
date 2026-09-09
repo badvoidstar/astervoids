@@ -9,6 +9,12 @@ set -euo pipefail
 
 echo "Configuring custom domain: $CUSTOM_DOMAIN (single-region managed-cert flow)"
 
+set_custom_domain_ready() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'custom_domain_ready=%s\n' "$1" >> "$GITHUB_OUTPUT"
+  fi
+}
+
 check_dns() {
   local cname_result txt_result
   echo "Checking DNS propagation for $CUSTOM_DOMAIN..."
@@ -119,6 +125,7 @@ for attempt in $(seq 1 "$max_retries"); do
       echo "DNS not propagated yet, will retry..."
       if [ "$attempt" -eq "$max_retries" ]; then
         echo "::warning::DNS not propagated after $max_retries attempts. Custom domain setup incomplete."
+        set_custom_domain_ready false
         exit 0
       fi
       continue
@@ -127,6 +134,7 @@ for attempt in $(seq 1 "$max_retries"); do
 
   if bind_single_region; then
     echo "Single-region custom domain bound on attempt $attempt"
+    set_custom_domain_ready true
     exit 0
   fi
   echo "Bind attempt $attempt failed; will retry..."
@@ -135,3 +143,4 @@ done
 echo "::warning::Custom domain setup incomplete after $max_retries attempts."
 echo "The deployment succeeded but HTTPS is not yet configured."
 echo "Usually resolves on the next deployment after DNS propagates."
+set_custom_domain_ready false

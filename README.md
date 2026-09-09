@@ -74,10 +74,10 @@ Deployment time varies with image build, registry, and Azure provisioning state.
 | Resource | Name Pattern | Purpose |
 |----------|--------------|---------|
 | Resource Group | `rg-{env}` | Container for all resources |
-| Container Registry | `cr{env}{unique}` | Stores Docker images |
-| Container Apps Environment | `cae-{env}` | Managed environment for containers |
-| Container App | `ca-web-{env}` | Runs the game; scaling limits are defined in [`infra/main.bicep`](infra/main.bicep) |
-| Log Analytics | `log-cae-{env}` | Logging and monitoring |
+| Container Registry | `cr{normalized-env}{unique}` | Stores Docker images; hyphens are removed and the original environment still contributes to the unique suffix |
+| Container Apps Environment | `cae-{safe-env}` | Managed environment for containers; long or unsuitable environment labels use a deterministic safe suffix |
+| Container App | `ca-web-{safe-env}` | Runs the game; scaling limits are defined in [`infra/main.bicep`](infra/main.bicep) |
+| Log Analytics | `log-cae-{safe-env}` | Logging and monitoring |
 
 ## Project Structure
 

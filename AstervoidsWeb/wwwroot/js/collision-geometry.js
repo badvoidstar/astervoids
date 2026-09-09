@@ -1,5 +1,5 @@
 /**
- * Pure continuous-collision geometry for fast projectiles.
+ * Shared stationary and continuous-collision geometry.
  */
 const AstervoidsCollision = (function() {
     function pointSegmentDistanceSquared(point, start, end) {
@@ -98,6 +98,19 @@ const AstervoidsCollision = (function() {
         return inside;
     }
 
+    function circlePolygonCollision(circle, vertices) {
+        if (pointInPolygon(circle, vertices)) return true;
+        const radiusSquared = circle.radius * circle.radius;
+        for (let i = 0; i < vertices.length; i++) {
+            if (pointSegmentDistanceSquared(
+                circle, vertices[i], vertices[(i + 1) % vertices.length])
+                <= radiusSquared) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function sweptCircleIntersectsCircle(start, end, circle) {
         const reach = start.radius + circle.radius;
         return pointSegmentDistanceSquared(circle, start, end) <= reach * reach;
@@ -127,6 +140,8 @@ const AstervoidsCollision = (function() {
     }
 
     return Object.freeze({
+        pointInPolygon,
+        circlePolygonCollision,
         sweptCircleIntersectsCircle,
         sweptCirclePolygonCollision,
         wrappedDelta,

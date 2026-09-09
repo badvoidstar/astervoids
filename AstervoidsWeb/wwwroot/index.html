@@ -3082,21 +3082,7 @@
      * @returns {boolean} True if point is inside polygon
      */
     function pointInPolygon(point, vertices) {
-        let inside = false;
-        const n = vertices.length;
-        
-        for (let i = 0, j = n - 1; i < n; j = i++) {
-            const xi = vertices[i].x, yi = vertices[i].y;
-            const xj = vertices[j].x, yj = vertices[j].y;
-            
-            // Check if ray from point crosses this edge
-            if (((yi > point.y) !== (yj > point.y)) &&
-                (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi)) {
-                inside = !inside;
-            }
-        }
-        
-        return inside;
+        return AstervoidsCollision.pointInPolygon(point, vertices);
     }
 
     /**
@@ -3107,45 +3093,7 @@
      * @returns {boolean} True if collision detected
      */
     function circlePolygonCollision(circle, vertices) {
-        // First check if circle center is inside polygon
-        if (pointInPolygon({x: circle.x, y: circle.y}, vertices)) {
-            return true;
-        }
-        
-        // Then check if circle intersects any polygon edge
-        const n = vertices.length;
-        for (let i = 0; i < n; i++) {
-            const v1 = vertices[i];
-            const v2 = vertices[(i + 1) % n];
-            
-            // Find closest point on edge to circle center
-            const edgeX = v2.x - v1.x;
-            const edgeY = v2.y - v1.y;
-            const edgeLength = Math.sqrt(edgeX * edgeX + edgeY * edgeY);
-            
-            // Normalize edge vector
-            const edgeNormX = edgeX / edgeLength;
-            const edgeNormY = edgeY / edgeLength;
-            
-            // Vector from v1 to circle center
-            const toCircleX = circle.x - v1.x;
-            const toCircleY = circle.y - v1.y;
-            
-            // Project onto edge
-            let projection = toCircleX * edgeNormX + toCircleY * edgeNormY;
-            projection = Math.max(0, Math.min(edgeLength, projection));
-            
-            // Closest point on edge
-            const closestX = v1.x + edgeNormX * projection;
-            const closestY = v1.y + edgeNormY * projection;
-            
-            // Check distance from closest point to circle center
-            if (distance(closestX, closestY, circle.x, circle.y) <= circle.radius) {
-                return true;
-            }
-        }
-        
-        return false;
+        return AstervoidsCollision.circlePolygonCollision(circle, vertices);
     }
 
     // ============================================
@@ -5852,45 +5800,20 @@
         }
     }
 
-    /**
-     * Sync GameState to ObjectSync (GameState owner only)
-     * Aggregates score from all ships and processes hitCounts for lives
-     */
-    let malformedGameStateLedgerKey = null;
-    function syncGameState(immediate = false) {
-        if (!isSessionMode() || !isGameStateOwner() || !game.multiplayer.gameStateObjectId) return;
-        
-        const gsObj = ObjectSync.getObject(game.multiplayer.gameStateObjectId);
-        let processedHits;
-        let processedScores;
-        try {
-            processedHits = AstervoidsWireCodec.unpackCounterMap(
-                gsObj?.data?.processedHits);
-            processedScores = AstervoidsWireCodec.unpackCounterMap(
-                gsObj?.data?.processedScores);
-            malformedGameStateLedgerKey = null;
-        } catch (error) {
-            const ledgerKey = `${game.multiplayer.gameStateObjectId}:${gsObj?.version ?? 0}`;
-            if (malformedGameStateLedgerKey !== ledgerKey) {
-                malformedGameStateLedgerKey = ledgerKey;
-                _error('[Multiplayer] Refusing malformed GameState ledgers:', error);
-            }
-            return;
-        }
-        let groupScore = gsObj?.data?.groupScore || 0;
+    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold) {
+        const processedHits = { ...ledgers.processedHits };
+        const processedScores = { ...ledgers.processedScores };
+        let groupScore = persisted?.groupScore || 0;
         const persistedScoreLifeAwardCount =
-            Number(gsObj?.data?.scoreLifeAwardCount);
+            Number(persisted?.scoreLifeAwardCount);
         let scoreLifeAwardCount = Number.isFinite(persistedScoreLifeAwardCount)
             && persistedScoreLifeAwardCount > 0
             ? Math.floor(persistedScoreLifeAwardCount)
             : 0;
-        let observedScoreLifeAwardCount =
-            game.multiplayer.observedScoreLifeAwardCount;
+        let observedScoreLifeAwardCount = local.observedScoreLifeAwardCount;
         if (observedScoreLifeAwardCount === null
             || scoreLifeAwardCount > observedScoreLifeAwardCount) {
             observedScoreLifeAwardCount = scoreLifeAwardCount;
-            game.multiplayer.observedScoreLifeAwardCount =
-                observedScoreLifeAwardCount;
         }
         const pendingScoreLifeAwards = Math.max(
             0, observedScoreLifeAwardCount - scoreLifeAwardCount);
@@ -5901,10 +5824,9 @@
         // so that they are always from the same sync point. Using game.lives would
         // be stale if a remote delta arrived between the last updateGameStateFromSync()
         // and an ownership migration — causing incorrect lives on the new owner.
-        let lives = (gsObj?.data?.lives ?? game.lives) + pendingScoreLifeAwards;
+        let lives = (persisted?.lives ?? local.lives) + pendingScoreLifeAwards;
         
         // Accumulate score deltas from all ships (survives member departure)
-        const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
         for (const ship of shipObjects) {
             const shipId = ship.id.toLowerCase();
             const shipScore = ship.data?.score || 0;
@@ -5915,22 +5837,23 @@
                 processedScores[shipId] = shipScore;
             }
         }
-        game.score = groupScore;
 
         // Score-based lives are derived from the authoritative shared total.
         // The persisted count makes the award idempotent across ownership migration.
         const eligibleScoreLifeAwards = countExtraLivesForScore(
-            groupScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+            groupScore, extraLifeThreshold);
         const newScoreLifeAwards = Math.max(
             0, eligibleScoreLifeAwards - scoreLifeAwardCount);
+        let announceScoreLifeAward = false;
         if (newScoreLifeAwards > 0 && lives > 0) {
             lives += newScoreLifeAwards;
             scoreLifeAwardCount += newScoreLifeAwards;
-            game.multiplayer.observedScoreLifeAwardCount = scoreLifeAwardCount;
-            announceExtraLifeAward();
+            observedScoreLifeAwardCount = scoreLifeAwardCount;
+            announceScoreLifeAward = true;
         }
         
         // Process hitCounts from all ships (idempotent via processedHits tracking)
+        let beatStopCount = 0;
         for (const ship of shipObjects) {
             const shipId = ship.id.toLowerCase();
             const hitCount = ship.data?.hitCount || 0;
@@ -5941,7 +5864,7 @@
                 processedHits[shipId] = hitCount;
                 if (lives <= 0) {
                     lives = 0;
-                    AudioSystem.beat.stop();
+                    beatStopCount++;
                 }
             }
         }
@@ -5949,55 +5872,111 @@
         // Award extra lives when the ship count exceeds the previous peak.
         // Uses a high-water mark so reconnecting members (whose count returns to
         // a previously seen level) don't receive an extra life.
-        let peakShipCount = gsObj?.data?.peakShipCount || 0;
+        let peakShipCount = persisted?.peakShipCount || 0;
         const currentShipCount = shipObjects.length;
         if (currentShipCount > peakShipCount && lives > 0) {
             lives += currentShipCount - peakShipCount;
             peakShipCount = currentShipCount;
         }
         
-        // Write back to game.lives for local rendering/game-over checks
-        game.lives = lives;
+        return {
+            groupScore,
+            lives,
+            processedHits,
+            processedScores,
+            peakShipCount,
+            scoreLifeAwardCount,
+            observedScoreLifeAwardCount,
+            announceScoreLifeAward,
+            beatStopCount,
+            // A spectator inheriting ownership must not publish lobby as game state.
+            state: local.state === 'lobby' ? (persisted?.state ?? 'playing') : local.state
+        };
+    }
 
+    function calculateGameStateTerminal(lives, persisted, serverNowMs, terminalDelayMs) {
         // Stamp the authoritative game-over instant exactly once, the first sync
         // where the shared lives reach 0. Carried on the GameState object so every
         // member converges on the SAME server-time anchor (gameOverAt) for
         // deterministic terminal convergence, independent of when each member's local
         // lives counter observes the transition. Preserve any value already set
         // (gsObj.data) so later syncs don't move the anchor.
-        let gameOverAt = gsObj?.data?.gameOverAt ?? null;
+        let gameOverAt = persisted?.gameOverAt ?? null;
         if (lives <= 0 && gameOverAt == null) {
-            gameOverAt = Math.round(RemoteObjects.serverNowMs());
+            gameOverAt = Math.round(serverNowMs);
         }
-        let terminalAt = gsObj?.data?.terminalAt ?? null;
+        let terminalAt = persisted?.terminalAt ?? null;
         if (gameOverAt != null && terminalAt == null) {
-            terminalAt = gameOverAt + CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS;
+            terminalAt = gameOverAt + terminalDelayMs;
         }
-        
-        // If game.state is 'lobby' (spectator who just inherited ownership),
-        // adopt the actual game state from the GameState object so we don't
-        // broadcast 'lobby' as the state. After this, game.state tracks the
-        // actual state and no further guard is needed.
-        if (game.state === 'lobby') {
-            game.state = gsObj?.data?.state ?? 'playing';
-        }
-        
-        const gameStateData = {
+        return { gameOverAt, terminalAt };
+    }
+
+    function applyCalculatedGameState(next) {
+        game.score = next.groupScore;
+        game.multiplayer.observedScoreLifeAwardCount = next.observedScoreLifeAwardCount;
+        if (next.announceScoreLifeAward) announceExtraLifeAward();
+        for (let i = 0; i < next.beatStopCount; i++) AudioSystem.beat.stop();
+        game.lives = next.lives;
+    }
+
+    function serializeGameState(next, terminal) {
+        const { processedHits, processedScores } = next;
+        return {
             type: OBJECT_TYPES.GAME_STATE,
             gameStarted: true,
             wave: game.wave,
             state: game.state,
-            lives: lives,
-            groupScore: groupScore,
+            lives: next.lives,
+            groupScore: next.groupScore,
             speedMultiplier: game.speedMultiplier,
             waveDelayTimer: game.waveDelayTimer,
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
-            peakShipCount: peakShipCount,
-            gameOverAt: gameOverAt,
-            terminalAt: terminalAt,
-            scoreLifeAwardCount: scoreLifeAwardCount
+            peakShipCount: next.peakShipCount,
+            gameOverAt: terminal.gameOverAt,
+            terminalAt: terminal.terminalAt,
+            scoreLifeAwardCount: next.scoreLifeAwardCount
         };
+    }
+
+    let malformedGameStateLedgerKey = null;
+    function syncGameState(immediate = false) {
+        if (!isSessionMode() || !isGameStateOwner() || !game.multiplayer.gameStateObjectId) return;
+
+        const gsObj = ObjectSync.getObject(game.multiplayer.gameStateObjectId);
+        let ledgers;
+        try {
+            ledgers = {
+                processedHits: AstervoidsWireCodec.unpackCounterMap(gsObj?.data?.processedHits),
+                processedScores: AstervoidsWireCodec.unpackCounterMap(gsObj?.data?.processedScores)
+            };
+            malformedGameStateLedgerKey = null;
+        } catch (error) {
+            const ledgerKey = `${game.multiplayer.gameStateObjectId}:${gsObj?.version ?? 0}`;
+            if (malformedGameStateLedgerKey !== ledgerKey) {
+                malformedGameStateLedgerKey = ledgerKey;
+                _error('[Multiplayer] Refusing malformed GameState ledgers:', error);
+            }
+            return;
+        }
+
+        const next = calculateGameState(
+            gsObj?.data, ledgers, ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP),
+            {
+                lives: game.lives,
+                state: game.state,
+                observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
+            },
+            CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+        applyCalculatedGameState(next);
+        // Sample the clock only on the terminal edge, after score and damage effects.
+        const serverNowMs = next.lives <= 0 && gsObj?.data?.gameOverAt == null
+            ? RemoteObjects.serverNowMs() : null;
+        const terminal = calculateGameStateTerminal(
+            next.lives, gsObj?.data, serverNowMs, CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS);
+        game.state = next.state;
+        const gameStateData = serializeGameState(next, terminal);
         
         // This queues into pendingUpdates with the other object updates.
         ObjectSync.updateObject(game.multiplayer.gameStateObjectId, gameStateData, immediate);
@@ -6209,6 +6188,7 @@
         }
         
         updateHUD();
+        publishDebugMetrics();
         return true;
     }
     
@@ -6246,6 +6226,7 @@
         }
         
         updateHUD();
+        publishDebugMetrics();
         return true;
     }
 
@@ -6561,6 +6542,7 @@
         }
 
         updateHUD();
+        publishDebugMetrics();
     }
 
     /**
@@ -7036,6 +7018,7 @@
             }, ship.colorIndex);
             game.lives--;
             updateHUD();
+            publishDebugMetrics();
             if (game.lives <= 0) {
                 game.state = 'gameover';
                 AudioSystem.beat.stop();
@@ -7091,6 +7074,9 @@
             }
         }
         
+    }
+
+    function publishDebugMetrics() {
         // Broadcast debug metrics to /debug page via BroadcastChannel.
         // Early-out: skip all metric computation when no debug page is listening.
         if (isSessionMode() && (Date.now() - debugLastHeartbeat) < DEBUG_HEARTBEAT_TIMEOUT) {
@@ -7964,6 +7950,56 @@
         requestAnimationFrame(gameLoop);
     }
 
+    function updateOwnedAsteroids(dt, memberId) {
+        game.astervoids.forEach(asteroid => {
+            if (!asteroid.syncObjectId) {
+                asteroid.update(dt);
+            } else {
+                const record = ObjectSync.getObject(asteroid.syncObjectId);
+                if (record && record.ownerMemberId === memberId) {
+                    asteroid.update(dt);
+                }
+            }
+        });
+    }
+
+    function updateLocalBullet(bullet, dt, memberId) {
+        const isMyBullet = !isSessionMode() || bullet.ownerMemberId === memberId;
+        if (isMyBullet) bullet.update(dt);
+        if (isMyBullet && bullet.isExpired()) {
+            if (isSessionMode() && bullet.syncObjectId) {
+                deleteSyncedBullet(bullet);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    function advanceWaveProgression(dt, onWaveSpawned) {
+        if (game.astervoids.length === 0 && game.state === 'playing' && !spawningWave) {
+            if (!isSessionMode() || isGameStateOwner()) {
+                game.state = 'waveDelay';
+                game.waveDelayTimer = CONFIG.WAVE_DELAY;
+                if (isSessionMode()) syncGameState();
+            }
+        }
+        if (game.state === 'waveDelay') {
+            game.waveDelayTimer -= dt;
+            if (game.waveDelayTimer <= 0) {
+                if (!isSessionMode() || isGameStateOwner()) {
+                    spawningWave = true;
+                    spawnWave().then(() => {
+                        spawningWave = false;
+                        onWaveSpawned();
+                    });
+                }
+                game.state = 'playing';
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Advance the simulation by one logic step.
      * @param {number} dt - Delta-time multiplier (1.0 = one 60fps frame). In
@@ -8026,17 +8062,7 @@
                 // Update astervoids: owner updates locally, non-owners sync from server
                 if (isSessionMode()) {
                     const myMemberId = SessionClient.getCurrentMember()?.id;
-                    // Update locally-owned astervoids
-                    game.astervoids.forEach(asteroid => {
-                        if (!asteroid.syncObjectId) {
-                            asteroid.update(dt); // Unsynced local asteroid
-                        } else {
-                            const syncObj = ObjectSync.getObject(asteroid.syncObjectId);
-                            if (syncObj && syncObj.ownerMemberId === myMemberId) {
-                                asteroid.update(dt); // We own this asteroid
-                            }
-                        }
-                    });
+                    updateOwnedAsteroids(dt, myMemberId);
                     // Sync owned astervoids to server
                     syncLocalAstervoids();
                     // Update non-owned astervoids from ObjectSync
@@ -8051,17 +8077,7 @@
                 const myMemberId = SessionClient.getCurrentMember()?.id;
                 for (let i = game.bullets.length - 1; i >= 0; i--) {
                     const bullet = game.bullets[i];
-                    // Only locally update our own bullets; remote bullets are positioned by sync
-                    const isMyBullet = !isSessionMode() || bullet.ownerMemberId === myMemberId;
-                    if (isMyBullet) {
-                        bullet.update(dt);
-                    }
-
-                    // Only expire our own bullets; remote bullet lifecycle is owner-driven
-                    if (isMyBullet && bullet.isExpired()) {
-                        if (isSessionMode() && bullet.syncObjectId) {
-                            deleteSyncedBullet(bullet);
-                        }
+                    if (!updateLocalBullet(bullet, dt, myMemberId)) {
                         game.bullets.splice(i, 1);
                     }
                 }
@@ -8075,33 +8091,11 @@
                 // Check collisions
                 checkCollisions();
                 
-                // Check for wave completion (GameState owner detects locally)
-                if (game.astervoids.length === 0 && game.state === 'playing' && !spawningWave) {
-                    if (!isSessionMode() || isGameStateOwner()) {
-                        game.state = 'waveDelay';
-                        game.waveDelayTimer = CONFIG.WAVE_DELAY;
-                        if (isSessionMode()) syncGameState();
-                    }
-                }
-                
-                // Handle wave delay countdown (adjusted for delta time)
-                if (game.state === 'waveDelay') {
-                    game.waveDelayTimer -= dt;
-                    if (game.waveDelayTimer <= 0) {
-                        // GameState owner spawns waves in multiplayer
-                        if (!isSessionMode() || isGameStateOwner()) {
-                            spawningWave = true;
-                            spawnWave().then(() => {
-                                spawningWave = false;
-                                if (isSessionMode()) syncGameState();
-                            });
-                        }
-                        game.state = 'playing';
-                        // Play wave audio only for entered players (not spectators)
-                        if (!lobbySpectating) {
-                            AudioSystem.playNewWave();
-                        }
-                    }
+                const waveStarted = advanceWaveProgression(dt, () => {
+                    if (isSessionMode()) syncGameState();
+                });
+                if (waveStarted && !lobbySpectating) {
+                    AudioSystem.playNewWave();
                 }
                 
                 // Update background beat tempo based on asteroid count
@@ -8126,6 +8120,7 @@
             }
             
             updateHUD();
+            publishDebugMetrics();
         }
 
         // Terminal maintenance is deliberately outside the playing/waveDelay
@@ -8139,6 +8134,7 @@
             updateBulletsFromSync();
             publishOwnedTerminalTargets();
             updateHUD();
+            publishDebugMetrics();
         }
         
         // Lobby bootstrap: when in session with game.state === 'lobby', sync from
@@ -8148,6 +8144,7 @@
         if (!frozenForReconnect && game.state === 'lobby' && isSessionMode() && sessionPicker.gameStarted) {
             updateGameStateFromSync();
             updateHUD();
+            publishDebugMetrics();
         }
     }
 
@@ -9776,23 +9773,10 @@
             if (result) {
                 // Record pre-existing object ids so we don't spawn-project
                 // adopted orphans (e.g. entering an emptied session).
-                replicationRuntime.beginSession({
-                    epoch: SessionClient.getSessionEpoch(),
-                    snapshotObjectIds: (result.session.objects || []).map(o => o.id)
-                });
+                beginSessionSnapshot(result);
                 // Enter lobby state (not playing yet)
                 game.state = 'lobby';
-                game.mode = 'session';
-                game.sessionInfo = {
-                    id: result.session.id,
-                    name: result.session.name,
-                    memberId: result.member.id,
-                    role: result.member.role,
-                    metadata: result.session.metadata
-                };
-                adoptSessionConfig(result.session.metadata);
-                sessionPicker.currentSessionId = result.session.id;
-                sessionPicker.isServer = result.member.role === 'Server';
+                applySessionMembership(result);
                 // Derive gameStarted from presence of GameState object in session objects
                 sessionPicker.gameStarted = (result.session.objects || []).some(
                     obj => obj.data?.type === OBJECT_TYPES.GAME_STATE
@@ -9813,6 +9797,46 @@
             await activateSessionPickerUpdates();
             setPickerStatus('Failed to join session', 'error');
         }
+    }
+
+    function beginSessionSnapshot(result) {
+        // Existing snapshot objects must not be spawn-projected on adoption.
+        replicationRuntime.beginSession({
+            epoch: SessionClient.getSessionEpoch(),
+            snapshotObjectIds: (result.session.objects || []).map(o => o.id)
+        });
+    }
+
+    function applySessionMembership(result) {
+        game.mode = 'session';
+        game.sessionInfo = {
+            id: result.session.id,
+            name: result.session.name,
+            memberId: result.member.id,
+            role: result.member.role,
+            metadata: result.session.metadata
+        };
+        adoptSessionConfig(result.session.metadata);
+        sessionPicker.currentSessionId = result.session.id;
+        sessionPicker.isServer = result.member.role === 'Server';
+    }
+
+    function clearPickerMembership() {
+        sessionPicker.currentSessionId = null;
+        sessionPicker.isServer = false;
+        sessionPicker.gameStarted = false;
+    }
+
+    function beginVoluntarySessionLeave() {
+        // Run before any await so disconnect handlers cannot rejoin this session.
+        leavingSession = true;
+        clearPickerMembership();
+    }
+
+    function restoreSoloMode() {
+        game.mode = 'solo';
+        game.sessionInfo = null;
+        restoreLocalConfigBaseline();
     }
 
     // Handle create session - creates and enters lobby
@@ -9874,22 +9898,10 @@
             }
             if (result) {
                 // Newly created session: no pre-existing objects to guard.
-                replicationRuntime.beginSession({
-                    epoch: SessionClient.getSessionEpoch(),
-                    snapshotObjectIds: (result.session.objects || []).map(o => o.id)
-                });
+                beginSessionSnapshot(result);
                 // Enter lobby state as server
                 game.state = 'lobby';
-                game.mode = 'session';
-                game.sessionInfo = {
-                    id: result.session.id,
-                    name: result.session.name,
-                    memberId: result.member.id,
-                    role: result.member.role,
-                    metadata: result.session.metadata
-                };
-                adoptSessionConfig(result.session.metadata);
-                sessionPicker.currentSessionId = result.session.id;
+                applySessionMembership(result);
                 sessionPicker.isServer = true; // Creator is always server
                 sessionPicker.gameStarted = false; // New session, game not started
                 updatePickerButtons();
@@ -9926,9 +9938,7 @@
         cancelPickerOperations();
         const shouldLeaveSessionInBackground = sessionPicker.currentSessionId
             && SessionClient.isConnected();
-        sessionPicker.currentSessionId = null;
-        sessionPicker.isServer = false;
-        sessionPicker.gameStarted = false;
+        clearPickerMembership();
 
         // Solo play does not need live session updates, but closing service
         // connections must not delay a local game start.
@@ -9944,9 +9954,7 @@
             leaveSessionInBackground('Failed to leave session before solo:');
         }
 
-        game.mode = 'solo';
-        game.sessionInfo = null;
-        restoreLocalConfigBaseline();
+        restoreSoloMode();
         await startGameFromPicker();
     }
 
@@ -9977,13 +9985,7 @@
 
     // Leave lobby and return to start state
     async function handleLeaveLobby(message = null) {
-        // Mark as leaving FIRST and clear session refs synchronously so that a
-        // transport drop during the awaited teardown below cannot trigger
-        // attemptAutoRejoin into the session we're voluntarily leaving.
-        leavingSession = true;
-        sessionPicker.currentSessionId = null;
-        sessionPicker.isServer = false;
-        sessionPicker.gameStarted = false;
+        beginVoluntarySessionLeave();
         try {
             // Delete synced ship if we have one
             if (game.multiplayer.myShipObjectId) {
@@ -10003,14 +10005,13 @@
 
             // Reset to start state
             game.state = 'start';
-            game.mode = 'solo';
-            game.sessionInfo = null;
-            restoreLocalConfigBaseline();
+            restoreSoloMode();
         
         // Recalculate viewport for solo mode
         resizeCanvas(true);
         
         updateHUD();
+        publishDebugMetrics();
         
             // Multi-region: re-open spectator hubs + restart background poll
             // so the picker is live again for the user. Reconnect SessionClient
@@ -10098,14 +10099,8 @@
 
     // Return to start screen
     async function returnToStartScreen(errorMessage = null) {
-        // Mark as leaving FIRST and clear session refs synchronously so that a
-        // transport drop during the awaited teardown below cannot trigger
-        // attemptAutoRejoin into the session we're voluntarily leaving.
-        leavingSession = true;
-        sessionPicker.currentSessionId = null;
-        sessionPicker.isServer = false;
+        beginVoluntarySessionLeave();
         sessionPicker.selectedSessionId = null;
-        sessionPicker.gameStarted = false;
         try {
             // Delete synced ship if we have one
             if (game.multiplayer.myShipObjectId) {
@@ -10121,9 +10116,7 @@
             resetMultiplayerState();
 
             // Reset game mode
-            game.mode = 'solo';
-            game.sessionInfo = null;
-            restoreLocalConfigBaseline();
+            restoreSoloMode();
 
         // Reset game state
         game.state = 'start';
@@ -10152,6 +10145,7 @@
         }
 
         updateHUD();
+        publishDebugMetrics();
 
         // Reconnect and refresh if needed
         if (!SessionClient.isConnected()) {
@@ -10302,25 +10296,12 @@
                     if (result) {
                         // Record pre-existing object ids so re-adopted orphans
                         // aren't spawn-projected on rejoin.
-                        replicationRuntime.beginSession({
-                            epoch: SessionClient.getSessionEpoch(),
-                            snapshotObjectIds: (result.session.objects || []).map(o => o.id)
-                        });
+                        beginSessionSnapshot(result);
                         _log('[Rejoin] Success! Session:', result.session.name,
                             'Role:', result.member.role, 'Objects:', result.session.objects?.length);
                         setPickerStatus('Reconnected!', 'connected');
                         // Successfully rejoined — restore game/lobby state
-                        game.mode = 'session';
-                        game.sessionInfo = {
-                            id: result.session.id,
-                            name: result.session.name,
-                            memberId: result.member.id,
-                            role: result.member.role,
-                            metadata: result.session.metadata
-                        };
-                        adoptSessionConfig(result.session.metadata);
-                        sessionPicker.currentSessionId = result.session.id;
-                        sessionPicker.isServer = result.member.role === 'Server';
+                        applySessionMembership(result);
                         sessionPicker.gameStarted = (result.session.objects || []).some(
                             obj => obj.data?.type === OBJECT_TYPES.GAME_STATE
                         );
@@ -10429,9 +10410,7 @@
         if (leavingSession || isActiveSoloGame()) return;
 
         const lostSessionId = sessionPicker.currentSessionId;
-        sessionPicker.currentSessionId = null;
-        sessionPicker.isServer = false;
-        sessionPicker.gameStarted = false;
+        clearPickerMembership();
         updatePickerButtons();
         updatePickerConnectionStatus();
         
@@ -10615,35 +10594,15 @@
                     
                     // Update astervoids (owned locally, others from sync)
                     const bgMemberId = SessionClient.getCurrentMember()?.id;
-                    game.astervoids.forEach(a => {
-                        if (!a.syncObjectId) {
-                            a.update(dt);
-                        } else {
-                            const syncObj = ObjectSync.getObject(a.syncObjectId);
-                            if (syncObj && syncObj.ownerMemberId === bgMemberId) {
-                                a.update(dt);
-                            }
-                        }
-                    });
+                    updateOwnedAsteroids(dt, bgMemberId);
                     syncLocalAstervoids();
                     updateAstervoidsFromSync();
                     
                     // Update bullets (owned locally) and expire them.
                     // Bullet sync + remote update placed before checkCollisions()
                     // so collision detection sees current positions.
-                    game.bullets = game.bullets.filter(bullet => {
-                        const isMyBullet = bullet.ownerMemberId === bgMemberId;
-                        if (isMyBullet) {
-                            bullet.update(dt);
-                        }
-                        if (isMyBullet && bullet.isExpired()) {
-                            if (bullet.syncObjectId) {
-                                deleteSyncedBullet(bullet);
-                            }
-                            return false;
-                        }
-                        return true;
-                    });
+                    game.bullets = game.bullets.filter(
+                        bullet => updateLocalBullet(bullet, dt, bgMemberId));
                     syncLocalBullets();
                     updateBulletsFromSync();
                     
@@ -10651,26 +10610,7 @@
                     checkCollisions();
                     
                     // Wave management
-                    if (game.astervoids.length === 0 && game.state === 'playing' && !spawningWave) {
-                        if (isGameStateOwner()) {
-                            game.state = 'waveDelay';
-                            game.waveDelayTimer = CONFIG.WAVE_DELAY;
-                            syncGameState();
-                        }
-                    }
-                    if (game.state === 'waveDelay') {
-                        game.waveDelayTimer -= dt;
-                        if (game.waveDelayTimer <= 0) {
-                            if (isGameStateOwner()) {
-                                spawningWave = true;
-                                spawnWave().then(() => {
-                                    spawningWave = false;
-                                    syncGameState();
-                                });
-                            }
-                            game.state = 'playing';
-                        }
-                    }
+                    advanceWaveProgression(dt, () => syncGameState());
                     
                     // Update remote state
                     updateRemoteShips();

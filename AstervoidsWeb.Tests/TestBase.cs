@@ -13,7 +13,7 @@ public abstract class TestBase
 
     protected TestBase()
     {
-        SessionService = new SessionService();
+        SessionService = TestServiceFactory.CreateSessionService();
         ObjectService = new ObjectService(SessionService);
     }
 

@@ -32,12 +32,12 @@ public class SessionCleanupService : BackgroundService
         SyncSchemaRegistry schemaRegistry,
         IOptions<SessionSettings> settings,
         ILogger<SessionCleanupService> logger,
-        ISessionOperationCoordinator? operationCoordinator = null)
+        ISessionOperationCoordinator operationCoordinator)
     {
         _sessionService = sessionService;
         _hubContext = hubContext;
         _schemaRegistry = schemaRegistry;
-        _operationCoordinator = operationCoordinator ?? new SessionOperationCoordinator();
+        _operationCoordinator = operationCoordinator ?? throw new ArgumentNullException(nameof(operationCoordinator));
         _logger = logger;
         _emptyTimeout = TimeSpan.FromSeconds(settings.Value.EmptyTimeoutSeconds);
         _absoluteTimeout = TimeSpan.FromMinutes(settings.Value.AbsoluteTimeoutMinutes);
