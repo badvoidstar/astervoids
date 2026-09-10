@@ -585,6 +585,34 @@ test('SessionClient merges canonical activity overtaking a join and ignores old-
     assert.equal(client.getCurrentSession().simulationSuspended, false);
 });
 
+test('SessionClient activity recovered from reconciliation carries decoded canonical records', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('JoinSession', id => Promise.resolve({
+        ...joinResponse(id), simulationRevision: 1
+    }));
+    connection.invokers.set('GetSessionState', () => Promise.resolve({
+        simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'member-session', simulationActive: true }],
+        objects: [['object', 'creator', 'member-session', 'Session', { x: 7 }, 5]],
+        validAts: [['object', 1000]], resetObjectIds: ['object'], memberSequences: []
+    }));
+    let decodes = 0;
+    const { client } = loadSessionClient([connection], undefined, undefined, {
+        ...SyncPayload, unwrapObjectData() { decodes++; }
+    });
+    await connectImmediately(client, connection);
+    await client.joinSession('session');
+    const events = [];
+    client.on('onSimulationActivityChanged', info => events.push(info));
+    await client.getSessionState();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].snapshot, true);
+    assert.equal(events[0].objects[0].data.x, 7);
+    assert.equal(events[0].validAts.object, 1000);
+    assert.deepEqual(events[0].resetObjectIds, ['object']);
+    assert.equal(decodes, 1, 'already decoded snapshot data is not unwrapped twice');
+});
+
 test('failed leave keeps reconnect identity available for recovery', async () => {
     const connection = new FakeConnection();
     connection.invokers.set('JoinSession', sessionId =>
@@ -1234,6 +1262,7 @@ test('activity transfer installs canonical state and discards queued former-owne
     assert.equal(canonical.ownerMemberId, 'next');
     assert.equal(canonical.ownerActive, true);
     assert.equal(canonical.ownershipMigrationPending, false);
+    assert.equal(canonical.ownershipMigrationVersion, 2);
     assert.equal(canonical.simulationAnchorAt, 1000);
     assert.equal(canonical.simulationAnchorReset, false,
         'ordinary handoff preserves authored time rather than inventing a resume anchor');
@@ -1259,11 +1288,13 @@ test('activity transfer revives a locally deleted record while its rejected requ
     sync.handleSimulationActivity({
         simulationRevision: 1, simulationSuspended: false,
         members: [{ id: 'next', simulationActive: true }],
+        migratedObjects: [{ objectId: 'shared', newOwnerId: 'next', newVersion: 2 }],
         objects: [objectInfo('shared', 2, { x: 1 }, 'next')],
         validAts: { shared: 1000 }
     });
 
     assert.equal(sync.getObject('shared').data.x, 1);
+    assert.equal(sync.getObject('shared').ownershipMigrationVersion, 2);
     deletion.resolve({ success: false });
     assert.equal(await deleting, false);
     assert.equal(sync.getObject('shared').ownerMemberId, 'next');
@@ -1291,6 +1322,28 @@ test('activity retains the server reset list instead of treating every transfer 
     assert.equal(sync.getObject('transfer').simulationAnchorReset, false);
     assert.equal(sync.getObject('resume').simulationAnchorReset, true);
     assert.equal(sync.getObject('ship').simulationAnchorReset, true);
+});
+
+test('activity reset IDs exclude snapshots already superseded by live authored data', () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        objects: [objectInfo('resume', 4, { sampleAt: 10001 }, 'me')],
+        validAts: { resume: 10002 }, metadata: {}
+    });
+    const activity = {
+        simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 3, { sampleAt: 100 }, 'me')],
+        validAts: { resume: 10000 }, resetObjectIds: ['resume']
+    };
+    sync.handleSimulationActivity(activity);
+    assert.deepEqual(activity.resetObjectIds, [],
+        'game adapters must not reset an already newer authored pose');
+    assert.equal(sync.getObject('resume').version, 4);
+    assert.equal(sync.getObject('resume').data.sampleAt, 10001);
 });
 
 test('snapshot recovery retains paused anchors when its activity event was missed', () => {
@@ -1335,6 +1388,110 @@ test('authored updates clear recovered activity anchors on receive and owner con
     sync.updateObject('resume', { sampleAt: 20001 });
     await sync.flushUpdates();
     assert.equal(sync.getObject('resume').simulationAnchorReset, false);
+});
+
+test('missed resume recovered by snapshot invalidates older queued writes and confirmations', async () => {
+    const client = makeObjectSyncClient();
+    const oldResponse = deferred();
+    let sends = 0;
+    client.updateObjects = () => { sends++; return oldResponse.promise; };
+    client.getSessionState = async () => ({
+        simulationRevision: 3, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 3, { x: 0, sampleAt: 100 }, 'me')],
+        validAts: { resume: 10000 }, resetObjectIds: ['resume'], memberSequences: {}
+    });
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 1, { x: 0, sampleAt: 100 }, 'me')],
+        validAts: { resume: 100 }, resetObjectIds: [], metadata: {}
+    });
+    sync.updateObject('resume', { x: 50 });
+    const flushing = sync.flushUpdates();
+    sync.updateObject('resume', { x: 99 });
+    await sync.triggerReconciliation();
+    oldResponse.resolve({ versions: { resume: 2 }, memberSequence: 1 });
+    await flushing;
+    assert.equal(sync.getObject('resume').simulationAnchorReset, true);
+    assert.equal(sync.getObject('resume').validAt, 10000);
+    assert.equal(sync.isDataConfirmed('resume', { x: 0 }), true);
+    await sync.flushUpdates();
+    assert.equal(sends, 1, 'pre-resume queued state must not overwrite the recovered anchor');
+});
+
+test('activity snapshot recovery preserves unrelated local pending updates', async () => {
+    const client = makeObjectSyncClient();
+    let sent;
+    client.updateObjects = async updates => {
+        sent = updates;
+        return { versions: { unchanged: 2 }, memberSequence: 1 };
+    };
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }, { id: 'other', simulationActive: true }],
+        objects: [objectInfo('unchanged', 1, { x: 0 }, 'me')],
+        validAts: {}, resetObjectIds: [], metadata: {}
+    });
+    sync.updateObject('unchanged', { x: 99 });
+    sync.handleSimulationActivity({
+        snapshot: true, simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }, { id: 'other', simulationActive: false }],
+        objects: [objectInfo('unchanged', 1, { x: 0 }, 'me')],
+        validAts: {}, resetObjectIds: []
+    });
+    await sync.flushUpdates();
+    assert.equal(sent?.[0]?.data.x, 99);
+});
+
+test('newer non-reset recovery snapshots preserve the next queued owner write', async () => {
+    const client = makeObjectSyncClient();
+    let sent;
+    client.updateObjects = async updates => {
+        sent = updates;
+        return { versions: { unchanged: 3 }, memberSequence: 1 };
+    };
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('unchanged', 1, { x: 0 }, 'me')],
+        validAts: {}, metadata: {} });
+    sync.updateObject('unchanged', { x: 99 });
+    sync.handleSimulationActivity({
+        snapshot: true, simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('unchanged', 2, { x: 50 }, 'me')],
+        validAts: {}, resetObjectIds: []
+    });
+    await sync.flushUpdates();
+    assert.equal(sent?.[0]?.data.x, 99);
+});
+
+test('non-reset recovery snapshots do not revive unrelated pending deletions', async () => {
+    const client = makeObjectSyncClient();
+    const response = deferred();
+    client.deleteObject = () => response.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('deleting', 1, { x: 0 }, 'me')],
+        validAts: {}, metadata: {} });
+    const deleting = sync.deleteObject('deleting');
+    sync.handleSimulationActivity({
+        snapshot: true, simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('deleting', 1, { x: 0 }, 'me')],
+        validAts: {}, resetObjectIds: []
+    });
+    assert.equal(sync.getObject('deleting'), undefined);
+    response.resolve({ success: true });
+    assert.equal(await deleting, true);
 });
 
 test('old in-flight update confirmation cannot overwrite a transferred canonical baseline', async () => {
@@ -1393,7 +1550,8 @@ test('activity temporal resets are distinguished from ordinary canonical handoff
         simulationRevision: 1, simulationSuspended: true,
         members: [{ id: 'me', simulationActive: false }],
         objects: [{ ...memberObject, version: 2 }, objectInfo('shared', 2, { x: 0 }, 'me')],
-        validAts: { 'member-object': 1000, shared: 1000 }
+        validAts: { 'member-object': 1000, shared: 1000 },
+        resetObjectIds: ['member-object', 'shared']
     };
     sync.handleSimulationActivity(frozen);
     assert.deepEqual(frozen.anchorResetObjectIds, ['member-object', 'shared']);
@@ -1401,12 +1559,14 @@ test('activity temporal resets are distinguished from ordinary canonical handoff
         simulationRevision: 2, simulationSuspended: false,
         members: [{ id: 'me', simulationActive: true }],
         objects: [{ ...memberObject, version: 3 }, objectInfo('shared', 3, { x: 0 }, 'me')],
-        validAts: { 'member-object': 9000, shared: 9000 }
+        validAts: { 'member-object': 9000, shared: 9000 },
+        resetObjectIds: ['member-object', 'shared']
     };
     sync.handleSimulationActivity(resumed);
     assert.deepEqual(resumed.anchorResetObjectIds, ['member-object', 'shared']);
     assert.equal(sync.getObject('shared').simulationAnchorAt, 9000);
     assert.equal(sync.getObject('shared').simulationCanonicalVersion, 3);
+    assert.equal(sync.getObject('shared').ownershipMigrationVersion, undefined);
 });
 
 test('activity drops pending writes for an inactive owner even without an ownership transfer', async () => {

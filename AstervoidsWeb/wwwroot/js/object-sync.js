@@ -1382,6 +1382,10 @@ const ObjectSync = (function() {
                             continue;
                         }
                         const obj = objects.get(id);
+                        if (obj && version < obj.version) {
+                            sentData.delete(id);
+                            continue;
+                        }
                         if (obj) obj.simulationAnchorReset = false;
                         if (obj && version > obj.version) {
                             obj.version = version;
@@ -1433,7 +1437,7 @@ const ObjectSync = (function() {
             throw new Error('Not in a session');
         }
         const context = captureAsyncContext();
-        const operation = { context };
+        const operation = { context, ownerMemberId: objects.get(objectId)?.ownerMemberId };
         let accepted = false;
 
         // Local-first: remove immediately so getObjectsByType() won't return it
@@ -1697,6 +1701,10 @@ const ObjectSync = (function() {
             || snapshot.simulationRevision !== simulationRevision) return;
         obj.simulationAnchorReset = resetIds.has(obj.id);
         if (obj.simulationAnchorReset) {
+            if (obj.simulationCanonicalVersion !== obj.version) {
+                authorityRevisions.set(obj.id, (authorityRevisions.get(obj.id) || 0) + 1);
+                pendingUpdates.delete(obj.id);
+            }
             obj.simulationCanonicalVersion = obj.version;
             obj.simulationAnchorAt = snapshot.validAts?.[obj.id] ?? obj.validAt;
         }
@@ -1708,28 +1716,39 @@ const ObjectSync = (function() {
         if (!SessionClient.isInSession()) return false;
         const session = SessionClient.getCurrentSession?.();
         if (session && info.sessionId && session.id !== info.sessionId) return false;
-        const suspensionChanged = simulationSuspended !== !!info.simulationSuspended;
-        const changedMembers = new Set();
         simulationRevision = info.simulationRevision;
         simulationSuspended = !!info.simulationSuspended;
         for (const member of info.members || []) {
-            if ((memberSimulationActive.get(member.id) !== false) !== (member.simulationActive !== false)) {
-                changedMembers.add(member.id);
-            }
             memberSimulationActive.set(member.id, member.simulationActive !== false);
         }
         handleOwnershipMigration(info.migratedObjects || []);
+        const migrations = new Map((info.migratedObjects || []).map(migration => [
+            migration.objectId, migration
+        ]));
         const arrivalTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
         const arrivalServerTime = getArrivalServerTimeMs();
-        const resetIds = Array.isArray(info.resetObjectIds) ? new Set(info.resetObjectIds) : null;
+        const resetIds = new Set(info.resetObjectIds || []);
         info.appliedObjectIds = [];
         info.anchorResetObjectIds = [];
         for (const source of info.objects || []) {
             let obj = objects.get(source.id);
             if (obj && obj.version > source.version) continue;
+            const deletion = pendingDeletes.get(source.id);
+            if (info.snapshot && deletion && !resetIds.has(source.id)
+                && deletion.ownerMemberId === source.ownerMemberId) continue;
+            if (info.snapshot && obj && obj.version === source.version
+                && obj.ownerMemberId === source.ownerMemberId
+                && (!resetIds.has(source.id)
+                    || (obj.simulationAnchorReset && obj.simulationCanonicalVersion === obj.version))) {
+                // Snapshot recovery includes untouched records. Their optimistic
+                // local writes are not old-authority data to discard.
+                continue;
+            }
             const record = { ...source, data: expandData(source.data) };
             const validAt = info.validAts?.[source.id];
-            pendingUpdates.delete(source.id);
+            const preservesPending = info.snapshot && obj
+                && obj.ownerMemberId === source.ownerMemberId && !resetIds.has(source.id);
+            if (!preservesPending) pendingUpdates.delete(source.id);
             pendingDeletes.delete(source.id);
             authorityRevisions.set(source.id, (authorityRevisions.get(source.id) || 0) + 1);
             if (obj) {
@@ -1745,11 +1764,11 @@ const ObjectSync = (function() {
             }
             // Unlike departure-only metadata, this is a canonical physics seed.
             obj.ownershipMigrationPending = false;
-            delete obj.ownershipMigrationVersion;
+            const migration = migrations.get(obj.id);
+            if (migration) obj.ownershipMigrationVersion = migration.newVersion;
             obj.simulationCanonicalVersion = obj.version;
             obj.simulationAnchorAt = validAt ?? obj.validAt;
-            obj.simulationAnchorReset = resetIds ? resetIds.has(obj.id)
-                : obj.scope === 'Session' ? suspensionChanged : changedMembers.has(obj.ownerMemberId);
+            obj.simulationAnchorReset = resetIds.has(obj.id);
             info.appliedObjectIds.push(obj.id);
             if (obj.simulationAnchorReset) info.anchorResetObjectIds.push(obj.id);
             lastSentData.set(obj.id, snapshotDataValues(obj.data));
@@ -1768,7 +1787,8 @@ const ObjectSync = (function() {
             }
         }
         if (pendingUpdates.size === 0) urgentPending = false;
-        if (!resetIds) info.resetObjectIds = [...info.anchorResetObjectIds];
+        const appliedIds = new Set(info.appliedObjectIds);
+        info.resetObjectIds = [...resetIds].filter(id => appliedIds.has(id));
         return true;
     }
 

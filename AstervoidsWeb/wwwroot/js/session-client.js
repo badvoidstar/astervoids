@@ -136,7 +136,7 @@ const SessionClient = (function() {
             event.accepted = info?.sessionId === currentSession.id
                 && info.simulationRevision > (currentSession.simulationRevision ?? -1);
             if (!event.accepted) return;
-            normalizeSimulationActivity(info);
+            if (!event.normalized) normalizeSimulationActivity(info);
             currentSession.simulationRevision = info.simulationRevision;
             currentSession.simulationSuspended = info.simulationSuspended;
             for (const state of info.members || []) {
@@ -1164,9 +1164,8 @@ const SessionClient = (function() {
             snapshot.validAts = WireEnum.pairsToObject(snapshot.validAts);
             snapshot.memberSequences = WireEnum.pairsToObject(snapshot.memberSequences);
             if ((snapshot.simulationRevision ?? -1) > (currentSession?.simulationRevision ?? 0)) {
-                handleMemberEvent({ kind: 'activity', info: {
-                    ...snapshot, sessionId: currentSession.id, migratedObjects: [], objects: [],
-                    validAts: {}
+                handleMemberEvent({ kind: 'activity', normalized: true, info: {
+                    ...snapshot, sessionId: currentSession.id, migratedObjects: [], snapshot: true
                 } });
             }
         }

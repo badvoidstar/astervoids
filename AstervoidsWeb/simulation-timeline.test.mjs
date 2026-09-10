@@ -12,6 +12,8 @@ const { createDeadReckoningPolicy } = require('./wwwroot/js/replication-presenta
 function harness() {
     let now = 1000;
     let initialized = true;
+    let deterministic = true;
+    let fires = 0;
     const records = new Map();
     const session = { members: [], simulationSuspended: false };
     const game = { ship: null, astervoids: [], bullets: [],
@@ -35,6 +37,7 @@ function harness() {
         serverNowMs: () => now + 10_000,
         validAtToPerfNow: value => value - 10_000,
         getDelay: () => 200,
+        getDelayForMember: () => 200,
         getJitter: () => 0,
         memberDelays: new Map(),
         getClockSampleRtt: () => 60,
@@ -52,14 +55,14 @@ function harness() {
         getShipTurnSpeed: () => 0.125,
         performance: { now: () => now },
         resolveTerminalSession: () => null,
-        isDeterministicMode: () => true,
+        isDeterministicMode: () => deterministic,
         sizeToNormalizedX: size => size,
         sizeToNormalizedY: size => size,
         velocityToNormalizedDeltaX: velocity => velocity / 60,
         velocityToNormalizedDeltaY: velocity => velocity / 60,
         wrapNormalized: value => value,
         wrapMarginX: () => 0, wrapMarginY: () => 0,
-        AudioSystem: { playFire() {} },
+        AudioSystem: { playFire() { fires++; } },
         rampInputToward: (_current, target) => target,
     };
     const production = loadInlineGameFunctions([
@@ -71,6 +74,7 @@ function harness() {
         'createDeadReckoningState', 'getBallisticPredictionFrames',
         'createKinematicPresentation', 'lifecycleSampleData', 'hasLifecycleResetAnchor', 'isLifecycleFrozen',
         'currentKinematicData', 'getKinematicInstance',
+        'sampleBulletPresentation',
     ], dependencies);
     Object.assign(DeadReckon, createDeadReckoningPolicy({
         config: CONFIG, nowMs: () => now,
@@ -82,6 +86,8 @@ function harness() {
     }));
     return { ...production, game, records, session, CONFIG, simulationTiming, RemoteObjects,
         at: value => { now = value; },
+        mode: value => { deterministic = value; },
+        fireCount: () => fires,
         clockReady: value => { initialized = value; } };
 }
 
@@ -104,6 +110,22 @@ test('remote canonical flags and identity survive a kinematic-only presentation'
     assert.equal(h.isShipDiscontinuity(ship, { respawnEpoch: 0, invulnerable: 179 }), false);
     assert.equal(h.isShipDiscontinuity(ship, { respawnEpoch: 1, invulnerable: 180 }), true);
     assert.equal(h.isShipDiscontinuity(ship, { respawnEpoch: 1, invulnerable: 179 }), false);
+});
+
+test('buffered firing activation follows the shooter delay and emits sound once', () => {
+    const h = harness();
+    h.mode(false);
+    const bullet = new h.Bullet(0.2, 0.3, 1, 0);
+    const record = { ownerMemberId: 'owner', data: { bornAt: 10_900 } };
+    h.sampleBulletPresentation(bullet, record);
+    assert.equal(bullet.presentationHidden, true);
+    assert.equal(h.fireCount(), 0);
+    h.at(1150);
+    h.sampleBulletPresentation(bullet, record);
+    assert.equal(bullet.presentationHidden, false);
+    assert.equal(h.fireCount(), 1);
+    h.sampleBulletPresentation(bullet, record);
+    assert.equal(h.fireCount(), 1);
 });
 
 test('production adapter uses the sample clock through asymmetric delivery and catch-up steps', () => {

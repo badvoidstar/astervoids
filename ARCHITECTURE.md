@@ -1299,6 +1299,11 @@ claims survive ordinary projectile expiry but have a separate 15-second
 monotonic deadline. Active terminal maintenance continues settlement and ledger
 cleanup. Target reservation, session epochs, ownership checks, and claim
 correlation prevent duplicate destruction or disappearance-based score awards.
+Resolution accepts shooter-view contacts only within `MAX_EXTRAPOLATION`
+(currently two seconds), with at most 250 ms future clock tolerance. This is
+separate from waiting for an already-committed result. Local claim states are
+explicitly pending, accepted, rejected, or expired; negative settlements are
+not competing broadcast authorities.
 
 Sweeps include translating and rotating asteroid polygons, full polygon-edge
 intersection for ships, inclusive tangency, and radius-aware seam transitions.

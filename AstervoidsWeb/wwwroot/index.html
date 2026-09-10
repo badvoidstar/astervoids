@@ -4253,6 +4253,7 @@
             this.hitClaimId = null;
             this.hitClaimAt = 0;
             this.hitPendingSincePerf = null;
+            this.hitState = 'active';
         }
 
         /**
@@ -5616,7 +5617,8 @@
 
     function sampleBulletPresentation(bullet, record) {
         const now = simulationTiming.stepPerf ?? performance.now();
-        const time = getPresentationTime(now);
+        const time = isDeterministicMode() ? getPresentationTime(now)
+            : now - RemoteObjects.getDelayForMember(record.ownerMemberId);
         const birth = record.data.bornAt;
         const birthPerf = Number.isFinite(birth) && RemoteObjects.isClockOffsetInitialized()
             ? RemoteObjects.validAtToPerfNow(birth) : null;
@@ -6815,7 +6817,7 @@
         const epoch = SessionClient.getSessionEpoch();
         let state = game.multiplayer.hitClaims;
         if (!state || state.epoch !== epoch) {
-            state = { epoch, reservations: new Map(), results: new Map() };
+            state = { epoch, reservations: new Map(), results: new Map(), settlements: new Map() };
             game.multiplayer.hitClaims = state;
         }
         return state;
@@ -6824,6 +6826,7 @@
     function beginBulletHit(bullet, asteroid, hit, impact) {
         const target = ObjectSync.getObject(asteroid.syncObjectId);
         bullet.pendingHit = true;
+        bullet.hitState = 'pending';
         bullet.hitTargetId = asteroid.syncObjectId;
         bullet.hitClaimId = crypto.randomUUID();
         bullet.hitPendingSincePerf = performance.now();
@@ -6854,21 +6857,39 @@
         if (!target || !Number.isInteger(claim.hitTargetVersion) || claim.hitTargetVersion < 1
             || !Number.isInteger(target.version)
             || !claim.hitTargetOwnerId || target.version < claim.hitTargetVersion) return false;
-        if (target.simulationAnchorReset
-            && (!Number.isInteger(target.simulationCanonicalVersion)
-                || claim.hitTargetVersion < target.simulationCanonicalVersion)) return false;
-        if (target.ownerMemberId === claim.hitTargetOwnerId) return true;
-        // Departure migration preserves the object's identity and canonical
-        // shape. A later migration version is evidence that a surviving claim
-        // predates this handoff; arbitrary owner changes/reset anchors are not.
-        return !target.simulationAnchorReset
+        const migrated = target.ownerMemberId !== claim.hitTargetOwnerId
             && Number.isInteger(target.ownershipMigrationVersion)
             && target.ownershipMigrationVersion > claim.hitTargetVersion
             && target.ownershipMigrationVersion <= target.version;
+        if (target.simulationAnchorReset
+            && (!Number.isInteger(target.simulationCanonicalVersion)
+                || claim.hitTargetVersion < target.simulationCanonicalVersion)
+            && !(migrated && target.simulationCanonicalVersion === target.ownershipMigrationVersion)) return false;
+        if (target.ownerMemberId === claim.hitTargetOwnerId) return true;
+        // A migration preserves object identity. Its revision can also explain
+        // the canonical reset delivered with an activity handoff, but not an
+        // unrelated later reset or arbitrary owner change.
+        return migrated;
+    }
+
+    function getHitClaimRejection(claim, target) {
+        if (!claim.hitClaimId || !claim.hitTargetId
+            || ![claim.hitClaimAt, claim.hitX, claim.hitY, claim.hitAngle,
+                claim.hitImpactTorque, claim.hitBulletAngle, claim.hitOffsetN].every(Number.isFinite)) {
+            return 'invalid-claim';
+        }
+        if (!Number.isInteger(claim.hitTargetVersion) || claim.hitTargetVersion < 1
+            || !claim.hitTargetOwnerId) return 'invalid-target-revision';
+        if (target && target.version < claim.hitTargetVersion) return 'future-target-revision';
+        if (target && !isHitClaimCurrent(claim, target)) return 'stale-target-authority';
+        return null;
     }
 
     function resolveOwnedHitClaim(claim, shooterId, asteroid, state) {
         const now = performance.now();
+        const contactAgeMs = RemoteObjects.serverNowMs() - claim.hitClaimAt;
+        if (!Number.isFinite(contactAgeMs) || contactAgeMs < -250
+            || contactAgeMs > CONFIG.MAX_EXTRAPOLATION * 1000) return;
         const targetId = asteroid.syncObjectId;
         const previous = state.reservations.get(targetId);
         if (previous && (previous.inFlight || previous.committed || now < previous.retryAt)) return;
@@ -6881,6 +6902,7 @@
         state.reservations.set(targetId, reservation);
         const result = {
             type: 'hitResult',
+            hitStatus: 'accepted',
             hitClaimId: claim.hitClaimId,
             hitTargetId: targetId,
             hitShooterId: shooterId,
@@ -6901,7 +6923,10 @@
             if (game.multiplayer.hitClaims !== state
                 || SessionClient.getSessionEpoch() !== state.epoch
                 || ObjectSync.getObject(targetId)?.ownerMemberId !== ownerId) return false;
-            return splitAsteroid(asteroid, shooterId, impact, getShipByMemberId(shooterId), result);
+            const shooter = SessionClient.getCurrentSession()?.members
+                ?.find(member => member.id === shooterId);
+            const childOwnerId = shooter && shooter.simulationActive !== false ? shooterId : null;
+            return splitAsteroid(asteroid, childOwnerId, impact, getShipByMemberId(shooterId), result);
         })
             .then(accepted => {
                 if (game.multiplayer.hitClaims !== state
@@ -6931,6 +6956,7 @@
         for (const object of ObjectSync.getObjectsByType('hitResult')) {
             const result = object.data;
             if (!result.hitClaimId || !result.hitTargetId || !result.hitShooterId
+                || (result.hitStatus !== undefined && result.hitStatus !== 'accepted')
                 || !Number.isFinite(result.hitExpiresAt) || !Number.isFinite(result.hitPoints)) continue;
             if (result.hitExpiresAt <= serverNow) {
                 if (object.ownerMemberId === myMemberId) {
@@ -6942,6 +6968,9 @@
         }
         for (const [claimId, result] of state.results) {
             if (result.hitExpiresAt <= serverNow) state.results.delete(claimId);
+        }
+        for (const [claimId, settlement] of state.settlements) {
+            if (now - settlement.settledAt >= 30000) state.settlements.delete(claimId);
         }
         for (const [targetId, reservation] of state.reservations) {
             const target = ObjectSync.getObject(targetId);
@@ -6957,7 +6986,19 @@
             const accepted = result?.hitTargetId === bullet.hitTargetId
                 && result.hitShooterId === myMemberId;
             if (!Number.isFinite(bullet.hitPendingSincePerf)) bullet.hitPendingSincePerf = now;
-            if (!accepted && now - bullet.hitPendingSincePerf < 15000) continue;
+            const rejection = accepted ? null
+                : getHitClaimRejection(bullet, ObjectSync.getObject(bullet.hitTargetId));
+            const status = accepted ? 'accepted' : rejection ? 'rejected'
+                : now - bullet.hitPendingSincePerf >= 15000 ? 'expired' : null;
+            if (!status) continue;
+            bullet.hitState = status;
+            bullet.pendingHit = false;
+            state.settlements.set(bullet.hitClaimId, {
+                status,
+                reason: rejection || (status === 'expired' ? 'result-timeout' : null),
+                targetId: bullet.hitTargetId,
+                settledAt: now,
+            });
             // Absence is never evidence of acceptance: only this unique claim's
             // atomic result can award points, once, before retiring the bullet.
             if (accepted && game.ship) {
@@ -10952,9 +10993,8 @@
     }
 
     SessionClient.on('onSimulationActivityChanged', info => {
-        const resetObjectIds = [...(info.resetObjectIds || [])];
         if (ObjectSync.handleSimulationActivity(info) === false) return;
-        applyAsteroidActivity({ ...info, resetObjectIds });
+        applyAsteroidActivity(info);
         resetAuthorityTiming();
     });
 
@@ -10983,7 +11023,6 @@
                         updateRemoteShips();
                         updateAstervoidsFromSync();
                         updateBulletsFromSync();
-                        repositionDeadReckonedRemotes();
                         resetAuthorityTiming();
                         return;
                     }

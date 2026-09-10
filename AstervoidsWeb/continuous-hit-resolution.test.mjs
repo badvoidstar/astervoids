@@ -103,6 +103,7 @@ test('full ship polygons detect edge-only crossings and swept thin obstacles', (
 function gameHarness({ session = true, replace = null } = {}) {
     let now = 0, epoch = 1, sequence = 0;
     const records = new Map();
+    const members = ['me', 'shooter', 'remote'].map(id => ({ id, simulationActive: true }));
     const calls = { splits: [], deleted: [], cues: [], score: 0, replacements: [] };
     const game = {
         bullets: [], astervoids: [], multiplayer: {}, score: 0, lives: 3,
@@ -112,6 +113,7 @@ function gameHarness({ session = true, replace = null } = {}) {
         BULLET_RADIUS: 0.001, BULLET_LIFETIME: 60, SHIP_SIZE: 0.02, TARGET_FPS: 60,
         EXTRA_LIFE_SCORE_THRESHOLD: 10000, ASTEROID_LARGE_THRESHOLD: 0.08,
         ASTEROID_MEDIUM_THRESHOLD: 0.04, MIN_ASTEROID_RADIUS: 0.01,
+        MAX_EXTRAPOLATION: 2,
     };
     const ObjectSync = {
         getObject: id => records.get(id),
@@ -123,7 +125,10 @@ function gameHarness({ session = true, replace = null } = {}) {
     const globals = {
         game, CONFIG, ObjectSync, AstervoidsCollision: collision,
         OBJECT_TYPES: { BULLET: 'bullet', ASTEROID: 'asteroid' },
-        SessionClient: { getCurrentMember: () => ({ id: 'me' }), getSessionEpoch: () => epoch },
+        SessionClient: {
+            getCurrentMember: () => ({ id: 'me' }), getSessionEpoch: () => epoch,
+            getCurrentSession: () => ({ members }),
+        },
         RemoteObjects: { serverNowMs: () => 100000 + now },
         performance: { now: () => now },
         simulationTiming: { presentationDelayMs: 100 },
@@ -153,11 +158,12 @@ function gameHarness({ session = true, replace = null } = {}) {
     };
     const functions = loadInlineGameFunctions([
         'Bullet', 'computeBulletImpact', 'getCollisionMotion', 'getHitClaimState',
-        'beginBulletHit', 'isHitClaimCurrent', 'resolveOwnedHitClaim', 'maintainHitClaims', 'checkCollisions',
+        'beginBulletHit', 'isHitClaimCurrent', 'getHitClaimRejection', 'resolveOwnedHitClaim',
+        'maintainHitClaims', 'checkCollisions',
         'checkShipAsteroidCollision', 'replaceSyncedAsteroid',
     ], globals);
     return {
-        ...functions, game, records, calls, globals,
+        ...functions, game, records, members, calls, globals,
         time: value => { now = value; }, epoch: value => { epoch = value; },
         asteroid(x, owner = 'me', id = `asteroid-${x}`) {
             const asteroid = {
@@ -183,6 +189,23 @@ function gameHarness({ session = true, replace = null } = {}) {
 }
 
 const microtasks = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+
+test('authority compensation is bounded independently of pending-result lifetime', async () => {
+    for (const elapsed of [1500, 2500]) {
+        const h = gameHarness();
+        const asteroid = h.asteroid(0.05, 'remote');
+        h.bullet();
+        h.checkCollisions();
+        const record = h.records.get(asteroid.syncObjectId);
+        record.ownerMemberId = 'me';
+        record.version++;
+        record.ownershipMigrationVersion = record.version;
+        h.time(elapsed);
+        h.maintainHitClaims();
+        await microtasks();
+        assert.equal(h.calls.splits.length, elapsed < 2000 ? 1 : 0);
+    }
+});
 
 test('production chooses earliest TOI irrespective of asteroid array order', () => {
     for (const order of [[0.03, 0.08], [0.08, 0.03]]) {
@@ -259,6 +282,11 @@ test('disappearance, unrelated claim results and wrong shooter never award a pen
     h.maintainHitClaims();
     assert.equal(h.game.bullets.length, 0);
     assert.equal(h.game.ship.score, 0);
+    assert.equal(bullet.hitState, 'expired');
+    assert.equal(h.game.multiplayer.hitClaims.settlements.get(bullet.hitClaimId).reason, 'result-timeout');
+    h.time(45001);
+    h.maintainHitClaims();
+    assert.equal(h.game.multiplayer.hitClaims.settlements.size, 0);
 });
 
 test('durable snapshot result settles a late claim after bullet lifetime and child deletion', () => {
@@ -277,6 +305,8 @@ test('durable snapshot result settles a late claim after bullet lifetime and chi
     h.maintainHitClaims();
     h.maintainHitClaims();
     assert.equal(h.game.ship.score, 100);
+    assert.equal(bullet.hitState, 'accepted');
+    assert.equal(h.game.multiplayer.hitClaims.settlements.get(bullet.hitClaimId).status, 'accepted');
     assert.deepEqual(h.calls.deleted, ['bullet']);
     h.time(30001);
     h.maintainHitClaims();
@@ -380,11 +410,34 @@ test('new target owner can settle a surviving claim, attributed to the canonical
     h.records.get(asteroid.syncObjectId).ownerMemberId = 'me';
     h.records.get(asteroid.syncObjectId).version = 2;
     h.records.get(asteroid.syncObjectId).ownershipMigrationVersion = 2;
+    h.records.get(asteroid.syncObjectId).simulationAnchorReset = true;
+    h.records.get(asteroid.syncObjectId).simulationCanonicalVersion = 2;
     h.maintainHitClaims();
     await microtasks();
     assert.equal(h.calls.splits.length, 1);
     assert.equal(h.calls.splits[0][4].hitShooterId, 'shooter');
     assert.equal(h.game.ship.score, 0);
+});
+
+test('a shooter that becomes inactive keeps attribution but does not acquire new Session objects', async () => {
+    const h = gameHarness();
+    h.asteroid(0.05, 'remote');
+    const bullet = h.bullet();
+    h.checkCollisions();
+    h.records.set('remote-claim', {
+        id: 'remote-claim', ownerMemberId: 'shooter', data: bullet.toSyncData(),
+    });
+    h.records.delete(bullet.syncObjectId);
+    h.game.bullets.length = 0;
+    const target = h.records.get(bullet.hitTargetId);
+    target.ownerMemberId = 'me';
+    target.version = target.ownershipMigrationVersion = 2;
+    h.members.find(member => member.id === 'shooter').simulationActive = false;
+    h.maintainHitClaims();
+    await microtasks();
+    assert.equal(h.calls.splits.length, 1);
+    assert.equal(h.calls.splits[0][1], null, 'children stay with the active resolving owner');
+    assert.equal(h.calls.splits[0][4].hitShooterId, 'shooter');
 });
 
 test('claims label the target scene TOI, not the shooter clock or its previous pose sample', () => {
@@ -414,6 +467,32 @@ test('claims reject future versions, unproven owner changes and reset-anchor dis
     assert.equal(h.isHitClaimCurrent(claim, {
         ownerMemberId: 'new', version: 7, ownershipMigrationVersion: 6, simulationAnchorReset: true,
     }), false);
+    assert.equal(h.isHitClaimCurrent(claim, {
+        ownerMemberId: 'new', version: 7, ownershipMigrationVersion: 6,
+        simulationAnchorReset: true, simulationCanonicalVersion: 6,
+    }), true, 'activity migration revision explains its accompanying canonical reset');
+    assert.equal(h.isHitClaimCurrent(claim, {
+        ownerMemberId: 'new', version: 8, ownershipMigrationVersion: 6,
+        simulationAnchorReset: true, simulationCanonicalVersion: 7,
+    }), false, 'a later unrelated reset does not inherit an earlier migration proof');
+});
+
+test('invalid target revisions and unproven authority changes explicitly reject without awarding score', () => {
+    for (const failure of ['future-target-revision', 'stale-target-authority']) {
+        const h = gameHarness();
+        const asteroid = h.asteroid(0.05, 'remote');
+        const bullet = h.bullet();
+        h.checkCollisions();
+        if (failure === 'future-target-revision') bullet.hitTargetVersion++;
+        else h.records.get(asteroid.syncObjectId).ownerMemberId = 'different-owner';
+        h.maintainHitClaims();
+        assert.equal(bullet.hitState, 'rejected');
+        assert.equal(bullet.pendingHit, false);
+        assert.equal(h.game.multiplayer.hitClaims.settlements.get(bullet.hitClaimId).reason, failure);
+        assert.equal(h.game.bullets.length, 0);
+        assert.equal(h.game.ship.score, 0);
+        assert.equal(h.calls.splits.length, 0);
+    }
 });
 
 test('explicit simulation discontinuities do not become field-crossing sweeps', () => {

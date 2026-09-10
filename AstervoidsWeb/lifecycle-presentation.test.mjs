@@ -236,21 +236,27 @@ test('temporal reset anchors survive metadata transfer but not a newer authored 
     assert.equal(h.api.lifecycleSampleData(record).sampleAt, 60100);
 });
 
-test('activity callback preserves server reset IDs independently of store bookkeeping', () => {
+test('activity callback respects store filtering of stale reset versions', () => {
     const h = harness();
-    const record = { id: 'a', version: 3, ownerMemberId: 'me', validAt: 1150,
-        data: { type: 'asteroid', x: 0.1, y: 0.2, radius: 0.05,
-            velocityX: 0.2, velocityY: 0, angle: 0, sampleAt: 1000 } };
+    const record = { id: 'a', version: 5, ownerMemberId: 'me', validAt: 1200,
+        data: { type: 'asteroid', x: 0.4, y: 0.2, radius: 0.05,
+            velocityX: 0.2, velocityY: 0, angle: 0, sampleAt: 1200 } };
     h.records.set('a', record);
+    const asteroid = h.api.Asteroid.fromSyncData(record.data);
+    asteroid.syncObjectId = 'a';
+    h.game.astervoids.push(asteroid);
     h.api.ObjectSync.handleSimulationActivity = info => {
-        info.resetObjectIds.push('a');
+        info.resetObjectIds = [];
         return true;
     };
     h.handlers.get('onSimulationActivityChanged')({
-        resetObjectIds: [],
-        migratedObjects: [{ objectId: 'a', newOwnerId: 'me', newVersion: 3 }]
+        resetObjectIds: ['a'],
+        migratedObjects: [],
+        objects: [{ id: 'a', version: 3 }]
     });
-    assert.ok(Math.abs(h.game.astervoids[0].x - 0.14) < 1e-12);
+    assert.equal(asteroid.x, 0.4);
+    assert.equal(record.simulationAnchorReset, undefined);
+    assert.equal(asteroid._lifecycleCorrection, undefined);
 });
 
 test('replacement rigid transform includes the displayed parent rotation and centroid', () => {
