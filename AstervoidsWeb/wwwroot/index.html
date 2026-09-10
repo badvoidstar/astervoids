@@ -6708,7 +6708,7 @@
                 if (!activeMembers.has(record.data.memberId)
                     || record.id === game.multiplayer.myShipObjectId) continue;
                 // Safety uses canonical ship samples, never their delayed render pose.
-                const pose = projectLifecyclePose(record.data, now);
+                const pose = projectLifecyclePose(lifecycleSampleData(record), now, record.validAt);
                 if (Number.isFinite(pose.x) && Number.isFinite(pose.y)) shipPoses.push(pose);
             }
         }

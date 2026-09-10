@@ -430,3 +430,15 @@ test('spawn retry budget is bounded and chooses maximum minimum clearance', asyn
     assert.equal(asteroid.y, 0.1);
     assert.ok(h.randomCalls <= 132, `bounded random draws: ${h.randomCalls}`);
 });
+
+test('spawn clearance uses recent batch timing after a ship retires its birth anchor', async () => {
+    const h = harness();
+    h.records.set('remote-ship', { id: 'remote-ship', validAt: 1200, data: {
+        type: 'ship', memberId: 'other', x: 0.2, y: 0.5,
+        velocityX: 0.4, velocityY: 0, sampleAt: 0
+    } });
+    h.setRandom([0.2, 0.5, 0.7, 0.5]);
+    const asteroid = await h.api.spawnAsteroidAwayFromShip();
+    assert.equal(asteroid.x, 0.7, 'reject the candidate overlapping the current canonical ship');
+    assert.equal(asteroid.y, 0.5);
+});
