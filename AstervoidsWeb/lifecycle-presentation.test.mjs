@@ -138,15 +138,16 @@ function harness({ deterministic = true, width = 1, height = 1 } = {}) {
 test('ownership adoption projects canonical samples, never a displayed puppet pose', () => {
     const h = harness();
     const data = { type: 'asteroid', x: 0.2, y: 0.3, angle: 0,
-        radius: 0.05, velocityX: 0.1, velocityY: 0, rotationSpeed: 0.01, sampleAt: 1000 };
-    const record = { id: 'a', ownerMemberId: 'other', version: 1, data, validAt: 1150 };
+        radius: 0.05, velocityX: 0.1, velocityY: 0, rotationSpeed: 0.01, sampleAt: 0 };
+    const record = { id: 'a', ownerMemberId: 'other', version: 2, data, validAt: 1150 };
     h.records.set('a', record);
     const asteroid = h.api.Asteroid.fromSyncData(data);
     Object.assign(asteroid, { syncObjectId: 'a', x: 0.12,
         _lastRenderedX: 0.1, _lastRenderedY: 0.3, _lastRenderedAngle: -0.2 });
     h.game.astervoids.push(asteroid);
-    h.api.migrateKinematicAuthority([{ objectId: 'a', newOwnerId: 'me', newVersion: 2 }]);
-    assert.ok(Math.abs(asteroid.x - 0.22) < 1e-12);
+    h.api.migrateKinematicAuthority([{ objectId: 'a', newOwnerId: 'me', newVersion: 3 }]);
+    assert.ok(Math.abs(asteroid.x - 0.205) < 1e-12,
+        'adopt the last accepted batch pose after retirement of the birth anchor');
     assert.equal(asteroid.velocityX, 0.1);
     assert.equal(asteroid._collisionPrevX, asteroid.x);
     assert.equal(asteroid._simulationSampleAt, 1200);
@@ -157,17 +158,19 @@ test('ownership adoption projects canonical samples, never a displayed puppet po
     h.setNow(1500);
     h.api.withLocalRenderInterpolation(1, () => assert.equal(asteroid.x, canonicalX));
     assert.equal(asteroid._lifecycleCorrection, undefined);
-    h.api.migrateKinematicAuthority([{ objectId: 'a', newOwnerId: 'me', newVersion: 2 }]);
+    h.api.migrateKinematicAuthority([{ objectId: 'a', newOwnerId: 'me', newVersion: 3 }]);
     assert.equal(asteroid._lifecycleCorrection, undefined, 'duplicate metadata cannot reseed motion');
 });
 
-test('birth sample time, not operation flush time, anchors owner adoption', () => {
+test('birth sample time anchors adoption even after metadata-only migrations', () => {
     const h = harness();
     const data = { x: 0.1, y: 0.2, radius: 0.05, velocityX: 0.2,
         velocityY: 0, angle: 0, sampleAt: 1000 };
-    const asteroid = h.api.adoptCanonicalAsteroid(
-        { id: 'child', version: 1, validAt: 1190, data });
-    assert.ok(Math.abs(asteroid.x - 0.14) < 1e-12);
+    for (const version of [1, 2, 3]) {
+        const asteroid = h.api.adoptCanonicalAsteroid(
+            { id: 'child', version, validAt: 1190, data });
+        assert.ok(Math.abs(asteroid.x - 0.14) < 1e-12);
+    }
     assert.equal(data.x, 0.1, 'canonical birth record stays immutable');
 });
 
@@ -210,20 +213,20 @@ test('activity snapshots installed before migration still seed canonical resumed
     assert.equal(asteroid.x, 0.1);
 });
 
-test('activity migration without suspension projects canonical motion at the preserved sample time', () => {
+test('activity migration without suspension projects motion from the preserved batch anchor', () => {
     const h = harness();
     const record = { id: 'a', version: 3, ownerMemberId: 'me', validAt: 1150,
         data: { type: 'asteroid', x: 0.1, y: 0.2, radius: 0.05,
-            velocityX: 0.2, velocityY: 0, angle: 0, sampleAt: 1000 } };
+            velocityX: 0.2, velocityY: 0, angle: 0, sampleAt: 0 } };
     h.records.set('a', record);
     h.api.applyAsteroidActivity({
         resetObjectIds: [],
         migratedObjects: [{ objectId: 'a', newOwnerId: 'me', newVersion: 3 }]
     });
-    assert.ok(Math.abs(h.game.astervoids[0].x - 0.14) < 1e-12);
+    assert.ok(Math.abs(h.game.astervoids[0].x - 0.11) < 1e-12);
 });
 
-test('temporal reset anchors survive metadata transfer but not a newer authored sample', () => {
+test('temporal reset anchors survive metadata transfer and advance with authored batches', () => {
     const h = harness();
     const record = { version: 3, validAt: 60000, simulationCanonicalVersion: 3,
         simulationAnchorReset: true, data: { sampleAt: 1000 } };
@@ -231,9 +234,10 @@ test('temporal reset anchors survive metadata transfer but not a newer authored 
     record.version = record.ownershipMigrationVersion = 4;
     assert.equal(h.api.lifecycleSampleData(record).sampleAt, 60000);
     record.version = 5;
-    record.data = { sampleAt: 60100 };
+    record.data.sampleAt = 0;
     record.validAt = 60150;
-    assert.equal(h.api.lifecycleSampleData(record).sampleAt, 60100);
+    assert.equal(h.api.lifecycleSampleData(record).sampleAt, 60150);
+    assert.equal(record.data.sampleAt, 0, 'the generic payload keeps the authored retirement marker');
 });
 
 test('activity callback respects store filtering of stale reset versions', () => {

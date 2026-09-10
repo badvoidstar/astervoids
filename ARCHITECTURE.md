@@ -342,6 +342,7 @@ after the session callback has initialized snapshot consumers.
 | `handleOwnershipMigration(migratedObjects)` | Applies server-authoritative `{ objectId, newOwnerId, newVersion }` entries from `MemberLeftInfo`; prevents version drift from blind local increments |
 | `handleMemberDeparture(deletedObjectIds)` | Removes member-scoped objects from the local map and fires `onObjectDeleted` for each |
 | `trackEventSequence(senderMemberId, memberSequence)` | Public alias for `trackMemberSequence`; keeps the per-member sequence map current for events not handled internally by `ObjectSync` |
+| `configure({ refreshPendingUpdate })` | Optional synchronous game serializer `(id, record) => fields \| null`; refreshes only queued updates before delta calculation, without changing send eligibility or interpreting game data |
 
 #### Event Registration
 
@@ -973,7 +974,7 @@ sequenceDiagram
         Note over OS: RTT = responseTimestamp - clientTimestamp (locally captured)
     and Broadcast to others
         HUB->>R: OnObjectsUpdated(objects[], senderMemberId,<br/>senderSeq, memberSeq, serverTimestamp,<br/>senderSendIntervalMs, validAt)
-        Note over R: validAt orders the operation;<br/>payload sampleAt anchors the pose<br/>on the receiver's monotonic scene timeline
+        Note over R: validAt orders the operation and anchors<br/>regular poses on the monotonic scene timeline
     end
 ```
 
@@ -1051,7 +1052,7 @@ flowchart TB
         direction TB
         PKT["Packet arrives from member X<br/>(remote broadcast only: clientTimestamp=null)"]
         MEM["getMemberDelay(senderMemberId)<br/>Independent state per member"]
-        LAG["lag = arrivalServerTime - sampleAt<br/>(pose age + transit + clock residual;<br/>one observation per operation stamp)"]
+        LAG["lag = arrivalServerTime - pose anchor<br/>(regular update: validAt; birth: sampleAt;<br/>one observation per operation stamp)"]
         LAGREC["Retain valid lag sample<br/>(0-5000ms)"]
         INT["interval = serverTimestamp - lastServerTimestamp"]
         OUT{"interval > 2 × remoteSendInterval?"}
@@ -1093,13 +1094,24 @@ Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
 events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
 `UpdateObjects` samples once at flush and fans that value across the coalesced
 batch, so it is an operation-ordering anchor, not an exact simulation timestamp.
-Game serializers separately carry `sampleAt` (estimated server milliseconds) and
-`sampleTick` (the owner's local simulation-step counter). `sampleAt` is omitted
-until clock bootstrap; ticks do not imply globally synchronized physics.
-Coalescing preserves the selected pose's sample time without relabeling it at
-flush. Both presentation modes prefer this pose timestamp. Legacy/bootstrap
-fallbacks use `validAt` for buffered snapshots and recorded arrival time for
-deterministic samples.
+Every active participant still simulates its owned objects each frame. Before
+flushing already-eligible updates, a game-owned serializer refreshes their poses
+from those live instances; it neither advances physics nor adds objects to the
+batch. Both presentation modes use the existing batch `validAt` for regular
+updates. This removes per-object timestamp/tick traffic and stale queued poses
+under backpressure, while retaining a frame-phase timing approximation: the
+latest simulated pose can precede the flush, especially during a frame stall.
+No exact per-pose timestamp is claimed.
+
+Creation/replacement data retains positive `sampleAt` for precise birth/contact
+placement when the clock is initialized. The first authored motion update retires
+it with `sampleAt: 0`, retried until confirmed, then omitted from recurring updates.
+This one-time field prevents stale birth anchors in merged snapshots without
+mistaking metadata-only ownership versions for new poses. Retired/absent birth
+anchors and idle-reset anchors use `validAt`. Simulation ticks stay
+local; reserved `sampleTick` schema slots are no longer emitted. Bootstrap
+fallbacks remain `validAt` for buffered samples and arrival time for deterministic
+samples when the presentation clock is unavailable.
 
 Every fixed catch-up step has its own end time. Simulation collision history is
 saved separately from the latest render sample. Deterministic remotes share a
@@ -1112,7 +1124,7 @@ rather than silently treating all displayed poses as current server truth.
 ```mermaid
 flowchart LR
     subgraph "Owner (sender)"
-        QUEUE["Game queues pose + sampleAt + sampleTick<br/>(updates may coalesce)"]
+        QUEUE["Game queues motion each eligible frame<br/>Refresh live poses before flush; delta-filter"]
         STAMP["At operation/flush:<br/>clientValidAt = Math.round(serverNowMs())<br/>or null before clock bootstrap"]
         QUEUE --> STAMP
     end
@@ -1122,7 +1134,7 @@ flowchart LR
     end
 
     subgraph "Receiver"
-        CONV["snapshot.time =<br/>pose sampleAt converted to monotonic time<br/>(legacy fallback: validAt / arrival)"]
+        CONV["snapshot.time =<br/>validAt converted to monotonic time<br/>(unretired birth: sampleAt)"]
         BRACKET["Bracket search runs in<br/>perf.now domain<br/>(monotonic, immune to wall-clock slewing)"]
         CONV --> BRACKET
     end
@@ -1142,7 +1154,7 @@ flowchart LR
 The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole
 batch (rather than one per object), saving 8 B per object:
 
-* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries share the operation timestamp. Each gameplay payload independently retains its pose's `sampleAt`.
+* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after refreshing and coalescing the batch. After one-time birth-anchor retirement, regular payloads contain no per-object timing fields. Constant state can produce no delta instead of a timestamp-only update.
 * **One server monotonic floor.** `ObjectService.UpdateObjects` validates that
   stamp once against the newest previous `ValidAt` among accepted objects, then
   stores the resolved value on every object. The broadcast timestamp therefore
@@ -1164,8 +1176,10 @@ teleport; the old counter-rise heuristic is only a legacy fallback. Respawn
 resets both local render history and collision history instead of interpolating
 across the playfield.
 
-Shots retain the firing tick, ship/respawn identity, and muzzle transform in an
-opaque `shot` payload, plus a `bornAt` activation time. Local firing is immediate
+The respawn epoch is published at creation and retried on updates until confirmed,
+not included on every regular update when delta encoding is disabled.
+Shots retain only `shipId`, `muzzleX`, and `muzzleY` in the opaque `shot` payload,
+plus a separate `bornAt` activation time. Local firing is immediate
 and retains the original bullet velocity (it does not inherit ship velocity).
 Remote activation/audio follows the presentation timeline, and an available
 historical ship pose can provide a short render-only muzzle correction. Late
@@ -1202,9 +1216,9 @@ running terminal maintenance after gameplay physics and collisions stop.
 
 The target fields remain opaque replicated data below the Astervoids adapter:
 `ReplicationRuntime`, `ObjectSync`, SignalR, and the backend do not interpret
-kinematics. Each known object type has one superset positional schema containing
-both its live and terminal fields. This is essential because the server retains
-an object's creation schema when it re-encodes later updates and join snapshots.
+kinematics. Each known object type has a superset creation schema containing
+both its live and terminal fields. The server retains this schema for full
+snapshots; live updates preserve the sender's payload and its own schema ID.
 Optional presence bits keep mode-specific and terminal fields absent from the
 body until needed.
 
@@ -1603,13 +1617,25 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose; sample time/tick; birth and exact fracture-parent transform |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; correlated contact claim and target revision; terminal epoch/position; sample time/tick; birth and firing reference |
 | 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; peak ships; game-over/terminal times |
+| 5 | Ship compact update | First 24 fields of schema 1: original motion/replay/terminal layout, 3-byte mask |
+| 6 | Asteroid compact update | First 14 fields of schema 2: original motion/terminal layout, 2-byte mask |
+| 7 | Bullet compact update | First 16 fields of schema 3: original motion/legacy-hit/terminal layout, 2-byte mask |
 
-Every known gameplay type uses exactly one superset schema for create, update,
-replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
-deterministic ships therefore share schema 1: the presence mask omits replay or
-terminal slots when a mode does not produce them. This prevents a later update
-from introducing fields that the object's retained creation schema cannot
-encode.
+Create/replace and full snapshots retain schemas 1–4. After delta calculation,
+motion updates use 5–7 only if every actual field fits and that schema is
+registered in the session. One-time birth-anchor retirement and rare
+respawn/contact metadata use the full schema;
+older registries fall back to a fitting full schema or schema 0, never silently
+dropping fields. Original field positions/quantization and RPC envelopes stay
+unchanged. Matching gameplay timing semantics still require updated peers; this
+registry fallback alone does not guarantee mixed-frontend-version compatibility.
+
+Compared with timestamp/tick-bearing updates, ordinary ship/asteroid/bullet data
+saves respectively 13/13/14 bytes per transmitted object, including mask savings.
+Representative non-delta motion bodies are 22/20/8 bytes (excluding DTO/SignalR
+overhead); deterministic ship controls add their existing fields. Confirmed frozen
+hit claims stop publishing even with delta encoding disabled; unconfirmed claims
+remain retryable. The adaptive flush cadence and per-frame simulation are unchanged.
 
 `thrustInput` is `f32` because the configured analog range extends past 1.
 Ship velocity and asteroid velocity/spin also use `f32`: their supported caps
@@ -1620,8 +1646,8 @@ asteroid update deltas include velocity and spin whenever those values change.
 
 Schema 0 remains reserved as the generic extension/fallback path. Its body is a
 MessagePack map and can preserve nested maps, arrays, nulls, binary values, and
-unknown fields. No current Astervoids gameplay object selects it, but JS and C#
-cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
+unknown fields. Hit-result ledger records and unknown/unregistered schema fields
+use it; JS and C# cross-wire, lifecycle, snapshot, and mixed-batch tests cover it.
 
 ### Nested compact data
 

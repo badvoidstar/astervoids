@@ -110,8 +110,9 @@ public class WireSizeBenchTests
         }),
         Version: 17L);
 
-    // ── Production positional schemas ──────────────────────────────────────────
-    // These mirror index.html WIREOPT_SCHEMAS exactly.
+    // ── Pre-lifecycle positional baselines ─────────────────────────────────────
+    // Ship/asteroid/bullet layouts match current compact update IDs 5/6/7 in
+    // game-wire-schemas.js. Full creation schemas 1/2/3 now have optional tails.
 
     private static readonly PositionalSchemaCodec.Schema ShipSchema =
         new(1, new[] {

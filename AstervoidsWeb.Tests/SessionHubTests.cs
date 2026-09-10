@@ -90,6 +90,57 @@ public class SessionHubTests
         snapshot.MemberSequences.Should().Contain(p => p.Id == client.Id);
     }
 
+    [Fact]
+    public async Task CompactUpdate_BroadcastsOriginalBytes_ButSnapshotsRetainCreationSchema()
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var sessionId = created.Session!.Id;
+        var full = new PositionalSchemaCodec.Schema(1, new[]
+        {
+            new PositionalSchemaCodec.FieldSpec("type", "str"),
+            new PositionalSchemaCodec.FieldSpec("x", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("y", "q16w"),
+            new PositionalSchemaCodec.FieldSpec("sampleAt", "f64"),
+            new PositionalSchemaCodec.FieldSpec("respawnEpoch", "u32")
+        });
+        var compact = new PositionalSchemaCodec.Schema(5, full.Fields.Take(3).ToArray());
+        _schemaRegistry.SetSessionSchemas(sessionId, new[] { full, compact });
+        var obj = _objectService.CreateObject(sessionId, created.Creator!.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "ship", ["x"] = 0.1, ["y"] = 0.5,
+                ["sampleAt"] = 1000.5, ["respawnEpoch"] = 2 }, schemaId: 1)!;
+        object?[]? broadcast = null;
+        var proxy = new Mock<IClientProxy>();
+        proxy.Setup(p => p.SendCoreAsync("OnObjectsUpdated",
+                It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((_, args, _) => broadcast = args)
+            .Returns(Task.CompletedTask);
+        var hub = CreateHub("connection-1", clientProxyMock: proxy);
+        await hub.UpdateObjects(new[] { new ObjectUpdateRequest(obj.Id,
+            new SyncPayload(1, PositionalSchemaCodec.Encode(full,
+                new Dictionary<string, object?> { ["sampleAt"] = 0.0 }))) });
+        var payload = new SyncPayload(5, PositionalSchemaCodec.Encode(compact,
+            new Dictionary<string, object?> { ["x"] = 0.75 }));
+        var result = await hub.UpdateObjects(new[] { new ObjectUpdateRequest(obj.Id, payload) });
+
+        result.Should().NotBeNull();
+        var sent = ((IEnumerable<ObjectUpdateInfo>)broadcast![0]!).Single();
+        sent.Data.SchemaId.Should().Be(5);
+        sent.Data.Data.Should().Equal(payload.Data);
+        obj.SchemaId.Should().Be(1);
+        var observer = CreateHub("connection-2");
+        var joined = await observer.JoinSession(sessionId);
+        await hub.SetSimulationActive(false);
+        var snapshot = await observer.GetSessionState();
+        foreach (var info in new[] { joined!.Objects.Single(), snapshot!.Objects.Single() })
+        {
+            info.Data.SchemaId.Should().Be(1);
+            var data = SyncPayloadCodec.DecodeDict(info.Data, sessionId, _schemaRegistry);
+            Convert.ToDouble(data["x"]).Should().BeApproximately(0.75, 0.0001);
+            Convert.ToDouble(data["sampleAt"]).Should().Be(0);
+            Convert.ToUInt32(data["respawnEpoch"]).Should().Be(2);
+        }
+    }
+
     /// <summary>
     /// Verifies that the snapshot is captured AFTER AddToGroupAsync so that any
     /// concurrent broadcast during the group-add window is delivered to the joiner

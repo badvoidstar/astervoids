@@ -222,6 +222,7 @@ const ObjectSync = (function() {
     // can therefore predate validAt by its queue wait. The server clamps client
     // stamps and applies a shared monotonic floor to each update batch.
     let clockSource = null;
+    let refreshPendingUpdate = null;
     
     // Delta-enabled flush opportunities between periodic forced-full payloads
     // for objects already pending in that batch. This counts flushes with
@@ -253,7 +254,7 @@ const ObjectSync = (function() {
     
     /**
      * Configure sync timing and field compression parameters.
-     * @param {object} config - { nominalFrameTime, deltaEncoding, adaptiveSendRate, fieldMap }
+     * @param {object} config - { nominalFrameTime, deltaEncoding, adaptiveSendRate, fieldMap, refreshPendingUpdate }
      */
     function configure(config) {
         if (config.nominalFrameTime !== undefined) {
@@ -274,6 +275,13 @@ const ObjectSync = (function() {
         }
         if (config.clockSource !== undefined) {
             clockSource = config.clockSource;
+        }
+        if (config.refreshPendingUpdate !== undefined) {
+            if (config.refreshPendingUpdate !== null
+                && typeof config.refreshPendingUpdate !== 'function') {
+                throw new TypeError('refreshPendingUpdate must be a function or null');
+            }
+            refreshPendingUpdate = config.refreshPendingUpdate;
         }
     }
     
@@ -1287,6 +1295,20 @@ const ObjectSync = (function() {
         if (!SessionClient.isInSession()) return;
         if (flushInProgress !== null) return;
         const context = captureAsyncContext();
+
+        // Refresh only already-eligible producers, before delta calculation.
+        // The game owns serialization; transport never interprets object data.
+        if (refreshPendingUpdate) {
+            for (const [objectId, data] of pendingUpdates) {
+                const object = objects.get(objectId);
+                if (!object) continue;
+                const fresh = refreshPendingUpdate(objectId, object);
+                if (!fresh) continue;
+                Object.assign(data, fresh);
+                Object.assign(object.data, fresh);
+                markObjectMutation(objectId);
+            }
+        }
 
         let updates;
         // Track deltas sent per object for deferred confirmation

@@ -55,6 +55,21 @@ public class SchemaCrossWireFixturesTests
         ("hitOffsetN", "q16s"), ("terminalEpoch", "f64"),
         ("terminalX", "f64"), ("terminalY", "f64"));
 
+    [Theory]
+    [InlineData((byte)5, "06000000800060")]
+    [InlineData((byte)6, "060000800060")]
+    [InlineData((byte)7, "060000800060")]
+    public void Fixture_CompactUpdate_PreservesOriginalMaskAndQuantization(byte id, string hex)
+    {
+        var fields = id == 5 ? ShipSchema().Fields
+            : id == 6 ? AsteroidSchema().Fields : BulletSchema().Fields;
+        var schema = new PositionalSchemaCodec.Schema(id, fields);
+        var data = new Dictionary<string, object?> { ["x"] = 0.5, ["y"] = 0.25 };
+        Hex(PositionalSchemaCodec.Encode(schema, data)).Should().Be(hex);
+        var decoded = PositionalSchemaCodec.Decode(schema, Convert.FromHexString(hex));
+        Hex(PositionalSchemaCodec.Encode(schema, decoded)).Should().Be(hex);
+    }
+
     [Fact]
     public void Fixture_BulletTimingAndClaim_ProductionSchema()
     {

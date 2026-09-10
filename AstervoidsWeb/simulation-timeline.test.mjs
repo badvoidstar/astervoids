@@ -14,6 +14,7 @@ function harness() {
     let initialized = true;
     let deterministic = true;
     let fires = 0;
+    const writes = [];
     const records = new Map();
     const session = { members: [], simulationSuspended: false };
     const game = { ship: null, astervoids: [], bullets: [],
@@ -47,8 +48,13 @@ function harness() {
     const DeadReckon = {};
     const dependencies = {
         game, simulationTiming, CONFIG, RemoteObjects, MsgpackCodec, DeadReckon,
-        SessionClient: { getCurrentSession: () => session },
-        ObjectSync: { getObject: id => records.get(id) },
+        SessionClient: { getCurrentSession: () => session, getCurrentMember: () => ({ id: 'local' }) },
+        ObjectSync: { getObject: id => records.get(id),
+            updateObject: (id, data) => writes.push({ id, data }),
+            isDataConfirmed: (id, fields) => Object.entries(fields).every(
+                ([key, value]) => records.get(id)?.confirmed?.[key] === value) },
+        isSessionMode: () => true,
+        SendGate: { shouldSend: () => true },
         OBJECT_TYPES: { SHIP: 'ship', BULLET: 'bullet', ASTEROID: 'asteroid' },
         TURN_CONTROL_MODE: { KEYBOARD_RATE: 0, ANALOG_TARGET: 1 },
         normalizeTurnControlMode: mode => mode || 0,
@@ -66,15 +72,15 @@ function harness() {
         rampInputToward: (_current, target) => target,
     };
     const production = loadInlineGameFunctions([
-        'Ship', 'Bullet', 'getPoseTiming', 'getSimulationStepMs',
+        'Ship', 'Asteroid', 'Bullet', 'getPoseTiming', 'getSimulationStepMs',
         'resetEntityHistory', 'captureCollisionState', 'beginSimulationStep',
         'finishSimulationStep', 'advancePresentationTime', 'getPresentationTime',
         'isShipDiscontinuity', 'applyRemoteShipState',
         'getDeterministicIngestBaselinePerf', 'getDeterministicJoinBaselinePerf',
         'createDeadReckoningState', 'getBallisticPredictionFrames',
         'createKinematicPresentation', 'lifecycleSampleData', 'hasLifecycleResetAnchor', 'isLifecycleFrozen',
-        'currentKinematicData', 'getKinematicInstance',
-        'sampleBulletPresentation',
+        'currentKinematicData', 'getKinematicInstance', 'refreshQueuedKinematicUpdate',
+        'sampleBulletPresentation', 'syncLocalBullets',
     ], dependencies);
     Object.assign(DeadReckon, createDeadReckoningPolicy({
         config: CONFIG, nowMs: () => now,
@@ -84,7 +90,7 @@ function harness() {
         createState: production.createDeadReckoningState,
         getMaxPredictionFrames: state => state.predictionFrames,
     }));
-    return { ...production, game, records, session, CONFIG, simulationTiming, RemoteObjects,
+    return { ...production, game, records, session, writes, CONFIG, simulationTiming, RemoteObjects,
         at: value => { now = value; },
         mode: value => { deterministic = value; },
         fireCount: () => fires,
@@ -171,22 +177,85 @@ test('respawn resets simulation, sweep, and render history without blending a te
     assert.equal(ship.respawnEpoch, 1);
 });
 
-test('pose sample timestamps survive queue delay and share the explicit simulation tick', () => {
+test('birth timestamps stay cold while current poses use the shared batch anchor', () => {
     const h = harness();
     h.beginSimulationStep(1, 980);
     const ship = new h.Ship(0.5, 0.5);
-    const data = ship.toUpdateData();
+    const data = ship.toSyncData();
     assert.equal(data.sampleAt, 10_980);
-    assert.equal(data.sampleTick, 1);
+    assert.equal(data.sampleTick, undefined);
+    assert.equal(h.simulationTiming.tick, 1, 'simulation still advances every frame');
+    assert.equal(ship.toUpdateData().sampleAt, undefined);
+    assert.equal(ship.toUpdateData().sampleTick, undefined);
+    assert.equal(ship.toUpdateData().respawnEpoch, undefined);
     h.finishSimulationStep();
     h.at(1300);
-    assert.equal(data.sampleAt, 10_980, 'flushing later must not relabel an older pose');
+    assert.equal(data.sampleAt, 10_980, 'birth remains anchored to the simulation step');
     assert.equal(h.getDeterministicIngestBaselinePerf(
-        { data, validAt: 11_300, arrivalTime: 1300 }, {}), 980);
+        { data, validAt: 11_300, arrivalTime: 1300, version: 1 }, {}), 980);
+    assert.equal(h.getDeterministicIngestBaselinePerf(
+        { data, validAt: 11_300, arrivalTime: 1300, version: 2 }, {}), 980,
+        'an ownership-only version must preserve the exact birth anchor');
+    assert.equal(h.getDeterministicIngestBaselinePerf(
+        { data: { ...data, sampleAt: 0 }, validAt: 11_300, arrivalTime: 1300, version: 3 }, {}), 1300,
+        'a retired birth anchor must not timestamp a newer pose');
     h.clockReady(false);
     assert.equal(h.getPoseTiming().sampleAt, undefined, 'no invented pre-bootstrap wall axis');
     assert.equal(h.getDeterministicIngestBaselinePerf(
         { data: {}, arrivalTime: 1250 }, {}), 1220);
+});
+
+test('queued ship poses refresh without resending confirmed lifecycle epochs', () => {
+    const h = harness();
+    h.game.ship = new h.Ship(0.5, 0.5);
+    h.game.multiplayer.myShipObjectId = 'ship';
+    const record = { data: { type: 'ship', sampleAt: 10_000 }, ownerMemberId: 'local',
+        confirmed: { respawnEpoch: 0 } };
+    h.records.set('ship', record);
+    h.game.ship.x = 0.7;
+    assert.deepEqual(h.refreshQueuedKinematicUpdate('ship', record),
+        { ...h.game.ship.toUpdateData(), sampleAt: 0 });
+    record.data.sampleAt = 0;
+    assert.equal(h.refreshQueuedKinematicUpdate('ship', record).sampleAt, 0,
+        'a failed retirement must be retried despite optimistic local data');
+    record.confirmed.sampleAt = 0;
+    assert.deepEqual(h.refreshQueuedKinematicUpdate('ship', record), h.game.ship.toUpdateData());
+    h.game.ship.reset();
+    assert.equal(h.refreshQueuedKinematicUpdate('ship', record).respawnEpoch, 1);
+    assert.equal(h.refreshQueuedKinematicUpdate('ship', record).respawnEpoch, 1,
+        'failed or in-flight lifecycle writes remain retryable');
+    record.confirmed.respawnEpoch = 1;
+    assert.equal(h.refreshQueuedKinematicUpdate('ship', record).respawnEpoch, undefined);
+    record.ownerMemberId = 'remote';
+    assert.equal(h.refreshQueuedKinematicUpdate('ship', record), null);
+});
+
+test('all motion serializers omit timing, even as the simulation advances every frame', () => {
+    const h = harness();
+    for (const Model of [h.Ship, h.Asteroid, h.Bullet]) {
+        const entity = Object.assign(Object.create(Model.prototype),
+            { x: 0.2, y: 0.3, angle: 1, velocityX: 0.1, velocityY: 0,
+                rotationSpeed: 0.01, lifetime: 42, respawnEpoch: 0 });
+        const initial = entity.toUpdateData();
+        h.beginSimulationStep(1, 1000);
+        h.finishSimulationStep();
+        assert.deepEqual(entity.toUpdateData(), initial);
+        assert.equal('sampleAt' in initial || 'sampleTick' in initial || 'respawnEpoch' in initial, false);
+    }
+});
+
+test('frozen claims retry until confirmation then stop even when the send gate is always eligible', () => {
+    const h = harness();
+    const bullet = new h.Bullet(0.2, 0.3, 1, 0);
+    Object.assign(bullet, { ownerMemberId: 'local', syncObjectId: 'bullet', pendingHit: true });
+    h.game.bullets.push(bullet);
+    h.syncLocalBullets();
+    h.syncLocalBullets();
+    assert.equal(h.writes.length, 2, 'missing confirmations leave the claim retryable');
+    h.records.set('bullet', { confirmed: bullet.toUpdateData() });
+    h.at(2000);
+    h.syncLocalBullets();
+    assert.equal(h.writes.length, 2, 'confirmed frozen state has no heartbeat payload');
 });
 
 test('collision history follows simulation poses rather than intervening render samples', () => {
@@ -236,9 +305,8 @@ test('production firing references the pre-step muzzle without adding ship veloc
     assert.equal(bullet.velocityX, 1, 'retain actual production bullet physics');
     assert.equal(shot.shipId, 'ship');
     assert.equal(shot.muzzleX, bullet.x);
-    assert.equal(shot.sampleTick, 1);
-    assert.ok(Math.abs(shot.sampleAt - (11_000 - 1000 / 60)) < 1e-9);
-    assert.equal(bullet.bornAt, shot.sampleAt);
+    assert.deepEqual(Object.keys(shot), ['shipId', 'muzzleX', 'muzzleY']);
+    assert.ok(Math.abs(bullet.bornAt - (11_000 - 1000 / 60)) < 1e-9);
     h.finishSimulationStep();
 });
 

@@ -76,6 +76,16 @@ const AstervoidsWireSchemas = (function() {
         ]},
     ];
 
+    // Keep the pre-lifecycle layouts on ordinary updates. Full creation schemas
+    // still retain rare fields for snapshots; no codec/envelope change is needed.
+    const UPDATE_SCHEMAS = [
+        { id: 5, fields: SCHEMAS[0].fields.slice(0, 24) },
+        { id: 6, fields: SCHEMAS[1].fields.slice(0, 14) },
+        { id: 7, fields: SCHEMAS[2].fields.slice(0, 16) },
+    ];
+    SCHEMAS.push(...UPDATE_SCHEMAS);
+    const UPDATE_SCHEMA_BY_TYPE = Object.freeze({ ship: 5, asteroid: 6, bullet: 7 });
+
     for (const schema of SCHEMAS) {
         for (const field of schema.fields) Object.freeze(field);
         Object.freeze(schema.fields);
@@ -92,12 +102,21 @@ const AstervoidsWireSchemas = (function() {
 
     function selectSchemaId(data, kind, context) {
         let type = data?.type;
+        const schemas = context?.schemas || SCHEMAS;
+        const fits = id => {
+            const schema = schemas.find(value => value.id === id);
+            return schema && Object.keys(data || {}).every(key =>
+                schema.fields.some(field => field[0] === key));
+        };
         if (kind === 'update') {
             type = context?.object?.data?.type || type;
+            const compact = UPDATE_SCHEMA_BY_TYPE[type];
+            if (fits(compact)) return compact;
         } else if (kind !== 'create' && kind !== 'replace') {
             return 0;
         }
-        return SCHEMA_BY_OBJECT_TYPE[type] || 0;
+        const full = SCHEMA_BY_OBJECT_TYPE[type];
+        return fits(full) ? full : 0;
     }
 
     return Object.freeze({

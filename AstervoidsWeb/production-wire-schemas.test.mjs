@@ -35,9 +35,9 @@ test('production bullet timing and claim fields match the C# cross-wire fixture'
     assert.deepEqual(decoded, data);
 });
 
-test('known gameplay objects each have one positional schema', () => {
+test('full gameplay schemas retain their IDs alongside compact update schemas', () => {
     const schemas = WireSchemas.SCHEMAS;
-    assert.deepEqual(schemas.map(schema => schema.id), [1, 2, 3, 4]);
+    assert.deepEqual(schemas.map(schema => schema.id), [1, 2, 3, 4, 5, 6, 7]);
     for (const schema of schemas) {
         assert.ok(schema.fields.length <= 32);
         assert.equal(
@@ -51,6 +51,63 @@ test('known gameplay objects each have one positional schema', () => {
         bullet: 3,
         gameState: 4,
     });
+});
+
+test('regular update bytes match the pre-lifecycle layouts exactly', () => {
+    registerProductionSchemas();
+    const poses = [
+        { type: 'ship', id: 5, fields: 24, bytes: 22, saved: 13, data: {
+            x: 0.5, y: 0.25, angle: 1, velocityX: 0.1, velocityY: 0,
+            rotationSpeed: 0.01, thrusting: true, invulnerable: 0 } },
+        { type: 'asteroid', id: 6, fields: 14, bytes: 20, saved: 13, data: {
+            x: 0.5, y: 0.25, angle: 1, velocityX: 0.1, velocityY: 0, rotationSpeed: 0.01 } },
+        { type: 'bullet', id: 7, fields: 16, bytes: 8, saved: 14, data: {
+            x: 0.5, y: 0.25, lifetime: 42 } },
+    ];
+    for (const { type, id, fields, bytes, saved, data } of poses) {
+        assert.equal(WireSchemas.selectSchemaId(data, 'update', { object: { data: { type } } }), id);
+        const compact = SchemaCodec.get(id);
+        const full = SchemaCodec.get(WireSchemas.SCHEMA_BY_OBJECT_TYPE[type]);
+        assert.equal(compact.fields.length, fields);
+        assert.deepEqual(compact.fields, full.fields.slice(0, fields));
+        const encoded = SchemaCodec.encode(compact, data);
+        assert.equal(encoded.length, bytes);
+        assert.deepEqual(SchemaCodec.decode(compact, encoded),
+            SchemaCodec.decode(full, SchemaCodec.encode(full, data)));
+        assert.equal(SchemaCodec.encode(full,
+            { ...data, sampleAt: 1_700_000_000_000, sampleTick: 60 }).length - encoded.length, saved);
+    }
+});
+
+test('compact update masks and quantization match the C# fixtures', () => {
+    registerProductionSchemas();
+    for (const [id, hex] of [[5, '06000000800060'], [6, '060000800060'], [7, '060000800060']]) {
+        const schema = SchemaCodec.get(id);
+        assert.equal(Buffer.from(SchemaCodec.encode(schema, { x: 0.5, y: 0.25 })).toString('hex'), hex);
+        const data = SchemaCodec.decode(schema, new Uint8Array(Buffer.from(hex, 'hex')));
+        assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
+    }
+});
+
+test('rare fields and sessions without compact schemas never silently lose data', () => {
+    for (const [type, extra] of [
+        ['ship', { respawnEpoch: 2 }],
+        ['asteroid', { parentX: 0.5 }],
+        ['bullet', { hitClaimAt: 1200 }],
+    ]) {
+        const full = WireSchemas.SCHEMA_BY_OBJECT_TYPE[type];
+        const context = { object: { data: { type } } };
+        assert.equal(WireSchemas.selectSchemaId({ x: 0.5, ...extra }, 'update', context), full);
+        assert.equal(WireSchemas.selectSchemaId({ type, ...extra }, 'create'), full);
+        assert.equal(WireSchemas.selectSchemaId({ type, ...extra }, 'replace'), full);
+        context.schemas = WireSchemas.SCHEMAS.slice(0, 4);
+        assert.equal(WireSchemas.selectSchemaId({ x: 0.5 }, 'update', context), full);
+        context.schemas = [];
+        assert.equal(WireSchemas.selectSchemaId({ x: 0.5 }, 'update', context), 0);
+        context.schemas = WireSchemas.SCHEMAS.slice(4).map(schema =>
+            ({ id: schema.id - 4, fields: schema.fields }));
+        assert.equal(WireSchemas.selectSchemaId(extra, 'update', context), 0);
+    }
 });
 
 test('unified ship schema carries adaptive, replay, identity, and terminal subsets', () => {
@@ -201,7 +258,7 @@ test('known terminal updates do not fall back to schema zero', () => {
     for (const type of Object.keys(WireSchemas.SCHEMA_BY_OBJECT_TYPE)) {
         assert.notEqual(
             WireSchemas.selectSchemaId(
-                { terminalEpoch: 1 },
+                type === 'gameState' ? { terminalAt: 1 } : { terminalEpoch: 1 },
                 'update',
                 { object: { data: { type } } }),
             0,

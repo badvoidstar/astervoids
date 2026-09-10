@@ -1218,6 +1218,72 @@ test('send cadence accumulates irregular elapsed steps rather than counting fram
     assert.equal(calls.length, 3, 'the previous 20ms overshoot is retained');
 });
 
+test('queued poses refresh at flush without new timestamps or overlapping invokes', async () => {
+    for (const deltaEncoding of [true, false]) {
+        const client = makeObjectSyncClient();
+        const gate = deferred();
+        const calls = [];
+        let pose = 0.2;
+        let now = 1000;
+        client.updateObjects = (updates, _sequence, _interval, validAt) => {
+            calls.push({ updates, validAt });
+            return calls.length === 1 ? gate.promise
+                : Promise.resolve({ versions: { ship: calls.length + 1 } });
+        };
+        const sync = loadObjectSync(client);
+        sync.init();
+        sync.configure({ deltaEncoding,
+            clockSource: { initialized: () => true, nowMs: () => now },
+            refreshPendingUpdate: () => ({ x: pose }) });
+        client.join({ objects: [objectInfo('ship', 1, { type: 'ship', x: 0.1 }, 'me')],
+            validAts: {}, metadata: {} });
+        sync.updateObject('ship', { x: 0.1 }, true);
+        assert.deepEqual(calls[0].updates[0].data, { x: 0.2 });
+        sync.updateObject('ship', { x: 0.3 }, true);
+        pose = 0.4;
+        now = 1500;
+        assert.equal(calls.length, 1);
+        gate.resolve({ versions: { ship: 2 } });
+        await drainMicrotasks();
+        assert.deepEqual(calls[1].updates[0].data, { x: 0.4 });
+        assert.equal(calls[1].validAt, 1500);
+        assert.equal(sync.getObject('ship').data.x, 0.4);
+        sync.updateObject('ship', { x: 0.4 });
+        now = 2000;
+        await sync.flushUpdates();
+        assert.equal(calls.length, deltaEncoding ? 2 : 3,
+            'clock advancement alone does not create a delta');
+        await sync.flushUpdates();
+        assert.equal(calls.length, deltaEncoding ? 2 : 3,
+            'refresh never enqueues an ineligible object');
+    }
+});
+
+test('forced full motion updates still use compact schemas without lifecycle fields', async () => {
+    const client = makeObjectSyncClient();
+    const calls = [];
+    client.updateObjects = async updates => {
+        calls.push(updates);
+        return { versions: { ship: 2 } };
+    };
+    const sync = loadObjectSync(client);
+    const schemas = evaluateModule('wwwroot/js/game-wire-schemas.js', 'AstervoidsWireSchemas', {});
+    const motion = { x: 0.5, y: 0.25, angle: 1 };
+    sync.init();
+    sync.setSchemaIdSelector(schemas.selectSchemaId);
+    sync.configure({ deltaEncoding: true, refreshPendingUpdate: () => motion });
+    client.join({ objects: [objectInfo('ship', 1,
+        { type: 'ship', ...motion, sampleAt: 0, respawnEpoch: 2 }, 'me')],
+        validAts: {}, metadata: {} });
+    for (let i = 0; i < 6000; i++) {
+        sync.updateObject('ship', motion);
+        await sync.flushUpdates();
+    }
+    assert.equal(calls.length, 1, 'only the existing periodic full-sync is sent');
+    assert.equal(calls[0][0].schemaId, 5);
+    assert.deepEqual(calls[0][0].data, motion);
+});
+
 test('ordinary sends retain due elapsed budget through in-flight backpressure', async () => {
     const client = makeObjectSyncClient();
     const gate = deferred();

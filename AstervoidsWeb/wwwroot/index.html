@@ -1797,7 +1797,7 @@
     };
 
     function getPoseTiming(offsetMs = 0) {
-        const timing = { sampleTick: simulationTiming.tick >>> 0 };
+        const timing = {};
         if (RemoteObjects.isClockOffsetInitialized()) {
             timing.sampleAt = (simulationTiming.stepServerMs
                 ?? RemoteObjects.serverNowMs()) + offsetMs;
@@ -2245,7 +2245,12 @@
     // nonzero values to 1, fixing the receiver in the "blink off" half and
     // making the ship invisible for the entire invuln period.
     const WIREOPT_SCHEMAS = AstervoidsWireSchemas.SCHEMAS;
-    const selectWireoptSchemaId = AstervoidsWireSchemas.selectSchemaId;
+    function selectWireoptSchemaId(data, kind, context) {
+        return AstervoidsWireSchemas.selectSchemaId(data, kind, {
+            ...context,
+            schemas: SessionClient.getCurrentSession()?.metadata?.schemas || []
+        });
+    }
 
     // Ship colors for up to 4 players (distinct, high-contrast)
     const SHIP_COLORS = [
@@ -3646,6 +3651,8 @@
             return {
                 type: OBJECT_TYPES.SHIP,
                 ...this.toUpdateData(),
+                ...getPoseTiming(),
+                respawnEpoch: this.respawnEpoch,
                 x: this.x,
                 y: this.y,
                 angle: this.angle,
@@ -3686,8 +3693,6 @@
                 thrusting: this.thrusting,
                 invulnerable: this.invulnerable
             };
-            Object.assign(data, getPoseTiming());
-            data.respawnEpoch = this.respawnEpoch;
             if (isDeterministicMode()) {
                 Object.assign(data, {
                     thrustInput: this.thrustInput,
@@ -3949,13 +3954,8 @@
             bullet.bornAt = timing.sampleAt;
             bullet.shot = MsgpackCodec.encode({
                 shipId: this.syncObjectId,
-                ...timing,
-                x: this.x,
-                y: this.y,
-                angle: this.angle,
                 muzzleX: noseX,
-                muzzleY: noseY,
-                respawnEpoch: this.respawnEpoch
+                muzzleY: noseY
             });
             return bullet;
         }
@@ -4047,8 +4047,7 @@
                 angle: this.angle,
                 velocityX: this.velocityX,
                 velocityY: this.velocityY,
-                rotationSpeed: this.rotationSpeed,
-                ...getPoseTiming()
+                rotationSpeed: this.rotationSpeed
             };
         }
 
@@ -4287,8 +4286,7 @@
             const data = {
                 x: this.x,
                 y: this.y,
-                lifetime: this.lifetime,
-                ...getPoseTiming(),
+                lifetime: this.lifetime
             };
             if (this.pendingHit) Object.assign(data, this.toHitData());
             return data;
@@ -5226,6 +5224,23 @@
         return null;
     }
 
+    function refreshQueuedKinematicUpdate(id, record) {
+        if (!record || record.ownerMemberId !== SessionClient.getCurrentMember()?.id
+            || isLifecycleFrozen(record) || resolveTerminalSession()) return null;
+        const instance = getKinematicInstance(record.data.type, id);
+        if (!instance) return null;
+        const data = instance.toUpdateData();
+        // Retire a birth anchor once, not by version: ownership-only versions
+        // must preserve exact birth timing even before the first motion update.
+        if (record.data.sampleAt !== undefined
+            && !ObjectSync.isDataConfirmed(id, { sampleAt: 0 })) data.sampleAt = 0;
+        if (record.data.type === OBJECT_TYPES.SHIP) {
+            const lifecycle = { respawnEpoch: instance.respawnEpoch };
+            if (!ObjectSync.isDataConfirmed(id, lifecycle)) Object.assign(data, lifecycle);
+        }
+        return data;
+    }
+
     function seedReplicaAtTerminalTarget(instance, record) {
         if (!instance || !hasPersistedTerminalTarget(record)) return instance;
         instance.x = record.data.terminalX;
@@ -5283,10 +5298,11 @@
                     return;
                 }
                 if (isDeterministicMode()) {
+                    const sampleAt = lifecycleSampleData(record)?.sampleAt;
                     if (RemoteObjects.isClockOffsetInitialized()
-                        && Number.isFinite(data.sampleAt)) {
+                        && Number.isFinite(sampleAt)) {
                         RemoteObjects.recordObjectSample(
-                            record.ownerMemberId, data.sampleAt,
+                            record.ownerMemberId, sampleAt,
                             record.arrivalServerTime ?? RemoteObjects.serverNowMs(),
                             record.validAt);
                     }
@@ -5303,8 +5319,8 @@
                         const existingShip = game.multiplayer.remoteShips.get(id);
                         isTeleport = isShipDiscontinuity(existingShip, data);
                     }
-                    // Preserve the pose's sampling time through queueing and
-                    // render scheduling. Replacement continuity is visual only.
+                    // Use the shared flush anchor after birth. Replacement
+                    // continuity is visual only.
                     DeadReckon.updateState(
                         id,
                         data,
@@ -5383,7 +5399,10 @@
     }
 
     function lifecycleSampleData(record) {
-        return hasLifecycleResetAnchor(record) && Number.isFinite(record.validAt)
+        // Positive sampleAt is birth-only; the first authored update retires it
+        // with zero. Metadata-only migrations retain the precise birth anchor.
+        return (hasLifecycleResetAnchor(record) || !(record.data.sampleAt > 0))
+            && Number.isFinite(record.validAt)
             ? { ...record.data, sampleAt: record.validAt }
             : record.data;
     }
@@ -6054,10 +6073,13 @@
             if (bullet.ownerMemberId === myMemberId && bullet.syncObjectId) {
                 // Send-on-change: bullets are frictionless/ballistic, so remotes
                 // predict from transmitted constant velocity and do not need
-                // per-frame re-anchors. A pending hit always remains eligible:
+                // per-frame re-anchors. An unconfirmed pending hit stays eligible:
                 // pendingHit + hit* fields are the owner-to-owner claim and are
                 // not derivable from kinematics. Buffered mode remains eligible every
-                // frame.
+                // frame. Confirmed claims are frozen and need no repeated payload,
+                // even with delta encoding disabled.
+                if (bullet.pendingHit
+                    && ObjectSync.isDataConfirmed(bullet.syncObjectId, bullet.toUpdateData())) continue;
                 const gateSend = SendGate.shouldSend(
                     bullet.syncObjectId, bullet.x, bullet.y, null,
                     bullet.velocityX, bullet.velocityY, 0);
@@ -10122,6 +10144,7 @@
                     minFrameTime: CONFIG.SYNC_MIN_FRAME_TIME,
                     deltaEncoding: CONFIG.DELTA_ENCODING_ENABLED,
                     adaptiveSendRate: CONFIG.ADAPTIVE_SEND_RATE,
+                    refreshPendingUpdate: refreshQueuedKinematicUpdate,
                     // Owner-stamp source for the `clientValidAt` carried by
                     // create, update, replace, and object-event operations.
                     // Updates sample it at ObjectSync flush time, so it excludes
