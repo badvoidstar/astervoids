@@ -19,6 +19,8 @@ const AstervoidsWireSchemas = (function() {
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['terminalAngle', 'f64'],
+            ['sampleAt', 'f64'], ['sampleTick', 'u32'],
+            ['respawnEpoch', 'u32'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],
@@ -31,6 +33,9 @@ const AstervoidsWireSchemas = (function() {
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['terminalAngle', 'f64'],
+            ['sampleAt', 'f64'], ['sampleTick', 'u32'],
+            ['bornAt', 'f64'],
+            ['parentX', 'f64'], ['parentY', 'f64'], ['parentAngle', 'f64'],
         ]},
         { id: 3, fields: [
             ['type', 'str'],
@@ -46,6 +51,12 @@ const AstervoidsWireSchemas = (function() {
             ['hitOffsetN', 'q16s'],
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
+            ['sampleAt', 'f64'], ['sampleTick', 'u32'],
+            ['bornAt', 'f64'], ['shot', 'bytes'],
+            ['hitClaimId', 'guid'], ['hitClaimAt', 'f64'],
+            ['hitX', 'f64'], ['hitY', 'f64'], ['hitAngle', 'f64'],
+            ['hitTargetVersion', 'u32'],
+            ['hitTargetOwnerId', 'guid'],
         ]},
         { id: 4, fields: [
             ['type', 'str'],

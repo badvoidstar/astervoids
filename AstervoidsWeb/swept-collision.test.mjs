@@ -165,9 +165,10 @@ test('wrap delta uses half of the margin-extended range', () => {
 });
 
 test('production tracks step poses and applies swept broad and narrow phases', () => {
-    assert.match(productionSource, /bullet\._collisionPrevX = bullet\.x;/);
-    assert.match(productionSource, /asteroid\._collisionPrevX = asteroid\.x;/);
-    assert.match(productionSource, /AstervoidsCollision\.wrappedDelta\(/);
-    assert.match(productionSource, /AstervoidsCollision\.sweptCircleIntersectsCircle\(/);
-    assert.match(productionSource, /AstervoidsCollision\.sweptCirclePolygonCollision\(/);
+    assert.match(productionSource, /function captureCollisionState\(\)/);
+    assert.match(productionSource, /const entities = \[\.\.\.game\.astervoids, \.\.\.game\.bullets\];/);
+    assert.match(productionSource, /entity\[`_collisionPrev\$\{axis\}`\]/);
+    assert.match(productionSource, /AstervoidsCollision\.movingCirclePolygonTOI\(/);
+    assert.match(productionSource, /AstervoidsCollision\.movingPolygonTOI\(/);
+    assert.match(productionSource, /marginX: wrapMarginX\(radius\) \* width/);
 });

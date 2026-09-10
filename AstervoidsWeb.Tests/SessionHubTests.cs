@@ -202,11 +202,13 @@ public class SessionHubTests
             .Setup(service => service.CreateSession(
                 "connection-new",
                 It.IsAny<Dictionary<string, object?>?>(),
-                It.IsAny<Guid?>()))
+                It.IsAny<Guid?>(),
+                It.IsAny<bool>()))
             .Returns((
                 string _,
                 Dictionary<string, object?>? _,
-                Guid? sessionId) =>
+                Guid? sessionId,
+                bool _) =>
             {
                 publishedSessionId = sessionId!.Value;
                 schemaWasPublished =

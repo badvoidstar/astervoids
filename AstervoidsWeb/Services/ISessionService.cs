@@ -16,7 +16,8 @@ public interface ISessionService
     CreateSessionResult CreateSession(
         string creatorConnectionId,
         Dictionary<string, object?>? metadata = null,
-        Guid? sessionId = null);
+        Guid? sessionId = null,
+        bool simulationActive = true);
 
     /// <summary>
     /// Joins an existing session as a client.
@@ -24,7 +25,7 @@ public interface ISessionService
     /// <param name="sessionId">The session to join.</param>
     /// <param name="connectionId">SignalR connection ID of the joining member.</param>
     /// <returns>Result indicating success/failure with session and member if successful.</returns>
-    JoinSessionResult JoinSession(Guid sessionId, string connectionId);
+    JoinSessionResult JoinSession(Guid sessionId, string connectionId, bool simulationActive = true);
 
     /// <summary>
     /// Rejoins an existing session by replacing a stale member identity.
@@ -42,7 +43,11 @@ public interface ISessionService
         Guid sessionId,
         string connectionId,
         Guid staleMemberId,
-        string reconnectToken);
+        string reconnectToken,
+        bool simulationActive = true);
+
+    /// <summary>Atomically changes activity and transfers only session-scoped authority.</summary>
+    SimulationActivityResult? SetSimulationActive(string connectionId, bool simulationActive);
 
     /// <summary>
     /// Removes a member from their session, performs server promotion if needed, and
@@ -148,7 +153,8 @@ public record LeaveSessionResult(
     /// <summary>IDs of member-scoped objects that were deleted on departure.</summary>
     IReadOnlyList<Guid> DeletedObjectIds,
     /// <summary>Session-scoped objects that were migrated to other members on departure.</summary>
-    IReadOnlyList<ObjectMigration> MigratedObjects
+    IReadOnlyList<ObjectMigration> MigratedObjects,
+    SimulationActivityResult? SimulationActivity = null
 );
 
 /// <summary>
@@ -200,7 +206,8 @@ public record JoinSessionResult(
     /// The hub must broadcast <c>OnMemberLeft</c> with this info so remaining members
     /// can remove the ghost member's objects from their local state.
     /// </summary>
-    EvictionInfo? Eviction = null
+    EvictionInfo? Eviction = null,
+    SimulationActivityResult? SimulationActivity = null
 );
 
 /// <summary>
@@ -222,3 +229,13 @@ public record ForceDestroySessionResult(
     IEnumerable<string> ConnectionIds,
     string SessionName
 );
+
+public record SimulationMemberState(Guid Id, bool SimulationActive);
+
+public record SimulationActivityResult(
+    Guid SessionId,
+    long SimulationRevision,
+    bool SimulationSuspended,
+    IReadOnlyList<SimulationMemberState> Members,
+    IReadOnlyList<ObjectMigration> MigratedObjects,
+    IReadOnlyList<SessionObject> Objects);

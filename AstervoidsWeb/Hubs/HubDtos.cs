@@ -12,7 +12,9 @@ public record CreateSessionResponse(
     [property: Key("memberId")] Guid MemberId,
     [property: Key("role")] MemberRole Role,
     [property: Key("reconnectToken")] string ReconnectToken,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata);
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("simulationSuspended")] bool SimulationSuspended = false,
+    [property: Key("simulationRevision")] long SimulationRevision = 0);
 
 [MessagePackObject]
 public record JoinSessionResponse(
@@ -24,7 +26,10 @@ public record JoinSessionResponse(
     [property: Key("members")] IEnumerable<MemberInfo> Members,
     [property: Key("objects")] IEnumerable<ObjectInfo> Objects,
     [property: Key("validAts")] GuidLongPair[] ValidAts,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("simulationSuspended")] bool SimulationSuspended = false,
+    [property: Key("simulationRevision")] long SimulationRevision = 0,
+    [property: Key("resetObjectIds")] Guid[]? ResetObjectIds = null
 );
 
 [MessagePackObject]
@@ -51,14 +56,34 @@ public record SessionStateSnapshot(
     [property: Key("members")] IEnumerable<MemberInfo> Members,
     [property: Key("objects")] IEnumerable<ObjectInfo> Objects,
     [property: Key("validAts")] GuidLongPair[] ValidAts,
-    [property: Key("memberSequences")] GuidLongPair[] MemberSequences);
+    [property: Key("memberSequences")] GuidLongPair[] MemberSequences,
+    [property: Key("simulationSuspended")] bool SimulationSuspended = false,
+    [property: Key("simulationRevision")] long SimulationRevision = 0,
+    [property: Key("resetObjectIds")] Guid[]? ResetObjectIds = null);
 
 // Member info
 [MessagePackObject]
 public record MemberInfo(
     [property: Key("id")] Guid Id,
     [property: Key("role")] MemberRole Role,
-    [property: Key("joinedAt")] DateTime JoinedAt);
+    [property: Key("joinedAt")] DateTime JoinedAt,
+    [property: Key("simulationActive")] bool SimulationActive = true);
+
+[MessagePackObject]
+public record SimulationMemberInfo(
+    [property: Key("id")] Guid Id,
+    [property: Key("simulationActive")] bool SimulationActive);
+
+[MessagePackObject]
+public record SimulationActivityInfo(
+    [property: Key("sessionId")] Guid SessionId,
+    [property: Key("simulationRevision")] long SimulationRevision,
+    [property: Key("simulationSuspended")] bool SimulationSuspended,
+    [property: Key("members")] SimulationMemberInfo[] Members,
+    [property: Key("migratedObjects")] IReadOnlyList<ObjectMigration> MigratedObjects,
+    [property: Key("objects")] ObjectInfo[] Objects,
+    [property: Key("validAts")] GuidLongPair[] ValidAts,
+    [property: Key("resetObjectIds")] Guid[] ResetObjectIds);
 
 [MessagePackObject]
 public record MemberLeftInfo(

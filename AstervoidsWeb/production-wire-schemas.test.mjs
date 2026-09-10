@@ -18,6 +18,23 @@ function registerProductionSchemas() {
     SchemaCodec.replaceAll(WireSchemas.SCHEMAS);
 }
 
+test('production bullet timing and claim fields match the C# cross-wire fixture', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(3);
+    const data = {
+        sampleAt: 1000.5, sampleTick: 24, bornAt: 980, shot: Uint8Array.of(0x90),
+        hitClaimId: '11223344-5566-7788-99aa-bbccddeeff00',
+        hitClaimAt: 1040.25, hitX: 0.5, hitY: 0.75, hitAngle: 1.5,
+        hitTargetVersion: 42, hitTargetOwnerId: '11223344-5566-7788-99aa-bbccddeeff00',
+    };
+    const expected = '0000ff070000000000448f40180000000000000000a08e400100000090'
+        + '443322116655887799aabbccddeeff000000000000419040000000000000e03f'
+        + '000000000000e83f000000000000f83f2a000000443322116655887799aabbccddeeff00';
+    assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), expected);
+    const decoded = SchemaCodec.decode(schema, new Uint8Array(Buffer.from(expected, 'hex')));
+    assert.deepEqual(decoded, data);
+});
+
 test('known gameplay objects each have one positional schema', () => {
     const schemas = WireSchemas.SCHEMAS;
     assert.deepEqual(schemas.map(schema => schema.id), [1, 2, 3, 4]);
@@ -154,8 +171,9 @@ test('bullet schema keeps ballistic and hit deltas sparse', () => {
         hitOffsetN: -0.25,
     });
 
-    assert.equal(ballistic.length, 8);
-    assert.equal(hit.length, 26);
+    const maskBytes = Math.ceil(schema.fields.length / 8);
+    assert.equal(ballistic.length, maskBytes + 6);
+    assert.equal(hit.length, maskBytes + 24);
     assert.equal(SchemaCodec.decode(schema, ballistic).lifetime, 42);
     assert.equal(
         SchemaCodec.decode(schema, hit).hitTargetId,

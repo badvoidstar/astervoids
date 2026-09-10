@@ -87,7 +87,8 @@ public class SessionService : ISessionService
     public CreateSessionResult CreateSession(
         string creatorConnectionId,
         Dictionary<string, object?>? metadata = null,
-        Guid? sessionId = null)
+        Guid? sessionId = null,
+        bool simulationActive = true)
     {
         lock (_sessionLock)
         {
@@ -113,11 +114,13 @@ public class SessionService : ISessionService
                     _sessions.Values.Select(s => s.Name).ToHashSet()),
                 Metadata = metadata != null
                     ? SyncDataCloner.CloneDictionary(metadata)
-                    : new Dictionary<string, object?>()
+                    : new Dictionary<string, object?>(),
+                SimulationSuspended = !simulationActive,
+                SimulationRevision = 1
             };
 
             _sessions.TryAdd(session.Id, session);
-            var creator = RegisterMember(creatorConnectionId, session, MemberRole.Server);
+            var creator = RegisterMember(creatorConnectionId, session, MemberRole.Server, simulationActive);
 
             _logger?.LogInformation("Session created: {SessionName} ({SessionId}) by {MemberId}", 
                 session.Name, session.Id, creator.Id);
@@ -126,22 +129,24 @@ public class SessionService : ISessionService
         }
     }
 
-    public JoinSessionResult JoinSession(Guid sessionId, string connectionId)
-        => JoinSessionCore(sessionId, connectionId, null, null);
+    public JoinSessionResult JoinSession(Guid sessionId, string connectionId, bool simulationActive = true)
+        => JoinSessionCore(sessionId, connectionId, null, null, simulationActive);
 
     public JoinSessionResult RejoinSession(
         Guid sessionId,
         string connectionId,
         Guid staleMemberId,
-        string reconnectToken)
+        string reconnectToken,
+        bool simulationActive = true)
         => JoinSessionCore(
-            sessionId, connectionId, staleMemberId, reconnectToken);
+            sessionId, connectionId, staleMemberId, reconnectToken, simulationActive);
 
     private JoinSessionResult JoinSessionCore(
         Guid sessionId,
         string connectionId,
         Guid? evictMemberId,
-        string? reconnectToken)
+        string? reconnectToken,
+        bool simulationActive)
     {
         lock (_sessionLock)
         {
@@ -204,13 +209,14 @@ public class SessionService : ISessionService
                 // Assign Server role if session has no members (rejoining an empty session)
                 var wasEmpty = session.Members.IsEmpty;
                 var role = wasEmpty ? MemberRole.Server : MemberRole.Client;
-                var member = RegisterMember(connectionId, session, role);
+                var member = RegisterMember(connectionId, session, role, simulationActive);
 
                 // When rejoining an empty session, adopt orphaned session-scoped objects.
                 // These were left without a valid owner when the last member departed
                 // (HandleObjectDeparture can't migrate when there are no remaining members).
                 if (wasEmpty)
                     AdoptOrphanedObjects(session, member.Id);
+                var simulationActivity = RebalanceSimulation(session);
 
                 // Clear empty-session tracking since we now have a member
                 session.LastMemberLeftAt = null;
@@ -218,7 +224,7 @@ public class SessionService : ISessionService
                 _logger?.LogInformation("Member {MemberId} joined session {SessionName} ({SessionId}) as {Role}",
                     member.Id, session.Name, session.Id, role);
 
-                return new JoinSessionResult(true, session, member, null, eviction);
+                return new JoinSessionResult(true, session, member, null, eviction, simulationActivity);
             }
         }
     }
@@ -293,6 +299,7 @@ public class SessionService : ISessionService
             // can race between membership change and object migration.
             var (deletedObjectIds, migratedObjects) = HandleObjectDeparture(
                 session, memberId, remainingMemberIds, distributeOrphanedObjects);
+            var simulationActivity = RebalanceSimulation(session, migrations: migratedObjects);
 
             // ── Empty-session bookkeeping ──────────────────────────────────────────
             // If the last member has left, mark the session for deferred cleanup.
@@ -316,10 +323,80 @@ public class SessionService : ISessionService
                 promotedMember,
                 remainingMemberIds,
                 deletedObjectIds,
-                migratedObjects
+                migratedObjects,
+                simulationActivity
             );
         }
     }
+
+    public SimulationActivityResult? SetSimulationActive(string connectionId, bool simulationActive)
+    {
+        var context = GetMemberAndSessionByConnectionId(connectionId);
+        if (context == null) return null;
+        var (member, session) = context.Value;
+        lock (session.SyncRoot)
+        {
+            if (session.LifecycleState != SessionLifecycleState.Active
+                || !session.Members.TryGetValue(member.Id, out var current)
+                || current.ConnectionId != connectionId)
+                return null;
+            if (member.SimulationActive == simulationActive)
+                return SnapshotSimulationActivity(session, [], []);
+            member.SimulationActive = simulationActive;
+            return RebalanceSimulation(session, member.Id);
+        }
+    }
+
+    // The server changes only authority and timing metadata, never game payloads.
+    private SimulationActivityResult RebalanceSimulation(
+        Session session, Guid? changedMemberId = null, List<ObjectMigration>? migrations = null)
+    {
+        migrations ??= [];
+        var active = session.Members.Values.Where(m => m.SimulationActive)
+            .OrderBy(m => m.JoinedAt).ThenBy(m => m.Id).Select(m => m.Id).ToArray();
+        var suspended = active.Length == 0;
+        var suspensionChanged = suspended != session.SimulationSuspended;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var changedObjects = new List<SessionObject>();
+        var migratedIds = migrations.Select(m => m.ObjectId).ToHashSet();
+        var index = 0;
+        foreach (var obj in session.Objects.Values.OrderBy(o => o.Id))
+        {
+            var migrated = migratedIds.Contains(obj.Id);
+            if (obj.Scope == ObjectScope.Session && active.Length > 0
+                && (!session.Members.TryGetValue(obj.OwnerMemberId, out var owner) || !owner.SimulationActive))
+            {
+                TransferObjectOwnership(obj, active[_distributeOrphanedObjects ? index++ % active.Length : 0]);
+                migrated = true;
+            }
+            var resetAnchor = obj.Scope == ObjectScope.Session
+                ? suspensionChanged
+                : obj.OwnerMemberId == changedMemberId;
+            if (resetAnchor)
+            {
+                // A frozen payload resumes at a fresh anchor, not at its old wall time.
+                obj.ValidAt = Math.Max(obj.ValidAt, now);
+                obj.SimulationAnchorReset = true;
+                obj.Version++;
+                obj.UpdatedAt = DateTime.UtcNow;
+            }
+            if (migrated)
+            {
+                migrations.RemoveAll(m => m.ObjectId == obj.Id);
+                migrations.Add(new ObjectMigration(obj.Id, obj.OwnerMemberId, obj.Version, obj.ValidAt, now));
+            }
+            if (migrated || resetAnchor) changedObjects.Add(ObjectService.Snapshot(obj));
+        }
+        session.SimulationSuspended = suspended;
+        session.SimulationRevision++;
+        return SnapshotSimulationActivity(session, migrations, changedObjects);
+    }
+
+    private static SimulationActivityResult SnapshotSimulationActivity(
+        Session session, IReadOnlyList<ObjectMigration> migrations, IReadOnlyList<SessionObject> objects)
+        => new(session.Id, session.SimulationRevision, session.SimulationSuspended,
+            session.Members.Values.Select(m => new SimulationMemberState(m.Id, m.SimulationActive)).ToArray(),
+            migrations.ToArray(), objects);
 
     public ActiveSessionsResult GetActiveSessions()
     {
@@ -513,13 +590,14 @@ public class SessionService : ISessionService
     /// Must be called while holding either <c>_sessionLock</c> (for creates/joins)
     /// or <c>session.SyncRoot</c>.
     /// </summary>
-    private Member RegisterMember(string connectionId, Session session, MemberRole role)
+    private Member RegisterMember(string connectionId, Session session, MemberRole role, bool simulationActive = true)
     {
         var member = new Member
         {
             ConnectionId = connectionId,
             Role = role,
-            SessionId = session.Id
+            SessionId = session.Id,
+            SimulationActive = simulationActive
         };
 
         session.Members.TryAdd(member.Id, member);
@@ -546,6 +624,9 @@ public class SessionService : ISessionService
         var deletedIds = new List<Guid>();
         var migratedObjects = new List<ObjectMigration>();
         var roundRobinIndex = 0;
+        var activeMemberIds = remainingMemberIds.Where(id => session.Members[id].SimulationActive)
+            .OrderBy(id => session.Members[id].JoinedAt).ThenBy(id => id).ToArray();
+        if (activeMemberIds.Length > 0) remainingMemberIds = activeMemberIds;
 
         foreach (var obj in session.Objects.Values.ToList())
         {
@@ -575,7 +656,8 @@ public class SessionService : ISessionService
                 // last validated server-time anchor; their first authored snapshot will
                 // carry a fresh validAt and observers will see motion continue smoothly
                 // across the handoff via normal bracket interpolation.
-                migratedObjects.Add(new ObjectMigration(obj.Id, newOwnerId, obj.Version, obj.ValidAt));
+                migratedObjects.Add(new ObjectMigration(obj.Id, newOwnerId, obj.Version, obj.ValidAt,
+                    new DateTimeOffset(obj.UpdatedAt).ToUnixTimeMilliseconds()));
             }
             // If scope == Session but no remaining members, leave the object in place;
             // it will be cleaned up when the session is eventually destroyed.

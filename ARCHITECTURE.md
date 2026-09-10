@@ -111,16 +111,16 @@ replication update:
 3. `updateRemoteShips`, `updateAstervoidsFromSync`,
    `updateBulletsFromSync`, and `updateGameStateFromSync` reconcile their type
    at their original game-owned pivots.
-4. Collision detection observes the same local and sampled remote state as
-   before extraction. Bullet hits sweep each local bullet's step-relative path
-   against the current asteroid polygon, including translational asteroid
-   motion and wrap-aware broad-phase rejection.
+4. Collision detection uses independently retained simulation-step history,
+   never a pose mutated by rendering. Bullet and ship sweeps account for
+   translation, rotation, wrapping, and first-contact ordering.
 5. Rendering remains outside the runtime.
 
-The hidden-tab fallback keeps its own established order: outbound tick, local
-ownership simulation, asteroid and bullet reconciliation, collision handling,
-then ship reconciliation. Consolidating these calls into a single automatic
-runtime tick is prohibited because it would change collision-visible state.
+The hidden-tab fallback pumps outbound transport, then asteroid and bullet
+reconciliation before ship reconciliation. Hidden members do not advance physics
+or collisions: their session-scoped authority moves to active members and their
+member-scoped objects remain frozen. Consolidating reconciliation pivots into an
+automatic runtime tick remains prohibited.
 
 Outbound authority remains game-owned. `replication-send-policy.js` returns
 explicit `{ send, immediate, reason }` decisions, but the game still invokes
@@ -164,10 +164,9 @@ The game continues to own orchestration in `wwwroot/index.html`:
   checks and viewport/picker updates. Rejoin resets old state **before** the
   join RPC installs its snapshot. Voluntary leave establishes its synchronous
   guard before asynchronous cleanup.
-- Visible and hidden simulation share owned-asteroid updates, local-bullet
-  expiration, and wave progression. Their orchestration and remote-ship
-  reconciliation points remain separate; hidden-tab timing is not the
-  deterministic foreground accumulator.
+- Visible simulation owns asteroid updates, bullet expiration, and wave
+  progression. Hidden tabs retain separate reconciliation pivots but never
+  advance these operations at browser-throttled timer rates.
 - `calculateGameState` computes score awards, damage, and historical
   player-count bonuses from explicit inputs without mutating them.
   `calculateGameStateTerminal` computes immutable terminal anchors from an
@@ -218,8 +217,9 @@ All wrappers route through `invokeHub()`, which enforces session membership and 
 
 | Wrapper | Hub method | Wire args | Return (after GUID normalization) |
 |---|---|---|---|
-| `createSession(metadata?)` | `CreateSession` | `metadata?` | `{ session, member }` or `null` |
-| `joinSession(sessionId, evictMemberId?)` | `JoinSession` | `sessionId, evictMemberId?` | `{ session, member }` or `null` |
+| `createSession(metadata?)` | `CreateSession` | `metadata?, simulationActive` | `{ session, member }` or `null` |
+| `joinSession(sessionId)` | `JoinSession` / authenticated `RejoinSession` | `sessionId, [staleMemberId, reconnectToken,] simulationActive` | `{ session, member }` or `null` |
+| `setSimulationActive(active)` | `SetSimulationActive` | `active` | Versioned simulation activity snapshot or `null` |
 | `leaveSession()` | `LeaveSession` | — | `void` (broadcast only) |
 | `getActiveSessions()` | `GetActiveSessions` | — | `{ sessions[], maxSessions, canCreateSession }` |
 | `createObject(data, scope, ownerMemberId?, clientValidAt?)` | `CreateObject` | `data, scope, ownerMemberId?, clientValidAt?` | `{ objectInfo, memberSequence }` |
@@ -253,7 +253,7 @@ These methods have no corresponding hub RPC.
 
 ### SessionClient Event Callbacks
 
-`SessionClient.on(name, fn)` registers callbacks from a fixed set of **16** names. The regular mapping is `OnFooBar` (hub broadcast) → `onFooBar` (JS callback). All handler arguments are walked through `GuidUtils.transformBinaryGuids` by `guard()` before dispatch, so callers never observe raw `Uint8Array` GUIDs.
+`SessionClient.on(name, fn)` registers callbacks from a fixed set of names. The regular mapping is `OnFooBar` (hub broadcast) → `onFooBar` (JS callback). All handler arguments are walked through `GuidUtils.transformBinaryGuids` by `guard()` before dispatch, so callers never observe raw `Uint8Array` GUIDs.
 
 | JS callback | Hub source | Notes |
 |---|---|---|
@@ -265,6 +265,7 @@ These methods have no corresponding hub RPC.
 | `onSessionLeft` | `leaveSession()` | Not a hub broadcast |
 | `onMemberJoined` | `OnMemberJoined` | `(memberInfo, senderMemberId, memberSequence)` |
 | `onMemberLeft` | `OnMemberLeft` | `(info, senderMemberId, memberSequence)`; may be immediately followed by `onRoleChanged` if the local member was promoted |
+| `onSimulationActivityChanged` | `OnSimulationActivityChanged` | `(info)`; ordered by session `simulationRevision`, includes activity, suspension, canonical changed objects and ownership migrations |
 | `onRoleChanged` | Derived from `OnMemberLeft` | Fired only when `info.promotedMemberId === currentMember.id`; arg: `(newRole)` |
 | `onObjectCreated` | `OnObjectCreated` | `(objectInfo, senderMemberId, memberSequence)` |
 | `onObjectsUpdated` | `OnObjectsUpdated` | Arg reorder: hub sends `serverTimestamp` at position 4; callback puts it at position 1 → `(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs)` |
@@ -303,7 +304,7 @@ after the session callback has initialized snapshot consumers.
 
 | Method | Description |
 |---|---|
-| `tick(frameTimeSec)` | Called once per game frame; recomputes `sendThreshold = round(nominalFrameTime / clampedFrameTime)`, increments the frame counter, and calls `flushUpdates()` when the threshold is reached |
+| `tick(frameTimeSec)` | Accumulates elapsed time, honors the adaptive send interval, and flushes pending updates without catch-up bursts; urgent writes survive in-flight backpressure |
 
 #### Queries
 
@@ -387,6 +388,36 @@ Cross-reference: [SignalR Reconnection & Reconciliation](#signalr-reconnection--
 #### Local-First Delete Safety
 
 `ObjectSync.deleteObject` adds the object id to `pendingDeletes` immediately after removing it from the local map, before the `DeleteObject` invoke resolves. A concurrent `triggerReconciliation` snapshot skips ids in `pendingDeletes` on the "add missing object" pass, preventing a racing snapshot from resurrecting a locally-deleted object. `pendingDeletes` is cleared when the invoke resolves (success or failure).
+
+Voluntary authority transfer can reject a local-first deletion after its local
+removal. The rejected operation must clear its deletion tombstone and reconcile;
+an authoritative transfer carrying the canonical object also restores that
+object. A late old-owner completion cannot remove the new owner's canonical
+record.
+
+#### Coordinated Simulation Activity
+
+`Member.simulationActive` is generic capability metadata, independent of the
+Server role. Visibility changes send `SetSimulationActive` immediately; the
+initial activity also accompanies create/join/rejoin, so a hidden join cannot
+briefly acquire active authority. Activity requests are serialized and scoped to
+the connection/session epoch.
+
+Under `Session.SyncRoot`, inactive owners' session-scoped objects transfer to
+active members deterministically. Member-scoped objects stay with their owners.
+When no active members remain, `simulationSuspended` freezes the session. Freeze
+and resume establish newer versions and fresh `validAt` anchors without modifying
+opaque game data. `resetObjectIds` identifies these anchors in both activity
+events and join/reconciliation snapshots until an owner update is accepted;
+gameplay must use their rebased `validAt`, not project an old payload `sampleAt`
+through the idle interval. An active-to-active handoff preserves the canonical timestamp
+and must never seed authoritative physics from the receiver's delayed display.
+
+The per-session asynchronous operation lease covers mutation and activity
+broadcast delivery, preventing subsequent object operations from overtaking the
+handoff. Inactive or non-owning members cannot update, delete, replace, or emit
+object events. `simulationRevision` orders activity snapshots independently of
+per-member object event sequences; join and reconciliation snapshots include it.
 
 #### Field-Name Compression Boundary
 
@@ -922,11 +953,11 @@ sequenceDiagram
     Note over GL,OS: Tick/Flush cycle (send rate ≠ frame rate)
     loop Every frame
         GL->>OS: tick(frameTimeSec)
-        OS->>OS: frameCounter++
+        OS->>OS: Accumulate elapsed milliseconds
         Note over OS: sendThreshold = round(nominalFrameTime / frameTime)<br/>e.g. 50ms / 16.7ms ≈ 3 frames
     end
 
-    Note over OS: frameCounter >= sendThreshold → flush
+    Note over OS: elapsed >= send interval, or pending urgency → flush
     OS->>OS: Compute deltas (only changed fields)
     OS->>OS: Check inFlightCount > 0? → skip (backpressure)
     OS->>OS: inFlightCount++, senderSequence++
@@ -942,7 +973,7 @@ sequenceDiagram
         Note over OS: RTT = responseTimestamp - clientTimestamp (locally captured)
     and Broadcast to others
         HUB->>R: OnObjectsUpdated(objects[], senderMemberId,<br/>senderSeq, memberSeq, serverTimestamp,<br/>senderSendIntervalMs, validAt)
-        Note over R: validAt is the unified interpolation axis:<br/>receiver converts validAt → perf.now via<br/>validAt - offsetMs + wallToPerfDelta<br/>and stores as snapshot.time
+        Note over R: validAt orders the operation;<br/>payload sampleAt anchors the pose<br/>on the receiver's monotonic scene timeline
     end
 ```
 
@@ -985,7 +1016,7 @@ flowchart LR
     end
 
     subgraph "Backpressure"
-        BP["flushInProgress?<br/>→ cap frame counter at threshold<br/>→ flush on next tick after completion<br/>(instant congestion signal)"]
+        BP["flushInProgress?<br/>→ retain coalesced state and pending urgency<br/>→ urgent drain on completion;<br/>ordinary flush on next eligible tick"]
     end
 
     EMA --> FORMULA
@@ -1007,13 +1038,20 @@ dead-reckoning bound. Immediate start, stop, and reversal edges still request a
 throttle-bypassing send, and ordinary shortest-angle correction absorbs
 remaining prediction error when the authoritative packet arrives.
 
+Ballistic objects use a separate prediction budget derived from observed
+serialized cadence, advertised interval, unseen transit, and jitter, bounded by
+`MAX_EXTRAPOLATION`. This avoids extending stale ship controls merely to cover
+slow ballistic updates. Prediction still holds during stalls beyond that bound.
+Urgent writes stay urgent behind an in-flight flush and drain when it completes;
+ordinary scheduling measures elapsed time rather than rendered frame count.
+
 ```mermaid
 flowchart TB
     subgraph "Per-Member BUF Calculation"
         direction TB
         PKT["Packet arrives from member X<br/>(remote broadcast only: clientTimestamp=null)"]
         MEM["getMemberDelay(senderMemberId)<br/>Independent state per member"]
-        LAG["lag = arrivalServerTime - validAt<br/>(post-flush transit + clock residual)"]
+        LAG["lag = arrivalServerTime - sampleAt<br/>(pose age + transit + clock residual;<br/>one observation per operation stamp)"]
         LAGREC["Retain valid lag sample<br/>(0-5000ms)"]
         INT["interval = serverTimestamp - lastServerTimestamp"]
         OUT{"interval > 2 × remoteSendInterval?"}
@@ -1049,19 +1087,32 @@ flowchart TB
     INTREC --> READY
 ```
 
-## Networking: Unified `validAt` Interpolation Axis
+## Networking: Operation, Simulation, and Presentation Time
 
 Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
 events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
 `UpdateObjects` samples once at flush and fans that value across the coalesced
-batch, so it is an ordering/presentation anchor rather than an exact simulation
-timestamp for every pose. Buffered interpolation uses this axis; deterministic
-live updates normally remain arrival-anchored.
+batch, so it is an operation-ordering anchor, not an exact simulation timestamp.
+Game serializers separately carry `sampleAt` (estimated server milliseconds) and
+`sampleTick` (the owner's local simulation-step counter). `sampleAt` is omitted
+until clock bootstrap; ticks do not imply globally synchronized physics.
+Coalescing preserves the selected pose's sample time without relabeling it at
+flush. Both presentation modes prefer this pose timestamp. Legacy/bootstrap
+fallbacks use `validAt` for buffered snapshots and recorded arrival time for
+deterministic samples.
+
+Every fixed catch-up step has its own end time. Simulation collision history is
+saved separately from the latest render sample. Deterministic remotes share a
+bounded, gradually adjusted scene delay; buffered objects retain smoothly
+changing owner-delay domains. Local controls remain immediate. A local ship and
+a delayed remote obstacle therefore cannot represent exactly the same physical
+instant: collision authority explicitly validates bounded shooter-view claims
+rather than silently treating all displayed poses as current server truth.
 
 ```mermaid
 flowchart LR
     subgraph "Owner (sender)"
-        QUEUE["Game queues latest state<br/>(updates may coalesce)"]
+        QUEUE["Game queues pose + sampleAt + sampleTick<br/>(updates may coalesce)"]
         STAMP["At operation/flush:<br/>clientValidAt = Math.round(serverNowMs())<br/>or null before clock bootstrap"]
         QUEUE --> STAMP
     end
@@ -1071,7 +1122,7 @@ flowchart LR
     end
 
     subgraph "Receiver"
-        CONV["snapshot.time =<br/>validAt - clock.offsetMs + wallToPerfDelta"]
+        CONV["snapshot.time =<br/>pose sampleAt converted to monotonic time<br/>(legacy fallback: validAt / arrival)"]
         BRACKET["Bracket search runs in<br/>perf.now domain<br/>(monotonic, immune to wall-clock slewing)"]
         CONV --> BRACKET
     end
@@ -1081,29 +1132,45 @@ flowchart LR
 ```
 
 * **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Min-RTT sampling reduces transient queue bias, but persistent path asymmetry remains as clock error; projection callers gate initialization and cap elapsed time.
-* **`clock.wallToPerfDelta = performance.now() - Date.now()`** is refreshed on every accepted ping burst. The conversion `validAt → snapshot.time` runs through it so bracket-search stays on a monotonic clock while the snapshot key still encodes the global server-time agreement.
-* **Causal deterministic replacements.** Normal deterministic updates arrival-anchor, but a replacement child inherits the parent's local presentation timeline: `min(nowPerf, parent.recvPerf + max(0, child.validAt - parent.validAt))`. The timestamp difference cancels absolute shared-clock offset and removes discontinuities from one-off replacement latency. The invoking owner records a local monotonic baseline, so adoption also works before clock bootstrap. Existing dead-reckoning and spawn-projection caps still bound stale estimates.
-* **Buffered replacement projection.** Buffered mode keys the first snapshot at `validAt` and adds a parent-pose bridge on that shared axis. Its locally owned children retain bounded `validAt` projection.
-* **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; buffered mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
+* **Monotonic clock mapping.** After bootstrap, the presentation clock advances from monotonic elapsed time and slews accepted clock corrections. Wall-clock jumps do not rewind presentation; persistent asymmetric-path bias remains a bounded-estimation limitation.
+* **Causal replacements.** Child physics starts from the authoritative birth sample (`data.sampleAt`), including the fracture's real velocity and spin impulses. Presentation alone inherits the parent's last displayed rigid transform: both child centroid and polygon angle rotate into that transform. A bounded render-only correction converges to the canonical child trajectory in either simulation mode; it never inserts synthetic snapshots, affects adaptive-delay estimates, or feeds collision history. Ordinary births use the same sample-time projection without a replacement bridge.
+* **Deletion presentation.** Canonical deletion removes the collider immediately. Its last displayed silhouette briefly fades on the collision-cue clock, while target-bound effects resolve at that same displayed pose. Replacements suppress the parent silhouette to avoid drawing parent and children simultaneously.
+* **Migration handoff.** The new owner seeds physics from canonical sample-time projection, never from a delayed or corrected puppet pose. Both remote presentation states and the send baseline are cleared. A render-only correction starts at the last displayed pose and converges without changing canonical motion. Frozen join/resume snapshots do not project idle time; collision and simulation history reset independently of display correction. Observers still skip metadata-only ownership versions.
 
 ### Shared batch `validAt` on `OnObjectsUpdated`
 
 The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole
 batch (rather than one per object), saving 8 B per object:
 
-* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries begin with the same operation timestamp. It does not retain each pose's original simulation time.
+* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries share the operation timestamp. Each gameplay payload independently retains its pose's `sampleAt`.
 * **One server monotonic floor.** `ObjectService.UpdateObjects` validates that
   stamp once against the newest previous `ValidAt` among accepted objects, then
   stores the resolved value on every object. The broadcast timestamp therefore
   includes the effect of server-side monotonic clamping for the entire batch.
-* **Receiver insertion remains monotonic.** The snapshot presentation policy
-  still prevents regressing keys, and its near-coincident-key cushion avoids an
-  immediate Hermite jump.
+* **Receiver insertion remains monotonic.** Snapshot keys cannot regress.
+  Near-coincident samples share the stretched interpolation endpoint with
+  extrapolation, avoiding a switch before the interpolated segment finishes.
 
 Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
 `SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
 each object's last accepted operation timestamp. Those timestamps can still be
 older/newer than the exact underlying pose time because update writes coalesce.
+
+### Ship State, Shots, and Discontinuities
+
+Ship adapters apply canonical identity, thrust, color, and invulnerability
+separately from sampled kinematics. The accepted `respawnEpoch` identifies a real
+teleport; the old counter-rise heuristic is only a legacy fallback. Respawn
+resets both local render history and collision history instead of interpolating
+across the playfield.
+
+Shots retain the firing tick, ship/respawn identity, and muzzle transform in an
+opaque `shot` payload, plus a `bornAt` activation time. Local firing is immediate
+and retains the original bullet velocity (it does not inherit ship velocity).
+Remote activation/audio follows the presentation timeline, and an available
+historical ship pose can provide a short render-only muzzle correction. Late
+shots retain their authoritative trajectory; no visual adjustment enters
+collision physics.
 
 ## Deterministic Terminal Convergence
 
@@ -1212,18 +1279,32 @@ sequenceDiagram
     participant B as Player B (asteroid owner)
 
     Note over A: A's bullet hits B's asteroid locally
-    A->>A: Mark bullet pendingHit=true, hitTargetId=asteroidId
+    A->>A: Find earliest swept contact; capture target revision,<br/>target-scene time/pose and unique hitClaimId
     A->>SRV: UpdateObjects(bullet with pendingHit)
     SRV->>B: OnObjectsUpdated (bullet data with pendingHit)
 
-    Note over B: B scans remote bullets for pendingHit on own asteroids
-    B->>B: Process split: create child asteroids
-    B->>SRV: ReplaceObject(asteroidId, [child1, child2])
+    Note over B: Validate bounded shooter view and current authority
+    B->>B: Reserve target before asynchronous replacement
+    B->>SRV: ReplaceObject(asteroidId, [children..., hitResult])
     SRV->>A: OnObjectReplaced (broadcast to ALL)
     SRV->>B: OnObjectReplaced (broadcast to ALL)
 
-    Note over A: A sees asteroid replaced → confirms hit, awards points
+    Note over A: Only the matching hitResult awards points once;<br/>target disappearance alone never confirms a hit
 ```
+
+`hitResult` is a game-owned schema-0 ledger record, not a server collision
+interpretation. It is created in the same atomic replacement as the children,
+including destruction with no fragments, and retained for 30 seconds. Pending
+claims survive ordinary projectile expiry but have a separate 15-second
+monotonic deadline. Active terminal maintenance continues settlement and ledger
+cleanup. Target reservation, session epochs, ownership checks, and claim
+correlation prevent duplicate destruction or disappearance-based score awards.
+
+Sweeps include translating and rotating asteroid polygons, full polygon-edge
+intersection for ships, inclusive tangency, and radius-aware seam transitions.
+Ordered distance-bound subdivision returns first contact to a documented
+spatial tolerance; fracture geometry uses that contact transform rather than
+end-of-step positions. Teleports and authority reseeding reset sweep history.
 
 ## Response-First vs Local-First Patterns
 
@@ -1513,9 +1594,9 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 
 | SchemaId | Type | Fields (positional, all optional per payload) |
 | --- | --- | --- |
-| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose |
-| 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
-| 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
+| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; sample time/tick; respawn epoch |
+| 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose; sample time/tick; birth and exact fracture-parent transform |
+| 3 | Bullet | type; pose/velocity; lifetime; color/owner; correlated contact claim and target revision; terminal epoch/position; sample time/tick; birth and firing reference |
 | 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; peak ships; game-over/terminal times |
 
 Every known gameplay type uses exactly one superset schema for create, update,

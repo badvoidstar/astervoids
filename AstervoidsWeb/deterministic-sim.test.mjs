@@ -31,6 +31,7 @@ function stepFixed(accumulatorMs, elapsed, stepMs, maxSteps, maxAccum) {
         MAX_SIM_STEPS_PER_FRAME: maxSteps,
         MAX_ACCUMULATED_MS: maxAccum,
         fpsTracker: { sample() {} },
+        advancePresentationTime() {},
         isSessionMode: () => false,
         isDeterministicMode: () => true,
         runSimulationStep: dt => {

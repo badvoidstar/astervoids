@@ -88,4 +88,9 @@ public class Session
     /// <see cref="SyncRoot"/>.
     /// </summary>
     public long Version { get; set; } = 1;
+
+    /// <summary>Activity changes are ordered independently of per-member object events.</summary>
+    public long SimulationRevision { get; set; }
+
+    public bool SimulationSuspended { get; set; }
 }

@@ -77,6 +77,12 @@ public class SessionObject
     public long ValidAt { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
     /// <summary>
+    /// ValidAt was rebased while payload data was frozen. Retained until an owner
+    /// update replaces that anchor, including across snapshot/rejoin recovery.
+    /// </summary>
+    public bool SimulationAnchorReset { get; set; }
+
+    /// <summary>
     /// Timestamp when the object was created.
     /// </summary>
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;

@@ -132,13 +132,16 @@ public record ObjectUpdate(
 /// at the moment of migration. The new owner uses this as the seed
 /// timestamp for its first-authored snapshot so observers see motion
 /// continue smoothly across the handoff (no synthetic "now" anchor).
+/// <c>HandoffAt</c> is the server UTC millisecond at which ownership changed;
+/// game adapters can project canonical state to it without using display lag.
 /// </summary>
 [MessagePackObject]
 public record ObjectMigration(
     [property: Key("objectId")] Guid ObjectId,
     [property: Key("newOwnerId")] Guid NewOwnerId,
     [property: Key("newVersion")] long NewVersion,
-    [property: Key("validAt")] long ValidAt);
+    [property: Key("validAt")] long ValidAt,
+    [property: Key("handoffAt")] long HandoffAt = 0);
 
 /// <summary>
 /// Result of handling a member's departure from a session.

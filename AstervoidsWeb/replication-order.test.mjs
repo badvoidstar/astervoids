@@ -34,15 +34,15 @@ function assertOrdered(source, markers, contract) {
 }
 
 test('main loop pumps ObjectSync before simulation and keeps receive paths at collision-visible pivots', () => {
-    const gameLoop = between('function gameLoop(timestamp)', 'function runSimulationStep(dt, frozenForReconnect)');
+    const gameLoop = between('function gameLoop(timestamp)', 'function runSimulationStep(dt, frozenForReconnect,');
     assertOrdered(gameLoop, [
         'ObjectSync.tick(elapsed / 1000)',
-        'runSimulationStep(1.0, frozenForReconnect)',
+        'runSimulationStep(1.0, frozenForReconnect,',
         'renderScene(fixedStep.alpha)'
     ], 'main frame');
 
     const simulation = between(
-        'function runSimulationStep(dt, frozenForReconnect)',
+        'function runSimulationStep(dt, frozenForReconnect,',
         'function renderScene(alpha)');
     assertOrdered(simulation, [
         'game.ship.update(dt)',
@@ -61,24 +61,17 @@ test('main loop pumps ObjectSync before simulation and keeps receive paths at co
     ], 'simulation step');
 });
 
-test('hidden-tab fallback preserves tick, ownership simulation, receive, then collision order', () => {
+test('hidden-tab fallback pumps transport and preserves receive pivots without physics', () => {
     const hiddenLoop = lastBetween(
         "document.addEventListener('visibilitychange', () => {",
         '// ── Region service bootstrap');
     assertOrdered(hiddenLoop, [
         'ObjectSync.tick(elapsed / 1000)',
-        'game.ship.update(dt)',
-        'syncLocalShip()',
-        'updateOwnedAsteroids(dt, bgMemberId)',
-        'syncLocalAstervoids()',
         'updateAstervoidsFromSync()',
-        'updateLocalBullet(bullet, dt, bgMemberId)',
-        'syncLocalBullets()',
         'updateBulletsFromSync()',
-        'checkCollisions()',
-        'advanceWaveProgression(dt,',
         'updateRemoteShips()'
     ], 'hidden-tab step');
+    assert.doesNotMatch(hiddenLoop, /game\.ship\.update\(|updateOwnedAsteroids\(|checkCollisions\(/);
 });
 
 test('shared ownership simulation only advances local and owned asteroids', () => {
@@ -126,17 +119,16 @@ test('shared bullet operation preserves owner-driven expiration and pending loca
     assert.deepEqual(events, [['update', 0.5], ['expire']]);
 });
 
-test('visible and hidden bullet traversal retain their distinct deletion order', () => {
+test('visible bullet traversal retains deletion order while hidden bullets remain frozen', () => {
     const simulation = between(
-        'function runSimulationStep(dt, frozenForReconnect)',
+        'function runSimulationStep(dt, frozenForReconnect,',
         'function renderScene(alpha)');
     const hidden = lastBetween(
         "document.addEventListener('visibilitychange', () => {",
         '// ── Region service bootstrap');
     assert.match(simulation,
         /for \(let i = game\.bullets\.length - 1; i >= 0; i--\)[\s\S]*?updateLocalBullet\(bullet, dt, myMemberId\)[\s\S]*?game\.bullets\.splice\(i, 1\)/);
-    assert.match(hidden,
-        /game\.bullets = game\.bullets\.filter\(\s*bullet => updateLocalBullet\(bullet, dt, bgMemberId\)\)/);
+    assert.doesNotMatch(hidden, /updateLocalBullet\(|deleteSyncedBullet\(/);
     assert.doesNotMatch(hidden, /AudioSystem\.playNewWave/);
 });
 
@@ -197,16 +189,17 @@ test('ship control edges remain explicit immediate ObjectSync updates', () => {
 
 test('GameState lifecycle reconciles for owners as well as replicas', () => {
     const simulation = between(
-        'function runSimulationStep(dt, frozenForReconnect)',
+        'function runSimulationStep(dt, frozenForReconnect,',
         'function renderScene(alpha)');
     assert.match(
         simulation,
-        /if \(isSessionMode\(\)\) \{\s*if \(isGameStateOwner\(\)\) \{\s*syncGameState\(\);\s*\}\s*updateGameStateFromSync\(\);\s*\}/);
+        /if \(isSessionMode\(\)\) \{\s*if \(simulationActive && isGameStateOwner\(\)\) \{\s*syncGameState\(\);\s*\}\s*updateGameStateFromSync\(\);\s*\}/);
 
     const hiddenLoop = lastBetween(
         "document.addEventListener('visibilitychange', () => {",
         '// ── Region service bootstrap');
     assert.match(
         hiddenLoop,
-        /updateRemoteShips\(\);\s*if \(isGameStateOwner\(\)\) syncGameState\(\);\s*updateGameStateFromSync\(\);/);
+        /updateRemoteShips\(\);\s*updateGameStateFromSync\(\);/);
+    assert.doesNotMatch(hiddenLoop, /\bsyncGameState\(\)/);
 });

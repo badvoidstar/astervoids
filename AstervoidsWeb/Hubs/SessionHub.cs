@@ -206,6 +206,7 @@ public class SessionHub : Hub
                     departure.MemberId,
                     (long)0,
                     serverTimestamp);
+                await BroadcastSimulationActivityAsync(session, departure.SimulationActivity);
             }
             catch (Exception ex)
             {
@@ -243,7 +244,31 @@ public class SessionHub : Hub
     }
 
     private static MemberInfo ToMemberInfo(Member member) =>
-        new(member.Id, member.Role, member.JoinedAt);
+        new(member.Id, member.Role, member.JoinedAt, member.SimulationActive);
+
+    private SimulationActivityInfo ToSimulationActivityInfo(SimulationActivityResult result) =>
+        new(result.SessionId, result.SimulationRevision, result.SimulationSuspended,
+            result.Members.Select(m => new SimulationMemberInfo(m.Id, m.SimulationActive)).ToArray(),
+            result.MigratedObjects, result.Objects.Select(ToObjectInfo).ToArray(),
+            result.Objects.Select(o => new GuidLongPair(o.Id, o.ValidAt)).ToArray(),
+            result.Objects.Where(o => o.SimulationAnchorReset).Select(o => o.Id).ToArray());
+
+    private Task BroadcastSimulationActivityAsync(Session session, SimulationActivityResult? result)
+        => result == null ? Task.CompletedTask
+            : BroadcastToAllAsync(session, "OnSimulationActivityChanged", ToSimulationActivityInfo(result));
+
+    public async Task<SimulationActivityInfo?> SetSimulationActive(bool simulationActive)
+    {
+        using var operation = await EnterCallerSessionAsync();
+        if (operation == null) return null;
+        var result = _sessionService.SetSimulationActive(Context.ConnectionId, simulationActive);
+        if (result == null) return null;
+        var info = ToSimulationActivityInfo(result);
+        // Keep the operation lease through delivery: no old-owner write or snapshot
+        // can overtake the authority event even though no synchronous lock is awaited.
+        await BroadcastToAllAsync(operation.Session, "OnSimulationActivityChanged", info);
+        return info;
+    }
 
     /// <summary>
     /// Converts a <see cref="SessionObject"/> to a <see cref="ObjectInfo"/> DTO.
@@ -273,7 +298,10 @@ public class SessionHub : Hub
         MemberInfo[] Members,
         ObjectInfo[] Objects,
         GuidLongPair[] ValidAts,
-        GuidLongPair[] MemberSequences) ToSessionSnapshot(Session session)
+        GuidLongPair[] MemberSequences,
+        bool SimulationSuspended,
+        long SimulationRevision,
+        Guid[] ResetObjectIds) ToSessionSnapshot(Session session)
     {
         lock (session.SyncRoot)
         {
@@ -286,7 +314,10 @@ public class SessionHub : Hub
                 [.. session.Members.Values.Select(ToMemberInfo)],
                 [.. objs.Select(ToObjectInfo)],
                 validAts,
-                memberSequences
+                memberSequences,
+                session.SimulationSuspended,
+                session.SimulationRevision,
+                objs.Where(o => o.SimulationAnchorReset).Select(o => o.Id).ToArray()
             );
         }
     }
@@ -311,7 +342,7 @@ public class SessionHub : Hub
     /// Creates a new session and joins as the server.
     /// </summary>
     /// <param name="metadata">Optional key-value metadata for the session (e.g. aspect ratio, game mode).</param>
-    public async Task<CreateSessionResponse?> CreateSession(Dictionary<string, object?>? metadata = null)
+    public async Task<CreateSessionResponse?> CreateSession(Dictionary<string, object?>? metadata = null, bool simulationActive = true)
     {
         IReadOnlyList<PositionalSchemaCodec.Schema> schemas;
         try
@@ -332,7 +363,7 @@ public class SessionHub : Hub
         // concurrent list/join cannot observe a session whose positional codec is absent.
         _schemaRegistry.SetSessionSchemas(sessionId, schemas);
         var result = _sessionService.CreateSession(
-            Context.ConnectionId, metadata, sessionId);
+            Context.ConnectionId, metadata, sessionId, simulationActive);
 
         if (!result.Success)
         {
@@ -398,7 +429,9 @@ public class SessionHub : Hub
             creator.Id,
             creator.Role,
             creator.ReconnectToken,
-            session.Metadata
+            session.Metadata,
+            session.SimulationSuspended,
+            session.SimulationRevision
         );
     }
 
@@ -406,8 +439,8 @@ public class SessionHub : Hub
     /// Joins an existing session as a client.
     /// </summary>
     /// <param name="sessionId">The session to join.</param>
-    public Task<JoinSessionResponse?> JoinSession(Guid sessionId)
-        => JoinSessionCore(sessionId, null, null);
+    public Task<JoinSessionResponse?> JoinSession(Guid sessionId, bool simulationActive = true)
+        => JoinSessionCore(sessionId, null, null, simulationActive);
 
     /// <summary>
     /// Rejoins a session by proving ownership of a stale member identity.
@@ -415,13 +448,15 @@ public class SessionHub : Hub
     public Task<JoinSessionResponse?> RejoinSession(
         Guid sessionId,
         Guid staleMemberId,
-        string reconnectToken)
-        => JoinSessionCore(sessionId, staleMemberId, reconnectToken);
+        string reconnectToken,
+        bool simulationActive = true)
+        => JoinSessionCore(sessionId, staleMemberId, reconnectToken, simulationActive);
 
     private async Task<JoinSessionResponse?> JoinSessionCore(
         Guid sessionId,
         Guid? evictMemberId,
-        string? reconnectToken)
+        string? reconnectToken,
+        bool simulationActive)
     {
         using var operation = await _operationCoordinator.EnterAsync(
             sessionId, Context.ConnectionAborted);
@@ -436,9 +471,9 @@ public class SessionHub : Hub
         var result = evictMemberId is Guid staleMemberId
             && reconnectToken is string token
                 ? _sessionService.RejoinSession(
-                    sessionId, Context.ConnectionId, staleMemberId, token)
+                    sessionId, Context.ConnectionId, staleMemberId, token, simulationActive)
                 : _sessionService.JoinSession(
-                    sessionId, Context.ConnectionId);
+                    sessionId, Context.ConnectionId, simulationActive);
         if (!result.Success)
         {
             _logger.LogWarning("Failed to join session {SessionId}: {Error}", sessionId, result.ErrorMessage);
@@ -522,11 +557,14 @@ public class SessionHub : Hub
         MemberInfo[] members;
         ObjectInfo[] objects;
         GuidLongPair[] validAts;
+        bool simulationSuspended;
+        long simulationRevision;
+        Guid[] resetObjectIds;
         try
         {
             await Groups.AddToGroupAsync(
                 Context.ConnectionId, session.Id.ToString());
-            (members, objects, validAts, _) = ToSessionSnapshot(session);
+            (members, objects, validAts, _, simulationSuspended, simulationRevision, resetObjectIds) = ToSessionSnapshot(session);
         }
         catch
         {
@@ -542,6 +580,7 @@ public class SessionHub : Hub
         {
             await BroadcastToOthersAsync(session, member.Id, "OnMemberJoined",
                 joinedMemberInfo, member.Id, memberSequence, serverTimestamp);
+            await BroadcastSimulationActivityAsync(session, result.SimulationActivity);
         }
         catch (Exception ex)
         {
@@ -571,7 +610,10 @@ public class SessionHub : Hub
             members,
             objects,
             validAts,
-            session.Metadata
+            session.Metadata,
+            simulationSuspended,
+            simulationRevision,
+            resetObjectIds
         );
     }
 
@@ -628,6 +670,7 @@ public class SessionHub : Hub
             {
                 await BroadcastToAllAsync(session, "OnMemberLeft",
                     departureInfo, result.MemberId, (long)0, serverTimestamp);
+                await BroadcastSimulationActivityAsync(session, result.SimulationActivity);
             }
 
             if (result.PromotedMember != null)
@@ -974,10 +1017,11 @@ public class SessionHub : Hub
         _metrics.OnHubInvocation(member.Id, 1); // GetSessionState has no payload arguments
         _metrics.OnReconciliation(member.Id);
 
-        var (members, objects, validAts, memberSequences) =
+        var (members, objects, validAts, memberSequences, simulationSuspended, simulationRevision, resetObjectIds) =
             ToSessionSnapshot(session);
 
-        return new SessionStateSnapshot(members, objects, validAts, memberSequences);
+        return new SessionStateSnapshot(members, objects, validAts, memberSequences,
+            simulationSuspended, simulationRevision, resetObjectIds);
     }
 
     /// <summary>
@@ -1017,6 +1061,7 @@ public class SessionHub : Hub
             if (session.LifecycleState != SessionLifecycleState.Active
                 || !session.Members.TryGetValue(member.Id, out var currentMember)
                 || currentMember.ConnectionId != Context.ConnectionId
+                || !currentMember.SimulationActive
                 || !session.Objects.TryGetValue(objectId, out var owned)
                 || owned.OwnerMemberId != member.Id)
             {

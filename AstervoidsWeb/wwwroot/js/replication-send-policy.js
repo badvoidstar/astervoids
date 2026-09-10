@@ -33,7 +33,7 @@ const ReplicationSendPolicy = (function () {
             });
         }
 
-        function decide(id, state) {
+        function decide(id, state, now = nowMs()) {
             if (!config.SEND_ON_CHANGE_ENABLED || !isDeterministic()) {
                 return { send: true, immediate: false, reason: 'unthrottled' };
             }
@@ -46,7 +46,6 @@ const ReplicationSendPolicy = (function () {
                 vy: state.vy || 0,
                 rs: state.rs || 0
             };
-            const now = nowMs();
             const baseline = baselines.get(id);
             if (!baseline) {
                 setBaseline(id, normalized, now);
@@ -79,8 +78,8 @@ const ReplicationSendPolicy = (function () {
         return {
             baselines,
             decide,
-            shouldSend(id, x, y, angle, vx, vy, rs) {
-                return decide(id, { x, y, angle, vx, vy, rs }).send;
+            shouldSend(id, x, y, angle, vx, vy, rs, now) {
+                return decide(id, { x, y, angle, vx, vy, rs }, now).send;
             },
             remove(id) {
                 baselines.delete(id);
@@ -150,7 +149,7 @@ const ReplicationSendPolicy = (function () {
             };
         }
 
-        function decide(id, ship, force = false) {
+        function decide(id, ship, force = false, now = nowMs()) {
             if (!config.SHIP_SEND_ON_CHANGE_ENABLED
                 || !config.SHIP_INPUT_REPLAY_ENABLED
                 || !isDeterministic()) {
@@ -161,7 +160,6 @@ const ReplicationSendPolicy = (function () {
                 };
             }
 
-            const now = nowMs();
             const baseline = baselines.get(id);
             if (force || !baseline) {
                 baselines.set(id, capture(ship, now));
@@ -199,8 +197,8 @@ const ReplicationSendPolicy = (function () {
         return {
             baselines,
             decide,
-            shouldSend(id, ship, force) {
-                return decide(id, ship, force).send;
+            shouldSend(id, ship, force, now) {
+                return decide(id, ship, force, now).send;
             },
             remove(id) {
                 baselines.delete(id);

@@ -56,6 +56,40 @@ public class SchemaCrossWireFixturesTests
         ("terminalX", "f64"), ("terminalY", "f64"));
 
     [Fact]
+    public void Fixture_BulletTimingAndClaim_ProductionSchema()
+    {
+        var additions = Schema(3,
+            ("sampleAt", "f64"), ("sampleTick", "u32"),
+            ("bornAt", "f64"), ("shot", "bytes"),
+            ("hitClaimId", "guid"), ("hitClaimAt", "f64"),
+            ("hitX", "f64"), ("hitY", "f64"), ("hitAngle", "f64"),
+            ("hitTargetVersion", "u32"), ("hitTargetOwnerId", "guid"));
+        var schema = new PositionalSchemaCodec.Schema(3,
+            BulletSchema().Fields.Concat(additions.Fields).ToArray());
+        var id = Guid.Parse("11223344-5566-7788-99aa-bbccddeeff00");
+        var data = new Dictionary<string, object?>
+        {
+            ["sampleAt"] = 1000.5, ["sampleTick"] = 24,
+            ["bornAt"] = 980.0, ["shot"] = new byte[] { 0x90 },
+            ["hitClaimId"] = id, ["hitClaimAt"] = 1040.25,
+            ["hitX"] = 0.5, ["hitY"] = 0.75, ["hitAngle"] = 1.5,
+            ["hitTargetVersion"] = 42, ["hitTargetOwnerId"] = id
+        };
+        // The current production JS schema pins this fixture independently in
+        // production-wire-schemas.test.mjs, including the fourth presence byte.
+        const string expected =
+            "0000ff070000000000448f40180000000000000000a08e400100000090" +
+            "443322116655887799aabbccddeeff000000000000419040000000000000e03f" +
+            "000000000000e83f000000000000f83f2a000000443322116655887799aabbccddeeff00";
+        Hex(PositionalSchemaCodec.Encode(schema, data)).Should().Be(expected);
+        var decoded = PositionalSchemaCodec.Decode(schema, Convert.FromHexString(expected));
+        decoded["sampleAt"].Should().Be(1000.5);
+        decoded["hitTargetOwnerId"].Should().Be(id.ToString());
+        decoded["shot"].Should().BeEquivalentTo(new byte[] { 0x90 });
+        Hex(PositionalSchemaCodec.Encode(schema, decoded)).Should().Be(expected);
+    }
+
+    [Fact]
     public void Fixture_AsteroidUpdate_AllFields()
     {
         var schema = AsteroidSchema();

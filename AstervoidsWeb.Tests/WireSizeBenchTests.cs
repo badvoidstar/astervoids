@@ -306,8 +306,8 @@ public class WireSizeBenchTests
             Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
 
         var size = Size(dto);
-        size.Should().BeInRange(1830, 1870,
-            "schema-0 comparison snapshot with compact ObjectInfo arrays");
+        size.Should().BeInRange(1922, 1962,
+            "schema-0 snapshot plus 92 bytes of activity, suspension and reset-anchor metadata");
     }
 
     [Fact]

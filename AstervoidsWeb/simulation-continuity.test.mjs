@@ -1363,14 +1363,14 @@ test('production kinematic presentation delegates to DeadReckon/RemoteObjects by
     // createKinematicPresentation is the production glue between
     // ReplicationRuntime's generic has/ingest/sample/remove contract and the
     // two concrete presentation models. Verify the actual extracted source
-    // switches on isDeterministicMode() for every one of those methods.
+    // switches on isDeterministicMode() after holding frozen lifecycle state.
     const start = productionSource.indexOf('    function createKinematicPresentation() {');
     const end = productionSource.indexOf('\n    const kinematicPresentation = createKinematicPresentation();');
     assert.ok(start >= 0 && end > start);
     const source = productionSource.slice(start, end);
     assert.match(source, /has\(id\) \{\s*return isDeterministicMode\(\)/);
-    assert.match(source, /ingest\(id, data, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
-    assert.match(source, /sample\(id, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
+    assert.match(source, /ingest\(id, data, facts, record, context\) \{\s*if \(isLifecycleFrozen\(record\)\) \{\s*DeadReckon\.remove\(id\);\s*RemoteObjects\.remove\(id\);\s*return;\s*\}\s*if \(isDeterministicMode\(\)\) \{/);
+    assert.match(source, /sample\(id, facts, record, context\) \{\s*if \(isLifecycleFrozen\(record\)\) \{\s*return currentKinematicData\(facts\.type, id, record\);\s*\}\s*if \(isDeterministicMode\(\)\) \{/);
     assert.match(source, /remove\(id, reason, facts, record, context\) \{\s*RemoteObjects\.remove\(id\);\s*DeadReckon\.remove\(id\);/);
     assert.match(source, /reset\(facts, context\) \{\s*RemoteObjects\.clear\(\);\s*DeadReckon\.clear\(\);/);
 });

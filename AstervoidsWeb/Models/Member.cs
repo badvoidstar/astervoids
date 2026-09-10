@@ -22,6 +22,9 @@ public class Member
     /// </summary>
     public MemberRole Role { get; set; }
 
+    /// <summary>Whether this member is currently able to advance simulation.</summary>
+    public bool SimulationActive { get; set; } = true;
+
     /// <summary>
     /// Timestamp when the member joined the session.
     /// </summary>

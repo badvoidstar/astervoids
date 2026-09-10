@@ -9,6 +9,7 @@ const ReplicationPresentation = (function () {
             computedDelay: config.INTERPOLATION_DELAY,
             lastServerTimestamp: 0,
             lastValidAt: 0,
+            sampledPackets: new Set(),
             remoteSendInterval: 0
         };
     }
@@ -94,12 +95,18 @@ const ReplicationPresentation = (function () {
             recompute(delay);
         }
 
-        function recordObjectSample(memberId, validAt, arrivalServerTime) {
+        function recordObjectSample(memberId, validAt, arrivalServerTime, packetId = validAt) {
             if (!config.ADAPTIVE_DELAY_ENABLED) return;
             if (!memberId || validAt == null || arrivalServerTime == null) return;
             const delay = getMemberDelay(memberId);
             const lag = arrivalServerTime - validAt;
             if (!Number.isFinite(lag) || lag < 0 || lag > 5000) return;
+            // A broadcast's object count must not weight its latency estimate.
+            if (delay.sampledPackets.has(packetId)) return;
+            delay.sampledPackets.add(packetId);
+            if (delay.sampledPackets.size > config.ADAPTIVE_DELAY_SAMPLES) {
+                delay.sampledPackets.delete(delay.sampledPackets.values().next().value);
+            }
             delay.lagSamples.push(lag);
             if (delay.lagSamples.length > config.ADAPTIVE_DELAY_SAMPLES) {
                 delay.lagSamples.shift();
@@ -114,7 +121,7 @@ const ReplicationPresentation = (function () {
             } else {
                 recompute(delay);
             }
-            delay.lastValidAt = validAt;
+            delay.lastValidAt = Math.max(delay.lastValidAt, validAt);
         }
 
         return {
@@ -256,6 +263,62 @@ const ReplicationPresentation = (function () {
         return Math.min(nowPerf, parentState.recvPerf + authoredDeltaMs);
     }
 
+    // Critically damped residual: both its value and first derivative match the
+    // outgoing presentation at a re-anchor, including another active residual.
+    function sampleCorrection(displacement, velocity, elapsedMs, tauMs) {
+        const t = Math.max(0, elapsedMs);
+        const k = Math.exp(-t / tauMs);
+        const b = velocity + displacement / tauMs;
+        return {
+            value: (displacement + b * t) * k,
+            velocity: (velocity - b * t / tauMs) * k
+        };
+    }
+
+    function createPresentationTimeline(options = {}) {
+        const maxSlewRate = Number.isFinite(options.maxSlewRate)
+            ? Math.max(0, Math.min(0.5, options.maxSlewRate)) : 0.1;
+        const smoothingMs = Number.isFinite(options.smoothingMs)
+            ? Math.max(1, options.smoothingMs) : 250;
+        let state = null;
+
+        return {
+            sampleTime(nowPerf, desiredDelayMs) {
+                if (!Number.isFinite(nowPerf)) throw new TypeError('nowPerf must be finite');
+                const delay = Number.isFinite(desiredDelayMs)
+                    ? Math.max(0, desiredDelayMs) : state?.target ?? 0;
+                if (!state) {
+                    state = {
+                        value: delay, velocity: 0, target: delay,
+                        now: nowPerf, time: nowPerf - delay, tau: smoothingMs
+                    };
+                    return state.time;
+                }
+                if (nowPerf < state.now) return state.time;
+                const elapsed = nowPerf - state.now;
+                const residual = sampleCorrection(
+                    state.value - state.target, state.velocity, elapsed, state.tau);
+                state.value = state.target + residual.value;
+                state.velocity = residual.velocity;
+                state.now = nowPerf;
+                state.time = Math.max(state.time, nowPerf - state.value);
+                if (maxSlewRate > 0 && state.target !== delay) {
+                    state.target = delay;
+                    // Bounding error/tau as well as the initial delay velocity
+                    // bounds its derivative throughout the damped transition.
+                    state.tau = Math.max(smoothingMs, Math.abs(state.value - delay) / maxSlewRate);
+                }
+                return state.time;
+            },
+            getRate() {
+                return 1 - (state?.velocity || 0);
+            },
+            reset() {
+                state = null;
+            }
+        };
+    }
+
     function createDeadReckoningPolicy(options) {
         const config = options?.config;
         const nowMs = options?.nowMs;
@@ -268,6 +331,14 @@ const ReplicationPresentation = (function () {
         const getAngularPredictionWindow =
             options?.getAngularPredictionWindow || (() => null);
         const replay = options?.replay;
+        const wrapX = options?.wrapX || (value => value);
+        const wrapY = options?.wrapY || (value => value);
+        const shortestDeltaX = options?.shortestDeltaX || ((from, to) => to - from);
+        const shortestDeltaY = options?.shortestDeltaY || ((from, to) => to - from);
+        const getMaxPredictionFrames = options?.getMaxPredictionFrames
+            || (() => config.DEADRECKON_MAX_FRAMES);
+        const isDiscontinuity = options?.isDiscontinuity
+            || ((_previous, _next, context) => !!(context?.impulse || context?.snap));
         if (!config) throw new TypeError('config is required');
         if (typeof nowMs !== 'function') throw new TypeError('nowMs must be a function');
         if (typeof velocityToDeltaX !== 'function') {
@@ -304,9 +375,11 @@ const ReplicationPresentation = (function () {
                 baselinePerf,
                 snap,
                 preserveDirection = false,
-                stateContext = null) {
-                const now = nowMs();
-                const displayed = (!snap && states.has(id))
+                stateContext = null,
+                now = stateContext?.nowPerf ?? nowMs()) {
+                const previous = states.get(id);
+                const discontinuity = snap || isDiscontinuity(previous, data, stateContext);
+                const displayed = (!discontinuity && previous)
                     ? policy._reckonAt(id, now)
                     : null;
                 const recvPerf = (typeof baselinePerf === 'number'
@@ -319,17 +392,26 @@ const ReplicationPresentation = (function () {
                 if (displayed && tau > 0) {
                     const fresh = policy._reckonRaw(id, now);
                     if (fresh) {
-                        let dx = displayed.x - fresh.x;
-                        let dy = displayed.y - fresh.y;
+                        const state = states.get(id);
+                        let dx = shortestDeltaX(fresh.x, displayed.x, state);
+                        let dy = shortestDeltaY(fresh.y, displayed.y, state);
                         let da = (displayed.angle != null && fresh.angle != null)
                             ? shortestAngleDelta(displayed.angle, fresh.angle)
                             : 0;
                         const snapDist = config.DEADRECKON_SNAP_DIST;
                         if (Math.abs(dx) > snapDist || Math.abs(dy) > snapDist) {
-                            dx = 0;
-                            dy = 0;
+                            smooth.delete(id);
+                            return;
                         }
-                        if (dx !== 0 || dy !== 0 || da !== 0) {
+                        const stepMs = 1000 / config.TARGET_FPS;
+                        const dvx = velocityToDeltaX(
+                            (displayed.velocityX || 0) - (fresh.velocityX || 0)) / stepMs;
+                        const dvy = velocityToDeltaY(
+                            (displayed.velocityY || 0) - (fresh.velocityY || 0)) / stepMs;
+                        const dva = ((displayed.rotationSpeed || 0)
+                            - (fresh.rotationSpeed || 0)) / stepMs;
+                        if (dx !== 0 || dy !== 0 || da !== 0
+                            || dvx !== 0 || dvy !== 0 || dva !== 0) {
                             if (preserveDirection) {
                                 const state = states.get(id);
                                 const stepMs = 1000 / config.TARGET_FPS;
@@ -354,7 +436,10 @@ const ReplicationPresentation = (function () {
                                 }
                                 tau *= 1.05;
                             }
-                            smooth.set(id, { dx, dy, da, t0: now, tauMs: tau });
+                            smooth.set(id, {
+                                dx, dy, da, dvx, dvy, dva, t0: now, tauMs: tau,
+                                angularStop: fresh.rotationSpeed === 0
+                            });
                             return;
                         }
                     }
@@ -368,9 +453,13 @@ const ReplicationPresentation = (function () {
                 const stepMs = 1000 / config.TARGET_FPS;
                 let frames = stepMs > 0 ? (nowPerf - state.recvPerf) / stepMs : 0;
                 if (!(frames > 0)) frames = 0;
-                if (frames > config.DEADRECKON_MAX_FRAMES) {
-                    frames = config.DEADRECKON_MAX_FRAMES;
-                }
+                const configuredMaximum = getMaxPredictionFrames(state);
+                const maximum = Number.isFinite(configuredMaximum)
+                    ? Math.max(0, configuredMaximum)
+                    : Number.isFinite(config.DEADRECKON_MAX_FRAMES)
+                        ? Math.max(0, config.DEADRECKON_MAX_FRAMES) : 0;
+                const stopped = frames >= maximum;
+                frames = Math.min(frames, maximum);
                 const out = {
                     x: state.x,
                     y: state.y,
@@ -405,6 +494,18 @@ const ReplicationPresentation = (function () {
                         targetMode,
                         replayContext,
                         angularPredictionWindow);
+                } else if (angularPredictionWindow) {
+                    const full = angularPredictionWindow.fullFrames;
+                    const taper = angularPredictionWindow.taperFrames;
+                    out.rotationSpeed *= frames <= full ? 1
+                        : taper > 0 ? Math.max(0, 1 - (frames - full) / taper) : 0;
+                }
+                out.x = wrapX(out.x, state);
+                out.y = wrapY(out.y, state);
+                if (stopped) {
+                    out.velocityX = 0;
+                    out.velocityY = 0;
+                    out.rotationSpeed = 0;
                 }
                 return out;
             },
@@ -427,24 +528,35 @@ const ReplicationPresentation = (function () {
                 const correction = smooth.get(id);
                 if (correction) {
                     const tau = correction.tauMs || config.DEADRECKON_SMOOTH_MS;
-                    const k = tau > 0
-                        ? Math.exp(-(nowPerf - correction.t0) / tau)
-                        : 0;
-                    if (k <= 1e-3) {
-                        smooth.delete(id);
-                    } else {
-                        out.x += correction.dx * k;
-                        out.y += correction.dy * k;
-                        if (out.angle !== undefined) {
-                            out.angle += correction.da * k;
+                    const elapsed = nowPerf - correction.t0;
+                    const x = sampleCorrection(correction.dx, correction.dvx || 0, elapsed, tau);
+                    const y = sampleCorrection(correction.dy, correction.dvy || 0, elapsed, tau);
+                    // A stop edge must not add more angular overshoot while
+                    // easing the already displayed angle back to its target.
+                    const a = correction.angularStop
+                        ? {
+                            value: correction.da * Math.exp(-Math.max(0, elapsed) / tau),
+                            velocity: -correction.da / tau * Math.exp(-Math.max(0, elapsed) / tau)
                         }
+                        : sampleCorrection(correction.da, correction.dva || 0, elapsed, tau);
+                    const state = states.get(id);
+                    const stepMs = 1000 / config.TARGET_FPS;
+                    out.x = wrapX(out.x + x.value, state);
+                    out.y = wrapY(out.y + y.value, state);
+                    const scaleX = velocityToDeltaX(1);
+                    const scaleY = velocityToDeltaY(1);
+                    if (scaleX) out.velocityX = (out.velocityX || 0) + x.velocity * stepMs / scaleX;
+                    if (scaleY) out.velocityY = (out.velocityY || 0) + y.velocity * stepMs / scaleY;
+                    if (out.angle !== undefined) {
+                        out.angle += a.value;
+                        out.rotationSpeed = (out.rotationSpeed || 0) + a.velocity * stepMs;
                     }
                 }
                 return out;
             },
 
-            getReckoned(id) {
-                return policy._reckonAt(id, nowMs());
+            getReckoned(id, now = nowMs()) {
+                return policy._reckonAt(id, now);
             },
 
             getResting(id) {
@@ -485,6 +597,14 @@ const ReplicationPresentation = (function () {
             h01: -2 * t3 + 3 * t2,
             h11: t3 - t2
         };
+    }
+
+    function hermiteDerivative(t, p0, p1, m0, m1) {
+        const t2 = t * t;
+        return (6 * t2 - 6 * t) * p0
+            + (3 * t2 - 4 * t + 1) * m0
+            + (-6 * t2 + 6 * t) * p1
+            + (3 * t2 - 2 * t) * m1;
     }
 
     /**
@@ -698,7 +818,7 @@ const ReplicationPresentation = (function () {
         });
     }
 
-    function interpolateHermiteAngle(options) {
+    function sampleHermiteAngle(options) {
         const previousAngle = options.previousAngle;
         const currentAngle = options.currentAngle;
         const previousRotationSpeed = options.previousRotationSpeed || 0;
@@ -708,9 +828,12 @@ const ReplicationPresentation = (function () {
         const basis = hermiteBasis(options.t);
         const dt = timeDiff / 1000;
         let delta = currentAngle - previousAngle;
-        while (delta > Math.PI) delta -= Math.PI * 2;
-        while (delta < -Math.PI) delta += Math.PI * 2;
-        if (Math.abs(delta) < 1e-6) return currentAngle;
+        delta -= Math.round(delta / (Math.PI * 2)) * Math.PI * 2;
+        if (options.rateAware) {
+            const expected = (previousRotationSpeed + rotationSpeed) * 0.5 * targetFps * dt;
+            delta += Math.round((expected - delta) / (Math.PI * 2)) * Math.PI * 2;
+        }
+        if (Math.abs(delta) < 1e-6) return { angle: currentAngle, rotationSpeed: 0 };
 
         const a0 = previousAngle;
         const a1 = a0 + delta;
@@ -725,10 +848,19 @@ const ReplicationPresentation = (function () {
         else if (Math.abs(tangent1) > maxTangent) {
             tangent1 = Math.sign(tangent1) * maxTangent;
         }
-        return basis.h00 * a0
+        const angle = basis.h00 * a0
             + basis.h10 * tangent0
             + basis.h01 * a1
             + basis.h11 * tangent1;
+        return {
+            angle,
+            rotationSpeed: dt > 0 ? hermiteDerivative(
+                options.t, a0, a1, tangent0, tangent1) / (dt * targetFps) : rotationSpeed
+        };
+    }
+
+    function interpolateHermiteAngle(options) {
+        return sampleHermiteAngle(options).angle;
     }
 
     function findSnapshotBracket(snapshots, targetTime) {
@@ -752,6 +884,9 @@ const ReplicationPresentation = (function () {
         const wrapX = options?.wrapX;
         const wrapY = options?.wrapY;
         const distanceBetween = options?.distanceBetween;
+        const isRotationTarget = options?.isRotationTarget || (() => false);
+        const isDiscontinuity = options?.isDiscontinuity
+            || ((_previous, _next, context) => !!(context?.impulse || context?.snap));
         const dependencies = [
             ['config', config],
             ['nowMs', nowMs],
@@ -777,8 +912,16 @@ const ReplicationPresentation = (function () {
             states,
             lastVersions,
 
-            updateState(objectId, data, ownerMemberId, validAt) {
-                const time = validAt != null ? validAtToTime(validAt) : nowMs();
+            updateState(objectId, data, ownerMemberId, validAt, now = nowMs(), context = null) {
+                const time = validAt != null ? validAtToTime(validAt, now) : now;
+                const existing = states.get(objectId);
+                const previous = existing?.snapshots[existing.snapshots.length - 1];
+                const discontinuity = previous && (
+                    isDiscontinuity(previous.data, data, context)
+                    || policy.shouldSnap(previous.data, data));
+                const displayed = existing && !discontinuity
+                    ? policy.getInterpolated(objectId, now)
+                    : null;
                 const snapshot = {
                     data: { ...data },
                     time,
@@ -788,16 +931,50 @@ const ReplicationPresentation = (function () {
                     },
                     rotationSpeed: data.rotationSpeed || 0
                 };
-                const existing = states.get(objectId);
+                if (previous && Number.isFinite(snapshot.data.angle)
+                    && Number.isFinite(previous.data.angle)
+                    && !isRotationTarget(data) && !discontinuity) {
+                    const dt = Math.max(0, time - previous.time) / 1000;
+                    const expected = (previous.rotationSpeed + snapshot.rotationSpeed)
+                        * 0.5 * config.TARGET_FPS * dt;
+                    const delta = snapshot.data.angle - previous.data.angle;
+                    snapshot.data.angle += Math.round(
+                        (expected - delta) / (Math.PI * 2)) * Math.PI * 2;
+                }
                 if (existing) {
                     existing.ownerMemberId = ownerMemberId;
                     const latest = existing.snapshots[existing.snapshots.length - 1];
                     if (latest && snapshot.time < latest.time) {
                         snapshot.time = latest.time;
                     }
+                    if (discontinuity) existing.snapshots.length = 0;
+                    else if (latest && snapshot.time === latest.time) {
+                        existing.snapshots.pop();
+                    }
                     existing.snapshots.push(snapshot);
                     if (existing.snapshots.length > config.SNAPSHOT_BUFFER_SIZE) {
                         existing.snapshots.shift();
+                    }
+                    existing.correction = null;
+                    if (displayed && config.INTERPOLATION_ENABLED) {
+                        const fresh = policy._baseInterpolated(existing, now);
+                        const tau = config.INTERPOLATION_SMOOTH_MS ?? config.DEADRECKON_SMOOTH_MS ?? 90;
+                        if (tau > 0) {
+                            existing.correction = {
+                                dx: shortestDeltaX(fresh.x, displayed.x, data),
+                                dy: shortestDeltaY(fresh.y, displayed.y, data),
+                                da: Number.isFinite(fresh.angle) && Number.isFinite(displayed.angle)
+                                    ? policy.lerpAngle(fresh.angle, displayed.angle, 1) - fresh.angle : 0,
+                                dvx: velocityToDeltaX(
+                                    (displayed.velocityX || 0) - (fresh.velocityX || 0)) / 1000,
+                                dvy: velocityToDeltaY(
+                                    (displayed.velocityY || 0) - (fresh.velocityY || 0)) / 1000,
+                                dva: ((displayed.rotationSpeed || 0) - (fresh.rotationSpeed || 0))
+                                    * config.TARGET_FPS / 1000,
+                                t0: now,
+                                tauMs: tau
+                            };
+                        }
                     }
                 } else {
                     states.set(objectId, {
@@ -807,13 +984,32 @@ const ReplicationPresentation = (function () {
                 }
             },
 
-            getInterpolated(objectId, renderTime) {
+            getInterpolated(objectId, renderTime = nowMs()) {
                 const state = states.get(objectId);
                 if (!state || state.snapshots.length === 0) return null;
-                return policy._baseInterpolated(state, renderTime);
+                const out = { ...policy._baseInterpolated(state, renderTime) };
+                const correction = state.correction;
+                if (correction) {
+                    const elapsed = renderTime - correction.t0;
+                    const x = sampleCorrection(correction.dx, correction.dvx, elapsed, correction.tauMs);
+                    const y = sampleCorrection(correction.dy, correction.dvy, elapsed, correction.tauMs);
+                    const a = sampleCorrection(correction.da, correction.dva, elapsed, correction.tauMs);
+                    out.x = wrapX(out.x + x.value, out);
+                    out.y = wrapY(out.y + y.value, out);
+                    const scaleX = velocityToDeltaX(1);
+                    const scaleY = velocityToDeltaY(1);
+                    if (scaleX) out.velocityX = (out.velocityX || 0) + x.velocity * 1000 / scaleX;
+                    if (scaleY) out.velocityY = (out.velocityY || 0) + y.velocity * 1000 / scaleY;
+                    if (out.angle !== undefined) {
+                        out.angle += a.value;
+                        out.rotationSpeed = (out.rotationSpeed || 0)
+                            + a.velocity * 1000 / config.TARGET_FPS;
+                    }
+                }
+                return out;
             },
 
-            getSettling(objectId, renderTime) {
+            getSettling(objectId, renderTime = nowMs()) {
                 const state = states.get(objectId);
                 if (!state || state.snapshots.length === 0) return null;
                 return policy._baseInterpolated(state, renderTime, true);
@@ -825,13 +1021,35 @@ const ReplicationPresentation = (function () {
                 if (!config.INTERPOLATION_ENABLED) return latest.data;
 
                 const delay = getDelayForMember(state.ownerMemberId);
-                const targetTime = renderTime - delay;
-                if (targetTime <= snapshots[0].time) return snapshots[0].data;
+                state.delayClock ||= createPresentationTimeline({
+                    maxSlewRate: config.INTERPOLATION_DELAY_SLEW_RATE
+                });
+                const targetTime = state.delayClock.sampleTime(renderTime, delay);
+                const out = policy._sampleAtTarget(
+                    state, targetTime, clampToLatest);
+                const speed = state.delayClock.getRate();
+                return {
+                    ...out,
+                    velocityX: (out.velocityX || 0) * speed,
+                    velocityY: (out.velocityY || 0) * speed,
+                    rotationSpeed: (out.rotationSpeed || 0) * speed
+                };
+            },
+
+            _sampleAtTarget(state, targetTime, clampToLatest) {
+                const snapshots = state.snapshots;
+                const latest = snapshots[snapshots.length - 1];
+                if (targetTime < snapshots[0].time) {
+                    return { ...snapshots[0].data, velocityX: 0, velocityY: 0, rotationSpeed: 0 };
+                }
                 if (targetTime >= latest.time) {
-                    if (clampToLatest) return latest.data;
+                    if (clampToLatest) {
+                        return { ...latest.data, velocityX: 0, velocityY: 0, rotationSpeed: 0 };
+                    }
                     const extraTime = Math.min(
                         (targetTime - latest.time) / 1000,
                         config.MAX_EXTRAPOLATION);
+                    const stopped = (targetTime - latest.time) / 1000 >= config.MAX_EXTRAPOLATION;
                     return {
                         ...latest.data,
                         x: wrapX(
@@ -844,6 +1062,9 @@ const ReplicationPresentation = (function () {
                                 + velocityToDeltaY(latest.velocity.y)
                                     * extraTime,
                             latest.data),
+                        velocityX: stopped ? 0 : latest.velocity.x,
+                        velocityY: stopped ? 0 : latest.velocity.y,
+                        rotationSpeed: stopped ? 0 : latest.rotationSpeed,
                         angle: latest.data.angle
                             + (latest.rotationSpeed || 0)
                                 * config.TARGET_FPS
@@ -855,8 +1076,7 @@ const ReplicationPresentation = (function () {
                 if (!bracket) return latest.data;
                 const timeDiff = bracket.current.time - bracket.previous.time;
                 if (timeDiff <= 0) return bracket.current.data;
-                const effectiveTimeDiff = Math.max(timeDiff, delay * 0.5);
-                const t = (targetTime - bracket.previous.time) / effectiveTimeDiff;
+                const t = (targetTime - bracket.previous.time) / timeDiff;
                 if (policy.shouldSnap(
                     bracket.previous.data,
                     bracket.current.data)) {
@@ -869,7 +1089,7 @@ const ReplicationPresentation = (function () {
                     current: bracket.current.data,
                     velocity: bracket.current.velocity,
                     rotationSpeed: bracket.current.rotationSpeed
-                }, Math.min(t, 1), effectiveTimeDiff);
+                }, Math.min(t, 1), timeDiff);
             },
 
             shouldSnap(a, b) {
@@ -898,6 +1118,10 @@ const ReplicationPresentation = (function () {
                             + basis.h01 * p1
                             + basis.h11 * m1,
                         state.current);
+                    const scale = velocityToDeltaX(1);
+                    if (dt > 0 && scale) {
+                        result.velocityX = hermiteDerivative(t, p0, p1, m0, m1) / dt / scale;
+                    }
                 }
                 if (state.previous.y !== undefined
                     && state.current.y !== undefined) {
@@ -916,18 +1140,25 @@ const ReplicationPresentation = (function () {
                             + basis.h01 * p1
                             + basis.h11 * m1,
                         state.current);
+                    const scale = velocityToDeltaY(1);
+                    if (dt > 0 && scale) {
+                        result.velocityY = hermiteDerivative(t, p0, p1, m0, m1) / dt / scale;
+                    }
                 }
                 if (state.previous.angle !== undefined
                     && state.current.angle !== undefined) {
-                    result.angle = interpolateHermiteAngle({
+                    const angular = sampleHermiteAngle({
                         previousAngle: state.previous.angle,
                         currentAngle: state.current.angle,
                         previousRotationSpeed: state.previousRotationSpeed,
                         rotationSpeed: state.rotationSpeed,
                         targetFps: config.TARGET_FPS,
+                        rateAware: !isRotationTarget(state.current),
                         t,
                         timeDiff
                     });
+                    result.angle = angular.angle;
+                    result.rotationSpeed = angular.rotationSpeed;
                 }
                 return result;
             },
@@ -956,6 +1187,7 @@ const ReplicationPresentation = (function () {
         createAdaptiveDelayPolicy,
         createDeadReckoningPolicy,
         createSnapshotInterpolationPolicy,
+        createPresentationTimeline,
         calculateRateAngularPredictionWindow,
         integrateRateAngularPredictionFrames,
         averageRateAngularPredictionScale,

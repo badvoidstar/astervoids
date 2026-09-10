@@ -2,6 +2,8 @@
  * Clock synchronization for replicated-object timelines.
  *
  * The service estimates the server UTC axis from minimum-RTT ping samples.
+ * Bootstrap establishes its epoch; afterward monotonic time advances the axis
+ * and accepted corrections slew at a bounded rate, independent of wall time.
  * All clocks, timers, transport calls, and document visibility are injected so
  * the same state machine is deterministic in tests and portable to other
  * browser games.
@@ -52,6 +54,10 @@ const ReplicationClock = (function () {
             offsetMs: 0,
             offsetInitialized: false,
             wallToPerfDelta: null,
+            serverTimeOffsetMs: null,
+            targetServerTimeOffsetMs: null,
+            lastSlewPerf: null,
+            maxSlewRate: Math.max(0, Math.min(0.5, options.maxSlewRate ?? 0.02)),
             lastSampleRtt: Infinity,
             sampleCount: 0,
             rejectedCount: 0,
@@ -77,19 +83,29 @@ const ReplicationClock = (function () {
             return new Promise(resolve => schedule(resolve, ms));
         }
 
-        function serverNowMs() {
-            return wallNowMs() + state.offsetMs;
+        function advanceClock(nowPerf) {
+            if (state.serverTimeOffsetMs === null) {
+                state.serverTimeOffsetMs = wallNowMs() - nowPerf;
+                state.targetServerTimeOffsetMs = state.serverTimeOffsetMs;
+                state.lastSlewPerf = nowPerf;
+            }
+            const elapsed = Math.max(0, nowPerf - state.lastSlewPerf);
+            const error = state.targetServerTimeOffsetMs - state.serverTimeOffsetMs;
+            const limit = elapsed * state.maxSlewRate;
+            state.serverTimeOffsetMs += Math.max(-limit, Math.min(limit, error));
+            state.lastSlewPerf = Math.max(state.lastSlewPerf, nowPerf);
+            return state.serverTimeOffsetMs;
         }
 
-        function validAtToMonotonicMs(validAt) {
+        function serverNowMs(nowPerf = monotonicNowMs()) {
+            return nowPerf + advanceClock(nowPerf);
+        }
+
+        function validAtToMonotonicMs(validAt, nowPerf = monotonicNowMs()) {
             if (validAt == null || !Number.isFinite(validAt)) {
-                return monotonicNowMs();
+                return nowPerf;
             }
-            const delta = state.wallToPerfDelta != null
-                ? state.wallToPerfDelta
-                : monotonicNowMs() - wallNowMs();
-            const offset = state.offsetInitialized ? state.offsetMs : 0;
-            return validAt - offset + delta;
+            return validAt - advanceClock(nowPerf);
         }
 
         async function runPingBurst(
@@ -117,7 +133,8 @@ const ReplicationClock = (function () {
                     samples.push({
                         rtt: t3Perf - t0Perf,
                         serverTime,
-                        t3Wall
+                        t3Wall,
+                        t3Perf
                     });
                 } catch {
                     // A later refresh retries transient transport failures.
@@ -127,9 +144,11 @@ const ReplicationClock = (function () {
             if (!state.running || generation !== state.generation) return null;
             const winner = pickMinRttSample(samples);
             if (!winner) return null;
-            const candidateOffset = computeOffsetForSample(winner);
+            // Gate in the monotonic domain: a local wall-clock adjustment is
+            // neither server drift nor a network outlier.
+            const candidateOffset = winner.serverTime + winner.rtt / 2 - winner.t3Perf;
             if (!passesOutlierGate({
-                currentOffset: state.offsetMs,
+                currentOffset: state.targetServerTimeOffsetMs,
                 lastSampleRtt: state.lastSampleRtt,
                 candidateOffset,
                 gateMs: state.outlierGateMs,
@@ -141,16 +160,20 @@ const ReplicationClock = (function () {
             }
 
             if (!state.offsetInitialized) {
-                state.offsetMs = candidateOffset;
+                state.serverTimeOffsetMs = candidateOffset;
+                state.targetServerTimeOffsetMs = candidateOffset;
+                state.lastSlewPerf = monotonicNowMs();
                 state.offsetInitialized = true;
             } else {
-                state.offsetMs = emaUpdate(
-                    state.offsetMs,
+                advanceClock(monotonicNowMs());
+                state.targetServerTimeOffsetMs = emaUpdate(
+                    state.targetServerTimeOffsetMs,
                     candidateOffset,
                     state.emaAlpha);
             }
             state.lastSampleRtt = winner.rtt;
             state.wallToPerfDelta = monotonicNowMs() - wallNowMs();
+            state.offsetMs = state.targetServerTimeOffsetMs + state.wallToPerfDelta;
             state.sampleCount++;
             return winner;
         }

@@ -49,6 +49,10 @@ public class ObjectService : IObjectService
             var effectiveOwner = ownerMemberId ?? creatorMemberId;
             if (effectiveOwner != creatorMemberId && !session.Members.TryGetValue(effectiveOwner, out _))
                 return null;
+            if (scope == ObjectScope.Session && !session.Members[effectiveOwner].SimulationActive)
+                effectiveOwner = session.Members.Values.Where(m => m.SimulationActive)
+                    .OrderBy(m => m.JoinedAt).ThenBy(m => m.Id)
+                    .Select(m => m.Id).FirstOrDefault(effectiveOwner);
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var validAt = ValidAtPolicy.Resolve(clientValidAt, receive);
@@ -106,7 +110,7 @@ public class ObjectService : IObjectService
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return results;
-            if (!session.Members.ContainsKey(ownerMemberId))
+            if (!session.Members.TryGetValue(ownerMemberId, out var member) || !member.SimulationActive)
                 return results;
 
             var acceptedUpdates = new List<(SessionObject Object, ObjectUpdate Update)>();
@@ -153,7 +157,7 @@ public class ObjectService : IObjectService
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return null;
-            if (!session.Members.ContainsKey(ownerMemberId))
+            if (!session.Members.TryGetValue(ownerMemberId, out var member) || !member.SimulationActive)
                 return null;
 
             if (!session.Objects.TryGetValue(objectId, out var obj))
@@ -185,7 +189,7 @@ public class ObjectService : IObjectService
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return null;
-            if (!session.Members.ContainsKey(ownerMemberId))
+            if (!session.Members.TryGetValue(ownerMemberId, out var member) || !member.SimulationActive)
                 return null;
 
             // Verify ownership of the object being replaced — atomic with the delete below
@@ -209,6 +213,8 @@ public class ObjectService : IObjectService
                     && session.Members.ContainsKey(spec.OwnerOverride.Value)
                     ? spec.OwnerOverride.Value
                     : ownerMemberId;
+                if (spec.Scope == ObjectScope.Session && !session.Members[effectiveOwner].SimulationActive)
+                    effectiveOwner = ownerMemberId;
 
                 var obj = NewSessionObject(sessionId, ownerMemberId, effectiveOwner, spec.Scope, spec.Data, validAt, spec.SchemaId);
                 session.Objects.TryAdd(obj.Id, obj);
@@ -273,6 +279,7 @@ public class ObjectService : IObjectService
         obj.Version++;
         obj.UpdatedAt = DateTime.UtcNow;
         obj.ValidAt = validAt;
+        obj.SimulationAnchorReset = false;
     }
 
     /// <summary>
@@ -301,7 +308,7 @@ public class ObjectService : IObjectService
             SchemaId = schemaId
         };
 
-    private static SessionObject Snapshot(SessionObject obj)
+    internal static SessionObject Snapshot(SessionObject obj)
         => new()
         {
             Id = obj.Id,
@@ -313,6 +320,7 @@ public class ObjectService : IObjectService
             SchemaId = obj.SchemaId,
             Version = obj.Version,
             ValidAt = obj.ValidAt,
+            SimulationAnchorReset = obj.SimulationAnchorReset,
             CreatedAt = obj.CreatedAt,
             UpdatedAt = obj.UpdatedAt
         };

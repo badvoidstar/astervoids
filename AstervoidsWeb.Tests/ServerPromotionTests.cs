@@ -365,8 +365,10 @@ public class ServerPromotionTests : TestBase
 
         // Assert — version incremented so clients see it as updated
         var stored = ObjectService.GetObject(session.Id, obj.Id);
-        stored!.Version.Should().Be(versionBeforeLeave + 1,
-            "adopted objects must have their version incremented");
+        stored!.Version.Should().Be(versionBeforeLeave + 3,
+            "suspension, ownership adoption, and resume each establish a newer canonical version");
+        stored.ValidAt.Should().BeGreaterThanOrEqualTo(obj.ValidAt,
+            "resuming an idle session must not project from its old wall-time anchor");
     }
 
     [Fact]

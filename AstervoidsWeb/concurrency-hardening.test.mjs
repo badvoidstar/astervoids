@@ -433,7 +433,7 @@ test('SessionClient proves reconnect ownership with the server-issued token', as
     const freshJoinCall = connection.invokeCalls
         .filter(call => call.method === 'JoinSession')
         .at(-1);
-    assert.deepEqual(freshJoinCall.args, ['session']);
+    assert.deepEqual(freshJoinCall.args, ['session', true]);
     client.clearSessionState();
     await client.joinSession('session');
 
@@ -442,7 +442,7 @@ test('SessionClient proves reconnect ownership with the server-issued token', as
         .at(-1);
     assert.deepEqual(
         reconnectCall.args,
-        ['session', 'member-session', 'token-session']);
+        ['session', 'member-session', 'token-session', true]);
 });
 
 test('SessionClient ignores delayed expiration for a replaced session', async () => {
@@ -471,6 +471,120 @@ test('SessionClient ignores delayed expiration for a replaced session', async ()
     }]);
 });
 
+test('SessionClient sends hidden activity in create, join, and authenticated rejoin', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('CreateSession', () => Promise.resolve({
+        ...joinResponse('created'), simulationSuspended: true, simulationRevision: 1
+    }));
+    connection.invokers.set('JoinSession', id => Promise.resolve({
+        ...joinResponse(id), simulationSuspended: true, simulationRevision: 2
+    }));
+    connection.invokers.set('RejoinSession', id => Promise.resolve({
+        ...joinResponse(id), simulationSuspended: true, simulationRevision: 3
+    }));
+    connection.invokers.set('LeaveSession', () => Promise.resolve());
+    const { client } = loadSessionClient([connection]);
+    await client.setSimulationActive(false);
+    await connectImmediately(client, connection);
+    await client.createSession({});
+    assert.equal(connection.invokeCalls.find(c => c.method === 'CreateSession').args.at(-1), false);
+    assert.equal(client.getCurrentMember().simulationActive, false);
+    await client.joinSession('session');
+    assert.equal(connection.invokeCalls.find(c => c.method === 'JoinSession').args.at(-1), false);
+    assert.equal(client.getCurrentSession().simulationSuspended, true);
+    client.clearSessionState();
+    await client.joinSession('session');
+    assert.equal(connection.invokeCalls.find(c => c.method === 'RejoinSession').args.at(-1), false);
+});
+
+test('SessionClient serializes immediate activity changes and rejects stale revisions', async () => {
+    const connection = new FakeConnection();
+    connection.invokers.set('JoinSession', id => Promise.resolve(joinResponse(id)));
+    const gate = deferred();
+    let calls = 0;
+    const info = (revision, active) => ({
+        sessionId: 'session', simulationRevision: revision, simulationSuspended: !active,
+        members: [{ id: 'member-session', simulationActive: active }],
+        migratedObjects: [], objects: [], validAts: []
+    });
+    connection.invokers.set('SetSimulationActive', active =>
+        ++calls === 1 ? gate.promise : Promise.resolve(info(2, active)));
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    await client.joinSession('session');
+    const events = [];
+    client.on('onSimulationActivityChanged', event => events.push(event.simulationRevision));
+
+    const hide = client.setSimulationActive(false);
+    assert.equal(connection.invokeCalls.at(-1).method, 'SetSimulationActive');
+    assert.deepEqual(connection.invokeCalls.at(-1).args, [false]);
+    const show = client.setSimulationActive(true);
+    assert.equal(calls, 1);
+    connection.emit('OnSimulationActivityChanged', info(1, false));
+    assert.equal(client.getCurrentMember().simulationActive, false);
+    gate.resolve(info(1, false));
+    await Promise.all([hide, show]);
+    connection.emit('OnSimulationActivityChanged', info(1, false));
+    assert.equal(client.getCurrentMember().simulationActive, true);
+    assert.equal(client.getCurrentSession().simulationSuspended, false);
+    assert.deepEqual(events, [1, 2]);
+    assert.equal(calls, 2);
+});
+
+test('SessionClient corrects visibility changes while joining before any background interval', async () => {
+    const connection = new FakeConnection();
+    const gate = deferred();
+    connection.invokers.set('JoinSession', () => gate.promise);
+    connection.invokers.set('SetSimulationActive', active => Promise.resolve({
+        sessionId: 'session', simulationRevision: 2, simulationSuspended: !active,
+        members: [{ id: 'member-session', simulationActive: active }], objects: [], validAts: []
+    }));
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    const joining = client.joinSession('session');
+    await drainMicrotasks();
+    await client.setSimulationActive(false);
+    gate.resolve({ ...joinResponse('session'), simulationRevision: 1 });
+    await joining;
+    await drainMicrotasks();
+    assert.deepEqual(connection.invokeCalls.find(c => c.method === 'SetSimulationActive').args, [false]);
+    assert.equal(client.getCurrentMember().simulationActive, false);
+});
+
+test('SessionClient merges canonical activity overtaking a join and ignores old-session responses', async () => {
+    const connection = new FakeConnection();
+    const joinGate = deferred();
+    const activityGate = deferred();
+    connection.invokers.set('JoinSession', id => id === 'session'
+        ? joinGate.promise : Promise.resolve(joinResponse(id)));
+    connection.invokers.set('SetSimulationActive', () => activityGate.promise);
+    connection.invokers.set('LeaveSession', () => Promise.resolve());
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    const joining = client.joinSession('session');
+    await drainMicrotasks();
+    connection.emit('OnSimulationActivityChanged', {
+        sessionId: 'session', simulationRevision: 2, simulationSuspended: true,
+        members: [{ id: 'member-session', simulationActive: false }],
+        migratedObjects: [], objects: [['object', 'creator', 'member-session', 'Session', { value: 7 }, 5]],
+        validAts: [['object', 100]], resetObjectIds: ['object']
+    });
+    joinGate.resolve({ ...joinResponse('session'), simulationRevision: 1 });
+    await joining;
+    assert.equal(client.getCurrentSession().objects[0].data.value, 7);
+    assert.equal(client.getCurrentSession().validAts.object, 100);
+    assert.deepEqual(client.getCurrentSession().resetObjectIds, ['object']);
+    const pending = client.setSimulationActive(true);
+    await client.joinSession('new');
+    activityGate.resolve({
+        sessionId: 'session', simulationRevision: 3, simulationSuspended: true,
+        members: [], objects: [], validAts: []
+    });
+    await pending;
+    assert.equal(client.getCurrentSession().id, 'new');
+    assert.equal(client.getCurrentSession().simulationSuspended, false);
+});
+
 test('failed leave keeps reconnect identity available for recovery', async () => {
     const connection = new FakeConnection();
     connection.invokers.set('JoinSession', sessionId =>
@@ -493,7 +607,7 @@ test('failed leave keeps reconnect identity available for recovery', async () =>
         .at(-1);
     assert.deepEqual(
         recovery.args,
-        ['session', 'member-session', 'token-session']);
+        ['session', 'member-session', 'token-session', true]);
 });
 
 test('SessionClient rejects session responses without reconnect credentials', async () => {
@@ -1037,10 +1151,287 @@ test('immediate update flushes now and coalesces behind in-flight backpressure',
     });
     await drainMicrotasks();
 
-    objectSync.tick(1);
-    await drainMicrotasks();
-    assert.equal(calls.length, 2, 'coalesced state leaves on the first eligible tick');
+    assert.equal(calls.length, 2, 'retained urgent state drains on completion without another tick');
     assert.equal(calls[1].updates[0].data.x, 3);
+});
+
+test('send cadence accumulates irregular elapsed steps rather than counting frames', async () => {
+    const client = makeObjectSyncClient();
+    const calls = [];
+    client.updateObjects = async updates => {
+        calls.push(updates);
+        return { versions: { shared: calls.length + 1 }, memberSequence: calls.length };
+    };
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: false, nominalFrameTime: 0.05 });
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 })], validAts: {}, metadata: {} });
+
+    for (const elapsed of [0.016, 0.009, 0.012, 0.012]) {
+        objectSync.updateObject('shared', { x: elapsed });
+        objectSync.tick(elapsed);
+        await drainMicrotasks();
+    }
+    assert.equal(calls.length, 0, '49ms is not yet due even across four render frames');
+    objectSync.tick(0.001);
+    await drainMicrotasks();
+    assert.equal(calls.length, 1);
+    objectSync.updateObject('shared', { x: 2 });
+    objectSync.tick(0.07);
+    await drainMicrotasks();
+    assert.equal(calls.length, 2);
+    objectSync.updateObject('shared', { x: 3 });
+    objectSync.tick(0.029);
+    await drainMicrotasks();
+    assert.equal(calls.length, 2);
+    objectSync.tick(0.001);
+    await drainMicrotasks();
+    assert.equal(calls.length, 3, 'the previous 20ms overshoot is retained');
+});
+
+test('ordinary sends retain due elapsed budget through in-flight backpressure', async () => {
+    const client = makeObjectSyncClient();
+    const gate = deferred();
+    let calls = 0;
+    client.updateObjects = () => ++calls === 1 ? gate.promise
+        : Promise.resolve({ versions: { shared: 3 }, memberSequence: 2 });
+    const objectSync = loadObjectSync(client);
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: false, nominalFrameTime: 0.05 });
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 })], validAts: {}, metadata: {} });
+    objectSync.updateObject('shared', { x: 1 });
+    objectSync.tick(0.05);
+    objectSync.updateObject('shared', { x: 2 });
+    objectSync.tick(0.08);
+    assert.equal(calls, 1);
+    gate.resolve({ versions: { shared: 2 }, memberSequence: 1 });
+    await drainMicrotasks();
+    objectSync.tick(0);
+    assert.equal(calls, 2, 'no new nominal wait is imposed after the old invoke');
+});
+
+test('activity transfer installs canonical state and discards queued former-owner writes', async () => {
+    const client = makeObjectSyncClient();
+    let sends = 0;
+    client.updateObjects = async () => { sends++; };
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 }, 'me')], validAts: {}, metadata: {} });
+    sync.updateObject('shared', { x: 99 });
+    assert.equal(sync.handleSimulationActivity({
+        simulationRevision: 1,
+        simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: false }, { id: 'next', simulationActive: true }],
+        migratedObjects: [{ objectId: 'shared', newOwnerId: 'next', newVersion: 2 }],
+        objects: [objectInfo('shared', 2, { x: 1 }, 'next')],
+        validAts: { shared: 1000 }
+    }), true);
+    const canonical = sync.getObject('shared');
+    assert.equal(canonical.data.x, 1);
+    assert.equal(canonical.ownerMemberId, 'next');
+    assert.equal(canonical.ownerActive, true);
+    assert.equal(canonical.ownershipMigrationPending, false);
+    assert.equal(canonical.simulationAnchorAt, 1000);
+    assert.equal(canonical.simulationAnchorReset, false,
+        'ordinary handoff preserves authored time rather than inventing a resume anchor');
+    assert.equal(sync.updateObject('shared', { x: 100 }), false);
+    await sync.flushUpdates();
+    assert.equal(sends, 0);
+    assert.equal(sync.handleSimulationActivity({
+        simulationRevision: 0, objects: [objectInfo('shared', 1, { x: 9 }, 'me')]
+    }), false);
+    assert.equal(canonical.data.x, 1);
+});
+
+test('activity transfer revives a locally deleted record while its rejected request is in flight', async () => {
+    const client = makeObjectSyncClient();
+    const deletion = deferred();
+    client.deleteObject = () => deletion.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 }, 'me')], validAts: {}, metadata: {} });
+    const deleting = sync.deleteObject('shared');
+    assert.equal(sync.getObject('shared'), undefined);
+    sync.handleSimulationActivity({
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'next', simulationActive: true }],
+        objects: [objectInfo('shared', 2, { x: 1 }, 'next')],
+        validAts: { shared: 1000 }
+    });
+
+    assert.equal(sync.getObject('shared').data.x, 1);
+    deletion.resolve({ success: false });
+    assert.equal(await deleting, false);
+    assert.equal(sync.getObject('shared').ownerMemberId, 'next');
+});
+
+test('activity retains the server reset list instead of treating every transfer as idle resume', () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [], validAts: {}, metadata: {} });
+    const activity = {
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'next', simulationActive: true }],
+        objects: [
+            objectInfo('transfer', 2, { sampleAt: 900 }, 'next'),
+            objectInfo('resume', 3, { sampleAt: 100 }, 'next'),
+            { ...objectInfo('ship', 4, { sampleAt: 200 }, 'next'), scope: 'Member' }
+        ],
+        validAts: { transfer: 950, resume: 1000, ship: 1000 },
+        resetObjectIds: ['resume', 'ship']
+    };
+    sync.handleSimulationActivity(activity);
+    assert.deepEqual(activity.resetObjectIds, ['resume', 'ship']);
+    assert.equal(sync.getObject('transfer').simulationAnchorReset, false);
+    assert.equal(sync.getObject('resume').simulationAnchorReset, true);
+    assert.equal(sync.getObject('ship').simulationAnchorReset, true);
+});
+
+test('snapshot recovery retains paused anchors when its activity event was missed', () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        simulationRevision: 3, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 7, { sampleAt: 100 }, 'me')],
+        validAts: { resume: 10000 }, resetObjectIds: ['resume'], metadata: {}
+    });
+    assert.equal(sync.getObject('resume').simulationAnchorReset, true);
+    assert.equal(sync.getObject('resume').validAt, 10000);
+});
+
+test('authored updates clear recovered activity anchors on receive and owner confirmation', async () => {
+    const client = makeObjectSyncClient();
+    client.updateObjects = async () => ({ versions: { resume: 9 }, memberSequence: 1 });
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        simulationRevision: 3, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 7, { sampleAt: 100 }, 'me')],
+        validAts: { resume: 10000 }, resetObjectIds: ['resume'], metadata: {}
+    });
+    assert.equal(sync.getObject('resume').simulationAnchorReset, true);
+    client.handlers.onObjectsUpdated(
+        [{ id: 'resume', version: 8, data: { sampleAt: 10001 } }],
+        10010, 'next', 1, 1, 50, 10010);
+    assert.equal(sync.getObject('resume').simulationAnchorReset, false);
+    sync.handleSimulationActivity({
+        simulationRevision: 4, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [objectInfo('resume', 8, { sampleAt: 10001 }, 'me')],
+        validAts: { resume: 20000 }, resetObjectIds: ['resume']
+    });
+    assert.equal(sync.getObject('resume').simulationAnchorReset, true);
+    sync.updateObject('resume', { sampleAt: 20001 });
+    await sync.flushUpdates();
+    assert.equal(sync.getObject('resume').simulationAnchorReset, false);
+});
+
+test('old in-flight update confirmation cannot overwrite a transferred canonical baseline', async () => {
+    const client = makeObjectSyncClient();
+    const update = deferred();
+    client.updateObjects = () => update.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 }, 'me')], validAts: {}, metadata: {} });
+    sync.updateObject('shared', { x: 99 });
+    const flushing = sync.flushUpdates();
+    sync.handleSimulationActivity({
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'next', simulationActive: true }],
+        objects: [objectInfo('shared', 3, { x: 1 }, 'next')],
+        validAts: { shared: 1000 }
+    });
+    update.resolve({ versions: { shared: 2 }, memberSequence: 1 });
+    await flushing;
+    assert.equal(sync.getObject('shared').version, 3);
+    assert.equal(sync.isDataConfirmed('shared', { x: 1 }), true);
+    assert.equal(sync.isDataConfirmed('shared', { x: 99 }), false);
+});
+
+test('rejected local-first delete releases its tombstone and reconciles canonical state', async () => {
+    const client = makeObjectSyncClient();
+    client.deleteObject = async () => ({ success: false });
+    let reconciliations = 0;
+    client.getSessionState = async () => {
+        reconciliations++;
+        return { objects: [objectInfo('shared', 2, { x: 1 }, 'next')], validAts: {}, memberSequences: {} };
+    };
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({ objects: [objectInfo('shared', 1, { x: 0 }, 'me')], validAts: {}, metadata: {} });
+    const rejected = [];
+    sync.on('onDeleteRejected', id => rejected.push(id));
+    assert.equal(await sync.deleteObject('shared'), false);
+    await drainMicrotasks();
+    assert.equal(reconciliations, 1);
+    assert.deepEqual(rejected, ['shared']);
+    assert.equal(sync.getObject('shared').ownerMemberId, 'next');
+});
+
+test('activity temporal resets are distinguished from ordinary canonical handoffs', () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    const memberObject = { ...objectInfo('member-object', 1, { x: 0 }, 'me'), scope: 'Member' };
+    client.join({ objects: [memberObject, objectInfo('shared', 1, { x: 0 }, 'me')],
+        validAts: {}, metadata: {} });
+    const frozen = {
+        simulationRevision: 1, simulationSuspended: true,
+        members: [{ id: 'me', simulationActive: false }],
+        objects: [{ ...memberObject, version: 2 }, objectInfo('shared', 2, { x: 0 }, 'me')],
+        validAts: { 'member-object': 1000, shared: 1000 }
+    };
+    sync.handleSimulationActivity(frozen);
+    assert.deepEqual(frozen.anchorResetObjectIds, ['member-object', 'shared']);
+    const resumed = {
+        simulationRevision: 2, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: true }],
+        objects: [{ ...memberObject, version: 3 }, objectInfo('shared', 3, { x: 0 }, 'me')],
+        validAts: { 'member-object': 9000, shared: 9000 }
+    };
+    sync.handleSimulationActivity(resumed);
+    assert.deepEqual(resumed.anchorResetObjectIds, ['member-object', 'shared']);
+    assert.equal(sync.getObject('shared').simulationAnchorAt, 9000);
+    assert.equal(sync.getObject('shared').simulationCanonicalVersion, 3);
+});
+
+test('activity drops pending writes for an inactive owner even without an ownership transfer', async () => {
+    const client = makeObjectSyncClient();
+    let sends = 0;
+    client.updateObjects = async () => { sends++; };
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    const record = { ...objectInfo('member-object', 1, { x: 0 }, 'me'), scope: 'Member' };
+    client.join({ objects: [record], validAts: {}, metadata: {} });
+    sync.updateObject(record.id, { x: 99 });
+    sync.handleSimulationActivity({
+        simulationRevision: 1, simulationSuspended: false,
+        members: [{ id: 'me', simulationActive: false }, { id: 'next', simulationActive: true }],
+        objects: [{ ...record, version: 2, data: { x: 0 } }], validAts: { [record.id]: 1000 },
+        resetObjectIds: [record.id]
+    });
+    assert.equal(sync.getObject(record.id).ownerMemberId, 'me');
+    assert.equal(sync.getObject(record.id).ownerActive, false);
+    assert.equal(sync.updateObject(record.id, { x: 100 }), false);
+    await sync.flushUpdates();
+    assert.equal(sends, 0);
+    assert.equal(sync.isDataConfirmed(record.id, { x: 0 }), true);
+    assert.equal(sync.isDataConfirmed(record.id, { x: 99 }), false);
 });
 
 test('stale create completion is ignored after reset', async () => {

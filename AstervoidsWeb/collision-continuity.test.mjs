@@ -208,7 +208,7 @@ test('solo collisions start the same local cues before removing their sources', 
     assert.match(asteroidCueSource, /resolvedAt: targetId \? null : now/);
 
     const soloCollisionStart = productionSource.indexOf('// Solo mode — process locally');
-    const collisionBreak = productionSource.indexOf('                    break;  // Bullet can only hit one asteroid', soloCollisionStart);
+    const collisionBreak = productionSource.indexOf('    function checkShipAsteroidCollision(ship)', soloCollisionStart);
     assert.ok(soloCollisionStart >= 0 && collisionBreak > soloCollisionStart);
     const soloCollision = productionSource.slice(soloCollisionStart, collisionBreak);
     const asteroidCueAt = soloCollision.indexOf(
@@ -227,7 +227,7 @@ test('solo collisions start the same local cues before removing their sources', 
         /CollisionEffects\.startShipHit\('solo', \{\s*hitCount: ship\.hitCount,\s*hitX: hitPose\.x,\s*hitY: hitPose\.y,\s*hitAngle: hitPose\.angle\s*\}, ship\.colorIndex\);/);
 });
 
-test('same-owner asteroid impacts broadcast a target-relative cue before replacement', () => {
+test('same-owner impacts publish the same correlated pending claim before asynchronous replacement', () => {
     assert.match(
         productionSource,
         /ASTEROID_IMPACT_CUE: 'asteroid-impact-cue'/);
@@ -251,18 +251,18 @@ test('same-owner asteroid impacts broadcast a target-relative cue before replace
     assert.match(helperSource, /cueId,\s*bulletAngle: impact\.bulletAngle,\s*offsetN: impact\.offsetN,/);
     assert.doesNotMatch(helperSource, /\bhit[XY]\b|\bimpact[XY]\b/);
 
-    const ownerBranchStart = productionSource.indexOf(
-        '                        if (asteroidOwner === myMemberId) {');
-    const ownerBranchEnd = productionSource.indexOf(
-        '                        } else {',
-        ownerBranchStart);
-    assert.ok(ownerBranchStart >= 0 && ownerBranchEnd > ownerBranchStart);
-    const ownerBranch = productionSource.slice(ownerBranchStart, ownerBranchEnd);
-    const cueAt = ownerBranch.indexOf('emitOwnedAsteroidImpactCue(asteroid, bullet, impact);');
-    const deleteAt = ownerBranch.indexOf('deleteSyncedBullet(removedBullet);');
-    const replaceAt = ownerBranch.indexOf('splitAsteroid(asteroid, null, impact, game.ship);');
-    assert.ok(cueAt >= 0 && cueAt < deleteAt && deleteAt < replaceAt);
-    assert.doesNotMatch(ownerBranch, /CollisionEffects\.startAsteroidHit/);
+    const collisionStart = productionSource.indexOf('    function checkCollisions()');
+    const collisionEnd = productionSource.indexOf('    function checkShipAsteroidCollision(ship)', collisionStart);
+    const collisionSource = productionSource.slice(collisionStart, collisionEnd);
+    assert.match(collisionSource,
+        /beginBulletHit\(bullet, asteroid, hit, impact\);\s*CollisionEffects\.startAsteroidHit\(bullet, asteroid, impact\);/);
+    const resolutionStart = productionSource.indexOf('    function resolveOwnedHitClaim(');
+    const resolutionEnd = productionSource.indexOf('    function maintainHitClaims()', resolutionStart);
+    const resolutionSource = productionSource.slice(resolutionStart, resolutionEnd);
+    assert.match(resolutionSource, /state\.reservations\.set\(targetId, reservation\)/);
+    assert.match(resolutionSource, /Promise\.resolve\(\)\.then\(\(\) =>/);
+    assert.ok(resolutionSource.indexOf('state.reservations.set') < resolutionSource.indexOf('splitAsteroid('));
+    assert.doesNotMatch(resolutionSource, /deleteSyncedBullet|game\.ship\.score/);
 });
 
 test('production join seeding targets the delayed presentation timeline only for active owners', () => {
@@ -274,12 +274,17 @@ test('production join seeding targets the delayed presentation timeline only for
     assert.match(productionSource, /getDeterministicJoinBaselinePerf\(record, facts\)/);
 });
 
-test('production migration handoff skips ownership-only anchors and preserves direction', () => {
+test('production migration handoff skips ownership-only anchors and keeps display correction separate', () => {
     assert.match(runtimeSource, /record\.ownershipMigrationVersion === record\.version/);
     assert.match(runtimeSource, /preserveDirection = !!transition\?\.pending && !ownershipVersion;/);
     assert.match(
         productionSource,
-        /isTeleport,\s*facts\.preserveDirection,\s*\{\s*validAt: record\.validAt,\s*rateAngularPredictionWindow:/);
+        /isTeleport,\s*facts\.preserveDirection,\s*\{\s*validAt: record\.validAt,/);
+    assert.match(productionSource,
+        /predictionFrames: getBallisticPredictionFrames\(record\.ownerMemberId\)/);
+    assert.match(productionSource, /return adoptCanonicalAsteroid\(record, instance, facts\);/);
+    assert.match(productionSource, /applyLifecycleCorrection\(o, renderNow\);/);
+    assert.match(productionSource, /resetEntityHistory\(asteroid\);/);
     assert.match(presentationSource, /correctionAlong \* stepMs \/ motion/);
     assert.match(presentationSource, /tauMs: tau/);
 });

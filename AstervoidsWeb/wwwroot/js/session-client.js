@@ -20,6 +20,8 @@ const SessionClient = (function() {
     let sessionEpoch = 0;
     let pendingSessionTransition = null;
     let sessionTransitionTail = Promise.resolve();
+    let desiredSimulationActive = typeof document === 'undefined' || !document.hidden;
+    let activityRequest = null;
     // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
     // Empty string = same-origin single-region behavior. Tracked so reconnect logic
     // can rebuild the connection against the correct region after a transient drop.
@@ -36,6 +38,7 @@ const SessionClient = (function() {
         onSessionTransition: null,
         onMemberJoined: null,
         onMemberLeft: null,
+        onSimulationActivityChanged: null,
         onRoleChanged: null,
         onObjectCreated: null,
         onObjectsUpdated: null,
@@ -128,6 +131,34 @@ const SessionClient = (function() {
     function applyMemberEvent(event) {
         if (!currentSession || !event) return;
 
+        if (event.kind === 'activity') {
+            const info = event.info;
+            event.accepted = info?.sessionId === currentSession.id
+                && info.simulationRevision > (currentSession.simulationRevision ?? -1);
+            if (!event.accepted) return;
+            normalizeSimulationActivity(info);
+            currentSession.simulationRevision = info.simulationRevision;
+            currentSession.simulationSuspended = info.simulationSuspended;
+            for (const state of info.members || []) {
+                const member = currentSession.members?.find(m => m.id === state.id);
+                if (member) member.simulationActive = state.simulationActive;
+                if (currentMember?.id === state.id) currentMember.simulationActive = state.simulationActive;
+            }
+            // A newer activity event may overtake the join response on the client.
+            // Fold its canonical objects into the pending join snapshot as well.
+            if (pendingSessionTransition) {
+                const records = new Map((currentSession.objects || []).map(o => [o.id, o]));
+                for (const object of info.objects || []) records.set(object.id, object);
+                currentSession.objects = [...records.values()];
+                currentSession.validAts = { ...currentSession.validAts, ...info.validAts };
+                const resetIds = new Set(currentSession.resetObjectIds || []);
+                for (const object of info.objects || []) resetIds.delete(object.id);
+                for (const id of info.resetObjectIds || []) resetIds.add(id);
+                currentSession.resetObjectIds = [...resetIds];
+            }
+            return;
+        }
+
         if (event.kind === 'joined') {
             if (!Array.isArray(currentSession.members)) {
                 currentSession.members = [];
@@ -155,6 +186,12 @@ const SessionClient = (function() {
     }
 
     function dispatchMemberEvent(event) {
+        if (event.kind === 'activity') {
+            if (event.accepted && callbacks.onSimulationActivityChanged) {
+                callbacks.onSimulationActivityChanged(event.info);
+            }
+            return;
+        }
         if (event.kind === 'joined') {
             if (callbacks.onMemberJoined) {
                 callbacks.onMemberJoined(
@@ -210,6 +247,49 @@ const SessionClient = (function() {
             data: value[4],
             version: value[5]
         };
+    }
+
+    function normalizeSimulationActivity(info) {
+        if (Array.isArray(info.objects)) {
+            for (let i = 0; i < info.objects.length; i++) {
+                const object = normalizeObjectInfo(info.objects[i]);
+                WireEnum.translateObject(object);
+                SyncPayload.unwrapObjectData(object);
+                info.objects[i] = object;
+            }
+        }
+        info.validAts = WireEnum.pairsToObject(info.validAts);
+        return info;
+    }
+
+    function setSimulationActive(active) {
+        desiredSimulationActive = !!active;
+        return sendDesiredSimulationActivity();
+    }
+
+    function sendDesiredSimulationActivity() {
+        if (!currentSession || !isConnected()) return Promise.resolve(null);
+        const context = captureSessionContext();
+        if (activityRequest && isSessionContextCurrent(activityRequest.context)) {
+            return activityRequest.promise;
+        }
+        const request = { context, promise: null };
+        activityRequest = request;
+        request.promise = (async () => {
+            let info = null;
+            let sent;
+            do {
+                sent = desiredSimulationActive;
+                const response = await context.connection.invoke('SetSimulationActive', sent);
+                if (!isSessionContextCurrent(context)) return null;
+                info = GuidUtils.transformBinaryGuids(response);
+                if (info) handleMemberEvent({ kind: 'activity', info });
+            } while (sent !== desiredSimulationActive);
+            return info;
+        })().finally(() => {
+            if (activityRequest === request) activityRequest = null;
+        });
+        return request.promise;
     }
 
     function normalizeObjectUpdateInfo(value) {
@@ -460,6 +540,7 @@ const SessionClient = (function() {
         thisConnection.onreconnected(guard(connectionId => {
             // console.log('[SessionClient] Reconnected:', connectionId);
             reconnectAttempts = 0;
+            sendDesiredSimulationActivity().catch(() => {});
             // Reconcile state — invoke responses for Create/Delete/Update may have been
             // lost during the reconnection window (OthersInGroup means no broadcast fallback)
             ObjectSync.triggerReconciliation();
@@ -505,6 +586,10 @@ const SessionClient = (function() {
                 memberSequence,
                 roleChanged: false
             });
+        }, true));
+
+        thisConnection.on('OnSimulationActivityChanged', guard(info => {
+            handleMemberEvent({ kind: 'activity', info });
         }, true));
 
         // Object events
@@ -647,7 +732,8 @@ const SessionClient = (function() {
         }
 
         try {
-            const rawResponse = await context.connection.invoke('CreateSession', metadata || null);
+            const initialSimulationActive = desiredSimulationActive;
+            const rawResponse = await context.connection.invoke('CreateSession', metadata || null, initialSimulationActive);
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
@@ -662,14 +748,17 @@ const SessionClient = (function() {
             const createdMember = {
                 id: response.memberId,
                 role: WireEnum.roleFromWire(response.role),
-                joinedAt: new Date().toISOString()
+                joinedAt: new Date().toISOString(),
+                simulationActive: initialSimulationActive
             };
             const createdSession = {
                 id: response.sessionId,
                 name: response.sessionName,
                 members: [createdMember],
                 objects: [],
-                metadata: response.metadata || {}
+                metadata: response.metadata || {},
+                simulationSuspended: response.simulationSuspended ?? false,
+                simulationRevision: response.simulationRevision ?? 0
             };
             const nextReconnectIdentity = reconnectIdentityFromResponse(
                 response, createdSession.id, createdMember.id);
@@ -681,6 +770,9 @@ const SessionClient = (function() {
             // console.log('[SessionClient] Session created:', currentSession.name);
             lastSessionId = currentSession.id;
             finishSessionTransition(thisSessionEpoch);
+            if (initialSimulationActive !== desiredSimulationActive) {
+                sendDesiredSimulationActivity().catch(() => {});
+            }
 
             if (callbacks.onSessionCreated) {
                 callbacks.onSessionCreated(currentSession, currentMember);
@@ -729,14 +821,16 @@ const SessionClient = (function() {
 
         try {
             _log('[SessionClient] JoinSession invoking:', sessionId, 'rejoin:', !!reconnecting);
+            const initialSimulationActive = desiredSimulationActive;
             const rawResponse = reconnecting
                 ? await context.connection.invoke(
                     'RejoinSession',
                     sessionId,
                     reconnecting.memberId,
-                    reconnecting.token)
+                    reconnecting.token,
+                    initialSimulationActive)
                 : await context.connection.invoke(
-                    'JoinSession', sessionId);
+                    'JoinSession', sessionId, initialSimulationActive);
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
@@ -771,11 +865,16 @@ const SessionClient = (function() {
                 members: response.members,
                 objects: response.objects,
                 validAts: WireEnum.pairsToObject(response.validAts),
-                metadata: response.metadata || {}
+                resetObjectIds: response.resetObjectIds || [],
+                metadata: response.metadata || {},
+                simulationSuspended: response.simulationSuspended ?? false,
+                simulationRevision: response.simulationRevision ?? 0
             };
             const joinedMember = {
                 id: response.memberId,
-                role: WireEnum.roleFromWire(response.role)
+                role: WireEnum.roleFromWire(response.role),
+                simulationActive: response.members?.find(m => m.id === response.memberId)?.simulationActive
+                    ?? initialSimulationActive
             };
             const nextReconnectIdentity = reconnectIdentityFromResponse(
                 response, joinedSession.id, joinedMember.id);
@@ -787,6 +886,9 @@ const SessionClient = (function() {
             _log('[SessionClient] Joined session:', currentSession.name, 'as', currentMember.role);
             lastSessionId = currentSession.id;
             finishSessionTransition(thisSessionEpoch);
+            if (initialSimulationActive !== desiredSimulationActive) {
+                sendDesiredSimulationActivity().catch(() => {});
+            }
 
             if (callbacks.onSessionJoined) {
                 callbacks.onSessionJoined(currentSession, currentMember);
@@ -1061,6 +1163,12 @@ const SessionClient = (function() {
             }
             snapshot.validAts = WireEnum.pairsToObject(snapshot.validAts);
             snapshot.memberSequences = WireEnum.pairsToObject(snapshot.memberSequences);
+            if ((snapshot.simulationRevision ?? -1) > (currentSession?.simulationRevision ?? 0)) {
+                handleMemberEvent({ kind: 'activity', info: {
+                    ...snapshot, sessionId: currentSession.id, migratedObjects: [], objects: [],
+                    validAts: {}
+                } });
+            }
         }
         return snapshot;
     }
@@ -1174,6 +1282,7 @@ const SessionClient = (function() {
         deleteObject,
         broadcastObjectEvent,
         getSessionState,
+        setSimulationActive,
         ping,
         on,
         getCurrentSession,
