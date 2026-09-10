@@ -1715,13 +1715,12 @@
 
     function rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio) {
         asteroid.radius *= radiusRatio;
-        asteroid.boundRadius *= radiusRatio;
         for (const vertex of asteroid.vertices) {
             vertex.distance *= radiusRatio;
         }
         asteroid.velocityX *= speedRatio;
         asteroid.velocityY *= speedRatio;
-        asteroid._cachedVerts = null;
+        asteroid.rebuildShapeCache();
     }
 
     function rescaleAsteroidsForAspectChange(previousScales, nextScales) {
@@ -3890,7 +3889,7 @@
             // shards (where `radius` is an area-equivalent disk radius) the
             // polygon can extend much farther — a long sliver can have small
             // area but large linear extent. Cache the actual maximum.
-            this.boundRadius = this.vertices.reduce((m, v) => v.distance > m ? v.distance : m, 0);
+            this.rebuildShapeCache();
             this.syncObjectId = null;      // ObjectSync ID when in session
         }
 
@@ -4007,8 +4006,28 @@
             return vertices;
         }
 
+        // Polar vertices remain authoritative for fracture and wire data.
+        // Call after mutating them; pose/viewport changes only refresh world points.
+        rebuildShapeCache() {
+            this._localVerts ??= [];
+            this._cachedVerts ??= [];
+            this._localVerts.length = this.vertices.length;
+            this._cachedVerts.length = this.vertices.length;
+            this.boundRadius = 0;
+            for (let i = 0; i < this.vertices.length; i++) {
+                const vertex = this.vertices[i];
+                const local = this._localVerts[i] ??= { x: 0, y: 0 };
+                local.x = Math.cos(vertex.angle) * vertex.distance;
+                local.y = Math.sin(vertex.angle) * vertex.distance;
+                this._cachedVerts[i] ??= { x: 0, y: 0 };
+                if (vertex.distance > this.boundRadius) this.boundRadius = vertex.distance;
+            }
+            this._cacheAngle = NaN;
+        }
+
         /**
-         * Get vertices in pixel coordinates for rendering and collision
+         * Get vertices in pixel coordinates for rendering and collision.
+         * The returned array/points are borrowed read-only until the next refresh.
          * @returns {array} Array of {x, y} pixel coordinates
          */
         getWorldVertices() {
@@ -4025,11 +4044,14 @@
                 return this._cachedVerts;
             }
             
-            // Calculate and cache - convert normalized distances to pixels
-            this._cachedVerts = this.vertices.map(v => ({
-                x: pixelX + Math.cos(v.angle + this.angle) * v.distance * ref,
-                y: pixelY + Math.sin(v.angle + this.angle) * v.distance * ref
-            }));
+            const cos = Math.cos(this.angle) * ref;
+            const sin = Math.sin(this.angle) * ref;
+            for (let i = 0; i < this._localVerts.length; i++) {
+                const local = this._localVerts[i];
+                const world = this._cachedVerts[i];
+                world.x = pixelX + (local.x * cos - local.y * sin);
+                world.y = pixelY + (local.x * sin + local.y * cos);
+            }
             this._cacheX = pixelX;
             this._cacheY = pixelY;
             this._cacheAngle = this.angle;
@@ -5009,7 +5031,18 @@
         return getDeterministicJoinBaselinePerf(record, facts);
     }
 
-    function getKinematicInstance(type, id) {
+    function indexKinematicInstances(instances) {
+        const byId = new Map();
+        for (const instance of instances) {
+            if (instance.syncObjectId && !byId.has(instance.syncObjectId)) {
+                byId.set(instance.syncObjectId, instance);
+            }
+        }
+        return byId;
+    }
+
+    function getKinematicInstance(type, id, context) {
+        if (context?.instanceType === type) return context.instances.get(id);
         if (type === OBJECT_TYPES.SHIP) {
             if (game.multiplayer.myShipObjectId === id) return game.ship;
             return game.multiplayer.remoteShips.get(id);
@@ -5035,8 +5068,8 @@
         return instance;
     }
 
-    function currentKinematicData(type, id, record) {
-        const instance = getKinematicInstance(type, id);
+    function currentKinematicData(type, id, record, context) {
+        const instance = getKinematicInstance(type, id, context);
         if (!instance) return record.data;
         const data = {
             ...record.data,
@@ -5122,7 +5155,7 @@
                 if (isDeterministicMode()) {
                     DeadReckon.lastVersions.set(id, record.version);
                     if (resolveTerminalSession()) {
-                        return currentKinematicData(facts.type, id, record);
+                        return currentKinematicData(facts.type, id, record, context);
                     }
                     return DeadReckon.getReckoned(id) || record.data;
                 }
@@ -5195,23 +5228,21 @@
             if (record.ownerMemberId === facts.currentMemberId) return 'owned';
             return facts.ownerIsActive ? 'replica' : 'ignore';
         },
-        getInstance(id) {
-            return game.astervoids.find(a => a.syncObjectId === id);
+        getInstance(id, context) {
+            return getKinematicInstance(OBJECT_TYPES.ASTEROID, id, context);
         },
-        getInstances() {
-            const entries = [];
-            for (const asteroid of game.astervoids) {
-                if (asteroid.syncObjectId) entries.push([asteroid.syncObjectId, asteroid]);
-            }
-            return entries;
+        getInstances(context) {
+            return context?.instanceType === OBJECT_TYPES.ASTEROID
+                ? context.instances : indexKinematicInstances(game.astervoids);
         },
-        createReplica(record) {
+        createReplica(record, facts, context) {
             const asteroid = Asteroid.fromSyncData(record.data);
             asteroid.syncObjectId = record.id;
             game.astervoids.push(asteroid);
+            context?.instances?.set(record.id, asteroid);
             return seedReplicaAtTerminalTarget(asteroid, record);
         },
-        adoptOwned(record, instance, facts) {
+        adoptOwned(record, instance, facts, context) {
             // Already tracked locally (e.g. ownership just migrated to us) —
             // local physics keeps driving it; nothing left to project.
             if (instance) return instance;
@@ -5244,14 +5275,16 @@
             }
             record.spawnHandled = true;
             game.astervoids.push(asteroid);
+            context?.instances?.set(record.id, asteroid);
             return seedReplicaAtTerminalTarget(asteroid, record);
         },
         apply(instance, data) {
             instance.fromSyncData(data);
         },
-        remove(instance, reason, facts) {
+        remove(instance, reason, facts, context) {
             const id = facts.objectId;
             game.astervoids = game.astervoids.filter(a => a !== instance);
+            if (context?.instanceType === OBJECT_TYPES.ASTEROID) context.instances.delete(id);
             if (reason === ReplicationRuntime.RemovalReason.DELETED
                 || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
                 CollisionEffects.resolveTarget(id);
@@ -5285,21 +5318,19 @@
             if (ownerId === facts.currentMemberId) return 'owned';
             return !!ownerId && facts.activeMemberIds.includes(ownerId) ? 'replica' : 'ignore';
         },
-        getInstance(id) {
-            return game.bullets.find(b => b.syncObjectId === id);
+        getInstance(id, context) {
+            return getKinematicInstance(OBJECT_TYPES.BULLET, id, context);
         },
-        getInstances() {
-            const entries = [];
-            for (const bullet of game.bullets) {
-                if (bullet.syncObjectId) entries.push([bullet.syncObjectId, bullet]);
-            }
-            return entries;
+        getInstances(context) {
+            return context?.instanceType === OBJECT_TYPES.BULLET
+                ? context.instances : indexKinematicInstances(game.bullets);
         },
-        createReplica(record) {
+        createReplica(record, facts, context) {
             // Create new bullet from sync data — play fire sound for remote player
             const bullet = Bullet.fromSyncData(record.data);
             bullet.syncObjectId = record.id;
             game.bullets.push(bullet);
+            context?.instances?.set(record.id, bullet);
             if (!resolveTerminalSession()) AudioSystem.playFire();
             return seedReplicaAtTerminalTarget(bullet, record);
         },
@@ -5322,9 +5353,10 @@
                 });
             }
         },
-        remove(instance, reason, facts) {
+        remove(instance, reason, facts, context) {
             const id = facts.objectId;
             game.bullets = game.bullets.filter(b => b !== instance);
+            if (context?.instanceType === OBJECT_TYPES.BULLET) context.instances.delete(id);
             if (reason === ReplicationRuntime.RemovalReason.DELETED
                 || reason === ReplicationRuntime.RemovalReason.TYPE_MISSING) {
                 CollisionEffects.resolveBullet(id);
@@ -5411,8 +5443,8 @@
     const replicationRuntime = ReplicationRuntime.createRuntime({
         objectStore: ObjectSync,
         getCurrentMemberId: () => SessionClient.getCurrentMember()?.id,
-        getActiveMemberIds: () => new Set(
-            (SessionClient.getCurrentSession()?.members || []).map(m => m.id)),
+        getActiveMemberIds: () =>
+            (SessionClient.getCurrentSession()?.members || []).map(m => m.id),
         monotonicNowMs: () => performance.now(),
         descriptors: [
             shipReplicationDescriptor,
@@ -5424,9 +5456,17 @@
 
     // Shared context builder for every reconcileType call so join/receive
     // paths agree on the current session epoch and render sampling instant.
-    function buildReplicationContext() {
+    function buildReplicationContext(type) {
         const now = performance.now();
         return {
+            // Rebuild references once at this synchronous pivot. Local expiry,
+            // replacements and asynchronous ID assignment need no second
+            // persistent collection or separate lifecycle bookkeeping.
+            instanceType: type,
+            instances: type === OBJECT_TYPES.ASTEROID
+                ? indexKinematicInstances(game.astervoids)
+                : type === OBJECT_TYPES.BULLET
+                    ? indexKinematicInstances(game.bullets) : undefined,
             epoch: SessionClient.getSessionEpoch(),
             renderTime: now,
             now
@@ -5491,6 +5531,7 @@
         game.multiplayer.isAuthority = false;
         game.multiplayer.observedScoreLifeAwardCount = null;
         game.multiplayer.processedPendingBullets.clear();
+        resetGameStateSyncCache();
         clearExtraLifeAwardFeedback();
         CollisionEffects.clear();
         game.astervoids = [];
@@ -5577,12 +5618,17 @@
      */
     function updateAstervoidsFromSync() {
         if (!isSessionMode()) return;
-        replicationRuntime.reconcileType(OBJECT_TYPES.ASTEROID, buildReplicationContext());
+        replicationRuntime.reconcileType(
+            OBJECT_TYPES.ASTEROID, buildReplicationContext(OBJECT_TYPES.ASTEROID));
         // Orphaned local astervoids with no syncObjectId (defensive — should
         // not normally occur once in session mode) are not tracked by
         // replicationRuntime (it only enumerates synced instances); drop them
         // here, matching the old sync loop's unconditional orphan removal.
-        game.astervoids = game.astervoids.filter(a => !!a.syncObjectId);
+        let retained = 0;
+        for (const asteroid of game.astervoids) {
+            if (asteroid.syncObjectId) game.astervoids[retained++] = asteroid;
+        }
+        game.astervoids.length = retained;
     }
 
     /**
@@ -5753,7 +5799,8 @@
      */
     function updateBulletsFromSync() {
         if (!isSessionMode()) return;
-        replicationRuntime.reconcileType(OBJECT_TYPES.BULLET, buildReplicationContext());
+        replicationRuntime.reconcileType(
+            OBJECT_TYPES.BULLET, buildReplicationContext(OBJECT_TYPES.BULLET));
     }
 
     /**
@@ -5912,16 +5959,22 @@
         return { gameOverAt, terminalAt };
     }
 
-    function applyCalculatedGameState(next) {
+    function applyCalculatedGameState(next, applyEffects = true) {
         game.score = next.groupScore;
         game.multiplayer.observedScoreLifeAwardCount = next.observedScoreLifeAwardCount;
-        if (next.announceScoreLifeAward) announceExtraLifeAward();
-        for (let i = 0; i < next.beatStopCount; i++) AudioSystem.beat.stop();
+        if (applyEffects) {
+            if (next.announceScoreLifeAward) announceExtraLifeAward();
+            for (let i = 0; i < next.beatStopCount; i++) AudioSystem.beat.stop();
+        }
         game.lives = next.lives;
     }
 
-    function serializeGameState(next, terminal) {
+    function serializeGameState(next, terminal, packedLedgers = null) {
         const { processedHits, processedScores } = next;
+        const ledgers = packedLedgers ?? {
+            processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
+            processedScores: AstervoidsWireCodec.packCounterMap(processedScores)
+        };
         return {
             type: OBJECT_TYPES.GAME_STATE,
             gameStarted: true,
@@ -5931,8 +5984,8 @@
             groupScore: next.groupScore,
             speedMultiplier: game.speedMultiplier,
             waveDelayTimer: game.waveDelayTimer,
-            processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
-            processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
+            processedHits: ledgers.processedHits,
+            processedScores: ledgers.processedScores,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -5941,16 +5994,116 @@
     }
 
     let malformedGameStateLedgerKey = null;
+    let gameStateSyncCache = null;
+
+    function resetGameStateSyncCache() {
+        gameStateSyncCache = null;
+        malformedGameStateLedgerKey = null;
+    }
+
+    function gameStateCounterMapsEqual(left, right) {
+        if (left === right) return true;
+        if (!left || !right || typeof left !== 'object' || typeof right !== 'object'
+            || Array.isArray(left) || Array.isArray(right)
+            || left instanceof Uint8Array || right instanceof Uint8Array) return false;
+        let leftCount = 0;
+        let rightCount = 0;
+        for (const key in left) {
+            if (!Object.hasOwn(left, key)) continue;
+            if (!Object.hasOwn(right, key) || !Object.is(left[key], right[key])) return false;
+            leftCount++;
+        }
+        for (const key in right) {
+            if (Object.hasOwn(right, key)) rightCount++;
+        }
+        return leftCount === rightCount;
+    }
+
+    function gameStateLedgerMatches(value, entry) {
+        if (!entry) return false;
+        if (value instanceof Uint8Array) {
+            return AstervoidsWireCodec.bytesEqual(value, entry.snapshot);
+        }
+        return value == null ? value === entry.snapshot
+            : gameStateCounterMapsEqual(value, entry.snapshot);
+    }
+
+    function readGameStateLedger(value, previous, packed) {
+        if (gameStateLedgerMatches(value, packed)) return packed;
+        if (gameStateLedgerMatches(value, previous)) return previous;
+        const counters = AstervoidsWireCodec.unpackCounterMap(value);
+        return {
+            counters,
+            // ObjectSync exposes mutable data, including byte-array views. A
+            // private snapshot detects edits that do not advance object.version.
+            snapshot: value instanceof Uint8Array ? new Uint8Array(value)
+                : value == null ? value : counters
+        };
+    }
+
+    function packGameStateLedger(counters, previous) {
+        if (previous && gameStateCounterMapsEqual(counters, previous.counters)
+            && AstervoidsWireCodec.bytesEqual(previous.bytes, previous.snapshot)) {
+            previous.counters = counters;
+            return previous;
+        }
+        const bytes = AstervoidsWireCodec.packCounterMap(counters);
+        return { counters, bytes, snapshot: new Uint8Array(bytes) };
+    }
+
+    function gameStateCalculationInputs(data, hits, scores, ships) {
+        const inputs = [
+            data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
+            data?.peakShipCount, data?.state, hits, scores,
+            game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
+            CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
+        ];
+        // Score/hit events mutate ship data without changing its wire version.
+        // Preserve membership and iteration order (damage clamps per ship).
+        for (const ship of ships) {
+            inputs.push(ship.id, ship.ownerMemberId, ship.data?.score, ship.data?.hitCount);
+        }
+        return inputs;
+    }
+
+    function gameStateInputsEqual(left, right) {
+        return !!right && left.length === right.length
+            && left.every((value, index) => Object.is(value, right[index]));
+    }
+
     function syncGameState(immediate = false) {
-        if (!isSessionMode() || !isGameStateOwner() || !game.multiplayer.gameStateObjectId) return;
+        if (!isSessionMode() || !isGameStateOwner() || !game.multiplayer.gameStateObjectId) {
+            resetGameStateSyncCache();
+            return;
+        }
 
         const gsObj = ObjectSync.getObject(game.multiplayer.gameStateObjectId);
-        let ledgers;
-        try {
-            ledgers = {
-                processedHits: AstervoidsWireCodec.unpackCounterMap(gsObj?.data?.processedHits),
-                processedScores: AstervoidsWireCodec.unpackCounterMap(gsObj?.data?.processedScores)
+        if (!gsObj) {
+            resetGameStateSyncCache();
+            return;
+        }
+        const epoch = SessionClient.getSessionEpoch();
+        const memberId = SessionClient.getCurrentMember()?.id;
+        if (!gameStateSyncCache || gameStateSyncCache.object !== gsObj
+            || gameStateSyncCache.data !== gsObj.data
+            || gameStateSyncCache.objectId !== game.multiplayer.gameStateObjectId
+            || gameStateSyncCache.ownerMemberId !== gsObj.ownerMemberId
+            || gameStateSyncCache.epoch !== epoch || gameStateSyncCache.memberId !== memberId) {
+            const sameGame = gameStateSyncCache?.objectId === game.multiplayer.gameStateObjectId
+                && gameStateSyncCache.epoch === epoch && gameStateSyncCache.memberId === memberId;
+            gameStateSyncCache = {
+                object: gsObj, data: gsObj.data, epoch, memberId,
+                objectId: game.multiplayer.gameStateObjectId, ownerMemberId: gsObj.ownerMemberId,
+                stoppedHits: sameGame ? gameStateSyncCache.stoppedHits : null,
+                terminal: sameGame ? gameStateSyncCache.terminal : null
             };
+        }
+        const cache = gameStateSyncCache;
+        try {
+            cache.hits = readGameStateLedger(
+                gsObj.data?.processedHits, cache.hits, cache.packedHits);
+            cache.scores = readGameStateLedger(
+                gsObj.data?.processedScores, cache.scores, cache.packedScores);
             malformedGameStateLedgerKey = null;
         } catch (error) {
             const ledgerKey = `${game.multiplayer.gameStateObjectId}:${gsObj?.version ?? 0}`;
@@ -5961,25 +6114,64 @@
             return;
         }
 
-        const next = calculateGameState(
-            gsObj?.data, ledgers, ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP),
-            {
-                lives: game.lives,
-                state: game.state,
-                observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
-            },
-            CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
-        applyCalculatedGameState(next);
-        // Sample the clock only on the terminal edge, after score and damage effects.
-        const serverNowMs = next.lives <= 0 && gsObj?.data?.gameOverAt == null
-            ? RemoteObjects.serverNowMs() : null;
-        const terminal = calculateGameStateTerminal(
-            next.lives, gsObj?.data, serverNowMs, CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS);
+        const ships = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
+        const inputs = gameStateCalculationInputs(gsObj.data, cache.hits, cache.scores, ships);
+        const changed = !gameStateInputsEqual(inputs, cache.inputs);
+        if (changed) {
+            cache.next = calculateGameState(
+                gsObj.data,
+                { processedHits: cache.hits.counters, processedScores: cache.scores.counters },
+                ships,
+                {
+                    lives: game.lives,
+                    state: game.state,
+                    observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
+                },
+                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+        }
+        const next = cache.next;
+        const effects = changed && next.beatStopCount
+            && gameStateCounterMapsEqual(next.processedHits, cache.stoppedHits)
+            ? { ...next, beatStopCount: 0 } : next;
+        applyCalculatedGameState(effects, changed);
+        if (changed && next.beatStopCount) cache.stoppedHits = next.processedHits;
+        const terminalInputs = [next.lives, gsObj.data?.gameOverAt, gsObj.data?.terminalAt,
+            CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS];
+        if (!gameStateInputsEqual(terminalInputs, cache.terminalInputs)) {
+            // Sample the clock only on the terminal edge, after score and damage effects.
+            const serverNowMs = next.lives <= 0 && gsObj.data?.gameOverAt == null
+                ? cache.terminal?.gameOverAt ?? RemoteObjects.serverNowMs() : null;
+            cache.terminal = calculateGameStateTerminal(
+                next.lives, gsObj.data, serverNowMs, CONFIG.DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS);
+            cache.terminalInputs = terminalInputs;
+        }
+        const terminal = cache.terminal;
         game.state = next.state;
-        const gameStateData = serializeGameState(next, terminal);
+        const packedHits = packGameStateLedger(next.processedHits, cache.packedHits);
+        const packedScores = packGameStateLedger(next.processedScores, cache.packedScores);
+        const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores;
+        cache.packedHits = packedHits;
+        cache.packedScores = packedScores;
+        const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores;
+        const gameStateData = serializeGameState(next, terminal, {
+            processedHits: packedHits.bytes, processedScores: packedScores.bytes
+        });
+        const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
+            'peakShipCount', 'state'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
         
-        // This queues into pendingUpdates with the other object updates.
+        // A cached calculation is not a server acknowledgement. Keep enqueueing:
+        // ObjectSync retries unconfirmed fields against its confirmed baseline.
         ObjectSync.updateObject(game.multiplayer.gameStateObjectId, gameStateData, immediate);
+        cache.terminalInputs[1] = gsObj.data?.gameOverAt;
+        cache.terminalInputs[2] = gsObj.data?.terminalAt;
+        if (changed || packedChanged || optimisticLedgersChanged || calculationWriteChanged) {
+            cache.hits = readGameStateLedger(gsObj.data?.processedHits, cache.hits, packedHits);
+            cache.scores = readGameStateLedger(gsObj.data?.processedScores, cache.scores, packedScores);
+            // Our own optimistic write and local effects must not dirty the next
+            // step. Only adopt ledgers actually present in ObjectSync, not merely
+            // the attempted payload (updateObject can fail).
+            cache.inputs = gameStateCalculationInputs(gsObj.data, cache.hits, cache.scores, ships);
+        }
     }
 
     /**
@@ -6741,6 +6933,13 @@
      */
     function checkCollisions() {
         const myMemberId = SessionClient.getCurrentMember()?.id;
+        const bulletPxRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
+        const bulletMarginX = wrapMarginX(CONFIG.BULLET_RADIUS);
+        const bulletMarginY = wrapMarginY(CONFIG.BULLET_RADIUS);
+        // Geometry helpers consume these synchronously and never retain them.
+        const bulletStart = { x: 0, y: 0, radius: bulletPxRadius };
+        const bulletEnd = { x: 0, y: 0, radius: bulletPxRadius };
+        const asteroidBounds = { x: 0, y: 0, radius: 0 };
         
         // Bullet vs Asteroid collisions — only check local player's bullets
         for (let i = game.bullets.length - 1; i >= 0; i--) {
@@ -6751,44 +6950,38 @@
                 continue;
             }
             
+            const bulletDeltaX = AstervoidsCollision.wrappedDelta(
+                bullet._collisionPrevX, bullet.x, bulletMarginX);
+            const bulletDeltaY = AstervoidsCollision.wrappedDelta(
+                bullet._collisionPrevY, bullet.y, bulletMarginY);
+            bulletEnd.x = fromNormalizedX(bullet.x);
+            bulletEnd.y = fromNormalizedY(bullet.y);
+
             for (let j = game.astervoids.length - 1; j >= 0; j--) {
                 const asteroid = game.astervoids[j];
                 
-                const bulletPxRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
-                const bulletDeltaX = AstervoidsCollision.wrappedDelta(
-                    bullet._collisionPrevX, bullet.x, wrapMarginX(CONFIG.BULLET_RADIUS));
-                const bulletDeltaY = AstervoidsCollision.wrappedDelta(
-                    bullet._collisionPrevY, bullet.y, wrapMarginY(CONFIG.BULLET_RADIUS));
                 const asteroidDeltaX = AstervoidsCollision.wrappedDelta(
                     asteroid._collisionPrevX, asteroid.x, wrapMarginX(asteroid.boundRadius));
                 const asteroidDeltaY = AstervoidsCollision.wrappedDelta(
                     asteroid._collisionPrevY, asteroid.y, wrapMarginY(asteroid.boundRadius));
-                const bulletEnd = {
-                    x: fromNormalizedX(bullet.x),
-                    y: fromNormalizedY(bullet.y),
-                    radius: bulletPxRadius
-                };
                 // Express the previous bullet pose in the asteroid's current
                 // translational frame. This sweeps their relative motion while
                 // keeping wrap jumps out of the segment.
-                const bulletStart = {
-                    x: fromNormalizedX(bullet.x - bulletDeltaX + asteroidDeltaX),
-                    y: fromNormalizedY(bullet.y - bulletDeltaY + asteroidDeltaY),
-                    radius: bulletPxRadius
-                };
+                bulletStart.x = fromNormalizedX(bullet.x - bulletDeltaX + asteroidDeltaX);
+                bulletStart.y = fromNormalizedY(bullet.y - bulletDeltaY + asteroidDeltaY);
 
                 // Broad phase: swept circle-vs-circle on bounding radii. Use the
                 // asteroid's true `boundRadius` (max vertex distance) so
                 // fracture shards — where `radius` is an area-equivalent disk
                 // radius and the polygon may extend much farther — aren't
                 // missed.
-                const asteroidPxX = fromNormalizedX(asteroid.x);
-                const asteroidPxY = fromNormalizedY(asteroid.y);
-                const asteroidPxBound = fromNormalizedSize(asteroid.boundRadius);
+                asteroidBounds.x = fromNormalizedX(asteroid.x);
+                asteroidBounds.y = fromNormalizedY(asteroid.y);
+                asteroidBounds.radius = fromNormalizedSize(asteroid.boundRadius);
                 if (!AstervoidsCollision.sweptCircleIntersectsCircle(
                     bulletStart,
                     bulletEnd,
-                    { x: asteroidPxX, y: asteroidPxY, radius: asteroidPxBound })) {
+                    asteroidBounds)) {
                     continue;
                 }
 
@@ -8876,6 +9069,15 @@
     };
 
     let pickerOperationGeneration = 0;
+    let pickerUpdatesActive = true;
+
+    function isSessionPickerVisible() {
+        return !document.hidden && !startScreen.classList.contains('hidden');
+    }
+
+    function isSessionPickerActive() {
+        return pickerUpdatesActive && isSessionPickerVisible();
+    }
 
     function beginPickerOperation() {
         const generation = ++pickerOperationGeneration;
@@ -8888,6 +9090,7 @@
 
     // Update status message
     function setPickerStatus(message, type = '') {
+        if (!isSessionPickerVisible()) return;
         sessionPicker.statusEl.textContent = message;
         sessionPicker.statusEl.className = 'picker-status' + (type ? ' ' + type : '');
     }
@@ -9024,6 +9227,7 @@
 
     // Render session list
     function renderSessionList() {
+        if (!isSessionPickerVisible()) return;
         const { listEl, sessions, currentSessionId } = sessionPicker;
         listEl.innerHTML = '';
 
@@ -9096,6 +9300,7 @@
     // converges as bursts land WITHOUT rebuilding the list (which would
     // teleport the user's selection / scroll position).
     function updatePingCellsForRegion(regionId) {
+        if (!isSessionPickerVisible()) return;
         const ping = pingForRegion(regionId);
         const pingClass = rttClassFor(ping.state, ping.valueMs);
         const pingText = ping.state === 'unavailable'
@@ -9118,6 +9323,7 @@
     }
 
     function renderRegionBanner() {
+        if (!isSessionPickerVisible()) return;
         const banner = sessionPicker.regionBannerEl;
         if (!banner) return;
         // Closest-region messaging now lives directly in the picker select/button
@@ -9128,6 +9334,7 @@
     }
 
     function renderCreateRegionSelector() {
+        if (!isSessionPickerVisible()) return;
         const sel = sessionPicker.createRegionSelectEl;
         const row = sessionPicker.createRegionRowEl;
         if (!sel || !row) return;
@@ -9213,6 +9420,7 @@
 
     // Update button states
     function updatePickerButtons() {
+        if (!isSessionPickerVisible()) return;
         const { btnLeaveCreate, btnStartEnter, currentSessionId, isServer, gameStarted, canCreate, connected } = sessionPicker;
         
         // Leave/Create button - context aware
@@ -9283,6 +9491,7 @@
 
     // Refresh session list from server (or from pushed data)
     function updateSessionList(result) {
+        if (!isSessionPickerActive()) return;
         sessionPicker.sessions = result.sessions || [];
         sessionPicker.maxSessions = result.maxSessions;
         sessionPicker.canCreate = result.canCreateSession;
@@ -9352,16 +9561,17 @@
     // REST polls + spectator-push-driven refetches.
     let sessionListRequestSequence = 0;
     async function refreshSessionList() {
+        if (!isSessionPickerActive()) return;
         const usingMultiRegion = sessionPicker.regions.length > 1;
         if (!usingMultiRegion) {
             if (!SessionClient.isConnected()) return;
             const requestSequence = ++sessionListRequestSequence;
             try {
                 const result = await SessionClient.getActiveSessions();
-                if (requestSequence !== sessionListRequestSequence) return;
+                if (requestSequence !== sessionListRequestSequence || !isSessionPickerActive()) return;
                 updateSessionList(result);
             } catch (err) {
-                if (requestSequence !== sessionListRequestSequence) return;
+                if (requestSequence !== sessionListRequestSequence || !isSessionPickerActive()) return;
                 _error('Failed to refresh sessions:', err);
                 setPickerStatus('Failed to load sessions', 'error');
             }
@@ -9942,11 +10152,9 @@
 
         // Solo play does not need live session updates, but closing service
         // connections must not delay a local game start.
-        if (sessionPicker.regions.length > 1) {
-            void teardownMultiRegionPicker().catch(err => {
-                _warn('[Picker] Failed to stop regional updates for solo play:', err);
-            });
-        }
+        void teardownMultiRegionPicker().catch(err => {
+            _warn('[Picker] Failed to stop regional updates for solo play:', err);
+        });
 
         // Tell the server about a prior session without making local solo play
         // dependent on a reachable hub.
@@ -10067,6 +10275,8 @@
             return;
         }
 
+        pickerUpdatesActive = false;
+        pausePickerAssessment();
         sessionPicker.btnStartEnter.disabled = true;
         const operation = { context, promise: null };
         startGameOperation = operation;
@@ -10521,9 +10731,12 @@
 
     // Handle session list changes (signal from server - fetch fresh data with jitter)
     let sessionRefreshTimeout = null;
-    SessionClient.on('onSessionsChanged', () => {
-        // Refresh session list when the start screen is visible (player can see the list)
-        if (!startScreen.classList.contains('hidden')) {
+    function handleSessionListChanged() {
+        if (!isSessionPickerActive()) return;
+        if (sessionPicker.regions.length > 1) {
+            const region = getSessionClientRegion();
+            if (region) MultiRegionSessions.requestRefresh(region);
+        } else {
             // Debounce: cancel pending refresh if another signal arrives
             if (sessionRefreshTimeout) {
                 clearTimeout(sessionRefreshTimeout);
@@ -10531,10 +10744,11 @@
             // Random jitter 0-500ms to prevent thundering herd
             sessionRefreshTimeout = setTimeout(() => {
                 sessionRefreshTimeout = null;
-                refreshSessionList();
+                if (isSessionPickerActive()) refreshSessionList();
             }, Math.random() * 500);
         }
-    });
+    }
+    SessionClient.on('onSessionsChanged', handleSessionListChanged);
 
     window.addEventListener('online', updatePickerConnectionStatus);
     window.addEventListener('offline', updatePickerConnectionStatus);
@@ -10697,6 +10911,7 @@
             return;
         }
         window.RegionService.on('rttUpdated', (regionId) => {
+            if (!isSessionPickerActive()) return;
             updatePingCellsForRegion(regionId);
             renderRegionBanner();
             // Best-region may have flipped; refresh the create row + button label
@@ -10714,28 +10929,32 @@
             updatePickerConnectionStatus();
         });
         window.RegionService.on('coldStart', (regionId) => {
+            if (!isSessionPickerActive()) return;
             _log('[RegionService] cold start:', regionId);
             updatePingCellsForRegion(regionId);
         });
         window.RegionService.on('regionsLoaded', async ({ regions }) => {
             sessionPicker.regions = regions;
             sessionPicker.regionDiscoveryState = 'loaded';
-            renderRegionBanner();
-            renderCreateRegionSelector();
-            renderSessionList();
-            updatePickerButtons();
-            updatePickerConnectionStatus();
+            if (isSessionPickerActive()) {
+                renderRegionBanner();
+                renderCreateRegionSelector();
+                renderSessionList();
+                updatePickerButtons();
+                updatePickerConnectionStatus();
+            }
 
             // Phase 3: spin up the multi-region picker plumbing when N>1.
             // Single-region deployments use the legacy SignalR same-origin
             // path; nothing here is needed for that case.
             if (regions.length > 1) {
                 await initMultiRegionPicker(regions);
+            } else if (isSessionPickerActive()) {
+                await activateSessionPickerUpdates();
             }
         });
         try {
             await window.RegionService.load();
-            window.RegionService.start();
         } catch (err) {
             _warn('[RegionService] load failed (single-region fallback):', err);
             sessionPicker.regionDiscoveryState = 'fallback';
@@ -10753,11 +10972,13 @@
     // the UI can show a ↻ badge per row and the picker doesn't surface
     // false "region missing" panic during transient drops.
     const staleRegions = new Set();
+    const reconnectingSince = new Map();
 
     async function initMultiRegionPicker(regions) {
         if (!window.SpectatorClient || !window.MultiRegionSessions && false) {
             // MultiRegionSessions lives in this same file; the SpectatorClient
             // check guards against the script tag being absent (e.g. test page).
+            if (isSessionPickerActive()) await activateSessionPickerUpdates();
             return;
         }
         if (!multiRegionInitialized) {
@@ -10765,7 +10986,7 @@
 
             // ── Spectator push → region-scoped REST refetch ────────────
             window.SpectatorClient.on('sessionsChanged', (regionId) => {
-                if (!multiRegionActive) return;
+                if (!multiRegionActive || !isSessionPickerActive()) return;
                 const r = sessionPicker.regions.find(x => x.id === regionId);
                 if (r) MultiRegionSessions.requestRefresh(r);
             });
@@ -10774,15 +10995,16 @@
             // SignalR transitions to 'reconnecting' as soon as it loses the
             // socket. We wait 10s before flagging the region as stale to
             // avoid a flicker during normal short drops.
-            const reconnectingSince = new Map();
             window.SpectatorClient.on('connectionStateChanged', (regionId, state) => {
+                if (!multiRegionActive || !isSessionPickerActive()) return;
                 if (state === 'reconnecting') {
                     if (!reconnectingSince.has(regionId)) {
                         reconnectingSince.set(regionId, setTimeout(() => {
+                            reconnectingSince.delete(regionId);
+                            if (!multiRegionActive || !isSessionPickerActive()) return;
                             staleRegions.add(regionId);
                             renderSessionList();  // re-render to show ↻ on rows
                             renderRegionDownBanner();
-                            reconnectingSince.delete(regionId);
                         }, 10000));
                     }
                 } else {
@@ -10797,37 +11019,25 @@
                 }
             });
 
-            // ── Visibility gating ──────────────────────────────────────
-            // While the tab is hidden, close spectator connections AND stop
-            // the background REST poll so backgrounded tabs don't keep
-            // regions warm (would defeat CAE scale-to-zero).
-            document.addEventListener('visibilitychange', async () => {
-                if (!multiRegionInitialized) return;
-                if (document.hidden) {
-                    if (multiRegionActive) {
-                        await pauseMultiRegionPicker();
-                    }
-                } else {
-                    // A session lobby still uses the picker and must show every
-                    // region. Resume whenever that UI is visible, whether or not
-                    // the player is already a member of a session.
-                    if (multiRegionActive && !startScreen.classList.contains('hidden')) {
-                        await startMultiRegionPicker();
-                    }
-                }
-            });
         }
 
-        await startMultiRegionPicker();
+        if (isSessionPickerActive()) await activateSessionPickerUpdates();
     }
 
-    async function startMultiRegionPicker() {
-        if (startScreen.classList.contains('hidden')) return;
+    // Visibility gating also applies to the single-region picker and initial load.
+    function handlePickerVisibilityChange() {
+        if (document.hidden) {
+            void pauseMultiRegionPicker().catch(err => _warn('[Picker] Failed to pause updates:', err));
+        } else if (isSessionPickerActive()) {
+            void activateSessionPickerUpdates().catch(err => _warn('[Picker] Failed to resume updates:', err));
+        }
+    }
+    document.addEventListener('visibilitychange', handlePickerVisibilityChange);
 
-        // Record desired picker activity even while hidden. The visibility
-        // handler uses this intent to perform the physical restart on return.
+    async function startMultiRegionPicker() {
+        if (!isSessionPickerActive()) return;
+
         multiRegionActive = true;
-        if (document.hidden) return;
 
         MultiRegionSessions.stop();
 
@@ -10851,23 +11061,48 @@
     }
 
     async function pauseMultiRegionPicker() {
+        pausePickerAssessment();
         MultiRegionSessions.stop();
+        for (const timer of reconnectingSince.values()) clearTimeout(timer);
+        reconnectingSince.clear();
+        staleRegions.clear();
         if (window.SpectatorClient) {
             await window.SpectatorClient.closeAll();
         }
     }
 
     async function teardownMultiRegionPicker() {
+        pickerUpdatesActive = false;
         multiRegionActive = false;
         await pauseMultiRegionPicker();
     }
 
+    function pausePickerAssessment() {
+        window.RegionService?.stop();
+        sessionListRequestSequence++;
+        if (sessionRefreshTimeout != null) {
+            clearTimeout(sessionRefreshTimeout);
+            sessionRefreshTimeout = null;
+        }
+    }
+
     async function activateSessionPickerUpdates() {
+        if (startScreen.classList.contains('hidden')) return;
+        pickerUpdatesActive = true;
+        if (!isSessionPickerActive()) return;
+
+        if (sessionPicker.regionDiscoveryState === 'loaded' && sessionPicker.regions.length > 0) {
+            window.RegionService?.start();
+        }
+        renderRegionBanner();
+        renderCreateRegionSelector();
+        renderSessionList();
+        updatePickerButtons();
+        updatePickerConnectionStatus();
         if (sessionPicker.regions.length <= 1) {
             await refreshSessionList();
             return;
         }
-        if (startScreen.classList.contains('hidden')) return;
 
         try {
             await startMultiRegionPicker();
@@ -10878,6 +11113,7 @@
     }
 
     function renderRegionDownBanner() {
+        if (!isSessionPickerVisible()) return;
         // Reuse #region-banner: if any region is stale, append a warning suffix.
         // Banner already updates per rttUpdated; we just trigger a refresh.
         const banner = sessionPicker.regionBannerEl;
@@ -10926,6 +11162,15 @@
     function getRegionHostnameById(regionId) {
         const r = sessionPicker.regions.find(x => x.id === regionId);
         return r ? r.hostname : '';
+    }
+
+    function getSessionClientRegion() {
+        const hubHostname = SessionClient.getCurrentHubHostname();
+        const hostname = (hubHostname || window.location.origin).replace(/\/$/, '');
+        return sessionPicker.regions.find(region => region.hostname.replace(/\/$/, '') === hostname)
+            || (!hubHostname
+                ? sessionPicker.regions.find(region => region.id === window.RegionService?.getLocalRegionId())
+                : null);
     }
 
     initRegionService();
