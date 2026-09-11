@@ -54,9 +54,7 @@
  *
  * Gap detection is only performed for OTHER members' streams. The local member's
  * own sequence is tracked (to keep the map current) but gaps are not flagged,
- * because the sender can't miss their own events and the mixed delivery channels
- * (concurrent invoke responses) can race
- * at await microtask boundaries.
+ * because concurrent invoke responses can race at await microtask boundaries.
  *
  * This works because SignalR guarantees in-order delivery per connection, and all
  * events for a given member flow through that member's single connection. So the
@@ -229,6 +227,7 @@ const ObjectSync = (function() {
     // Retained configured value; adaptive updates currently do not auto-reset to it.
     let baseNominalFrameTime = 1 / 30;
     let elapsedSinceFlushSec = 0;
+    let flushDue = false;
     let adaptiveSendRate = false;    // dynamically adjust send rate based on RTT
     const ADAPTIVE_SEND_MIN = 1 / 20; // fastest send interval (20Hz) in seconds
     const ADAPTIVE_SEND_MAX = 1 / 1;  // slowest send interval (1Hz) in seconds
@@ -414,6 +413,7 @@ const ObjectSync = (function() {
         pendingOwnershipMigrations.clear();
         stateRevision = 0;
         elapsedSinceFlushSec = 0;
+        flushDue = false;
         fullSyncCounter = 0;
         senderSequence = 0;
         memberSequences.clear();
@@ -1053,6 +1053,7 @@ const ObjectSync = (function() {
                 return null;
             }
 
+            if (!isAsyncContextCurrent(context)) return null;
             // Response-first: register the object from the invoke response (no broadcast echo)
             applyAuthoritativeCreate(objectInfo, response.validAt);
 
@@ -1117,7 +1118,8 @@ const ObjectSync = (function() {
             }
             // The server may have committed while the only authoritative
             // response was lost. Restore truth rather than leaving a ghost parent.
-            if (isAsyncContextCurrent(context)) triggerReconciliation();
+            if (!isAsyncContextCurrent(context)) return null;
+            triggerReconciliation();
             throw err;
         }
     }
@@ -1174,9 +1176,11 @@ const ObjectSync = (function() {
     function tick(frameTimeSec) {
         if (!Number.isFinite(frameTimeSec) || frameTimeSec < 0) return;
         elapsedSinceFlushSec = Math.min(nominalFrameTime, elapsedSinceFlushSec + frameTimeSec);
-        if (flushInProgress === null
-            && (pendingUrgentUpdates.size > 0
-                || elapsedSinceFlushSec + Number.EPSILON >= nominalFrameTime)) {
+        // Once due, an RTT-driven interval increase must not add another wait
+        // after an already-saturated in-flight batch.
+        flushDue ||= elapsedSinceFlushSec + Number.EPSILON >= nominalFrameTime;
+        if (pendingUpdates.size > 0 && flushInProgress === null
+            && (pendingUrgentUpdates.size > 0 || flushDue)) {
             flushUpdates();
         }
     }
@@ -1311,6 +1315,7 @@ const ObjectSync = (function() {
         pendingUpdates.clear();
         pendingUrgentUpdates.clear();
         elapsedSinceFlushSec = 0;
+        flushDue = false;
 
         if (updates.length === 0) return;
 

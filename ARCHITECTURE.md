@@ -881,6 +881,13 @@ sequenceDiagram
     Note over C: Shared replacement application installs children<br/>and removes parent before lifecycle callbacks;<br/>public API still returns createdInfos[]
 ```
 
+SessionClient's optional seventh replacement argument supplies the result
+handler; ObjectSync uses it to enforce its replication epoch before applying the
+response. Newer updates, migrations, tombstones and reconciled children are not
+rewound or re-anchored by a late result. If the invocation fails after the server
+may have committed, ObjectSync requests reconciliation rather than retaining a
+ghost parent indefinitely.
+
 ## Session & Member Model
 
 ```mermaid
@@ -1042,6 +1049,9 @@ TX is the shared ObjectSync flush cadence for both simulation modes. It is not
 the same as buffered BUF (render delay), and it is not a packet guarantee:
 game-layer send-on-change gates may queue nothing, while in-flight backpressure
 can coalesce multiple simulation frames into a later batch.
+Once elapsed eligibility is reached, it remains latched across adaptive interval
+increases until serviced. Legacy `minFrameTime` configuration remains accepted
+and validated, but elapsed scheduling never invents time for short/zero ticks.
 
 Ship invulnerability remains authoritative in simulation ticks. The game schema
 appends `invulnerabilityRevision` (`u32`) and `invulnerableAt` (`f64` server-time
@@ -1630,18 +1640,25 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 
 | Payload | Current compact size |
 | --- | ---: |
-| ship create body | 51 B |
+| ship create body (including countdown timing) | 64 B |
 | seeded asteroid create body | 40 B |
 | bullet create body | 37 B |
-| GameState create body | 48 B |
+| GameState create body | 52 B |
 | asteroid x/y/angle update DTO | 29–35 B |
 | ballistic bullet update DTO | 29–35 B |
 | pending-hit bullet update DTO | 50–60 B |
-| full replay-capable ship update DTO | 52–62 B |
+| full replay-capable ship update DTO (including countdown timing) | 65–75 B |
 | three-asteroid update batch | 90–105 B |
-| seven-object mixed steady-state batch | 235–255 B |
+| seven-object mixed steady-state batch | 248–268 B |
 | three-version update acknowledgement | 72 B |
 | aliased ship-state object event | 35–45 B |
+
+The full ship fixture grows by 13 B for explicit countdown timing; unchanged
+countdowns no longer trigger per-step ship publication. Replacement response
+fixtures additionally cover SignalR MessagePack invocation/completion framing:
+the sender receives one completion, with 11 B of authoritative metadata, instead
+of a completion plus duplicate child broadcast. Neither budget includes
+WebSocket, TLS or IP overhead.
 
 ### Hazards verified by tests
 

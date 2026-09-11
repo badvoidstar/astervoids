@@ -1313,12 +1313,15 @@ test('elapsed scheduler retains due work behind one invoke and only pumps on a t
     sync.tick(5);
     assert.equal(calls.length, 1);
     client.updateObjects = update;
+    sync.configure({ adaptiveSendRate: true });
+    sync.updateSendRate(1000);
     gate.resolve({ versions: {}, memberSequence: 1 });
     await drainMicrotasks();
     assert.equal(calls.length, 1, 'no completion-triggered draining');
     sync.tick(0);
     assert.equal(calls.length, 2, 'already-elapsed eligibility is retained');
     assert.equal(calls[1].updates[0].data.value, 2);
+    assert.equal(calls[1].interval, 1000, 'slower adaptive cadence cannot revoke existing eligibility');
 });
 
 for (const removal of ['delete', 'replace', 'clear']) {
@@ -1402,6 +1405,22 @@ test('stale create completion is ignored after reset', async () => {
 
     assert.equal(await creating, null);
     assert.equal(objectSync.getObject('old-object'), undefined);
+});
+
+test('create liveness callback cannot apply an old response after resetting the epoch', async () => {
+    const client = makeObjectSyncClient();
+    client.createObject = async () => ({
+        objectInfo: objectInfo('old-object', 1, { type: 'counter' }),
+        memberSequence: 1, validAt: 1000
+    });
+    const sync = loadObjectSync(client);
+    sync.init();
+    const result = await sync.createObject({ type: 'counter' }, 'Member', null, () => {
+        sync.clear();
+        return true;
+    });
+    assert.equal(result, null);
+    assert.equal(sync.getObjectCount(), 0);
 });
 
 test('stale delete completion cannot clear the next session pending delete', async () => {

@@ -46,6 +46,8 @@ public class ReplacementWireTests
         decoded.CreatedObjects.Select(child => child.Id).Should().Equal(children.Select(child => child.Id));
         decoded.MemberSequence.Should().Be(7);
         decoded.ValidAt.Should().Be(response.ValidAt);
+        bytes.Length.Should().Be(162,
+            "the two-child response payload budget excludes SignalR and transport framing");
         bytes.Length.Should().Be(
             MessagePackSerializer.Serialize(children, SerializerOptions).Length + 11,
             "the array, small sequence, and int64 validAt add only eleven bytes");
@@ -66,8 +68,10 @@ public class ReplacementWireTests
             "1", new ReplaceObjectResponse(children, 7, validAt)));
 
         completion.Should().Be(oldCompletion + 11);
+        oldCompletion.Should().Be(159);
+        oldEcho.Should().Be(232);
         completion.Should().Be(170, "two small generic children fit in one compact completion");
-        (oldCompletion + oldEcho - completion).Should().BeGreaterThan(200,
+        (oldCompletion + oldEcho - completion).Should().Be(221,
             "the sender no longer receives an invocation containing the same children");
     }
 }
