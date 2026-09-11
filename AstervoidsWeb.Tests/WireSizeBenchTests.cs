@@ -139,6 +139,8 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
+            new PositionalSchemaCodec.FieldSpec("invulnerabilityRevision", "u32"),
+            new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
         });
 
     private static readonly PositionalSchemaCodec.Schema AsteroidSchema =
@@ -371,6 +373,8 @@ public class WireSizeBenchTests
             ["rotationSpeed"] = 0.01,
             ["thrusting"] = true,
             ["invulnerable"] = 120,
+            ["invulnerabilityRevision"] = 1,
+            ["invulnerableAt"] = 1_800_000_000_000d,
             ["thrustInput"] = 1d,
             ["brakeInput"] = 0d,
             ["turnControlMode"] = 1,
@@ -411,7 +415,7 @@ public class WireSizeBenchTests
     public void Production_ShipUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleShipUpdateQuantized());
-        size.Should().BeInRange(52, 62, "full replay-capable ship update");
+        size.Should().BeInRange(65, 75, "full replay-capable ship update with countdown timing");
     }
 
     [Fact]
@@ -447,7 +451,7 @@ public class WireSizeBenchTests
             SampleBulletUpdateQuantized(), SampleBulletUpdateQuantized()
         };
         var size = Size(batch);
-        size.Should().BeInRange(235, 255, "mixed steady-state positional batch");
+        size.Should().BeInRange(248, 268, "mixed steady-state positional batch with ship timing");
     }
 
     [Fact]
@@ -460,6 +464,7 @@ public class WireSizeBenchTests
             ["velocityX"] = 0.1, ["velocityY"] = -0.05,
             ["rotationSpeed"] = 0.01,
             ["thrusting"] = true, ["invulnerable"] = 120,
+            ["invulnerabilityRevision"] = 1, ["invulnerableAt"] = 1_800_000_000_000d,
             ["colorIndex"] = 1,
             ["memberId"] = "00112233-4455-6677-8899-aabbccddeeff",
             ["score"] = 0, ["hitCount"] = 0
@@ -497,7 +502,7 @@ public class WireSizeBenchTests
             ["scoreLifeAwardCount"] = 0
         });
 
-        shipCreate.Length.Should().Be(51);
+        shipCreate.Length.Should().Be(64);
         asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
         gameStateCreate.Length.Should().Be(52);

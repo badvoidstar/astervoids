@@ -247,6 +247,21 @@ const SessionClient = (function() {
         };
     }
 
+    function dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt,
+        handler = callbacks.onObjectReplaced) {
+        event = normalizeObjectReplacedEvent(event);
+        if (event && Array.isArray(event.createdObjects)) {
+            for (let i = 0; i < event.createdObjects.length; i++) {
+                const objectInfo = normalizeObjectInfo(event.createdObjects[i]);
+                event.createdObjects[i] = objectInfo;
+                WireEnum.translateObject(objectInfo);
+                SyncPayload.unwrapObjectData(objectInfo);
+            }
+        }
+        if (handler) handler(event, senderMemberId, memberSequence, validAt);
+        return event.createdObjects;
+    }
+
     function normalizeUpdateObjectsResponse(value) {
         if (!Array.isArray(value)) return value;
         return {
@@ -541,18 +556,7 @@ const SessionClient = (function() {
         }, true));
 
         thisConnection.on('OnObjectReplaced', guard((event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
-            event = normalizeObjectReplacedEvent(event);
-            if (event && Array.isArray(event.createdObjects)) {
-                for (let i = 0; i < event.createdObjects.length; i++) {
-                    const objectInfo = normalizeObjectInfo(event.createdObjects[i]);
-                    event.createdObjects[i] = objectInfo;
-                    WireEnum.translateObject(objectInfo);
-                    SyncPayload.unwrapObjectData(objectInfo);
-                }
-            }
-            if (callbacks.onObjectReplaced) {
-                callbacks.onObjectReplaced(event, senderMemberId, memberSequence, validAt);
-            }
+            dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt);
         }, true));
 
         // Generic per-object event channel (Phase 2.1).
@@ -982,8 +986,11 @@ const SessionClient = (function() {
      *   Server clamps to ±2000ms of its own UtcNow before forwarding as the
      *   broadcast's validAt. Pass null to fall back to server's hub-entry
      *   timestamp (less accurate).
+     * @param {function} [onReplaced] - Authoritative result handler, invoked before
+     *   resolving the created-object array. Defaults to onObjectReplaced; ObjectSync
+     *   overrides it to reject results from a cleared replication epoch.
      */
-    async function replaceObject(deleteObjectId, replacements, scope = 'Session', ownerMemberId = null, clientValidAt = null, schemaIds = null) {
+    async function replaceObject(deleteObjectId, replacements, scope = 'Session', ownerMemberId = null, clientValidAt = null, schemaIds = null, onReplaced = callbacks.onObjectReplaced) {
         const context = captureSessionContext();
         // Phase 3 envelope: each replacement is a raw game data dict; wrap before invoke.
         // Phase 4: schemaIds may be a parallel array of schemaId per replacement;
@@ -991,20 +998,19 @@ const SessionClient = (function() {
         const wrapped = Array.isArray(replacements)
             ? replacements.map((r, i) => SyncPayload.wrap(r, (schemaIds && schemaIds[i]) || 0))
             : replacements;
-        const created = await invokeHub('ReplaceObject', GuidUtils.guidToBytes(deleteObjectId), wrapped, scope, ownerMemberId, clientValidAt);
+        const response = await invokeHub('ReplaceObject', GuidUtils.guidToBytes(deleteObjectId), wrapped, scope, ownerMemberId, clientValidAt);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
-        // Server returns List<ObjectInfo> for the owner; unwrap each so any
-        // downstream consumer sees the canonical dict shape.
-        if (Array.isArray(created)) {
-            for (let i = 0; i < created.length; i++) {
-                created[i] = normalizeObjectInfo(created[i]);
-                WireEnum.translateObject(created[i]);
-                SyncPayload.unwrapObjectData(created[i]);
-            }
-        }
-        return created;
+        if (!response) return null;
+        const [createdObjects, memberSequence, validAt] = Array.isArray(response)
+            ? response
+            : [response.createdObjects, response.memberSequence, response.validAt];
+        // Preserve the public array return while delivering authoritative metadata
+        // before resolving. ObjectSync supplies a handler scoped to its own epoch.
+        return dispatchObjectReplacement(
+            { deletedObjectId: deleteObjectId, createdObjects },
+            currentMember.id, memberSequence, validAt, onReplaced);
     }
 
     /**

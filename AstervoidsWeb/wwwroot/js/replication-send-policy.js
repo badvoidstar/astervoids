@@ -131,6 +131,9 @@ const ReplicationSendPolicy = (function () {
         const isDeterministic = requireFunction(
             options?.isDeterministic, 'isDeterministic');
         const nowMs = requireFunction(options?.nowMs, 'nowMs');
+        const getTransitionKey = options?.getTransitionKey == null
+            ? state => state.invulnerable || 0
+            : requireFunction(options.getTransitionKey, 'getTransitionKey');
         if (!config) throw new TypeError('config is required');
 
         const baselines = new Map();
@@ -145,7 +148,7 @@ const ReplicationSendPolicy = (function () {
                 turnMagnitude: ship.turnMagnitude || 0,
                 turnBias: ship.turnBias || 0,
                 thrusting: !!ship.thrusting,
-                invulnerable: ship.invulnerable || 0,
+                transitionKey: getTransitionKey(ship),
                 lastSentMs: now
             };
         }
@@ -183,7 +186,7 @@ const ReplicationSendPolicy = (function () {
                 || Math.abs((ship.turnTargetAngle || 0) - baseline.turnTargetAngle) > rotationEpsilon
                 || (ship.turnControlMode || 0) !== baseline.turnControlMode
                 || !!ship.thrusting !== baseline.thrusting
-                || (ship.invulnerable || 0) !== baseline.invulnerable) {
+                || !Object.is(getTransitionKey(ship), baseline.transitionKey)) {
                 reason = 'intent-change';
             } else if ((now - baseline.lastSentMs) >= config.SEND_ON_CHANGE_HEARTBEAT_MS) {
                 reason = 'heartbeat';

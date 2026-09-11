@@ -567,6 +567,7 @@ public class SessionHubTests
         var createResult = _sessionService.CreateSession("connection-1");
         var session = createResult.Session!;
         var creator = createResult.Creator!;
+        _sessionService.JoinSession(session.Id, "connection-2");
         var parent = _objectService.CreateObject(
             session.Id, creator.Id, Models.ObjectScope.Session,
             new Dictionary<string, object?> { ["type"] = "asteroid" })!;
@@ -605,6 +606,13 @@ public class SessionHubTests
         var batchValidAt = (long)capturedArgs[4]!;
         batchValidAt.Should().Be(clientStamp,
             "in-bounds clientValidAt should be forwarded verbatim as the batch-level validAt");
+        result!.CreatedObjects.Should().Equal(replaceEvent.CreatedObjects);
+        result.MemberSequence.Should().Be((long)capturedArgs[2]!);
+        result.ValidAt.Should().Be(batchValidAt);
+        Mock.Get(hub.Clients).Verify(
+            clients => clients.OthersInGroup(session.Id.ToString()), Times.Once);
+        Mock.Get(hub.Clients).Verify(
+            clients => clients.Group(It.IsAny<string>()), Times.Never);
     }
 
     [Fact]
@@ -614,6 +622,7 @@ public class SessionHubTests
         var createResult = _sessionService.CreateSession("connection-1");
         var session = createResult.Session!;
         var creator = createResult.Creator!;
+        _sessionService.JoinSession(session.Id, "connection-2");
         var parent = _objectService.CreateObject(
             session.Id, creator.Id, Models.ObjectScope.Session,
             new Dictionary<string, object?> { ["type"] = "asteroid" })!;
@@ -649,6 +658,7 @@ public class SessionHubTests
         var batchValidAt = (long)capturedArgs[4]!;
         batchValidAt.Should().BeCloseTo(serverTimestamp, 50,
             "out-of-bounds clientValidAt must be rejected and the batch-level validAt should fall back to the hub-entry serverTimestamp");
+        result!.ValidAt.Should().Be(batchValidAt);
     }
 
     [Fact]
@@ -658,6 +668,7 @@ public class SessionHubTests
         var createResult = _sessionService.CreateSession("connection-1");
         var session = createResult.Session!;
         var creator = createResult.Creator!;
+        _sessionService.JoinSession(session.Id, "connection-2");
         var parent = _objectService.CreateObject(
             session.Id, creator.Id, Models.ObjectScope.Session,
             new Dictionary<string, object?> { ["type"] = "asteroid" })!;
@@ -686,6 +697,28 @@ public class SessionHubTests
         var batchValidAt = (long)capturedArgs[4]!;
         batchValidAt.Should().BeCloseTo(serverTimestamp, 50,
             "null clientValidAt must fall back to the hub-entry serverTimestamp");
+        result!.ValidAt.Should().Be(batchValidAt);
+    }
+
+    [Fact]
+    public async Task ReplaceObject_EmptySuccessAndFailure_HaveDistinctResponses()
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var parent = _objectService.CreateObject(
+            created.Session!.Id, created.Creator!.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "counter" })!;
+        var hub = CreateHub("connection-1");
+
+        var response = await hub.ReplaceObject(parent.Id, []);
+
+        response.Should().NotBeNull();
+        response!.CreatedObjects.Should().BeEmpty();
+        response.MemberSequence.Should().BeGreaterThan(0);
+        response.ValidAt.Should().BeGreaterThan(0);
+        created.Session.Objects.Should().NotContainKey(parent.Id);
+        (await hub.ReplaceObject(parent.Id, [])).Should().BeNull();
+        Mock.Get(hub.Clients).Verify(
+            clients => clients.Group(It.IsAny<string>()), Times.Never);
     }
 
     // ─────────────────────────────────────────────────────────────────────

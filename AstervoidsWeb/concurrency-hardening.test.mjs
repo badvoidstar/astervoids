@@ -547,7 +547,7 @@ test('SessionClient adapts compact object DTO arrays at every wire boundary', as
         Promise.resolve([compact('owned-create', 1, { type: 'bullet' }), 18, 124]));
     connection.invokers.set('DeleteObject', () => Promise.resolve([true, 19]));
     connection.invokers.set('ReplaceObject', () =>
-        Promise.resolve([compact('owned-child', 1, { type: 'asteroid' })]));
+        Promise.resolve([[compact('owned-child', 1, { type: 'asteroid' })], 20, 125]));
     connection.invokers.set('GetSessionState', () => Promise.resolve({
         members: [],
         objects: [compact('reconciled', 4, { type: 'gameState' })],
@@ -1056,10 +1056,329 @@ test('immediate update flushes now and coalesces behind in-flight backpressure',
     });
     await drainMicrotasks();
 
-    objectSync.tick(1);
+    objectSync.updateObject('shared', { x: 4 });
+    assert.equal(calls.length, 1, 'completion is not a flush loop');
+    objectSync.tick(0.001);
     await drainMicrotasks();
     assert.equal(calls.length, 2, 'coalesced state leaves on the first eligible tick');
-    assert.equal(calls[1].updates[0].data.x, 3);
+    assert.equal(calls[1].updates[0].data.x, 4);
+});
+
+async function replacementHarness() {
+    const connection = new FakeConnection();
+    const parentId = fixtureGuid('replace-parent');
+    const responseGate = deferred();
+    connection.invokers.set('JoinSession', sessionId =>
+        Promise.resolve(joinResponse(sessionId, [
+            objectInfo(parentId, 1, { type: 'counter', value: 1 })
+        ])));
+    connection.invokers.set('ReplaceObject', () => responseGate.promise);
+    let objectSync;
+    const loaded = loadSessionClient([connection], {
+        triggerReconciliation: () => objectSync?.triggerReconciliation()
+    });
+    objectSync = loadObjectSync(loaded.client, loaded.window);
+    objectSync.init();
+    await connectImmediately(loaded.client, connection);
+    await loaded.client.joinSession(fixtureGuid('replace-session'));
+    return { ...loaded, connection, parentId, responseGate, objectSync };
+}
+
+test('replace response applies once, atomically, before resolving the public array', async () => {
+    const h = await replacementHarness();
+    const children = [
+        objectInfo('first', 1, { type: 'counter', value: 2 }, 'me'),
+        objectInfo('second', 1, { type: 'counter', value: 3 }, 'other')
+    ];
+    const order = [];
+    const assertAtomic = () => {
+        assert.equal(h.objectSync.getObject(h.parentId), undefined);
+        assert.deepEqual(h.objectSync.getAllObjects().map(obj => obj.id), ['first', 'second']);
+    };
+    h.objectSync.on('onObjectDeleted', obj => { assertAtomic(); order.push(['delete', obj.id]); });
+    h.objectSync.on('onObjectCreated', obj => { assertAtomic(); order.push(['create', obj.id]); });
+    h.objectSync.on('onObjectReplaced', (id, infos, validAt) => {
+        assertAtomic();
+        assert.deepEqual(infos, children);
+        order.push(['replace', id, validAt]);
+    });
+    const replacing = h.objectSync.replaceObject(h.parentId, children.map(child => child.data));
+    assert.ok(h.objectSync.getObject(h.parentId), 'not speculative/local-first');
+    h.responseGate.resolve([children, 19, 1234]);
+    const result = await replacing;
+    assert.ok(Array.isArray(result));
+    assert.deepEqual(result, children);
+    assert.deepEqual(order, [
+        ['delete', h.parentId], ['create', 'first'], ['create', 'second'],
+        ['replace', h.parentId, 1234]
+    ]);
+    assert.equal(h.objectSync.getObject('first').validAt, 1234);
+    assert.equal(h.objectSync.getObject('second').validAt, 1234);
+    assert.equal(h.objectSync.getReconciliationCount(), 0, 'own sequence jumps do not reconcile');
+});
+
+test('delayed replacement cannot resurrect deleted children or rewind updates and migrations', async () => {
+    const h = await replacementHarness();
+    const ids = ['updated', 'deleted', 'departed', 'migrated', 'snapshotted', 'fresh'];
+    const children = ids.map(id =>
+        objectInfo(id, 1, { type: 'counter', value: 1, staticField: 'seed' }, 'old-owner'));
+    let anchored;
+    h.objectSync.on('onObjectReplaced', (_, infos) => { anchored = infos.map(obj => obj.id); });
+    const replacing = h.objectSync.replaceObject(h.parentId, children.map(child => child.data));
+    h.connection.emit('OnObjectsUpdated',
+        [{ id: 'updated', data: { value: 4 }, version: 4 }], 'other', 1, 1, 4000, 50, 3990);
+    h.connection.emit('OnObjectDeleted', 'deleted', 'other', 2, 4001);
+    h.objectSync.handleMemberDeparture(['departed']);
+    h.objectSync.handleOwnershipMigration([
+        { objectId: 'migrated', newOwnerId: 'new-owner', newVersion: 2 }
+    ]);
+    h.connection.emit('OnObjectCreated',
+        objectInfo('snapshotted', 1, { type: 'counter', value: 1 }),
+        'other', 3, 4002, 1200);
+    h.responseGate.resolve([children, 8, 1200]);
+    assert.equal((await replacing).length, 6, 'public result remains the server array');
+    assert.equal(h.objectSync.getObject('deleted'), undefined);
+    assert.equal(h.objectSync.getObject('departed'), undefined);
+    assert.equal(h.objectSync.getObject('updated').version, 4);
+    assert.equal(h.objectSync.getObject('updated').data.value, 4);
+    assert.equal(h.objectSync.getObject('updated').data.staticField, 'seed');
+    assert.equal(h.objectSync.getObject('updated').validAt, 3990);
+    assert.equal(h.objectSync.getObject('migrated').ownerMemberId, 'new-owner');
+    assert.equal(h.objectSync.getObject('migrated').version, 2);
+    assert.equal(h.objectSync.getObject('migrated').ownershipMigrationPending, true);
+    assert.deepEqual(anchored, ['fresh'], 'older spawn anchors never replace newer presentation');
+});
+
+for (const reset of ['clear', 'session']) {
+    test(`replacement result is inert after ${reset} epoch reset`, async () => {
+        const h = await replacementHarness();
+        let notifications = 0;
+        h.objectSync.on('onObjectCreated', () => notifications++);
+        h.objectSync.on('onObjectReplaced', () => notifications++);
+        const replacing = h.objectSync.replaceObject(h.parentId, [{ type: 'counter' }]);
+        if (reset === 'clear') h.objectSync.clear();
+        else h.client.clearSessionState();
+        h.responseGate.resolve([[objectInfo('old-child', 1, { type: 'counter' })], 10, 2000]);
+        assert.equal(await replacing, null);
+        assert.equal(h.objectSync.getObjectCount(), 0);
+        assert.equal(notifications, 0);
+    });
+}
+
+test('replacement callbacks stop after a synchronous reset', async () => {
+    const h = await replacementHarness();
+    const notifications = [];
+    h.objectSync.on('onObjectDeleted', () => {
+        notifications.push('delete');
+        h.objectSync.clear();
+    });
+    h.objectSync.on('onObjectCreated', () => notifications.push('create'));
+    h.objectSync.on('onObjectReplaced', () => notifications.push('replace'));
+    const replacing = h.objectSync.replaceObject(h.parentId, [{ type: 'counter' }]);
+    h.responseGate.resolve([[objectInfo('child', 1, { type: 'counter' })], 10, 2000]);
+    assert.equal(await replacing, null);
+    assert.deepEqual(notifications, ['delete']);
+    assert.equal(h.objectSync.getObjectCount(), 0);
+});
+
+test('a lost replacement response reconciles the committed children and removes the ghost parent', async () => {
+    const h = await replacementHarness();
+    const child = objectInfo('committed-child', 1, { type: 'counter', value: 2 });
+    h.connection.invokers.set('GetSessionState', () => Promise.resolve({
+        members: [], objects: [child], validAts: [['committed-child', 1234]],
+        memberSequences: [[h.client.getCurrentMember().id, 10]]
+    }));
+    const reconciled = deferred();
+    h.objectSync.on('onReconciliationComplete', reconciled.resolve);
+    const replacing = h.objectSync.replaceObject(h.parentId, [child.data]);
+    h.responseGate.reject(new Error('response lost after commit'));
+    await assert.rejects(replacing, /response lost/);
+    await reconciled.promise;
+    assert.equal(h.objectSync.getObject(h.parentId), undefined);
+    assert.equal(h.objectSync.getObject('committed-child').validAt, 1234);
+    assert.equal(h.objectSync.getReconciliationCount(), 1);
+});
+
+for (const outcome of ['empty', 'null', 'error']) {
+    test(`replacement ${outcome} result preserves authoritative success/failure semantics`, async () => {
+        const h = await replacementHarness();
+        const notifications = [];
+        h.objectSync.on('onObjectReplaced', (...args) => notifications.push(args));
+        const replacing = h.objectSync.replaceObject(h.parentId, []);
+        if (outcome === 'error') {
+            h.responseGate.reject(new Error('transport failed'));
+            await assert.rejects(replacing, /transport failed/);
+        } else {
+            h.responseGate.resolve(outcome === 'null' ? null : [[], 2, 3000]);
+            assert.deepEqual(await replacing, outcome === 'null' ? null : []);
+        }
+        assert.equal(!!h.objectSync.getObject(h.parentId), outcome !== 'empty');
+        assert.equal(notifications.length, outcome === 'empty' ? 1 : 0);
+        if (outcome === 'empty') assert.deepEqual(notifications[0], [h.parentId, [], 3000]);
+    });
+}
+
+for (const overtaking of ['update', 'delete', 'migration']) {
+    test(`create response respects an overtaking ${overtaking}`, async () => {
+        const client = makeObjectSyncClient();
+        const gate = deferred();
+        client.createObject = () => gate.promise;
+        const sync = loadObjectSync(client);
+        sync.init();
+        const creating = sync.createObject({ type: 'counter' });
+        if (overtaking === 'update') {
+            client.handlers.onObjectsUpdated(
+                [{ id: 'child', version: 3, data: { value: 3 } }],
+                3000, 'other', 1, 1, 50, 2990);
+        } else if (overtaking === 'delete') {
+            client.handlers.onObjectDeleted('child', 'other', 1);
+        } else {
+            sync.handleOwnershipMigration([
+                { objectId: 'child', newOwnerId: 'new-owner', newVersion: 2 }
+            ]);
+        }
+        gate.resolve({
+            objectInfo: objectInfo('child', 1, { type: 'counter', value: 1, seed: 5 }),
+            memberSequence: 1, validAt: 1000
+        });
+        await creating;
+        const child = sync.getObject('child');
+        if (overtaking === 'delete') assert.equal(child, undefined);
+        else {
+            assert.equal(child.data.seed, 5);
+            assert.equal(child.version, overtaking === 'update' ? 3 : 2);
+            assert.equal(child.ownerMemberId, overtaking === 'update' ? 'owner' : 'new-owner');
+            assert.equal(child.validAt, overtaking === 'update' ? 2990 : 1000);
+        }
+    });
+}
+
+function schedulerHarness() {
+    const client = makeObjectSyncClient();
+    const calls = [];
+    client.updateObjects = async (updates, sequence, interval) => {
+        calls.push({ updates, sequence, interval });
+        return { versions: {}, memberSequence: sequence };
+    };
+    client.deleteObject = async () => ({ success: true, memberSequence: 1 });
+    const sync = loadObjectSync(client);
+    sync.init();
+    sync.configure({ nominalFrameTime: 0.1, deltaEncoding: false });
+    client.join({ objects: [objectInfo('state', 1, { type: 'counter', value: 0 })] });
+    return { sync, client, calls };
+}
+
+test('elapsed scheduler handles varying frame duration without rounding or catch-up bursts', async () => {
+    const { sync, calls } = schedulerHarness();
+    sync.updateObject('state', { value: 1 });
+    for (const dt of [0.01, 0.04, 0.02, 0.029]) sync.tick(dt);
+    assert.equal(calls.length, 0, '99ms is still below the real 100ms interval');
+    sync.tick(0.001);
+    assert.equal(calls.length, 1);
+    await drainMicrotasks();
+    sync.updateObject('state', { value: 2 });
+    sync.tick(10);
+    assert.equal(calls.length, 2, 'a stall grants one opportunity, not 100');
+    await drainMicrotasks();
+    sync.updateObject('state', { value: 3 });
+    sync.tick(0.001);
+    assert.equal(calls.length, 2, 'no retained catch-up debt');
+    sync.tick(0.099);
+    assert.equal(calls.length, 3);
+});
+
+test('elapsed scheduler validates time without inventing time for zero or tiny frames', () => {
+    const { sync, calls } = schedulerHarness();
+    sync.configure({ minFrameTime: 1 });
+    sync.updateObject('state', { value: 1 });
+    for (const dt of [NaN, Infinity, -Infinity, -1, undefined, '1', 0]) sync.tick(dt);
+    for (let i = 0; i < 100; i++) sync.tick(0.0001);
+    assert.equal(calls.length, 0);
+    sync.tick(0.09);
+    assert.equal(calls.length, 1);
+    for (const nominalFrameTime of [NaN, Infinity, 0, -1]) {
+        assert.throws(() => sync.configure({ nominalFrameTime }), RangeError);
+    }
+});
+
+test('elapsed scheduler retains due work behind one invoke and only pumps on a tick', async () => {
+    const { sync, client, calls } = schedulerHarness();
+    const gate = deferred();
+    const update = client.updateObjects;
+    client.updateObjects = (...args) => { update(...args); return gate.promise; };
+    sync.updateObject('state', { value: 1 });
+    sync.tick(0.1);
+    sync.updateObject('state', { value: 2 });
+    sync.tick(5);
+    sync.tick(5);
+    assert.equal(calls.length, 1);
+    client.updateObjects = update;
+    gate.resolve({ versions: {}, memberSequence: 1 });
+    await drainMicrotasks();
+    assert.equal(calls.length, 1, 'no completion-triggered draining');
+    sync.tick(0);
+    assert.equal(calls.length, 2, 'already-elapsed eligibility is retained');
+    assert.equal(calls[1].updates[0].data.value, 2);
+});
+
+for (const removal of ['delete', 'replace', 'clear']) {
+    test(`pending urgency disappears when its object is removed by ${removal}`, async () => {
+        const { sync, client, calls } = schedulerHarness();
+        const gate = deferred();
+        const update = client.updateObjects;
+        client.updateObjects = (...args) => { update(...args); return gate.promise; };
+        sync.updateObject('state', { value: 1 }, true);
+        sync.updateObject('state', { value: 2 }, true);
+        if (removal === 'delete') await sync.deleteObject('state');
+        else if (removal === 'replace') {
+            client.handlers.onObjectReplaced(
+                { deletedObjectId: 'state', createdObjects: [] }, 'other', 1, 1000);
+        } else sync.clear();
+        client.updateObjects = update;
+        client.handlers.onObjectCreated(objectInfo('new', 1, { type: 'counter' }), 'other', 2, 1000);
+        sync.updateObject('new', { value: 3 });
+        gate.resolve({ versions: {}, memberSequence: 1 });
+        await drainMicrotasks();
+        sync.tick(0.001);
+        assert.equal(calls.length, 1, 'ordinary work must not inherit deleted urgency');
+        sync.tick(0.099);
+        assert.equal(calls.length, 2);
+        assert.deepEqual(calls[1].updates.map(obj => obj.objectId), ['new']);
+    });
+}
+
+test('elapsed scheduler adapts interval changes, ignores invalid RTT, and resets cadence on manual flush', async () => {
+    const { sync, calls } = schedulerHarness();
+    sync.configure({ adaptiveSendRate: true });
+    sync.updateObject('state', { value: 1 });
+    sync.tick(0.04);
+    sync.updateSendRate(50);
+    sync.tick(0.01);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].interval, 50);
+    for (const rtt of [NaN, Infinity, -1]) sync.updateSendRate(rtt);
+    assert.equal(sync.getSendRate(), 20);
+    await drainMicrotasks();
+    sync.updateObject('state', { value: 2 });
+    sync.tick(0.04);
+    await sync.flushUpdates();
+    sync.updateObject('state', { value: 3 });
+    sync.tick(0.01);
+    assert.equal(calls.length, 2);
+    sync.tick(0.04);
+    assert.equal(calls.length, 3);
+});
+
+test('ObjectSync transfers independent type membership snapshots with borrowed records', () => {
+    const { sync, client } = schedulerHarness();
+    const snapshot = sync.getObjectsByTypeSnapshot('counter');
+    assert.equal(snapshot[0], sync.getObject('state'), 'record data is not deep-cloned');
+    snapshot.length = 0;
+    assert.equal(sync.getObjectsByType('counter').length, 1, 'caller owns the array');
+    const retained = sync.getObjectsByTypeSnapshot('counter');
+    client.handlers.onObjectDeleted('state', 'other', 1);
+    assert.equal(retained.length, 1, 'later registry mutations cannot change membership');
+    assert.equal(sync.getObjectsByTypeSnapshot('counter').length, 0);
 });
 
 test('stale create completion is ignored after reset', async () => {

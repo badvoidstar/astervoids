@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
+const { SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
 
 function hexToBytes(hex) {
     if (hex.length % 2 !== 0) throw new Error(`odd hex length: ${hex.length}`);
@@ -31,6 +32,7 @@ const SHIP_SCHEMA_FIELDS = [
     ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'], ['turnBias', 'q16s'],
     ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
     ['terminalY', 'f64'], ['terminalAngle', 'f64'],
+    ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
 ];
 const ASTEROID_SCHEMA_FIELDS = [
     ['type', 'str'],
@@ -50,6 +52,14 @@ const BULLET_SCHEMA_FIELDS = [
     ['hitOffsetN', 'q16s'], ['terminalEpoch', 'f64'],
     ['terminalX', 'f64'], ['terminalY', 'f64'],
 ];
+
+test('cross-wire fixtures match every production positional field', () => {
+    for (const [id, fields] of [
+        [1, SHIP_SCHEMA_FIELDS], [2, ASTEROID_SCHEMA_FIELDS], [3, BULLET_SCHEMA_FIELDS]
+    ]) {
+        assert.deepEqual(fields, SCHEMAS.find(schema => schema.id === id).fields);
+    }
+});
 
 test('cross-wire: asteroid update — all fields', () => {
     freshRegistry();
@@ -75,7 +85,7 @@ test('cross-wire: ship update — mixed types', () => {
     freshRegistry();
     const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
     const bytes = hexToBytes(
-        'fe0100' +
+        'fe010000' +
         '0080' +
         '0080' +
         '00000000' +
@@ -99,7 +109,7 @@ test('cross-wire: ship update — mixed types', () => {
 test('cross-wire: ship update — values beyond the unit interval', () => {
     freshRegistry();
     const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
-    const bytes = hexToBytes('102000' + '0000c03f' + '0000c03f');
+    const bytes = hexToBytes('10200000' + '0000c03f' + '0000c03f');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.equal(decoded.velocityX, 1.5);
     assert.equal(decoded.thrustInput, 1.5);
@@ -193,13 +203,14 @@ test('cross-wire: unified ship create encoding length is byte-stable', () => {
     freshRegistry();
     const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, { type: 'ship', x: 0.5, y: 0.25 });
-    assert.equal(bytes.length, 3 + 2 + 4 + 2 + 2);
+    assert.equal(bytes.length, 4 + 2 + 4 + 2 + 2);
     assert.equal(bytes[0], 0x07);
     assert.equal(bytes[1], 0x00);
     assert.equal(bytes[2], 0x00);
-    assert.equal(bytes[3], 0x04);
-    assert.equal(bytes[4], 0x00);
-    assert.equal(String.fromCharCode(bytes[5], bytes[6], bytes[7], bytes[8]), 'ship');
+    assert.equal(bytes[3], 0x00);
+    assert.equal(bytes[4], 0x04);
+    assert.equal(bytes[5], 0x00);
+    assert.equal(String.fromCharCode(bytes[6], bytes[7], bytes[8], bytes[9]), 'ship');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.equal(decoded.type, 'ship');
     assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
@@ -219,9 +230,18 @@ test('cross-wire: persisted ship terminal target uses exact f64 fields', () => {
         .map(b => b.toString(16).padStart(2, '0')).join('');
     assert.equal(
         hex,
-        '0000f0'
+        '0000f000'
         + '0000000000408f40'
         + '000000000000d03f'
         + '000000000000e83f'
         + '182d4454fb210940');
+});
+
+test('cross-wire: invulnerability transition and capture time have canonical bytes', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(1, SHIP_SCHEMA_FIELDS);
+    const data = { invulnerable: 180, invulnerabilityRevision: 7, invulnerableAt: 1000 };
+    const hex = '00010003' + 'b400' + '07000000' + '0000000000408f40';
+    assert.deepEqual(SchemaCodec.decode(schema, hexToBytes(hex)), data);
+    assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
 });

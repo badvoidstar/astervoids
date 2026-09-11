@@ -18,9 +18,11 @@ function deferred() {
     return { promise, resolve };
 }
 
-function createRegionHarness({ manifest = regions, ping, manifestResponse, hidden = false } = {}) {
+function createRegionHarness({ manifest = regions, ping, manifestResponse, hidden = false, latencyMs = () => 20 } = {}) {
     const timers = new Map();
     const visibilityListeners = new Set();
+    const onlineListeners = new Set();
+    const connectionListeners = new Set();
     const requests = [];
     let nextTimer = 0;
     let now = 0;
@@ -29,7 +31,21 @@ function createRegionHarness({ manifest = regions, ping, manifestResponse, hidde
         addEventListener: (_, listener) => visibilityListeners.add(listener),
         removeEventListener: (_, listener) => visibilityListeners.delete(listener),
     };
-    const window = { location: { origin: regions[0].hostname } };
+    const window = {
+        location: { origin: regions[0].hostname },
+        addEventListener: (event, listener) => {
+            assert.equal(event, 'online');
+            onlineListeners.add(listener);
+        },
+        removeEventListener: (event, listener) => onlineListeners.delete(listener),
+    };
+    const navigator = { connection: {
+        addEventListener: (event, listener) => {
+            assert.equal(event, 'change');
+            connectionListeners.add(listener);
+        },
+        removeEventListener: (event, listener) => connectionListeners.delete(listener),
+    } };
     const setTimeout = (fn, delay) => {
         timers.set(++nextTimer, { fn, delay });
         return nextTimer;
@@ -37,7 +53,7 @@ function createRegionHarness({ manifest = regions, ping, manifestResponse, hidde
     const clearTimeout = id => timers.delete(id);
     const module = { exports: {} };
     runInNewContext(regionSource, {
-        module, window, document, AbortController, console, Date, setTimeout, clearTimeout,
+        module, window, document, navigator, AbortController, console, Date, setTimeout, clearTimeout,
         performance: { now: () => now },
         fetch: async (url, init) => {
             if (url.endsWith('/api/regions')) {
@@ -45,7 +61,7 @@ function createRegionHarness({ manifest = regions, ping, manifestResponse, hidde
             }
             const request = { url, signal: init.signal };
             requests.push(request);
-            now += 20;
+            now += latencyMs();
             return ping ? ping(request, requests.length) : ok();
         },
     });
@@ -62,10 +78,153 @@ function createRegionHarness({ manifest = regions, ping, manifestResponse, hidde
         for (const listener of [...visibilityListeners]) listener();
     }
     return {
-        service, window, document, timers, requests, visibilityListeners,
+        service, window, document, timers, requests, visibilityListeners, onlineListeners, connectionListeners,
         runTimers, visibility, setTimeout, clearTimeout,
+        online: () => { for (const listener of [...onlineListeners]) listener(); },
+        networkChange: () => { for (const listener of [...connectionListeners]) listener(); },
     };
 }
+
+test('RTT bootstrap stays rapid until full confidence, then stable bursts back off to a bounded cadence', async t => {
+    const h = createRegionHarness({ manifest: regions.slice(0, 1) });
+    t.after(() => h.service.stop());
+    h.service._configure({ BURST_INTERVAL_MS: 5000 });
+    await h.service.load();
+    h.service.start();
+    await h.runTimers();
+    assert.equal(h.requests.length, 3, 'bootstrap still sends its three immediate pings');
+    for (let sampleCount = 1; sampleCount <= 10; sampleCount++) {
+        assert.equal(h.service.getRtt('a').sampleCount, sampleCount);
+        assert.equal(h.service.getRtt('a').confidence, sampleCount / 10);
+        assert.deepEqual([...h.timers.values()].map(timer => timer.delay), [5000]);
+        if (sampleCount < 10) await h.runTimers(5000);
+    }
+    for (const delay of [10_000, 20_000, 40_000, 60_000, 60_000, 60_000]) {
+        await h.runTimers(Infinity);
+        assert.deepEqual([...h.timers.values()].map(timer => timer.delay), [delay]);
+        assert.equal(h.service.getRtt('a').state, 'settled');
+    }
+    const count = h.requests.length;
+    await h.runTimers(59_999);
+    assert.equal(h.requests.length, count, 'settled regions no longer send five-second bursts');
+});
+
+for (const initialFailure of [false, true]) {
+    test(`${initialFailure ? 'unavailable' : 'cold-start'} regions retain rapid retry and recovery before backing off`, async t => {
+        let failing = initialFailure;
+        const h = createRegionHarness({
+            manifest: regions.slice(0, 1),
+            latencyMs: () => 2000,
+            ping: () => {
+                if (failing) throw new Error('unreachable');
+                return ok();
+            },
+        });
+        t.after(() => h.service.stop());
+        h.service._configure({ BURST_INTERVAL_MS: 5000, CONFIDENCE_FULL_AFTER_SAMPLES: 2 });
+        await h.service.load();
+        h.service.start();
+        await h.runTimers();
+        assert.equal(h.service.getRtt('a').state, initialFailure ? 'unavailable' : 'warming');
+        assert.equal([...h.timers.values()][0].delay, 5000);
+        failing = false;
+        await h.runTimers(5000);
+        assert.equal(h.service.getRtt('a').valueMs, 2000, 'only the genuine first slow sample is suppressed');
+        assert.equal(h.service.getRtt('a').confidence, 0.5);
+        assert.equal([...h.timers.values()][0].delay, 5000);
+        await h.runTimers(5000);
+        assert.equal(h.service.getRtt('a').confidence, 1);
+        assert.equal([...h.timers.values()][0].delay, 5000);
+        await h.runTimers(5000);
+        assert.equal([...h.timers.values()][0].delay, 10_000);
+    });
+}
+
+for (const disturbance of ['partial failure', 'total failure', 'latency increase', 'latency decrease']) {
+    test(`RTT ${disturbance} resets stable backoff without losing an assessed region`, async t => {
+        let latency = 100;
+        let failing = false;
+        const h = createRegionHarness({
+            manifest: regions.slice(0, 1),
+            latencyMs: () => latency,
+            ping: (_, count) => {
+                if (failing && (disturbance === 'total failure' || count % 3 === 1)) {
+                    throw new Error('unreachable');
+                }
+                return ok();
+            },
+        });
+        t.after(() => h.service.stop());
+        h.service._configure({ BURST_INTERVAL_MS: 5000, CONFIDENCE_FULL_AFTER_SAMPLES: 2 });
+        await h.service.load();
+        h.service.start();
+        for (let i = 0; i < 6; i++) await h.runTimers(Infinity);
+        assert.equal([...h.timers.values()][0].delay, 60_000);
+
+        latency = 115;
+        await h.runTimers(Infinity);
+        assert.equal([...h.timers.values()][0].delay, 60_000, 'ordinary relative jitter stays backed off');
+        latency = disturbance === 'latency increase' ? 250
+            : disturbance === 'latency decrease' ? 20 : h.service.getRtt('a').valueMs;
+        failing = disturbance.includes('failure');
+        await h.runTimers(Infinity);
+        assert.equal([...h.timers.values()][0].delay, 5000);
+        assert.equal(h.service.areAllRegionsAssessed(), true);
+        assert.equal(h.service.isRegionAvailable('a'), true);
+        assert.equal(h.service.getRtt('a').confidence, 1, 'transient failures retain accumulated measurements');
+
+        failing = false;
+        latency = h.service.getRtt('a').valueMs;
+        await h.runTimers(Infinity);
+        assert.equal([...h.timers.values()][0].delay, 10_000, 'stable cadence rebuilds from the base, not its old maximum');
+    });
+}
+
+test('visibility and network changes promptly reassess a stable region and reset backoff', async t => {
+    const pending = deferred();
+    let block = false;
+    const h = createRegionHarness({
+        manifest: regions.slice(0, 1),
+        ping: () => block ? pending.promise : ok(),
+    });
+    t.after(() => h.service.stop());
+    h.service._configure({ BURST_INTERVAL_MS: 5000, CONFIDENCE_FULL_AFTER_SAMPLES: 2 });
+    await h.service.load();
+    h.service.start();
+    for (let i = 0; i < 6; i++) await h.runTimers(Infinity);
+    assert.equal([...h.timers.values()][0].delay, 60_000);
+    const measured = h.service.getRtt('a');
+    h.visibility(true);
+    h.online();
+    h.networkChange();
+    assert.equal(h.timers.size, 0, 'network events never reactivate hidden probes');
+    assert.strictEqual(h.service.getRtt('a'), measured);
+    h.visibility(false);
+    await h.runTimers();
+    assert.equal(h.service.getRtt('a').sampleCount, measured.sampleCount + 1);
+    assert.equal([...h.timers.values()][0].delay, 10_000);
+
+    block = true;
+    h.networkChange();
+    await h.runTimers();
+    const cancelled = h.requests.at(-1);
+    block = false;
+    h.online();
+    assert.equal(cancelled.signal.aborted, true, 'a new network invalidates the in-flight measurement');
+    await h.runTimers();
+    const fresh = h.service.getRtt('a');
+    assert.equal(fresh.sampleCount, measured.sampleCount + 2);
+    pending.resolve(ok());
+    await drain();
+    assert.strictEqual(h.service.getRtt('a'), fresh, 'old network completion cannot change RTT');
+    h.service.stop();
+    assert.equal(h.onlineListeners.size, 0);
+    assert.equal(h.connectionListeners.size, 0);
+    h.online();
+    h.networkChange();
+    await h.runTimers(Infinity);
+    assert.equal(h.timers.size, 0);
+});
 
 for (const manifest of [regions.slice(0, 1), regions]) {
     test(`${manifest.length} region(s): picker stop aborts a burst, rejects stale completion, and resumes fresh`, async t => {

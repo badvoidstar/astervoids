@@ -74,7 +74,7 @@ These rules are enforced purely by module structure and must not be violated whe
   payloads remain unchanged; callers above the transport keep readable IDs.
 - **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
 - **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
-- **Send rate is decoupled from frame rate.** The game calls only `ObjectSync.tick(frameTimeSec)` once per frame; `ObjectSync` internally computes `sendThreshold` from `nominalFrameTime` and flushes batched mutations independently.
+- **Send rate is decoupled from frame rate.** The game calls `ObjectSync.tick(frameTimeSec)` at its existing reconciliation pivot; ObjectSync accumulates elapsed time against its RTT-derived interval. Immediate updates retain urgency under backpressure; at most one update invocation is in flight, with no catch-up bursts after stalls.
 - **`ReplicationRuntime` is pull-driven.** It never owns a frame loop, calls
   `ObjectSync.tick`, sends a mutation, or subscribes to SignalR. The game invokes
   one type reconciliation at each existing collision-visible simulation pivot.
@@ -206,11 +206,33 @@ refresh reusable world points with one rotation transform, shared by drawing
 and collision. `getWorldVertices()` returns borrowed read-only storage, valid
 until the next refresh; consumers must not retain a pose across refreshes.
 
+Aspect compensation caches immutable results against session mode, effective
+severity and both balance/difficulty settings. Motion caps remain enforced at
+simulation and serialization boundaries. Collision passes lazily prepare each
+asteroid's pixel bounds and wrapped displacement once, sharing exact borrowed
+geometry between bullet and ship checks without freezing collection membership:
+same-pass split children remain eligible in the existing traversal order.
+
+Local render interpolation uses reentrant scratch storage rather than aggregate
+entity arrays and per-entity pose tuples. Restoration remains in `finally`,
+including preparation failures; entity references are cleared after use.
+Retained storage is bounded to four buffers of at most 1,024 poses each.
+Rendered overlays/mobile visibility use change-gated writes. Analog input skips
+idle mapping and reuses its result until input, anchor identity, viewport scale,
+control mode or mapping configuration changes.
+
 Tests import production modules directly where possible. For declarations that
 remain inline, `AstervoidsWeb/test-support/inline-game.mjs` loads selected
 functions/classes using Node's parser and explicitly supplied dependencies,
 without starting the browser runtime. Expected results and deliberate
 architecture/order assertions remain independent of the implementation.
+
+Performance regressions use these same production-function harnesses: repeated
+aspect queries reuse one derivation, 600 frames of 200 entities reuse one flat
+render buffer, and a 32-bullet/200-asteroid pass prepares asteroid movement once
+per object rather than once per pair. These operation/allocation assertions and
+wire-size budgets are not substitutes for device frame-time, GC or end-to-end
+network profiling.
 
 ### Future Native Client Contract
 
@@ -246,7 +268,7 @@ All wrappers route through `invokeHub()`, which enforces session membership and 
 | `getActiveSessions()` | `GetActiveSessions` | — | `{ sessions[], maxSessions, canCreateSession }` |
 | `createObject(data, scope, ownerMemberId?, clientValidAt?)` | `CreateObject` | `data, scope, ownerMemberId?, clientValidAt?` | `{ objectInfo, memberSequence }` |
 | `updateObjects(updates, senderSequence, senderSendIntervalMs, clientValidAt?)` | `UpdateObjects` | `updates[], senderSequence, senderSendIntervalMs, clientValidAt?` | `{ versions{}, memberSequence, serverTimestamp }` |
-| `replaceObject(deleteObjectId, replacements, scope, ownerMemberId?, clientValidAt?)` | `ReplaceObject` | `deleteObjectId, replacements[], scope, ownerMemberId?, clientValidAt?` | `createdInfos[]` |
+| `replaceObject(deleteObjectId, replacements, scope, ownerMemberId?, clientValidAt?)` | `ReplaceObject` | `deleteObjectId, replacements[], scope, ownerMemberId?, clientValidAt?` | `createdInfos[]` (normalized from `[createdObjects, memberSequence, validAt]`; applied before resolution) |
 | `deleteObject(objectId)` | `DeleteObject` | `objectId` | `{ success, memberSequence }` |
 | `getSessionState()` | `GetSessionState` | — | `{ members[], objects[], memberSequences{} }` |
 
@@ -316,16 +338,16 @@ after the session callback has initialized snapshot consumers.
 | Method | Description |
 |---|---|
 | `createObject(data, scope?, ownerMemberId?, isStillNeeded?)` | **Response-first**: invokes `CreateObject`, registers the server-assigned id + version; if `isStillNeeded()` returns `false` after the round-trip, fires a fire-and-forget delete to clean up the orphan |
-| `updateObject(id, data, immediate?)` | Mutates the local object immediately and queues for batched flush; `immediate=true` forces a flush without waiting for `tick()` |
+| `updateObject(id, data, immediate?)` | Mutates the local object immediately and queues for batched flush; `immediate=true` flushes now if possible, otherwise retains urgency for the next eligible tick |
 | `deleteObject(id)` | **Local-first**: removes from the local map and `pendingUpdates`, adds to `pendingDeletes`, then invokes `DeleteObject` |
-| `replaceObject(deleteId, replacements, scope?, ownerMemberId?)` | Atomic delete-plus-create round-trip; local map is not mutated until the `OnObjectReplaced` broadcast echo arrives |
+| `replaceObject(deleteId, replacements, scope?, ownerMemberId?)` | Atomic delete-plus-create round-trip; sender applies the response through the same replacement handler as remote broadcasts, before returning the children array |
 | `flushUpdates()` | Builds the wire batch (delta or full), compresses field names via `fieldMap`, and calls `SessionClient.updateObjects` |
 
 #### Frame Pump
 
 | Method | Description |
 |---|---|
-| `tick(frameTimeSec)` | Called once per game frame; recomputes `sendThreshold = round(nominalFrameTime / clampedFrameTime)`, increments the frame counter, and calls `flushUpdates()` when the threshold is reached |
+| `tick(frameTimeSec)` | Accumulates nonnegative finite elapsed seconds, capped at one interval; services elapsed eligibility or pending urgency when no update invocation is in flight |
 
 #### Queries
 
@@ -335,6 +357,7 @@ after the session callback has initialized snapshot consumers.
 | `getAllObjects()` | Returns an array of all locally tracked objects |
 | `getObjectsByOwner(memberId)` | Returns all objects where `ownerMemberId === memberId` |
 | `getObjectsByType(type)` | O(n-matching) type lookup via the internal `typeIndex` |
+| `getObjectsByTypeSnapshot(type)` | Same implementation, explicitly transferring ownership of the membership array; records remain canonical references. ReplicationRuntime avoids a second copy when this optional store method exists, and otherwise snapshots legacy stores defensively |
 | `getObjectByType(type)` | O(1) singleton lookup (e.g. `GameState`) via `typeIndex` |
 | `getObjectCount()` | Returns the number of locally tracked objects |
 | `getReconciliationCount()` | Returns the number of completed reconciliations in this session |
@@ -755,7 +778,7 @@ flowchart TB
         CO["CreateObject(data, scope, ownerMemberId?)<br/>→ Broadcast: OnObjectCreated to OthersInGroup<br/>→ Response: objectInfo + memberSequence"]
         UO["UpdateObjects(updates[], senderSeq,<br/>clientTimestamp, senderSendIntervalMs)<br/>→ ObjectService filters to caller-owned objects atomically<br/>→ Broadcast: OnObjectsUpdated to OthersInGroup<br/>→ Response: versions{} + memberSequence + serverTimestamp"]
         DO["DeleteObject(objectId)<br/>→ ObjectService enforces ownership atomically<br/>→ Broadcast: OnObjectDeleted to OthersInGroup<br/>→ Response: success + memberSequence"]
-        RO["ReplaceObject(deleteId, replacements[],<br/>scope, ownerMemberId?)<br/>→ ObjectService atomic delete + create (ownership enforced)<br/>→ Broadcast: OnObjectReplaced to Group (ALL)<br/>→ Response: createdInfos[]"]
+        RO["ReplaceObject(deleteId, replacements[],<br/>scope, ownerMemberId?)<br/>→ ObjectService atomic delete + create (ownership enforced)<br/>→ Broadcast: OnObjectReplaced to OthersInGroup<br/>→ Response: children, memberSequence, validAt"]
         GS["GetSessionState()<br/>→ No broadcast (read-only)<br/>→ Response: full snapshot (members, objects, sequences)"]
     end
 ```
@@ -826,8 +849,8 @@ flowchart TB
 
     subgraph "Broadcast Targets"
         ALL_BC["OnSessionsChanged<br/>→ AllClients"]
-        OTHERS["OnObjectCreated/Updated/Deleted<br/>→ OthersInGroup (sender excluded)"]
-        GROUP["OnMemberLeft, OnObjectReplaced<br/>→ Group (ALL in session)"]
+        OTHERS["OnObjectCreated/Updated/Deleted/Replaced<br/>→ OthersInGroup (sender excluded)"]
+        GROUP["OnMemberLeft<br/>→ Group (ALL in session)"]
     end
 ```
 
@@ -838,7 +861,7 @@ sequenceDiagram
     participant C as Caller (asteroid owner)
     participant HUB as SessionHub
     participant OS as ObjectService
-    participant ALL as All Session Members
+    participant ALL as Other Session Members
 
     Note over C: Asteroid split — need atomic delete + create children
     C->>HUB: ReplaceObject(deleteId, [{child1Data}, {child2Data}],<br/>scope="Session", ownerMemberId=null)
@@ -850,11 +873,12 @@ sequenceDiagram
 
     HUB->>HUB: memberSequence = Interlocked.Increment
 
-    HUB->>ALL: OnObjectReplaced({<br/>  deletedObjectId,<br/>  createdObjects[{Id, Owner, Scope, Data, Version}]<br/>}, memberId, memberSequence, serverTimestamp)
+    HUB->>ALL: OnObjectReplaced({<br/>  deletedObjectId,<br/>  createdObjects[{Id, Owner, Scope, Data, Version}]<br/>}, memberId, memberSequence, serverTimestamp, validAt)
 
-    Note over ALL: Broadcast to ALL (not OthersInGroup)<br/>because caller also needs to sync<br/>new server-assigned Ids for children
+    Note over ALL: Only other members receive the broadcast
 
-    HUB-->>C: Response: createdInfos[]
+    HUB-->>C: Response: [createdInfos[], memberSequence, validAt]
+    Note over C: Shared replacement application installs children<br/>and removes parent before lifecycle callbacks;<br/>public API still returns createdInfos[]
 ```
 
 ## Session & Member Model
@@ -944,11 +968,11 @@ sequenceDiagram
     Note over GL,OS: Tick/Flush cycle (send rate ≠ frame rate)
     loop Every frame
         GL->>OS: tick(frameTimeSec)
-        OS->>OS: frameCounter++
-        Note over OS: sendThreshold = round(nominalFrameTime / frameTime)<br/>e.g. 50ms / 16.7ms ≈ 3 frames
+        OS->>OS: Accumulate elapsed seconds, capped at nominalFrameTime
+        Note over OS: Keep pending immediate-update urgency<br/>until a flush can service it
     end
 
-    Note over OS: frameCounter >= sendThreshold → flush
+    Note over OS: Interval elapsed or urgent update → flush if idle
     OS->>OS: Compute deltas (only changed fields)
     OS->>OS: Check inFlightCount > 0? → skip (backpressure)
     OS->>OS: inFlightCount++, senderSequence++
@@ -1007,7 +1031,7 @@ flowchart LR
     end
 
     subgraph "Backpressure"
-        BP["flushInProgress?<br/>→ cap frame counter at threshold<br/>→ flush on next tick after completion<br/>(instant congestion signal)"]
+        BP["flushInProgress?<br/>→ retain elapsed eligibility and urgency<br/>→ flush on next eligible tick after completion<br/>→ no completion-driven or catch-up bursts"]
     end
 
     EMA --> FORMULA
@@ -1018,6 +1042,22 @@ TX is the shared ObjectSync flush cadence for both simulation modes. It is not
 the same as buffered BUF (render delay), and it is not a packet guarantee:
 game-layer send-on-change gates may queue nothing, while in-flight backpressure
 can coalesce multiple simulation frames into a later batch.
+
+Ship invulnerability remains authoritative in simulation ticks. The game schema
+appends `invulnerabilityRevision` (`u32`) and `invulnerableAt` (`f64` server-time
+capture timestamp) to the existing counter. Respawn/reset and expiry advance the
+revision; ordinary countdown ticks do not. The game injects that revision as the
+ship send gate's transition key, so unchanged invulnerable ships send on the
+existing heartbeat rather than every simulation step.
+
+Receivers derive the presentation countdown and blink phase from the captured
+remaining ticks/time, including buffered render delay. Before clock bootstrap
+they use receipt time; a zero authored timestamp falls back to record `validAt`.
+Explicit revisions distinguish respawn teleports from heartbeat timing
+corrections, including repeated resets to the same duration. Heartbeat captures
+re-anchor any simulation-versus-wall-time drift; owner hidden-tab/step-clamp
+semantics remain unchanged. These fields and their interpretation stay in the
+game adapter/schema; generic transport treats them as opaque payload data.
 
 Deterministic ship rotation uses two presentation paths. Target-heading touch
 controls replay toward their transmitted target angle and cannot turn past it.
@@ -1241,11 +1281,23 @@ sequenceDiagram
     Note over B: B scans remote bullets for pendingHit on own asteroids
     B->>B: Process split: create child asteroids
     B->>SRV: ReplaceObject(asteroidId, [child1, child2])
-    SRV->>A: OnObjectReplaced (broadcast to ALL)
-    SRV->>B: OnObjectReplaced (broadcast to ALL)
+    SRV->>A: OnObjectReplaced (broadcast to others)
+    SRV-->>B: Replacement response (same application path)
 
     Note over A: A sees asteroid replaced → confirms hit, awards points
 ```
+
+The first pending-hit publication includes the collision pose and claim.
+Subsequent publications retry only unconfirmed claim fields, using ObjectSync's
+existing confirmation baseline; hidden pending bullets no longer publish motion
+or lifetime. The owner still advances local lifetime and deletes on expiry or
+target-removal confirmation.
+
+Wave spawning uses at most four concurrent create calls in multiplayer, awaiting
+each bounded group before scheduling more. Random generation/invocation order,
+ownership, cancellation checks and stale-create cleanup remain game-owned.
+Solo spawning remains sequential. This reduces serialized round trips, not the
+number of create messages or server-side operation ordering.
 
 ## Response-First vs Local-First Patterns
 
@@ -1273,12 +1325,12 @@ flowchart TB
         D1 --> D2 --> D3 --> D4 --> D5
     end
 
-    subgraph "ReplaceObject (Broadcast-Dependent)"
+    subgraph "ReplaceObject (Response-First)"
         direction TB
         R1["Invoke server ReplaceObject"]
         R2["Server creates children,<br/>deletes parent"]
-        R3["Broadcast: Group (ALL)<br/>sender included"]
-        R4["Sender updates local Map<br/>from broadcast echo"]
+        R3["Broadcast: OthersInGroup<br/>Response: children + sequence + validAt"]
+        R4["Sender applies response through<br/>the shared replacement handler"]
         R1 --> R2 --> R3 --> R4
     end
 ```
@@ -1535,7 +1587,7 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 
 | SchemaId | Type | Fields (positional, all optional per payload) |
 | --- | --- | --- |
-| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose |
+| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
 | 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; peak ships; game-over/terminal times |
@@ -1715,6 +1767,17 @@ clock synchronization remains independent and active.
 Session-list notifications from the active connection refresh only its region,
 just like spectator notifications. Explicit refreshes and fallback polling still
 cover all regions.
+
+After confidence is full, wholly successful stable RTT bursts progressively
+double their five-second interval up to 60 seconds. Stability allows the greater
+of 10 ms or 20% deviation from the previous EMA. Failures or meaningful changes
+restore the base interval; returning to visibility, going online or a supported
+network-connection change triggers prompt reassessment.
+
+Session-list refreshes are single-flight per region. Hints received during a
+request coalesce into one pending follow-up rather than aborting useful work;
+explicit callers await that follow-up. Teardown still aborts requests and
+invalidates old generations so delayed responses cannot repopulate the picker.
 
 ### Configuration
 

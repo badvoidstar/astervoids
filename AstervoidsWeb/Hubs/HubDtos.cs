@@ -113,6 +113,12 @@ public record CreateObjectResponse(
     [property: Key(2)] long ValidAt);
 
 [MessagePackObject]
+public record ReplaceObjectResponse(
+    [property: Key(0)] List<ObjectInfo> CreatedObjects,
+    [property: Key(1)] long MemberSequence,
+    [property: Key(2)] long ValidAt);
+
+[MessagePackObject]
 public record UpdateObjectsResponse(
     [property: Key(0)] GuidLongPair[] Versions,
     [property: Key(1)] long MemberSequence,

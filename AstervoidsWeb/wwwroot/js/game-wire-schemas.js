@@ -19,6 +19,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['terminalAngle', 'f64'],
+            ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],

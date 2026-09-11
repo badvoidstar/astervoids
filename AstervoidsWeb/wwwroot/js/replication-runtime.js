@@ -76,6 +76,12 @@ const ReplicationRuntime = (function () {
         }
         const getObjectsByType = requireFunction(
             store.getObjectsByType, 'store.getObjectsByType').bind(store);
+        // Opt-in ownership contract, not an Array.isArray heuristic: this method
+        // transfers a membership snapshot that store mutations cannot change.
+        const getObjectsByTypeSnapshot = store.getObjectsByTypeSnapshot === undefined
+            ? type => Array.from(getObjectsByType(type) || [])
+            : requireFunction(store.getObjectsByTypeSnapshot,
+                'store.getObjectsByTypeSnapshot').bind(store);
         const getObject = requireFunction(store.getObject, 'store.getObject').bind(store);
         if (store.getAllObjects !== undefined) {
             requireFunction(store.getAllObjects, 'store.getAllObjects');
@@ -145,21 +151,26 @@ const ReplicationRuntime = (function () {
             });
         }
 
-        function enumerateInstances(descriptor, context) {
+        function enumerateInstances(descriptor, context, retainedIds) {
             const collection = descriptor.getInstances(context);
             if (collection == null || typeof collection[Symbol.iterator] !== 'function') {
                 throw new TypeError(
                     `${descriptor.type}.getInstances must return an iterable`);
             }
-            // Map iteration already produces fresh entry pairs. Snapshot them
-            // once so removal callbacks cannot extend or skip the cleanup pass.
-            if (collection instanceof Map) return Array.from(collection);
             const result = [];
+            if (collection instanceof Map) {
+                collection.forEach((instance, id) => {
+                    if (!retainedIds?.has(id)) result.push([id, instance]);
+                });
+                return result;
+            }
             for (const entry of collection) {
                 if (Array.isArray(entry) && entry.length >= 2) {
-                    result.push([entry[0], entry[1]]);
+                    if (!retainedIds?.has(entry[0])) result.push([entry[0], entry[1]]);
                 } else if (entry && typeof entry === 'object' && 'id' in entry) {
-                    result.push([entry.id, entry.instance ?? entry]);
+                    if (!retainedIds?.has(entry.id)) {
+                        result.push([entry.id, entry.instance ?? entry]);
+                    }
                 } else {
                     throw new TypeError(
                         `${descriptor.type}.getInstances entries must identify an id`);
@@ -304,7 +315,10 @@ const ReplicationRuntime = (function () {
             const descriptor = descriptors.get(type);
             if (!descriptor) throw new Error(`unregistered replication type: ${type}`);
 
-            const records = Array.from(getObjectsByType(type) || []);
+            const records = getObjectsByTypeSnapshot(type);
+            if (!Array.isArray(records)) {
+                throw new TypeError('store.getObjectsByTypeSnapshot must return an owned array');
+            }
             const members = memberFacts();
             const retainedIds = new Set();
             let created = 0;
@@ -469,8 +483,8 @@ const ReplicationRuntime = (function () {
                 }
             }
 
-            for (const [id, instance] of enumerateInstances(descriptor, context)) {
-                if (retainedIds.has(id)) continue;
+            // Snapshot only cleanup candidates before callbacks can mutate them.
+            for (const [id, instance] of enumerateInstances(descriptor, context, retainedIds)) {
                 const record = getObject(id);
                 const reason = record
                     ? REMOVAL_REASONS.TYPE_MISSING

@@ -46,6 +46,7 @@ test('unified ship schema carries adaptive, replay, identity, and terminal subse
         'thrustInput', 'brakeInput', 'turnControlMode', 'turnTarget',
         'turnTargetAngle', 'turnMagnitude', 'turnBias',
         'terminalEpoch', 'terminalX', 'terminalY', 'terminalAngle',
+        'invulnerabilityRevision', 'invulnerableAt',
     ]) {
         assert.ok(names.has(name), `ship schema missing ${name}`);
     }
@@ -58,6 +59,22 @@ test('unified ship schema carries adaptive, replay, identity, and terminal subse
     assert.deepEqual(
         SchemaCodec.decode(schema, SchemaCodec.encode(schema, terminal)),
         terminal);
+});
+
+test('ship transition slots append to the stable schema and preserve timing precision', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(1);
+    assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
+        ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64']
+    ]);
+    const data = {
+        invulnerable: 180, invulnerabilityRevision: 0xffffffff,
+        invulnerableAt: 1_800_000_000_123.5
+    };
+    const bytes = SchemaCodec.encode(schema, data);
+    assert.equal(bytes.length, 18, '4-byte mask + 2-byte countdown + 4-byte revision + 8-byte timestamp');
+    assert.deepEqual(SchemaCodec.decode(schema, bytes), data);
+    assert.equal(SchemaCodec.encode(schema, { x: 0.5 }).length, 6, 'absent timing slots have no body cost');
 });
 
 test('ship schema preserves analog thrust above the unit interval', () => {

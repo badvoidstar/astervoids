@@ -55,7 +55,7 @@
  * Gap detection is only performed for OTHER members' streams. The local member's
  * own sequence is tracked (to keep the map current) but gaps are not flagged,
  * because the sender can't miss their own events and the mixed delivery channels
- * (invoke response for updates vs broadcast for create/delete/replace) can race
+ * (concurrent invoke responses) can race
  * at await microtask boundaries.
  *
  * This works because SignalR guarantees in-order delivery per connection, and all
@@ -67,15 +67,13 @@
  *
  * ## Self-Echo Elimination
  *
- * Three event types use OthersInGroup (sender does NOT receive broadcast echo):
+ * Object mutations use OthersInGroup (sender does NOT receive broadcast echo):
  *   - UpdateObjects: sender gets versions, memberSequence, serverTimestamp from response
  *   - CreateObject: sender registers object from invoke response (response-first)
  *   - DeleteObject: sender removes object before invoking (local-first)
- * For all three, the sender's own memberSequence is tracked from the invoke response.
- *
- * OnObjectReplaced still uses Group (sender DOES receive echo) because replaceObject
- * is NOT local-first — the sender relies on the broadcast to mutate its object map
- * (delete parent + add children, which may have different owners).
+ *   - ReplaceObject: sender applies the atomic replacement from its response
+ *     using the same handler as remote broadcasts, including validated validAt.
+ * The sender's own memberSequence is tracked from each invoke response.
  *
  * Because the sender's own events arrive through invoke responses (not broadcasts),
  * gap detection is skipped for the sender's own member stream. This avoids false
@@ -181,6 +179,7 @@ const ObjectSync = (function() {
     // Map<objectId, data> so repeated updateObject() calls for the same object
     // coalesce in O(1) instead of scanning an array.
     const pendingUpdates = new Map();
+    const pendingUrgentUpdates = new Set();
     
     // Sender sequence counter (incremented per flush)
     let senderSequence = 0;
@@ -192,6 +191,7 @@ const ObjectSync = (function() {
     let stateEpoch = 0;
     let stateRevision = 0;
     const objectRevisions = new Map();
+    const pendingOwnershipMigrations = new Map();
     // External callers (e.g. attemptAutoRejoin) can suspend reconciliation during
     // windows where currentMember/currentSession are mid-transition. While suspended,
     // triggerReconciliation() is a silent no-op. Counter (not bool) so nested
@@ -224,13 +224,11 @@ const ObjectSync = (function() {
     // producer data, not render/simulation frames or all live objects.
     const FULL_SYNC_INTERVAL = 6000;
     
-    // Approximate wall-clock flush settings, driven by one tick per render frame.
+    // Elapsed-time flush settings, driven only by game-owned ticks.
     let nominalFrameTime = 1 / 30;  // target send interval in seconds
     // Retained configured value; adaptive updates currently do not auto-reset to it.
     let baseNominalFrameTime = 1 / 30;
-    let minFrameTime = 1 / 480;     // clamp to prevent extreme thresholds
-    let frameCounter = 0;
-    let sendThreshold = 2;          // recalculated each frame from actual frame time
+    let elapsedSinceFlushSec = 0;
     let adaptiveSendRate = false;    // dynamically adjust send rate based on RTT
     const ADAPTIVE_SEND_MIN = 1 / 20; // fastest send interval (20Hz) in seconds
     const ADAPTIVE_SEND_MAX = 1 / 1;  // slowest send interval (1Hz) in seconds
@@ -253,11 +251,18 @@ const ObjectSync = (function() {
      */
     function configure(config) {
         if (config.nominalFrameTime !== undefined) {
+            if (!Number.isFinite(config.nominalFrameTime) || config.nominalFrameTime <= 0) {
+                throw new RangeError('nominalFrameTime must be finite and positive');
+            }
             nominalFrameTime = config.nominalFrameTime;
             baseNominalFrameTime = config.nominalFrameTime;
         }
         if (config.minFrameTime !== undefined) {
-            minFrameTime = config.minFrameTime;
+            // Accepted for configuration compatibility; elapsed time is never
+            // inflated to a synthetic minimum frame duration.
+            if (!Number.isFinite(config.minFrameTime) || config.minFrameTime <= 0) {
+                throw new RangeError('minFrameTime must be finite and positive');
+            }
         }
         if (config.deltaEncoding !== undefined) {
             deltaEncodingEnabled = config.deltaEncoding;
@@ -284,7 +289,7 @@ const ObjectSync = (function() {
      * @param {number} rttMs - Current round-trip time in milliseconds
      */
     function updateSendRate(rttMs) {
-        if (!adaptiveSendRate) return;
+        if (!adaptiveSendRate || !Number.isFinite(rttMs) || rttMs < 0) return;
         const rttSec = rttMs / 1000;
         nominalFrameTime = Math.max(ADAPTIVE_SEND_MIN, Math.min(ADAPTIVE_SEND_MAX, rttSec));
     }
@@ -404,9 +409,11 @@ const ObjectSync = (function() {
         typeIndex.clear();
         lastSentData.clear();
         pendingUpdates.clear();
+        pendingUrgentUpdates.clear();
         objectRevisions.clear();
+        pendingOwnershipMigrations.clear();
         stateRevision = 0;
-        frameCounter = 0;
+        elapsedSinceFlushSec = 0;
         fullSyncCounter = 0;
         senderSequence = 0;
         memberSequences.clear();
@@ -471,6 +478,7 @@ const ObjectSync = (function() {
         objects.set(obj.id, obj);
         addToTypeIndex(obj);
         markObjectMutation(obj.id);
+        applyPendingOwnershipMigration(obj);
         return obj;
     }
 
@@ -485,6 +493,9 @@ const ObjectSync = (function() {
             objects.delete(objectId);
         }
         lastSentData.delete(objectId);
+        pendingUpdates.delete(objectId);
+        pendingUrgentUpdates.delete(objectId);
+        pendingOwnershipMigrations.delete(objectId);
         markObjectMutation(objectId);
         return obj || null;
     }
@@ -609,6 +620,15 @@ const ObjectSync = (function() {
      */
     function handleRemoteObjectCreated(objectInfo, senderMemberId, memberSequence, validAt) {
         trackMemberSequence(senderMemberId, memberSequence);
+        return applyAuthoritativeCreate(objectInfo, validAt);
+    }
+
+    function applyAuthoritativeCreate(objectInfo, validAt, createdCallbacks = null) {
+        if (pendingDeletes.has(objectInfo.id)) return null;
+        // IDs are server-assigned and never reused. A deletion that overtook a
+        // create/replace response must not be undone by the older full record.
+        if (!objects.has(objectInfo.id) && objectRevisions.has(objectInfo.id)
+            && !pendingOwnershipMigrations.has(objectInfo.id)) return null;
         objectInfo.data = expandData(objectInfo.data);
 
         // Capture wire-arrival metadata in the performance.now() domain.
@@ -658,7 +678,8 @@ const ObjectSync = (function() {
                 updateTypeIndex(existing, applied.oldType, applied.newType);
             }
             markObjectMutation(existing.id);
-            return;
+            applyPendingOwnershipMigration(existing);
+            return existing;
         }
 
         const obj = registerObject(objectInfo);
@@ -673,9 +694,12 @@ const ObjectSync = (function() {
             obj.validAt = validAt;
         }
 
-        if (callbacks.onObjectCreated) {
+        if (createdCallbacks) {
+            createdCallbacks.push(obj);
+        } else if (callbacks.onObjectCreated) {
             callbacks.onObjectCreated(obj);
         }
+        return obj;
     }
 
     /**
@@ -727,6 +751,8 @@ const ObjectSync = (function() {
                     }
                 }
             } else {
+                if (objectRevisions.has(update.id)
+                    && !pendingOwnershipMigrations.has(update.id)) continue;
                 // Object not yet known — create with available data
                 // (full metadata arrives via OnObjectCreated; this is a fallback)
                 const obj = {
@@ -743,6 +769,7 @@ const ObjectSync = (function() {
                 objects.set(obj.id, obj);
                 addToTypeIndex(obj);
                 markObjectMutation(obj.id);
+                applyPendingOwnershipMigration(obj);
 
                 if (callbacks.onObjectCreated) {
                     callbacks.onObjectCreated(obj);
@@ -763,11 +790,11 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Handle remote object replaced (atomic delete + create).
+     * Apply an authoritative replacement from a response or remote broadcast.
      *
      * `validAt` is one batch-level replacement-operation time (normally the
      * collision invocation) shared by every child. It is fanned out
-     * via handleRemoteObjectCreated so each child's `obj.validAt` is set
+     * via applyAuthoritativeCreate so each child's `obj.validAt` is set
      * consistently for the spawn-bridge / bracket-interpolation paths.
      *
      * @param {object} event - { deletedObjectId, createdObjects }
@@ -776,18 +803,34 @@ const ObjectSync = (function() {
      * @param {number} validAt - Server-validated replacement-operation time.
      */
     function handleRemoteObjectReplaced(event, senderMemberId, memberSequence, validAt) {
+        const context = captureAsyncContext();
         trackMemberSequence(senderMemberId, memberSequence);
-        // Delete the original object (no sequence tracking — already tracked above)
-        handleRemoteObjectDeleted(event.deletedObjectId);
-
-        // Create all replacement objects (no sequence tracking — already tracked above).
-        // All children share the same server-validated replacement validAt.
+        const deleted = removeObjectLocal(event.deletedObjectId);
+        const createdCallbacks = [];
+        const freshChildren = [];
+        // Install the entire replacement before exposing any lifecycle callback.
         for (const objectInfo of event.createdObjects) {
-            handleRemoteObjectCreated(objectInfo, undefined, undefined, validAt);
+            const existingVersion = objects.get(objectInfo.id)?.version;
+            const obj = applyAuthoritativeCreate(objectInfo, validAt, createdCallbacks);
+            // Do not re-anchor children already advanced by updates, migration,
+            // or a reconciliation snapshot during the response window.
+            if (obj && obj.version === objectInfo.version
+                && (existingVersion === undefined || objectInfo.version > existingVersion)) {
+                freshChildren.push(objectInfo);
+            }
         }
-
+        if (deleted && callbacks.onObjectDeleted) callbacks.onObjectDeleted(deleted);
+        if (!isAsyncContextCurrent(context)) return;
+        for (const obj of createdCallbacks) {
+            if (objects.get(obj.id) === obj && callbacks.onObjectCreated) {
+                callbacks.onObjectCreated(obj);
+            }
+            if (!isAsyncContextCurrent(context)) return;
+        }
         if (callbacks.onObjectReplaced) {
-            callbacks.onObjectReplaced(event.deletedObjectId, event.createdObjects, validAt);
+            callbacks.onObjectReplaced(event.deletedObjectId,
+                freshChildren.filter(child => objects.get(child.id)?.version === child.version),
+                validAt);
         }
     }
 
@@ -798,15 +841,13 @@ const ObjectSync = (function() {
      * own sequence is tracked (to keep the map current for reconciliation snapshots)
      * but gaps are NOT flagged, for two reasons:
      *
-     * 1. Self-echo elimination: UpdateObjects, CreateObject, and DeleteObject all use
+     * 1. Self-echo elimination: all object mutations use
      *    OthersInGroup — the sender never receives broadcast echoes for these events.
      *    The sender's own memberSequence is instead tracked from invoke responses
-     *    (flushUpdates, createObject, deleteObject). OnObjectReplaced still echoes.
+     *    (flushUpdates, createObject, deleteObject, replaceObject).
      *
-     * 2. Mixed delivery channels: even for OnObjectReplaced (which still uses Group),
-     *    the broadcast callback (synchronous) can race with invoke response processing
-     *    (await microtask), causing out-of-order sequence values for the sender's own
-     *    stream. This would trigger false reconciliations.
+     * 2. Concurrent invoke continuations can observe own responses out of order.
+     *    This must not trigger false reconciliations.
      *
      * If a sender's invoke response is lost, their own sequence map entry will be stale.
      * This is harmless because: (a) gap detection is skipped, and (b) the next successful
@@ -842,7 +883,7 @@ const ObjectSync = (function() {
         if (reconciling !== null) return;
         if (reconciliationSuspendCount > 0) return;
         const context = captureAsyncContext();
-        const revisionsAtStart = new Map(objectRevisions);
+        const revisionAtStart = stateRevision;
         const operation = { context };
         reconciling = operation;
         
@@ -912,7 +953,7 @@ const ObjectSync = (function() {
                     // Locally deleted but server hasn't processed yet — do NOT
                     // resurrect. The server will broadcast OnObjectDeleted shortly.
                     continue;
-                } else if (objectRevisions.get(obj.id) !== revisionsAtStart.get(obj.id)) {
+                } else if ((objectRevisions.get(obj.id) || 0) > revisionAtStart) {
                     // A live delete/replacement arrived after this snapshot request.
                     continue;
                 } else {
@@ -935,7 +976,7 @@ const ObjectSync = (function() {
             for (const [id, obj] of objects) {
                 if (!serverObjectIds.has(id)
                     && !pendingDeletes.has(id)
-                    && objectRevisions.get(id) === revisionsAtStart.get(id)) {
+                    && (objectRevisions.get(id) || 0) <= revisionAtStart) {
                     removeObjectLocal(id);
                     if (callbacks.onObjectDeleted) {
                         callbacks.onObjectDeleted(obj);
@@ -1004,7 +1045,6 @@ const ObjectSync = (function() {
             if (!response || !response.objectInfo) return null;
 
             const objectInfo = response.objectInfo;
-            objectInfo.data = expandData(objectInfo.data);
 
             // Auto-cleanup: if caller's object was destroyed during async creation
             if (isStillNeeded && !isStillNeeded()) {
@@ -1014,20 +1054,7 @@ const ObjectSync = (function() {
             }
 
             // Response-first: register the object from the invoke response (no broadcast echo)
-            const existing = objects.get(objectInfo.id);
-            if (!existing) {
-                const obj = registerObject(objectInfo);
-                // Stamp the server-validated batch-level validAt from the response
-                // so any path that consults obj.validAt (e.g. ownership migration
-                // back to this client) sees the same anchor remote receivers see.
-                if (response.validAt !== undefined && response.validAt !== null) {
-                    obj.validAt = response.validAt;
-                }
-
-                if (callbacks.onObjectCreated) {
-                    callbacks.onObjectCreated(obj);
-                }
-            }
+            applyAuthoritativeCreate(objectInfo, response.validAt);
 
             if (!isAsyncContextCurrent(context)) return null;
             // Track own member sequence from response (no broadcast echo to track it from)
@@ -1074,9 +1101,13 @@ const ObjectSync = (function() {
             // forces MessagePack to encode as int64.
             const clientValidAt = getClientValidAt();
             const createdInfos = await SessionClient.replaceObject(
-                deleteObjectId, replacementData, scope, ownerMemberId, clientValidAt, replacementSchemaIds);
+                deleteObjectId, replacementData, scope, ownerMemberId, clientValidAt, replacementSchemaIds,
+                (event, senderMemberId, memberSequence, validAt) => {
+                    if (isAsyncContextCurrent(context)) {
+                        handleRemoteObjectReplaced(event, senderMemberId, memberSequence, validAt);
+                    }
+                });
             if (!isAsyncContextCurrent(context)) return null;
-            // Objects will be added/removed via the onObjectReplaced event
             return createdInfos;
         } catch (err) {
             if (!isAsyncContextCurrent(context)) return null;
@@ -1084,6 +1115,9 @@ const ObjectSync = (function() {
             if (callbacks.onSyncError) {
                 callbacks.onSyncError('replace', err);
             }
+            // The server may have committed while the only authoritative
+            // response was lost. Restore truth rather than leaving a ghost parent.
+            if (isAsyncContextCurrent(context)) triggerReconciliation();
             throw err;
         }
     }
@@ -1120,11 +1154,10 @@ const ObjectSync = (function() {
         }
 
         if (immediate) {
-            // Best-effort immediate: flushUpdates will not overlap an in-flight
-            // invoke. The merged pending state remains queued for a later tick.
+            pendingUrgentUpdates.add(objectId);
             flushUpdates();
         }
-        // Otherwise, tick() will flush when frame counter reaches threshold
+        // Urgency survives ordinary coalesced writes and in-flight backpressure.
 
         return true;
     }
@@ -1133,26 +1166,17 @@ const ObjectSync = (function() {
     let flushInProgress = null;
 
     /**
-     * Called once per rendered frame to approximate nominal wall-clock cadence.
-     * Recalculates a frame threshold from current frame time and attempts a
-     * flush at that interval. Pending data may represent many simulation frames,
-     * and an empty interval sends nothing.
-     *
-     * Backpressure: when flushInProgress the counter caps at sendThreshold
-     * instead of resetting. This way the very next tick after the in-flight
-     * invoke completes will trigger a flush, preventing the effective send
-     * rate from gaining another full nominal wait when RTT is near or above the
-     * target interval. SignalR invokes remain serialized by this layer.
+     * Accumulate real elapsed time, capped at one flush opportunity. Backpressure
+     * retains elapsed eligibility and urgency until a later tick; completion
+     * never starts another invoke, and stalls never produce catch-up bursts.
      * @param {number} frameTimeSec - Elapsed time for this frame in seconds
      */
     function tick(frameTimeSec) {
-        const clampedFrameTime = Math.max(frameTimeSec, minFrameTime);
-        sendThreshold = Math.max(1, Math.round(nominalFrameTime / clampedFrameTime));
-        if (frameCounter < sendThreshold) {
-            frameCounter++;
-        }
-        if (frameCounter >= sendThreshold && flushInProgress === null) {
-            frameCounter = 0;
+        if (!Number.isFinite(frameTimeSec) || frameTimeSec < 0) return;
+        elapsedSinceFlushSec = Math.min(nominalFrameTime, elapsedSinceFlushSec + frameTimeSec);
+        if (flushInProgress === null
+            && (pendingUrgentUpdates.size > 0
+                || elapsedSinceFlushSec + Number.EPSILON >= nominalFrameTime)) {
             flushUpdates();
         }
     }
@@ -1285,6 +1309,8 @@ const ObjectSync = (function() {
             }
         }
         pendingUpdates.clear();
+        pendingUrgentUpdates.clear();
+        elapsedSinceFlushSec = 0;
 
         if (updates.length === 0) return;
 
@@ -1461,8 +1487,13 @@ const ObjectSync = (function() {
             const obj = objects.get(id);
             if (obj) result.push(obj);
         }
+
         return result;
     }
+
+    // Explicit ownership contract: the caller owns this membership array;
+    // canonical records remain borrowed. No store operation mutates the array.
+    const getObjectsByTypeSnapshot = getObjectsByType;
 
     /**
      * Get a single object by type (for singletons like GameState).
@@ -1612,8 +1643,10 @@ const ObjectSync = (function() {
         for (const migration of migratedObjects) {
             const obj = objects.get(migration.objectId);
             if (!obj) {
-                // We cannot materialize an object without its data, but recording
-                // the event prevents an older in-flight snapshot from doing so.
+                const previous = pendingOwnershipMigrations.get(migration.objectId);
+                if (!previous || migration.newVersion > previous.newVersion) {
+                    pendingOwnershipMigrations.set(migration.objectId, { ...migration });
+                }
                 markObjectMutation(migration.objectId);
                 continue;
             }
@@ -1627,6 +1660,17 @@ const ObjectSync = (function() {
             obj.ownershipMigrationVersion = migration.newVersion;
             obj.ownershipMigrationPending = true;
             markObjectMutation(obj.id);
+        }
+    }
+
+    function applyPendingOwnershipMigration(obj) {
+        const migration = pendingOwnershipMigrations.get(obj.id);
+        if (!migration) return;
+        pendingOwnershipMigrations.delete(obj.id);
+        if (migration.newVersion > obj.version) {
+            handleOwnershipMigration([migration]);
+        } else if (obj.ownerMemberId == null) {
+            obj.ownerMemberId = migration.newOwnerId;
         }
     }
 
@@ -1678,6 +1722,7 @@ const ObjectSync = (function() {
         getAllObjects,
         getObjectsByOwner,
         getObjectsByType,
+        getObjectsByTypeSnapshot,
         getObjectByType,
         getObjectCount,
         getReconciliationCount,

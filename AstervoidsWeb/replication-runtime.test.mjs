@@ -274,6 +274,51 @@ test('a mutable record array is still snapshotted before adapter callbacks', () 
     assert.deepEqual(applied, ['first', 'second']);
 });
 
+test('explicit owned record snapshots are consumed once without a second collection', () => {
+    const records = new Map([
+        ['first', { id: 'first', type: 'counter', version: 1, data: 1 }],
+        ['second', { id: 'second', type: 'counter', version: 1, data: 2 }]
+    ]);
+    const instances = new Map();
+    const applied = [];
+    let traversals = 0;
+    const runtime = createRuntime({
+        store: {
+            getObjectsByType: () => { throw new Error('must use explicit snapshot API'); },
+            getObjectsByTypeSnapshot() {
+                const snapshot = Array.from(records.values());
+                snapshot[Symbol.iterator] = function* () {
+                    traversals++;
+                    yield* Array.prototype.values.call(this);
+                };
+                return snapshot;
+            },
+            getObject: id => records.get(id)
+        },
+        getCurrentMemberId: () => null,
+        descriptors: [{
+            type: 'counter',
+            classify: () => 'replica',
+            getInstance: id => instances.get(id),
+            getInstances: () => instances,
+            createReplica(record) {
+                const instance = { id: record.id };
+                instances.set(record.id, instance);
+                return instance;
+            },
+            apply(instance) {
+                applied.push(instance.id);
+                if (instance.id === 'first') records.delete('second');
+            },
+            remove: instance => instances.delete(instance.id)
+        }]
+    });
+    runtime.beginSession({ epoch: 1 });
+    runtime.reconcileType('counter', { epoch: 1 });
+    assert.equal(traversals, 1, 'owned array is not copied then traversed again');
+    assert.deepEqual(applied, ['first', 'second'], 'snapshot membership survives callbacks');
+});
+
 test('migration version is metadata-only when presentation state exists', () => {
     const p = makePresentation();
     const h = makeHarness({ presentation: p.adapter });

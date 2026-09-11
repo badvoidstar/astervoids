@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const {
@@ -23,6 +24,120 @@ const {
 
 const EPS = 1e-10;
 const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
+
+function scaleCacheHarness() {
+    const state = { session: false, width: 1600, height: 900, derivations: 0 };
+    const config = { ...SHARED_DEFAULTS };
+    const production = loadInlineGameFunctions([
+        'getEffectiveAspectSeverity', 'getEffectiveAsteroidAspectScales',
+        'adoptSessionConfig', 'restoreLocalConfigBaseline',
+    ], {
+        CONFIG: config,
+        LOCAL_CONFIG_BASELINE: { ...config },
+        SESSION_CONFIG_KEYS,
+        adoptedAspectSeverity: 1,
+        asteroidAspectScaleCache: null,
+        isSessionMode: () => state.session,
+        getGameWidth: () => state.width,
+        getGameHeight: () => state.height,
+        AstervoidsFracture: {
+            getAspectSeverity,
+            getAsteroidAspectScales(...args) {
+                state.derivations++;
+                return getAsteroidAspectScales(...args);
+            },
+        },
+        applySessionConfigMetadata,
+        adoptSessionSim() {},
+        resetCosmeticAsteroids() {},
+    });
+    return { ...production, state, config };
+}
+
+test('production caches 10000 repeated aspect derivations as one immutable value', () => {
+    const h = scaleCacheHarness();
+    const scales = h.getEffectiveAsteroidAspectScales();
+    for (let i = 1; i < 10000; i++) {
+        assert.equal(h.getEffectiveAsteroidAspectScales(), scales);
+    }
+    assert.equal(h.state.derivations, 1);
+    assert.deepEqual(scales, getAsteroidAspectScales(
+        16 / 9, h.config.ASTEROID_ASPECT_SIZE_SPEED_BALANCE, h.config.ASTEROID_DIFFICULTY_FACTOR));
+    assert.ok(Object.isFrozen(scales), 'borrowed values cannot corrupt future cap/resize calculations');
+});
+
+test('production aspect cache follows exact balance, difficulty and solo severity inputs', () => {
+    const h = scaleCacheHarness();
+    const original = h.getEffectiveAsteroidAspectScales();
+    const snapshot = { ...original };
+    for (const mutate of [
+        () => { h.config.ASTEROID_ASPECT_SIZE_SPEED_BALANCE = 0.3; },
+        () => { h.config.ASTEROID_DIFFICULTY_FACTOR = 1.2; },
+        () => { h.state.width = 1200; },
+        () => { h.state.width += 0.00001; },
+    ]) {
+        const previous = h.getEffectiveAsteroidAspectScales();
+        mutate();
+        const next = h.getEffectiveAsteroidAspectScales();
+        assert.notEqual(next, previous);
+        assert.deepEqual(next, getAsteroidAspectScales(
+            getAspectSeverity(h.state.width, h.state.height),
+            h.config.ASTEROID_ASPECT_SIZE_SPEED_BALANCE, h.config.ASTEROID_DIFFICULTY_FACTOR));
+        assert.equal(h.getEffectiveAsteroidAspectScales(), next);
+    }
+    assert.equal(h.state.derivations, 5);
+    assert.deepEqual(original, snapshot, 'retained previous scales still describe the old shape');
+    const previous = h.getEffectiveAsteroidAspectScales();
+    [h.state.width, h.state.height] = [h.state.height, h.state.width];
+    assert.equal(h.getEffectiveAsteroidAspectScales(), previous,
+        'portrait/landscape changes with identical effective inputs need no derivation');
+});
+
+test('production aspect cache invalidates on session entry, adoption and exit', () => {
+    const h = scaleCacheHarness();
+    const solo = h.getEffectiveAsteroidAspectScales();
+    h.state.session = true;
+    h.adoptSessionConfig({ aspectSeverity: 16 / 9 });
+    const session = h.getEffectiveAsteroidAspectScales();
+    assert.notEqual(session, solo, 'mode changes invalidate even with identical scales');
+    assert.deepEqual(session, solo);
+    h.state.width = 500;
+    h.state.height = 1500;
+    assert.equal(h.getEffectiveAsteroidAspectScales(), session, 'session ignores local resize');
+    h.adoptSessionConfig({
+        aspectSeverity: 2,
+        config: { ASTEROID_ASPECT_SIZE_SPEED_BALANCE: 0.7, ASTEROID_DIFFICULTY_FACTOR: 1.5 },
+    });
+    assert.deepEqual(h.getEffectiveAsteroidAspectScales(), getAsteroidAspectScales(2, 0.7, 1.5));
+    h.adoptSessionConfig({});
+    const legacy = h.getEffectiveAsteroidAspectScales();
+    assert.deepEqual(legacy, getAsteroidAspectScales(
+        1, SHARED_DEFAULTS.ASTEROID_ASPECT_SIZE_SPEED_BALANCE, SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR));
+    h.state.session = false;
+    const nextSolo = h.getEffectiveAsteroidAspectScales();
+    assert.deepEqual(nextSolo, getAsteroidAspectScales(
+        3, SHARED_DEFAULTS.ASTEROID_ASPECT_SIZE_SPEED_BALANCE, SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR));
+    assert.notEqual(nextSolo, legacy);
+    assert.equal(h.state.derivations, 5);
+});
+
+test('production scale cache preserves clamping/defaults and distinguishes raw inputs', () => {
+    const h = scaleCacheHarness();
+    let previous;
+    for (const [balance, difficulty] of [
+        [NaN, undefined], [NaN, Infinity], [NaN, NaN], [-1, -1], [-2, -2],
+        [0, 0], [-0, -0], [1.5, 3], [2, 4], [undefined, undefined],
+    ]) {
+        h.config.ASTEROID_ASPECT_SIZE_SPEED_BALANCE = balance;
+        h.config.ASTEROID_DIFFICULTY_FACTOR = difficulty;
+        const scales = h.getEffectiveAsteroidAspectScales();
+        assert.notEqual(scales, previous);
+        assert.deepEqual(scales, getAsteroidAspectScales(16 / 9, balance, difficulty));
+        assert.equal(h.getEffectiveAsteroidAspectScales(), scales, 'including repeated NaN keys');
+        previous = scales;
+    }
+    assert.equal(h.state.derivations, 10);
+});
 
 test('asteroid basis radius and speed use the configured defaults', () => {
     assert.equal(SHARED_DEFAULTS.INITIAL_ASTEROID_RADIUS, 0.085);
@@ -411,9 +526,12 @@ test('difficulty compounds with severity before applying size/speed balance', ()
     assert.ok(Math.abs(radiusScale - Math.sqrt(combined)) < EPS);
     assert.ok(Math.abs(speedScale - Math.sqrt(combined)) < EPS);
     assert.ok(Math.abs(radiusScale * speedScale - combined) < EPS);
-    assert.match(
-        indexSource,
-        /getEffectiveAspectSeverity\(\),\s*CONFIG\.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,\s*CONFIG\.ASTEROID_DIFFICULTY_FACTOR/);
+    const h = scaleCacheHarness();
+    h.state.width = 1920;
+    h.state.height = 1080;
+    h.config.ASTEROID_ASPECT_SIZE_SPEED_BALANCE = 0.5;
+    h.config.ASTEROID_DIFFICULTY_FACTOR = difficulty;
+    assert.deepEqual(h.getEffectiveAsteroidAspectScales(), { radiusScale, speedScale });
 });
 
 test('difficulty uses the configured balance endpoints', () => {

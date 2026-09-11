@@ -27,9 +27,10 @@
  *   3. If a warming region cannot produce a sample for a complete burst, mark
  *      it `'unavailable'`. This concludes its assessment so the picker can
  *      stop waiting for a region that cannot currently be reached.
- *   4. Subsequent **rolling bursts** fire every `BURST_INTERVAL_MS` (5000 ms),
- *      staggered per region by a random initial offset to avoid synchronised
- *      bursts hammering the network.
+ *   4. Subsequent **rolling bursts** initially fire every `BURST_INTERVAL_MS`
+ *      (5000 ms). Once confidence is full, stable, entirely successful bursts
+ *      double the interval up to 60 s. Meaningful RTT changes or any failed ping
+ *      restore the base cadence; visibility/network changes reassess immediately.
  *   5. Each burst's minimum sample (jitter rejection) is fed into an
  *      exponential moving average with smoothing factor `EMA_ALPHA` (0.3).
  *      The displayed value is the EMA — stable across single-burst outliers.
@@ -60,6 +61,9 @@ const RegionService = (function () {
         BOOTSTRAP_SAMPLES: 3,           // pings in the initial burst (1 warm-up + 2 measured)
         ROLLING_SAMPLES: 3,             // pings in each rolling burst
         BURST_INTERVAL_MS: 5000,        // base interval between bursts per region
+        STABLE_BURST_MAX_INTERVAL_MS: 60000,
+        STABLE_RTT_CHANGE_MS: 10,       // tolerate small absolute or relative jitter
+        STABLE_RTT_CHANGE_RATIO: 0.2,
         BURST_STAGGER_MAX_MS: 1000,     // random offset per region so bursts don't align
         WARM_PING_TIMEOUT_MS: 5000,     // per-request timeout for warm regions
         COLD_PING_TIMEOUT_MS: 15000,    // per-request timeout for first ping (cold-start budget)
@@ -78,11 +82,14 @@ const RegionService = (function () {
     const burstTimers = new Map();  // regionId -> timeout handle
     const burstSequences = new Map();
     const inFlightBursts = new Map(); // regionId -> AbortController
+    const burstIntervals = new Map(); // regionId -> stable-confidence cadence
     let currentBestRegion = null;   // memoised, recomputed only when bestRegion() advantage exceeds hysteresis
     let started = false;
     let runGeneration = 0;
     let loadGeneration = 0;
     let visibilityHandler = null;
+    let networkChangeHandler = null;
+    let networkConnection = null;
 
     // ── Event bus (mirrors session-client.js shape) ───────────────────────────
     const listeners = {
@@ -315,8 +322,17 @@ const RegionService = (function () {
     function cancelBursts() {
         runGeneration++;
         clearAllBurstTimers();
+        burstIntervals.clear();
         for (const controller of inFlightBursts.values()) controller.abort();
         inFlightBursts.clear();
+    }
+
+    function reassess() {
+        if (!started) return;
+        cancelBursts();
+        for (const region of regions) {
+            scheduleNextBurst(region.id, 0, runGeneration);
+        }
     }
 
     function refreshBestRegion() {
@@ -355,6 +371,7 @@ const RegionService = (function () {
         const { minMs, successfulPingCount } = result;
 
         if (minMs == null) {
+            burstIntervals.delete(regionId);
             // A full failed burst concludes a still-pending assessment. Keep a
             // previously measured RTT intact during transient later failures.
             // A successful discarded warm-up request means the region is
@@ -373,6 +390,19 @@ const RegionService = (function () {
         }
 
         const { next, coldStart } = applyBurstSample(prev, minMs, Date.now());
+        const stable = !coldStart
+            && successfulPingCount === samples
+            && prev.confidence >= 1
+            && next.confidence >= 1
+            && Math.abs(minMs - prev.valueMs) <= Math.max(
+                CONFIG.STABLE_RTT_CHANGE_MS,
+                prev.valueMs * CONFIG.STABLE_RTT_CHANGE_RATIO);
+        const interval = stable
+            ? Math.min(
+                Math.max(CONFIG.BURST_INTERVAL_MS, CONFIG.STABLE_BURST_MAX_INTERVAL_MS),
+                (burstIntervals.get(regionId) ?? CONFIG.BURST_INTERVAL_MS) * 2)
+            : CONFIG.BURST_INTERVAL_MS;
+        burstIntervals.set(regionId, interval);
         rtt.set(regionId, next);
         // Publish the new recommendation with the same rttUpdated event that
         // drives the picker, so Create can use it immediately.
@@ -381,7 +411,7 @@ const RegionService = (function () {
         if (!started || generation !== runGeneration || isDocumentHidden()) return;
         emit('rttUpdated', regionId);
 
-        scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
+        scheduleNextBurst(regionId, interval, generation);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -490,21 +520,21 @@ const RegionService = (function () {
                 if (document.hidden) {
                     cancelBursts();
                 } else {
-                    // Immediate burst per region so the picker is fresh by the
-                    // time the user is looking, then resume the normal cadence.
-                    for (const r of regions) {
-                        if (!burstTimers.has(r.id)) {
-                            scheduleNextBurst(r.id, 0, runGeneration);
-                        }
-                    }
+                    reassess();
                 }
             };
             document.addEventListener('visibilitychange', visibilityHandler);
         }
+        networkChangeHandler = reassess;
+        if (typeof window !== 'undefined') {
+            window.addEventListener?.('online', networkChangeHandler);
+        }
+        networkConnection = typeof navigator !== 'undefined' ? navigator.connection : null;
+        networkConnection?.addEventListener?.('change', networkChangeHandler);
     }
 
     /**
-     * Cancel all timers/requests and detach the visibility listener. Does NOT clear
+     * Cancel all timers/requests and detach lifecycle listeners. Does NOT clear
      * the manifest or accumulated measurements so `start()` can resume cleanly.
      */
     function stop() {
@@ -513,6 +543,14 @@ const RegionService = (function () {
         if (typeof document !== 'undefined' && visibilityHandler != null) {
             document.removeEventListener('visibilitychange', visibilityHandler);
             visibilityHandler = null;
+        }
+        if (networkChangeHandler != null) {
+            if (typeof window !== 'undefined') {
+                window.removeEventListener?.('online', networkChangeHandler);
+            }
+            networkConnection?.removeEventListener?.('change', networkChangeHandler);
+            networkChangeHandler = null;
+            networkConnection = null;
         }
     }
 
