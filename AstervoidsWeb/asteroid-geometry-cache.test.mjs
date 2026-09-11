@@ -8,7 +8,7 @@ const collision = require('./wwwroot/js/collision-geometry.js');
 const fracture = require('./wwwroot/js/asteroid-fracture.js');
 const wire = require('./wwwroot/js/astervoids-wire-codec.js');
 
-function harness({ session = false, width = 1000, height = 1000 } = {}) {
+function harness({ session = false, width = 1000, height = 1000, onSplit } = {}) {
     const viewport = { width, height };
     const calls = { cos: 0, sin: 0, deltas: 0, broad: [], narrow: [], events: [] };
     const math = Object.create(Math);
@@ -37,7 +37,8 @@ function harness({ session = false, width = 1000, height = 1000 } = {}) {
         'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapMarginX', 'wrapMarginY', 'wrapNormalized', 'drawAsteroidsBatched',
-        'checkCollisions', 'checkShipAsteroidCollision', 'computeBulletImpact',
+        'checkCollisions', 'checkShipAsteroidCollision', 'prepareAsteroidCollision',
+        'computeBulletImpact',
     ], {
         Math: math, CONFIG: config, game,
         getGameWidth: () => viewport.width,
@@ -76,7 +77,10 @@ function harness({ session = false, width = 1000, height = 1000 } = {}) {
         CollisionEffects: {
             startAsteroidHit: (...args) => calls.events.push(['cue', ...args]),
         },
-        splitAsteroid: (...args) => calls.events.push(['split', ...args]),
+        splitAsteroid: (...args) => {
+            calls.events.push(['split', ...args]);
+            onSplit?.(game, ...args);
+        },
         emitOwnedAsteroidImpactCue: (...args) => calls.events.push(['owned-cue', ...args]),
         deleteSyncedBullet: bullet => calls.events.push(['delete', bullet]),
         emitShipStateChanged: () => calls.events.push(['ship-update']),
@@ -259,23 +263,133 @@ test('drawing and bullet/ship collisions consume the same refreshed geometry', (
     assert.equal(h.game.bullets.length, 0);
 });
 
-test('collision setup is per bullet and scratch objects are reused across rejected pairs', () => {
+test('collision setup is per bullet and per asteroid with reusable pair scratch', () => {
     const h = harness();
     h.game.bullets.push(bullet(0.1, 0.1, 0.09), bullet(0.2, 0.1, 0.19));
     h.game.astervoids.push(rock(h, 0.6, 0.8), rock(h, 0.7, 0.8), rock(h, 0.8, 0.8));
     h.checkCollisions();
     assert.equal(h.calls.broad.length, 6);
-    assert.equal(h.calls.deltas, 2 * 2 + 2 * 6, 'bullet deltas computed once per bullet');
+    assert.equal(h.calls.deltas, 2 * 2 + 2 * 3, 'deltas computed once per bullet and asteroid');
     assert.equal(h.calls.narrow.length, 0, 'broad misses never refresh polygon geometry');
     const first = h.calls.broad[0];
     for (const pair of h.calls.broad) {
         assert.equal(pair.start, first.start);
         assert.equal(pair.end, first.end);
-        assert.equal(pair.bounds, first.bounds);
+    }
+    assert.equal(new Set(h.calls.broad.map(pair => pair.bounds)).size, 3);
+    for (let i = 0; i < 3; i++) {
+        assert.equal(h.calls.broad[i].bounds, h.calls.broad[i + 3].bounds,
+            'reuse each asteroid preparation across bullets');
     }
     assert.deepEqual(h.calls.broad.map(pair => pair.snapshot.end.x), [200, 200, 200, 100, 100, 100]);
     assert.deepEqual(h.calls.broad.map(pair => pair.snapshot.bounds.x), [800, 700, 600, 800, 700, 600]);
     assert.equal(h.game.bullets.length, 2);
+});
+
+test('collision pass lazily prepares split children in existing traversal order', () => {
+    let parent;
+    let child;
+    const h = harness({
+        onSplit(game, asteroid) {
+            if (asteroid === parent) game.astervoids.push(child);
+        },
+    });
+    parent = rock(h);
+    child = rock(h);
+    const surviving = rock(h);
+    const shots = [bullet(0.5, 0.5), bullet(0.5, 0.5)];
+    h.game.astervoids.push(surviving, parent);
+    h.game.bullets.push(...shots);
+    h.checkCollisions();
+    assert.deepEqual(h.calls.events.filter(e => e[0] === 'cue').map(e => [e[1], e[2]]), [
+        [shots[1], parent], [shots[0], child],
+    ]);
+    assert.deepEqual(h.game.astervoids, [surviving]);
+    assert.equal(h.calls.broad.length, 2, 'unvisited survivor needs no preparation');
+    assert.equal(h.calls.deltas, 8);
+});
+
+test('ship collision sees children created by the final bullet of the pass', () => {
+    let child;
+    const h = harness({ onSplit: game => game.astervoids.push(child) });
+    child = rock(h, 0.7, 0.7);
+    const parent = rock(h);
+    h.game.astervoids.push(parent);
+    h.game.bullets.push(bullet(0.5, 0.5));
+    h.game.ship = {
+        x: 0.7, y: 0.7, invulnerable: 0,
+        getVertices: () => [{ x: 700, y: 700 }, { x: 701, y: 700 }, { x: 700, y: 701 }],
+    };
+    h.checkCollisions();
+    assert.equal(h.calls.events.at(-1)[0], 'ship-hit');
+    assert.equal(h.calls.deltas, 4, 'ship-only preparations need no swept motion');
+});
+
+test('rejected bullet narrow phases and ship collision borrow geometry only once per pass', () => {
+    const h = harness();
+    const asteroid = rock(h, 0.5, 0.5, 0.001, 0.14);
+    h.game.astervoids.push(asteroid);
+    h.game.bullets.push(bullet(0.6, 0.5), bullet(0.6, 0.5));
+    h.game.ship = {
+        x: 0.6, y: 0.5, invulnerable: 0,
+        getVertices: () => [{ x: 600, y: 500 }, { x: 601, y: 500 }, { x: 600, y: 501 }],
+    };
+    const getWorldVertices = asteroid.getWorldVertices.bind(asteroid);
+    let geometryReads = 0;
+    asteroid.getWorldVertices = () => { geometryReads++; return getWorldVertices(); };
+    h.checkCollisions();
+    assert.equal(h.calls.narrow.length, 2);
+    assert.equal(geometryReads, 1);
+    assert.equal(h.calls.narrow[0], h.calls.narrow[1]);
+    assert.equal(h.calls.events.length, 0);
+    asteroid.x = 0.6;
+    asteroid.rebuildShapeCache();
+    h.checkCollisions();
+    assert.equal(geometryReads, 2, 'next pass samples moved/rebuilt geometry afresh');
+    assert.equal(h.game.bullets.length, 1);
+});
+
+test('asteroid preparation is shared only for its pass and samples new viewport and bounds', () => {
+    const h = harness();
+    const asteroid = rock(h);
+    const firstPass = new Map();
+    const before = h.calls.deltas;
+    const prepared = h.prepareAsteroidCollision(firstPass, asteroid);
+    assert.equal(h.calls.deltas, before, 'stationary broad phase does not need motion');
+    h.prepareAsteroidCollision(firstPass, asteroid, true);
+    h.prepareAsteroidCollision(firstPass, asteroid, true);
+    assert.equal(h.calls.deltas - before, 2);
+    assert.equal(h.prepareAsteroidCollision(firstPass, asteroid), prepared);
+    asteroid.x = 0.6;
+    asteroid.y = 0.4;
+    asteroid._collisionPrevX = 0.55;
+    asteroid._collisionPrevY = 0.45;
+    h.rescaleAsteroidForAspectChange(asteroid, 2, 1);
+    h.viewport.width = 1200;
+    h.viewport.height = 600;
+    const next = h.prepareAsteroidCollision(new Map(), asteroid, true);
+    assert.notEqual(next, prepared);
+    assert.equal(next.x, 720);
+    assert.equal(next.y, 240);
+    assert.equal(next.radius, asteroid.boundRadius * 600);
+    assert.equal(next.deltaX, asteroid.x - asteroid._collisionPrevX);
+    assert.equal(next.deltaY, asteroid.y - asteroid._collisionPrevY);
+    assert.equal(next.vertices, null, 'broad setup never allocates geometry');
+});
+
+test('collision preparation reduces deterministic dense-pass motion work from pairs to entities', () => {
+    const h = harness();
+    const bulletCount = 32;
+    const asteroidCount = 200;
+    for (let i = 0; i < bulletCount; i++) h.game.bullets.push(bullet(0.1, 0.1, 0.09));
+    for (let i = 0; i < asteroidCount; i++) h.game.astervoids.push(rock(h, 0.8, 0.8));
+    h.checkCollisions();
+    assert.equal(h.calls.broad.length, bulletCount * asteroidCount);
+    assert.equal(h.calls.deltas, 2 * (bulletCount + asteroidCount));
+    assert.equal(new Set(h.calls.broad.map(pair => pair.bounds)).size, asteroidCount);
+    assert.equal(h.calls.narrow.length, 0);
+    assert.equal(h.calls.cos, 4 * asteroidCount, 'only local-shape setup, no world geometry');
+    assert.equal(h.calls.sin, 4 * asteroidCount);
 });
 
 test('collisions preserve reverse bullet/asteroid order and one target per bullet', () => {

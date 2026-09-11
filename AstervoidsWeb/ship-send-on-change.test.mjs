@@ -5,10 +5,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { createShipGate } = require('./wwwroot/js/replication-send-policy.js');
 
-// Mirrors the inline owner-side `ShipSendGate` send-on-change suppression in
-// wwwroot/index.html (the game layer). Per repo convention (see
-// send-on-change.test.mjs / ship-dead-reckoning.test.mjs) pure inline logic is
-// re-implemented here and asserted, since index.html is not importable.
+// Exercises the production policy with the game's normalized transition input.
 //
 // ShipSendGate is the ship-physics counterpart to SendGate: under deterministic
 // input-replay the receiver reproduces the ship's full non-linear motion by
@@ -18,8 +15,7 @@ const { createShipGate } = require('./wwwroot/js/replication-send-policy.js');
 //   1. no baseline (creation / adoption)
 //   2. control-intent change (thrustInput/brakeInput/thrusting flip, or any
 //      turn field: mode, target, target-angle, magnitude, bias)
-//   3. invulnerable change (respawn teleport + blink phase, fires per-frame
-//      during the countdown)
+//   3. explicit invulnerability transition (respawn / expiry, not countdown)
 //   4. heartbeat (>= HEARTBEAT_MS since last send)
 //   plus force=true (the P1 immediate control-edge flush) always sends.
 // Velocity / position are NOT triggers — the receiver derives them from replay.
@@ -40,13 +36,13 @@ function makeClock() {
     };
 }
 
-// Mirror of the inline ShipSendGate. `deterministic` and `config` are injectable
-// to exercise the always-send fall-throughs.
+// `deterministic` and `config` exercise the always-send fall-throughs.
 function makeGate(clock, deterministic = true, config = CONFIG) {
     return createShipGate({
         config,
         isDeterministic: () => deterministic,
-        nowMs: clock.now
+        nowMs: clock.now,
+        getTransitionKey: ship => ship.invulnerabilityRevision
     });
 }
 
@@ -58,6 +54,7 @@ function coastingShip(overrides = {}) {
         rotationSpeed: 0, angle: 0,
         thrustInput: 0, brakeInput: 0, thrusting: false,
         invulnerable: 0,
+        invulnerabilityRevision: 0,
         turnControlMode: 0, turnTarget: 0, turnTargetAngle: 0,
         turnMagnitude: 0, turnBias: 0,
         ...overrides,
@@ -150,23 +147,53 @@ test('turnMagnitude and turnBias changes each send', () => {
 });
 
 // ── invulnerable / respawn ──────────────────────────────────────────────────
-test('invulnerable countdown sends every frame (keeps blink phase fresh) then settles when it reaches 0', () => {
+test('countdown is suppressed between transition edges and ordinary heartbeats', () => {
     const clock = makeClock();
     const gate = makeGate(clock);
-    // respawn: invulnerable jumps 0 -> 120 (teleport edge)
-    gate.shouldSend('ship', coastingShip({ invulnerable: 0 }), false); // seed at 0
+    gate.shouldSend('ship', coastingShip(), false);
     clock.advance(16);
-    assert.equal(gate.shouldSend('ship', coastingShip({ invulnerable: 120 }), false), true, 'respawn teleport edge');
+    assert.equal(gate.shouldSend('ship', coastingShip({
+        invulnerable: 120, invulnerabilityRevision: 1
+    }), false), true, 'respawn transition');
     let sends = 0;
-    for (let inv = 119; inv >= 0; inv--) {
+    for (let inv = 119; inv > 0; inv--) {
         clock.advance(16);
-        if (gate.shouldSend('ship', coastingShip({ invulnerable: inv }), false)) sends++;
+        if (gate.shouldSend('ship', coastingShip({
+            invulnerable: inv, invulnerabilityRevision: 1
+        }), false)) sends++;
     }
-    // every decrementing frame is a change => a send, including the final ->0 edge
-    assert.equal(sends, 120, 'each invulnerable decrement (incl. ->0) sends');
-    // now stable at 0 => suppressed
+    assert.equal(sends, 7, 'only 250ms heartbeats, not 119 countdown sends');
     clock.advance(16);
-    assert.equal(gate.shouldSend('ship', coastingShip({ invulnerable: 0 }), false), false);
+    assert.equal(gate.shouldSend('ship', coastingShip({
+        invulnerable: 0, invulnerabilityRevision: 2
+    }), false), true, 'expiry transition');
+    clock.advance(16);
+    assert.equal(gate.shouldSend('ship', coastingShip({
+        invulnerable: 0, invulnerabilityRevision: 2
+    }), false), false);
+});
+
+test('transition input is injected, opaque, and validated without changing legacy callers', () => {
+    const clock = makeClock();
+    const gate = createShipGate({
+        config: CONFIG,
+        isDeterministic: () => true,
+        nowMs: clock.now,
+        getTransitionKey: state => state.lifecycle
+    });
+    gate.shouldSend('ship', { lifecycle: 'spawn' });
+    assert.equal(gate.shouldSend('ship', { lifecycle: 'spawn', invulnerable: 100 }), false);
+    assert.equal(gate.shouldSend('ship', { lifecycle: 'expire' }), true);
+
+    const legacy = createShipGate({
+        config: CONFIG, isDeterministic: () => true, nowMs: clock.now
+    });
+    legacy.shouldSend('ship', { invulnerable: 120 });
+    assert.equal(legacy.shouldSend('ship', { invulnerable: 119 }), true);
+    assert.throws(() => createShipGate({
+        config: CONFIG, isDeterministic: () => true, nowMs: clock.now,
+        getTransitionKey: 1
+    }), /getTransitionKey must be a function/);
 });
 
 // ── heartbeat ───────────────────────────────────────────────────────────────

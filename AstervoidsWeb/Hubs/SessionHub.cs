@@ -898,7 +898,7 @@ public class SessionHub : Hub
     /// Null when the owner's clock isn't yet initialized; server falls back
     /// to its hub-entry timestamp.
     /// </param>
-    public async Task<List<ObjectInfo>?> ReplaceObject(Guid deleteObjectId, List<SyncPayload> replacements, string scope = "Session", string? ownerMemberId = null, long? clientValidAt = null)
+    public async Task<ReplaceObjectResponse?> ReplaceObject(Guid deleteObjectId, List<SyncPayload> replacements, string scope = "Session", string? ownerMemberId = null, long? clientValidAt = null)
     {
         // Hub-entry serverTimestamp — used by recordPacketArrival (network arrival
         // timing, includes server processing time). NOT used as the spawn anchor;
@@ -943,21 +943,17 @@ public class SessionHub : Hub
 
         var memberSequence = NextMemberSequence(session, member);
 
-        // Single atomic broadcast to ALL members (including sender).
-        // NOTE: Cannot use OthersInGroup here — sender relies on this broadcast to
-        // update its local object map (replaceObject is not local-first). Would need
-        // to refactor replaceObject to process the invoke response locally first.
-        // ValidAt is a single batch-level trailing argument (all children share the
-        // same server-validated collision-time value).
+        // The caller applies the same atomic replacement from the response.
+        // Children and the response share one server-validated operation anchor.
         var batchValidAt = createdObjects.Count > 0 ? createdObjects[0].ValidAt : serverTimestamp;
         var replaceEvent = new ObjectReplacedEvent(deleteObjectId, createdInfos);
-        await BroadcastToAllAsync(session, "OnObjectReplaced",
+        await BroadcastToOthersAsync(session, member.Id, "OnObjectReplaced",
             replaceEvent, member.Id, memberSequence, serverTimestamp, batchValidAt);
 
         _logger.LogDebug("Object {ObjectId} replaced with {Count} objects in session {SessionId}",
             deleteObjectId, createdObjects.Count, member.SessionId);
 
-        return createdInfos;
+        return new ReplaceObjectResponse(createdInfos, memberSequence, batchValidAt);
     }
 
     /// <summary>

@@ -23,7 +23,6 @@ const MultiRegionSessionsFactory = (function() {
         const perRegion = new Map();
         const pendingRefetch = new Map();
         const inFlight = new Map();
-        const requestSequences = new Map();
         let backgroundPollHandle = null;
         let runGeneration = 0;
         let running = false;
@@ -52,64 +51,91 @@ const MultiRegionSessionsFactory = (function() {
             }
         }
 
-        async function refreshRegion(region, generation = runGeneration) {
-            const requestSequence =
-                (requestSequences.get(region.id) ?? 0) + 1;
-            requestSequences.set(region.id, requestSequence);
-            inFlight.get(region.id)?.abort();
-            const controller = new AbortController();
-            inFlight.set(region.id, controller);
+        async function performRefresh(region, request, generation) {
+            const isCurrent = () => generation === runGeneration
+                && inFlight.get(region.id) === request;
             try {
-                const body = await fetchOneRegion(region, controller);
-                if (generation !== runGeneration
-                    || requestSequences.get(region.id) !== requestSequence) {
-                    return;
+                try {
+                    const body = await fetchOneRegion(region, request.controller);
+                    if (!isCurrent()) return;
+                    if (request.controller.signal.aborted) throw new Error('Region refresh aborted');
+                    perRegion.set(region.id, {
+                        sessions: (body.sessions || []).map(session => ({
+                            ...session,
+                            regionId: session.regionId || region.id,
+                        })),
+                        maxSessions: body.maxSessions ?? 6,
+                        canCreate: body.canCreateSession ?? true,
+                        state: 'fresh',
+                        lastFetchAt: now(),
+                        lastError: null,
+                    });
+                } catch (error) {
+                    if (!isCurrent()) return;
+                    const previous = perRegion.get(region.id) ?? {};
+                    perRegion.set(region.id, {
+                        ...previous,
+                        sessions: [],
+                        state: 'stale',
+                        lastError: error?.message,
+                    });
                 }
-                perRegion.set(region.id, {
-                    sessions: (body.sessions || []).map(session => ({
-                        ...session,
-                        regionId: session.regionId || region.id,
-                    })),
-                    maxSessions: body.maxSessions ?? 6,
-                    canCreate: body.canCreateSession ?? true,
-                    state: 'fresh',
-                    lastFetchAt: now(),
-                    lastError: null,
-                });
-            } catch (error) {
-                if (generation !== runGeneration
-                    || requestSequences.get(region.id) !== requestSequence) {
-                    return;
-                }
-                const previous = perRegion.get(region.id) ?? {};
-                perRegion.set(region.id, {
-                    ...previous,
-                    sessions: [],
-                    state: 'stale',
-                    lastError: error?.message,
-                });
+                applyMerged();
             } finally {
-                if (inFlight.get(region.id) === controller) {
+                const followUp = request.followUp;
+                if (isCurrent()) {
                     inFlight.delete(region.id);
+                    if (followUp) {
+                        refreshRegion(followUp.region, generation).then(followUp.resolve, followUp.reject);
+                    }
+                } else {
+                    followUp?.resolve();
                 }
             }
+        }
 
-            if (generation !== runGeneration
-                || requestSequences.get(region.id) !== requestSequence) {
-                return;
+        function refreshRegion(region, generation = runGeneration) {
+            if (generation !== runGeneration) return Promise.resolve();
+            const active = inFlight.get(region.id);
+            if (active) {
+                // Hints during a request need one later snapshot, not a replacement
+                // request. Immediate callers wait for that snapshot, not the old one.
+                if (!active.followUp) {
+                    const followUp = { region };
+                    followUp.promise = new Promise((resolve, reject) => {
+                        followUp.resolve = resolve;
+                        followUp.reject = reject;
+                    });
+                    followUp.promise.catch(() => {});
+                    active.followUp = followUp;
+                }
+                active.followUp.region = region;
+                return active.followUp.promise;
             }
-            applyMerged();
+            const request = { controller: new AbortController(), followUp: null };
+            inFlight.set(region.id, request);
+            request.promise = performRefresh(region, request, generation);
+            // Background hints may ignore the promise; explicit callers can still
+            // observe callback errors without producing unhandled rejections.
+            request.promise.catch(() => {});
+            return request.promise;
         }
 
         function requestRefresh(region, immediate = false) {
-            if (immediate) {
-                return refreshRegion(region, runGeneration);
-            }
             const existing = pendingRefetch.get(region.id);
-            if (existing) clearTimeout(existing);
-            const handle = setTimeout(() => {
+            if (existing != null) {
+                clearTimeout(existing);
                 pendingRefetch.delete(region.id);
-                refreshRegion(region, runGeneration);
+            }
+            if (immediate || inFlight.has(region.id)) {
+                const promise = refreshRegion(region, runGeneration);
+                return immediate ? promise : Promise.resolve();
+            }
+            const generation = runGeneration;
+            const handle = setTimeout(() => {
+                if (pendingRefetch.get(region.id) !== handle) return;
+                pendingRefetch.delete(region.id);
+                refreshRegion(region, generation);
             }, COALESCE_MS);
             pendingRefetch.set(region.id, handle);
             return Promise.resolve();
@@ -156,8 +182,9 @@ const MultiRegionSessionsFactory = (function() {
                 clearTimeout(handle);
             }
             pendingRefetch.clear();
-            for (const controller of inFlight.values()) {
-                controller.abort();
+            for (const request of inFlight.values()) {
+                request.controller.abort();
+                request.followUp?.resolve();
             }
             inFlight.clear();
         }

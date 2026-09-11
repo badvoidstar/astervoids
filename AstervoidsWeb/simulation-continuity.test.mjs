@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -1369,7 +1370,12 @@ test('production kinematic presentation delegates to DeadReckon/RemoteObjects by
     assert.ok(start >= 0 && end > start);
     const source = productionSource.slice(start, end);
     assert.match(source, /has\(id\) \{\s*return isDeterministicMode\(\)/);
-    assert.match(source, /ingest\(id, data, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
+    const { createKinematicPresentation } = loadInlineGameFunctions(['createKinematicPresentation']);
+    // Ship transition capture precedes both modes; the branch belongs to
+    // ingest, but need not be its first statement.
+    assert.match(
+        createKinematicPresentation().ingest.toString(),
+        /if \(isDeterministicMode\(\)\) \{/);
     assert.match(source, /sample\(id, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
     assert.match(source, /remove\(id, reason, facts, record, context\) \{\s*RemoteObjects\.remove\(id\);\s*DeadReckon\.remove\(id\);/);
     assert.match(source, /reset\(facts, context\) \{\s*RemoteObjects\.clear\(\);\s*DeadReckon\.clear\(\);/);

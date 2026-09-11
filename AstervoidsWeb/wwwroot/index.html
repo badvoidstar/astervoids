@@ -1292,7 +1292,7 @@
         // changes the per-frame positional packets are redundant re-anchors. The
         // owner therefore broadcasts only when the receiver's replay would
         // diverge — i.e. on a control-intent change (thrust/brake/turn target or
-        // mode), an invulnerable change (respawn teleport + blink phase), a
+        // mode), an invulnerability transition (respawn or expiry), a
         // thrusting flip, or the heartbeat. Position/velocity changes are NOT
         // triggers: the receiver derives them from the replayed inputs. Gated by
         // isDeterministicMode() AND SHIP_INPUT_REPLAY_ENABLED — with replay off
@@ -1706,11 +1706,25 @@
 
     // Returns the aspect compensation scales derived from the effective severity
     // and the current CONFIG balance parameter.
+    let asteroidAspectScaleCache = null;
+
     function getEffectiveAsteroidAspectScales() {
-        return AstervoidsFracture.getAsteroidAspectScales(
-            getEffectiveAspectSeverity(),
-            CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE,
-            CONFIG.ASTEROID_DIFFICULTY_FACTOR);
+        const session = isSessionMode();
+        const severity = getEffectiveAspectSeverity();
+        const balance = CONFIG.ASTEROID_ASPECT_SIZE_SPEED_BALANCE;
+        const difficulty = CONFIG.ASTEROID_DIFFICULTY_FACTOR;
+        const cached = asteroidAspectScaleCache;
+        if (cached && cached.session === session
+            && Object.is(cached.severity, severity)
+            && Object.is(cached.balance, balance)
+            && Object.is(cached.difficulty, difficulty)) {
+            return cached.scales;
+        }
+        // Callers may retain the previous scales while resizing or adopting config.
+        const scales = Object.freeze(
+            AstervoidsFracture.getAsteroidAspectScales(severity, balance, difficulty));
+        asteroidAspectScaleCache = { session, severity, balance, difficulty, scales };
+        return scales;
     }
 
     function rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio) {
@@ -2090,9 +2104,9 @@
     //      prediction wrong. (turnTarget is the upstream cause of rotationSpeed,
     //      so gating on it rather than rotationSpeed avoids re-sending every
     //      frame of a turn-rate RAMP the receiver reproduces natively.)
-    //   3. invulnerable change → fires every frame of the ~2 s post-respawn
-    //      countdown (keeps the remote blink phase fresh) AND catches the respawn
-    //      teleport edge (0 → max, which the receiver snaps on) and its → 0 end.
+    //   3. Invulnerability revision → catches respawn and expiry transitions.
+    //      Receivers sample countdown/blinking from its explicit capture time;
+    //      ordinary countdown ticks do not make the ship send-eligible.
     //   4. Heartbeat → bounds dead-reckon clamp, ordered-stall recovery and
     //      server-state age for late joiners, identical to SendGate.
     //
@@ -2107,7 +2121,8 @@
     const ShipSendGate = ReplicationSendPolicy.createShipGate({
         config: CONFIG,
         isDeterministic: isDeterministicMode,
-        nowMs: () => performance.now()
+        nowMs: () => performance.now(),
+        getTransitionKey: ship => ship.invulnerabilityRevision
     });
 
     // ============================================
@@ -2146,9 +2161,9 @@
     // of clamping them at an edge. Angle uses q16_2pi (2 B, ~0.0055°
     // resolution). Velocity uses q16s (2 B, signed [-1,1] — game velocities
     // saturate well below ±1).
-    // `invulnerable` is a frame counter
-    // (0..INVULNERABILITY_TIME, decremented by dt each frame; receivers use
-    // its integer value to drive the blink phase via Math.floor(v/BLINK_RATE)
+    // `invulnerable` is a captured simulation-tick counter
+    // (0..INVULNERABILITY_TIME, paired with invulnerableAt and a transition
+    // revision; receivers derive its countdown and blink via Math.floor(v/BLINK_RATE)
     // % 2), so it MUST be encoded as an integer — `bool` would collapse all
     // nonzero values to 1, fixing the receiver in the "blink off" half and
     // making the ship invisible for the entire invuln period.
@@ -3526,7 +3541,9 @@
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
-            this.invulnerable = 0;         // Invulnerability frames remaining
+            this._invulnerable = 0;        // Authoritative simulation ticks / sampled presentation ticks
+            this.invulnerabilityRevision = 0;
+            this._invulnerabilityAnchor = null;
             this.shootCooldown = 0;        // Frames until can shoot again
             this.colorIndex = colorIndex;  // Player color index (0-3)
             this.syncObjectId = null;      // ObjectSync ID when in session
@@ -3540,6 +3557,72 @@
             this._vertCacheY = NaN;
             this._vertCacheAngle = NaN;
             this._vertCacheRef = NaN;
+        }
+
+        get invulnerable() {
+            return this._invulnerable;
+        }
+
+        set invulnerable(value) {
+            const remaining = Number.isFinite(value) ? Math.max(0, value) : 0;
+            // Preserve direct assignment by spawn/reset callers, including a
+            // second reset at the same duration. Ordinary countdown ticks are
+            // not transitions; expiry is clamped to one exact zero edge.
+            if ((remaining > 0 && remaining >= this._invulnerable)
+                || (remaining === 0 && this._invulnerable > 0)) {
+                this.invulnerabilityRevision = (this.invulnerabilityRevision + 1) >>> 0;
+            }
+            this._invulnerable = remaining;
+            this._invulnerabilityAnchor = null;
+        }
+
+        captureInvulnerability() {
+            return {
+                invulnerable: this.invulnerable,
+                invulnerabilityRevision: this.invulnerabilityRevision,
+                // This stamps the countdown capture, not the later wire flush.
+                // Zero explicitly requests receiver validAt/arrival fallback.
+                invulnerableAt: this.invulnerable > 0 && RemoteObjects.clock.offsetInitialized
+                    ? RemoteObjects.serverNowMs() : 0
+            };
+        }
+
+        ingestInvulnerability(data, record) {
+            const previous = this._invulnerabilityAnchor;
+            const remaining = Number.isFinite(data.invulnerable)
+                ? Math.max(0, data.invulnerable) : 0;
+            const revision = Number.isInteger(data.invulnerabilityRevision)
+                ? data.invulnerabilityRevision >>> 0 : null;
+            // More than one transition also catches a respawn whose complete
+            // countdown was coalesced while a previous send was in flight.
+            const teleport = !!previous
+                && (revision !== null && previous.revision !== null
+                    ? revision !== previous.revision
+                        && (remaining > 0 || ((revision - previous.revision) >>> 0) > 1)
+                    : remaining > 0 && remaining > previous.remaining);
+            this._invulnerabilityAnchor = {
+                remaining,
+                revision,
+                at: Number.isFinite(data.invulnerableAt) && data.invulnerableAt > 0
+                    ? data.invulnerableAt : record.validAt,
+                receivedPerf: performance.now()
+            };
+            return teleport;
+        }
+
+        sampleInvulnerability(renderTime = performance.now(), delayMs = 0) {
+            const anchor = this._invulnerabilityAnchor;
+            if (!anchor) return;
+            // Shared time corrects late joins (also once bootstrap completes).
+            // Until then, never interpret a remote UTC stamp as a local clock.
+            const baseline = RemoteObjects.clock.offsetInitialized
+                && Number.isFinite(anchor.at) && anchor.at > 0
+                ? replicationClock.validAtToMonotonicMs(anchor.at)
+                : anchor.receivedPerf;
+            const elapsedMs = Math.max(0, renderTime - Math.max(0, delayMs) - baseline);
+            this._invulnerable = Math.max(
+                0, anchor.remaining - elapsedMs * CONFIG.TARGET_FPS / 1000);
+            if (anchor.revision !== null) this.invulnerabilityRevision = anchor.revision;
         }
 
         /**
@@ -3556,7 +3639,7 @@
                 velocityY: this.velocityY,
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
-                invulnerable: this.invulnerable,
+                ...this.captureInvulnerability(),
                 colorIndex: this.colorIndex,
                 memberId: this.memberId,
                 score: this.score || 0,
@@ -3587,7 +3670,7 @@
                 velocityY: this.velocityY,
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
-                invulnerable: this.invulnerable
+                ...this.captureInvulnerability()
             };
             if (isDeterministicMode()) {
                 Object.assign(data, {
@@ -3615,7 +3698,12 @@
             if (data.velocityY !== undefined) this.velocityY = data.velocityY;
             if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
             if (data.thrusting !== undefined) this.thrusting = data.thrusting;
-            if (data.invulnerable !== undefined) this.invulnerable = data.invulnerable;
+            if (Number.isFinite(data.invulnerable)) {
+                this._invulnerable = Math.max(0, data.invulnerable);
+            }
+            if (Number.isInteger(data.invulnerabilityRevision)) {
+                this.invulnerabilityRevision = data.invulnerabilityRevision >>> 0;
+            }
             if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
             if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
             if (data.turnControlMode !== undefined) {
@@ -3723,7 +3811,7 @@
             this.y = wrapNormalized(this.y, wrapMarginY(CONFIG.SHIP_SIZE));
             
             // Decrement timers (adjusted for delta time)
-            if (this.invulnerable > 0) this.invulnerable -= dt;
+            if (this.invulnerable > 0 && dt > 0) this.invulnerable -= dt;
             if (this.shootCooldown > 0) this.shootCooldown -= dt;
         }
 
@@ -5107,6 +5195,9 @@
                     : RemoteObjects.states.has(id);
             },
             ingest(id, data, facts, record, context) {
+                const ship = facts.type === OBJECT_TYPES.SHIP
+                    ? game.multiplayer.remoteShips.get(id) : null;
+                const shipTeleport = ship?.ingestInvulnerability(data, record) || false;
                 if (isDeterministicMode()) {
                     if (resolveTerminalSession()) {
                         // Terminal versions carry a destination, not a fresh
@@ -5116,19 +5207,10 @@
                         DeadReckon.remove(id);
                         return;
                     }
-                    // Intentional respawn teleport (ship-only): the
-                    // invulnerability counter only ever decreases during play
-                    // and jumps back up to its max on Ship.reset(). A jump UP
-                    // means death/respawn, so we snap to the spawn pose
-                    // instead of gliding the replica there.
-                    let isTeleport = false;
-                    if (facts.type === OBJECT_TYPES.SHIP) {
-                        const existingShip = game.multiplayer.remoteShips.get(id);
-                        const prevInvuln = existingShip ? existingShip.invulnerable : undefined;
-                        isTeleport = DeadReckon.states.has(id)
-                            && typeof prevInvuln === 'number'
-                            && (data.invulnerable || 0) > prevInvuln;
-                    }
+                    // Only an explicit transition can teleport timed ships.
+                    // Heartbeat corrections of a locally sampled countdown
+                    // must not be mistaken for another respawn.
+                    const isTeleport = shipTeleport && DeadReckon.states.has(id);
                     // Normal updates are arrival-anchored. Replacement children
                     // carry a one-shot parent-timeline baseline instead so
                     // differential packet delay cannot introduce a discontinuity.
@@ -5147,6 +5229,7 @@
                                     : null
                         });
                 } else {
+                    if (shipTeleport) RemoteObjects.remove(id);
                     RemoteObjects.updateState(
                         id, data, record.ownerMemberId, record.validAt, record.arrivalServerTime);
                 }
@@ -5182,6 +5265,14 @@
     }
     const kinematicPresentation = createKinematicPresentation();
 
+    function applyShipReplicaData(instance, data, facts, context) {
+        instance.fromSyncData(data);
+        instance.sampleInvulnerability(
+            context?.renderTime,
+            isDeterministicMode() || !CONFIG.INTERPOLATION_ENABLED
+                ? 0 : RemoteObjects.getDelayForMember(instance.memberId));
+    }
+
     // Ship descriptor: own ship is never adopted via receive (it is created
     // and driven locally by createSyncedShip/syncLocalShip); a remote ship is
     // only a replica while its owning member is still active.
@@ -5203,12 +5294,7 @@
             game.multiplayer.remoteShips.set(record.id, remoteShip);
             return seedReplicaAtTerminalTarget(remoteShip, record);
         },
-        apply(instance, data) {
-            instance.fromSyncData(data);
-            // Apply invulnerable and thrusting directly from sync
-            if (data.invulnerable !== undefined) instance.invulnerable = data.invulnerable;
-            if (data.thrusting !== undefined) instance.thrusting = data.thrusting;
-        },
+        apply: applyShipReplicaData,
         remove(instance, reason, facts) {
             const id = facts.objectId;
             game.multiplayer.remoteShips.delete(id);
@@ -5560,13 +5646,13 @@
      * Create a synced asteroid object (authority only)
      * @param {Asteroid} asteroid - The asteroid to sync
      */
-    async function createSyncedAsteroid(asteroid, ownerMemberId = null) {
-        if (!isSessionMode()) return;
+    async function createSyncedAsteroid(asteroid, ownerMemberId = null, isStillNeeded = null) {
+        if (!isSessionMode() || (isStillNeeded && !isStillNeeded())) return;
         
         try {
             asteroid.clampMotion();
             const objectInfo = await ObjectSync.createObject(
-                asteroid.toSyncData(), 'Session', ownerMemberId);
+                asteroid.toSyncData(), 'Session', ownerMemberId, isStillNeeded);
             if (!objectInfo) return;
             asteroid.syncObjectId = objectInfo.id;
         } catch (err) {
@@ -5661,16 +5747,22 @@
         for (const bullet of game.bullets) {
             // Only sync our own bullets
             if (bullet.ownerMemberId === myMemberId && bullet.syncObjectId) {
+                if (bullet.pendingHit) {
+                    // Hidden claims no longer need motion updates. Retry until
+                    // server-confirmed; local simulation still owns expiration.
+                    const claim = bullet.toHitData();
+                    if (!ObjectSync.isDataConfirmed(bullet.syncObjectId, claim)) {
+                        ObjectSync.updateObject(bullet.syncObjectId, claim);
+                    }
+                    continue;
+                }
                 // Send-on-change: bullets are frictionless/ballistic, so remotes
                 // predict from transmitted constant velocity and do not need
-                // per-frame re-anchors. A pending hit always remains eligible:
-                // pendingHit + hit* fields are the owner-to-owner claim and are
-                // not derivable from kinematics. Buffered mode remains eligible every
-                // frame.
+                // per-frame re-anchors. Buffered mode remains eligible every frame.
                 const gateSend = SendGate.shouldSend(
                     bullet.syncObjectId, bullet.x, bullet.y, null,
                     bullet.velocityX, bullet.velocityY, 0);
-                if (gateSend || bullet.pendingHit) {
+                if (gateSend) {
                     ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData());
                 }
             }
@@ -6411,9 +6503,16 @@
             1 + (game.wave - 1) * (CONFIG.WAVE_SPEED_MULTIPLIER - 1)
         );
         
-        // Spawn astervoids at random positions away from ship
-        for (let i = 0; i < asteroidCount; i++) {
-            await spawnAsteroidAwayFromShip(isCurrent);
+        // Bound outstanding creates without serializing each one on its RTT.
+        // Each call generates its geometry synchronously, preserving RNG order.
+        const concurrency = isSessionMode() ? 4 : 1;
+        for (let i = 0; i < asteroidCount; i += concurrency) {
+            const pending = [];
+            for (let j = i; j < Math.min(i + concurrency, asteroidCount); j++) {
+                if (isCurrent && !isCurrent()) break;
+                pending.push(spawnAsteroidAwayFromShip(isCurrent));
+            }
+            await Promise.all(pending);
             if (isCurrent && !isCurrent()) return false;
         }
         
@@ -6469,7 +6568,7 @@
         // In session mode, let OnObjectCreated → updateAstervoidsFromSync handle local state
         // In solo mode, push directly to game state
         if (isSessionMode()) {
-            await createSyncedAsteroid(asteroid);
+            await createSyncedAsteroid(asteroid, null, isCurrent);
             if (isCurrent && !isCurrent()) return null;
         } else {
             game.astervoids.push(asteroid);
@@ -6936,10 +7035,10 @@
         const bulletPxRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
         const bulletMarginX = wrapMarginX(CONFIG.BULLET_RADIUS);
         const bulletMarginY = wrapMarginY(CONFIG.BULLET_RADIUS);
+        const asteroidCollisionCache = new Map();
         // Geometry helpers consume these synchronously and never retain them.
         const bulletStart = { x: 0, y: 0, radius: bulletPxRadius };
         const bulletEnd = { x: 0, y: 0, radius: bulletPxRadius };
-        const asteroidBounds = { x: 0, y: 0, radius: 0 };
         
         // Bullet vs Asteroid collisions — only check local player's bullets
         for (let i = game.bullets.length - 1; i >= 0; i--) {
@@ -6959,34 +7058,27 @@
 
             for (let j = game.astervoids.length - 1; j >= 0; j--) {
                 const asteroid = game.astervoids[j];
-                
-                const asteroidDeltaX = AstervoidsCollision.wrappedDelta(
-                    asteroid._collisionPrevX, asteroid.x, wrapMarginX(asteroid.boundRadius));
-                const asteroidDeltaY = AstervoidsCollision.wrappedDelta(
-                    asteroid._collisionPrevY, asteroid.y, wrapMarginY(asteroid.boundRadius));
+                const prepared = prepareAsteroidCollision(asteroidCollisionCache, asteroid, true);
                 // Express the previous bullet pose in the asteroid's current
                 // translational frame. This sweeps their relative motion while
                 // keeping wrap jumps out of the segment.
-                bulletStart.x = fromNormalizedX(bullet.x - bulletDeltaX + asteroidDeltaX);
-                bulletStart.y = fromNormalizedY(bullet.y - bulletDeltaY + asteroidDeltaY);
+                bulletStart.x = fromNormalizedX(bullet.x - bulletDeltaX + prepared.deltaX);
+                bulletStart.y = fromNormalizedY(bullet.y - bulletDeltaY + prepared.deltaY);
 
                 // Broad phase: swept circle-vs-circle on bounding radii. Use the
                 // asteroid's true `boundRadius` (max vertex distance) so
                 // fracture shards — where `radius` is an area-equivalent disk
                 // radius and the polygon may extend much farther — aren't
                 // missed.
-                asteroidBounds.x = fromNormalizedX(asteroid.x);
-                asteroidBounds.y = fromNormalizedY(asteroid.y);
-                asteroidBounds.radius = fromNormalizedSize(asteroid.boundRadius);
                 if (!AstervoidsCollision.sweptCircleIntersectsCircle(
                     bulletStart,
                     bulletEnd,
-                    asteroidBounds)) {
+                    prepared)) {
                     continue;
                 }
 
                 if (AstervoidsCollision.sweptCirclePolygonCollision(
-                    bulletStart, bulletEnd, asteroid.getWorldVertices())) {
+                    bulletStart, bulletEnd, prepared.vertices ??= asteroid.getWorldVertices())) {
                     if (isSessionMode()) {
                         // Check if we own this asteroid
                         const asteroidSyncObj = asteroid.syncObjectId ? ObjectSync.getObject(asteroid.syncObjectId) : null;
@@ -7074,7 +7166,7 @@
         
         // Ship vs Asteroid collisions — only check local player's ship
         if (game.ship && game.ship.invulnerable <= 0 && game.state === 'playing') {
-            if (checkShipAsteroidCollision(game.ship)) {
+            if (checkShipAsteroidCollision(game.ship, asteroidCollisionCache)) {
                 handleShipHit(game.ship);
             }
         }
@@ -7138,12 +7230,38 @@
         }
     }
 
+    // Pass-local data is prepared on first encounter, not from an array snapshot:
+    // a split can append new asteroids for later bullets and the ship in this pass.
+    function prepareAsteroidCollision(cache, asteroid, swept = false) {
+        let prepared = cache.get(asteroid);
+        if (!prepared) {
+            prepared = {
+                x: fromNormalizedX(asteroid.x),
+                y: fromNormalizedY(asteroid.y),
+                radius: fromNormalizedSize(asteroid.boundRadius),
+                deltaX: 0,
+                deltaY: 0,
+                motionReady: false,
+                vertices: null,
+            };
+            cache.set(asteroid, prepared);
+        }
+        if (swept && !prepared.motionReady) {
+            prepared.deltaX = AstervoidsCollision.wrappedDelta(
+                asteroid._collisionPrevX, asteroid.x, wrapMarginX(asteroid.boundRadius));
+            prepared.deltaY = AstervoidsCollision.wrappedDelta(
+                asteroid._collisionPrevY, asteroid.y, wrapMarginY(asteroid.boundRadius));
+            prepared.motionReady = true;
+        }
+        return prepared;
+    }
+
     /**
      * Check collision for a specific ship against all astervoids
      * @param {Ship} ship - The ship to check
      * @returns {boolean} True if collision detected
      */
-    function checkShipAsteroidCollision(ship) {
+    function checkShipAsteroidCollision(ship, asteroidCollisionCache = new Map()) {
         const shipVertices = ship.getVertices();
         const shipPxX = fromNormalizedX(ship.x);
         const shipPxY = fromNormalizedY(ship.y);
@@ -7152,15 +7270,13 @@
         for (const asteroid of game.astervoids) {
             // Broad phase: circle-vs-circle on bounding radii to skip far-away asteroids.
             // Asteroid jagged vertices can extend up to radius × (1 + JAGGEDNESS).
-            const astPxX = fromNormalizedX(asteroid.x);
-            const astPxY = fromNormalizedY(asteroid.y);
-            const astPxBound = fromNormalizedSize(asteroid.boundRadius);
-            const dx = shipPxX - astPxX;
-            const dy = shipPxY - astPxY;
-            const reach = shipPxRadius + astPxBound;
+            const prepared = prepareAsteroidCollision(asteroidCollisionCache, asteroid);
+            const dx = shipPxX - prepared.x;
+            const dy = shipPxY - prepared.y;
+            const reach = shipPxRadius + prepared.radius;
             if (dx * dx + dy * dy > reach * reach) continue;
 
-            const asteroidVerts = asteroid.getWorldVertices();
+            const asteroidVerts = prepared.vertices ??= asteroid.getWorldVertices();
             
             // Check if any ship vertex is inside asteroid
             for (const vertex of shipVertices) {
@@ -7580,56 +7696,60 @@
         };
     }
 
-    // Run `drawFn` with every local renderable temporarily posed at its
-    // interpolated transform, restoring true sim state afterward. No-op (draws
-    // current state directly) in buffered mode or when alpha has reached 1.
-    function withLocalRenderInterpolation(alpha, drawFn) {
-        const objs = [];
-        if (game.ship) objs.push(game.ship);
-        for (const a of game.astervoids) objs.push(a);
-        for (const b of game.bullets) objs.push(b);
-        if (game.state === 'start' && !isSessionMode()) {
-            for (const c of game.cosmeticAstervoids) objs.push(c);
-        }
-        const saved = [];
-        const shouldInterpolate = isDeterministicMode() && alpha < 1;
-        for (const o of objs) {
-            if (!shouldInterpolate
-                || typeof o._prevX !== 'number'
-                || typeof o._prevY !== 'number') {
-                rememberRenderedPose(o);
-                continue;
-            }
-            // Skip dead-reckoned remote objects: they are already positioned
-            // smoothly to "now" by DeadReckon.getReckoned every frame. Blending
-            // them between fixed-step snapshots double-smooths (adds lag) and,
-            // at a wrap seam, pulls them backward — visible as a remote bullet
-            // that fails to travel its full path. Render interpolation is only
-            // for objects THIS client simulates in discrete fixed steps.
-            if (o.syncObjectId && DeadReckon.states.has(o.syncObjectId)) {
-                rememberRenderedPose(o);
-                continue;
-            }
-            // Terminal convergence already samples these objects at render time.
-            // Fixed-step interpolation would double-smooth the trajectory.
-            if (o.syncObjectId
-                && deterministicTerminalState.transitions.has(o.syncObjectId)) {
-                rememberRenderedPose(o);
-                continue;
-            }
-            saved.push([o, o.x, o.y, o.angle]);
-            const r = wrapRadiusFor(o);
-            o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
-            o.y = interpNormalized(o._prevY, o.y, alpha, 1 + 2 * wrapMarginY(r));
-            if (typeof o.angle === 'number' && typeof o._prevAngle === 'number') {
-                o.angle = interpAngle(o._prevAngle, o.angle, alpha);
-            }
+    // Borrowed scratch is never shared by nested draws. Pool only four buffers
+    // of at most 1024 poses; clear entity references even when rendering throws.
+    const localRenderScratchPool = [];
+
+    function poseLocalRenderable(o, alpha, shouldInterpolate, scratch) {
+        if (!shouldInterpolate
+            || typeof o._prevX !== 'number'
+            || typeof o._prevY !== 'number'
+            // Remotes and terminal convergence are already sampled at render time.
+            || (o.syncObjectId && (DeadReckon.states.has(o.syncObjectId)
+                || deterministicTerminalState.transitions.has(o.syncObjectId)))) {
             rememberRenderedPose(o);
+            return;
         }
+        const index = scratch.count;
+        scratch.values[index] = o;
+        scratch.values[index + 1] = o.x;
+        scratch.values[index + 2] = o.y;
+        scratch.values[index + 3] = o.angle;
+        scratch.count += 4;
+        const r = wrapRadiusFor(o);
+        o.x = interpNormalized(o._prevX, o.x, alpha, 1 + 2 * wrapMarginX(r));
+        o.y = interpNormalized(o._prevY, o.y, alpha, 1 + 2 * wrapMarginY(r));
+        if (typeof o.angle === 'number' && typeof o._prevAngle === 'number') {
+            o.angle = interpAngle(o._prevAngle, o.angle, alpha);
+        }
+        rememberRenderedPose(o);
+    }
+
+    // Run `drawFn` at interpolated local poses; only presentation sees the blend.
+    function withLocalRenderInterpolation(alpha, drawFn) {
+        const scratch = localRenderScratchPool.pop() || { values: [], count: 0 };
+        const shouldInterpolate = isDeterministicMode() && alpha < 1;
         try {
+            if (game.ship) poseLocalRenderable(game.ship, alpha, shouldInterpolate, scratch);
+            for (const o of game.astervoids) poseLocalRenderable(o, alpha, shouldInterpolate, scratch);
+            for (const o of game.bullets) poseLocalRenderable(o, alpha, shouldInterpolate, scratch);
+            if (game.state === 'start' && !isSessionMode()) {
+                for (const o of game.cosmeticAstervoids) poseLocalRenderable(o, alpha, shouldInterpolate, scratch);
+            }
             drawFn();
         } finally {
-            for (const [o, x, y, a] of saved) { o.x = x; o.y = y; o.angle = a; }
+            const saved = scratch.values;
+            for (let i = 0; i < scratch.count; i += 4) {
+                const o = saved[i];
+                o.x = saved[i + 1];
+                o.y = saved[i + 2];
+                o.angle = saved[i + 3];
+                saved[i] = null;
+            }
+            scratch.count = 0;
+            if (saved.length <= 4096 && localRenderScratchPool.length < 4) {
+                localRenderScratchPool.push(scratch);
+            }
         }
     }
 
@@ -8433,21 +8553,7 @@
             CollisionEffects.draw(ctx);
         });
         
-        // Show/hide gameplay text overlays (HTML for crisp rendering at all DPIs)
-        if (game.state === 'waveDelay') {
-            waveTextEl.textContent = `WAVE ${game.wave + 1}`;
-            waveOverlay.classList.add('visible');
-        } else {
-            waveOverlay.classList.remove('visible');
-        }
-        
-        if (isGameOver()) {
-            gameoverScoreEl.textContent = `Final Score: ${game.score}`;
-            gameoverPromptEl.style.display = isLobbySpectating() ? 'none' : '';
-            gameoverOverlay.classList.add('visible');
-        } else {
-            gameoverOverlay.classList.remove('visible');
-        }
+        updateGameplayOverlays();
         
         // Restore context if we applied viewport transform
         if (hasViewportOffset) {
@@ -8463,6 +8569,35 @@
         // coords so it sits on top of gameplay and isn't clipped by the
         // aspect-locked viewport. No-op on desktop / when no anchor is held.
         drawAnalogAnchors(ctx);
+    }
+
+    const overlayCache = {};
+    function updateGameplayOverlays() {
+        const waveVisible = game.state === 'waveDelay';
+        if (overlayCache.waveVisible !== waveVisible) {
+            waveOverlay.classList.toggle('visible', waveVisible);
+            overlayCache.waveVisible = waveVisible;
+        }
+        if (waveVisible && overlayCache.wave !== game.wave) {
+            waveTextEl.textContent = `WAVE ${game.wave + 1}`;
+            overlayCache.wave = game.wave;
+        }
+        const gameoverVisible = isGameOver();
+        if (overlayCache.gameoverVisible !== gameoverVisible) {
+            gameoverOverlay.classList.toggle('visible', gameoverVisible);
+            overlayCache.gameoverVisible = gameoverVisible;
+        }
+        if (gameoverVisible) {
+            if (overlayCache.score !== game.score) {
+                gameoverScoreEl.textContent = `Final Score: ${game.score}`;
+                overlayCache.score = game.score;
+            }
+            const promptDisplay = isLobbySpectating() ? 'none' : '';
+            if (overlayCache.promptDisplay !== promptDisplay) {
+                gameoverPromptEl.style.display = promptDisplay;
+                overlayCache.promptDisplay = promptDisplay;
+            }
+        }
     }
 
     // ============================================
@@ -8693,6 +8828,7 @@
         function beginMoveAnchor(identifier, clientX, clientY) {
             if (stickInput.moveTouchId !== null) return false;
             stickInput.moveTouchId = identifier;
+            stickInput.mappingDirty = true;
             stickInput.moveAnchorX = clientX;
             stickInput.moveAnchorY = clientY;
             stickInput.moveCurrentX = clientX;
@@ -8736,14 +8872,54 @@
             return true;
         }
 
-        // Frame-time updater: recomputes cached analog values from the current
-        // movement anchor each animation frame, so changes in viewport size /
-        // orientation immediately affect mapping without per-event work. The
+        const analogInputCache = { config: {}, active: false };
+        const analogInputConfigKeys = [
+            'ANALOG_STICK_RADIUS_PX', 'ANALOG_RECTILINEAR_TURN_DEADZONE_PX',
+            'ANALOG_RECTILINEAR_THRUST_DEADZONE_PX', 'ANALOG_RECTILINEAR_TURN_GAIN',
+            'ANALOG_POLAR_DEADZONE_PX', 'ANALOG_POLAR_THRESHOLD_PX',
+            'ANALOG_POLAR_TURN_GAIN', 'ANALOG_TURN_MAX', 'ANALOG_THRUST_GAIN',
+            'ANALOG_THRUST_MAX', 'ANALOG_BRAKE_GAIN', 'ANALOG_BRAKE_MAX',
+        ];
+        // Only remap when the active anchor, viewport scale or configuration
+        // changes. Idle frames do not allocate input parameter objects. The
         // rectilinear scheme uses computeStickInput to cache a rotation offset;
         // polar uses computePolarStickInput to cache an absolute target angle.
         function updateStickAnalog() {
+            requestAnimationFrame(updateStickAnalog);
+            if (stickInput.moveTouchId === null) {
+                if (analogInputCache.active) {
+                    stickInput.rectRotationOffset = 0;
+                    stickInput.thrustInput = 0;
+                    stickInput.brakeInput = 0;
+                    stickInput.polarActive = false;
+                    stickInput.polarRadius = 0;
+                    stickInput.polarTurnMagnitude = 0;
+                    stickInput.polarThrust = 0;
+                    stickInput.polarBrake = 0;
+                    analogInputCache.active = false;
+                }
+                return;
+            }
             const scheme = getAnalogControlScheme();
             const anchorScale = getAnalogAnchorScale();
+            const dx = stickInput.moveCurrentX - stickInput.moveAnchorX;
+            const dy = stickInput.moveCurrentY - stickInput.moveAnchorY;
+            let changed = stickInput.mappingDirty || !analogInputCache.active
+                || analogInputCache.id !== stickInput.moveTouchId
+                || analogInputCache.scheme !== scheme
+                || analogInputCache.scale !== anchorScale
+                || analogInputCache.dx !== dx || analogInputCache.dy !== dy;
+            for (const key of analogInputConfigKeys) {
+                if (!Object.is(analogInputCache.config[key], CONFIG[key])) {
+                    analogInputCache.config[key] = CONFIG[key];
+                    changed = true;
+                }
+            }
+            if (!changed) return;
+            stickInput.mappingDirty = false;
+            Object.assign(analogInputCache, {
+                active: true, id: stickInput.moveTouchId, scheme, scale: anchorScale, dx, dy
+            });
             const rectParams = {
                 radiusPx: CONFIG.ANALOG_STICK_RADIUS_PX * anchorScale,
                 turnDeadzonePx:
@@ -8757,8 +8933,6 @@
                 brakeMax: CONFIG.ANALOG_BRAKE_MAX,
             };
             if (stickInput.moveTouchId !== null) {
-                const dx = stickInput.moveCurrentX - stickInput.moveAnchorX;
-                const dy = stickInput.moveCurrentY - stickInput.moveAnchorY;
                 if (scheme === ANALOG_CONTROL_SCHEMES.POLAR) {
                     const polarParams = {
                         radiusPx: CONFIG.ANALOG_STICK_RADIUS_PX * anchorScale,
@@ -8796,17 +8970,7 @@
                     stickInput.polarThrust = 0;
                     stickInput.polarBrake = 0;
                 }
-            } else {
-                stickInput.rectRotationOffset = 0;
-                stickInput.thrustInput = 0;
-                stickInput.brakeInput = 0;
-                stickInput.polarActive = false;
-                stickInput.polarRadius = 0;
-                stickInput.polarTurnMagnitude = 0;
-                stickInput.polarThrust = 0;
-                stickInput.polarBrake = 0;
             }
-            requestAnimationFrame(updateStickAnalog);
         }
         requestAnimationFrame(updateStickAnalog);
 
@@ -9012,16 +9176,24 @@
     
     // Mobile UI update loop (only runs after touch controls are enabled)
     function startMobileUILoop() {
+        const cache = {};
         requestAnimationFrame(function mobileLoop() {
             if (touchButtons.restart) {
-                touchButtons.restart.classList.toggle('visible', isGameOver());
+                const showRestart = isGameOver();
+                if (cache.restart !== showRestart) {
+                    touchButtons.restart.classList.toggle('visible', showRestart);
+                    cache.restart = showRestart;
+                }
             }
             // Show pause button only during active solo play or while paused
             if (touchButtons.pause) {
                 const showPause = !isSessionMode()
                     && startScreen.classList.contains('hidden')
                     && (game.state === 'playing' || game.state === 'waveDelay' || game.state === 'paused');
-                touchButtons.pause.style.display = showPause ? '' : 'none';
+                if (cache.pause !== showPause) {
+                    touchButtons.pause.style.display = showPause ? '' : 'none';
+                    cache.pause = showPause;
+                }
             }
             requestAnimationFrame(mobileLoop);
         });
@@ -10338,6 +10510,7 @@
         reconnectingOverlay.classList.remove('visible');
         waveOverlay.classList.remove('visible');
         gameoverOverlay.classList.remove('visible');
+        overlayCache.waveVisible = overlayCache.gameoverVisible = undefined;
         game.connectionLost = false;
         startScreen.classList.remove('hidden');
 

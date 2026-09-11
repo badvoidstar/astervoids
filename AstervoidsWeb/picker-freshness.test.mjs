@@ -13,16 +13,19 @@
  *   - Per-region failure (timeout / 5xx): drops only that region's rows
  *     from the merge — every healthy region's sessions remain visible.
  *   - Push coalescing: multiple OnSessionsChanged events from the same
- *     region within 250 ms collapse to a single refetch.
+ *     region within 250 ms collapse to a single refetch. Hints received while
+ *     fetching queue one follow-up without aborting the active request.
  *   - Visibility off (`document.hidden`): stop() halts background polls
  *     so backgrounded tabs don't keep regions warm (scale-to-zero).
  *   - Explicit refresh after stop(): remains available for Join/Create
  *     transitions while stale pre-stop requests are still rejected.
  *
  */
-import { test, describe, beforeEach } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const makeMultiRegionSessions =
@@ -33,6 +36,42 @@ function fakeOk(body) { return { ok: true, status: 200, json: async () => body }
 function fakeFail(status = 500) { return { ok: false, status, json: async () => ({}) }; }
 function session(id, regionId) {
     return { id, name: `s-${id}`, memberCount: 1, maxMembers: 4, createdAt: '2026-05-26T00:00:00Z', regionId };
+}
+const drain = () => new Promise(resolve => setImmediate(resolve));
+
+function refreshHarness({ updateSessionList } = {}) {
+    const timers = new Map();
+    const requests = [];
+    const updates = [];
+    let nextTimer = 0;
+    const module = { exports: {} };
+    runInNewContext(
+        readFileSync(new URL('wwwroot/js/multi-region-sessions.js', import.meta.url), 'utf8'),
+        {
+            module, AbortController, Date,
+            setTimeout: (fn, delay) => {
+                timers.set(++nextTimer, { fn, delay });
+                return nextTimer;
+            },
+            clearTimeout: id => timers.delete(id),
+            setInterval: () => ++nextTimer,
+            clearInterval() {},
+        });
+    const mrs = module.exports.create({
+        updateSessionList: updateSessionList ?? (result => updates.push(result)),
+        fetch: (url, init) => new Promise((resolve, reject) => {
+            requests.push({ url, signal: init.signal, resolve, reject });
+        }),
+    });
+    return {
+        mrs, requests, updates, timers,
+        runTimers: async delay => {
+            for (const [id, timer] of [...timers]) {
+                if (timer.delay <= delay && timers.delete(id)) timer.fn();
+            }
+            await drain();
+        },
+    };
 }
 
 describe('MultiRegionSessions bootstrap merge', () => {
@@ -115,39 +154,161 @@ describe('MultiRegionSessions push coalescing', () => {
         mrs.stop();
     });
 
-    test('an older response cannot overwrite a newer refresh', async () => {
-        const responses = [];
-        const fetch = () => new Promise(resolve => responses.push(resolve));
-        const updates = [];
-        const mrs = makeMultiRegionSessions({
-            updateSessionList: result => updates.push(result),
-            fetch
-        });
+    test('in-flight hints share exactly one follow-up and immediate callers wait for its snapshot', async t => {
+        const { mrs, requests, updates, runTimers } = refreshHarness();
+        t.after(() => mrs.stop());
         const region = { id: 'r1', hostname: 'https://r1.example.com' };
-
         const older = mrs.requestRefresh(region, true);
+        await mrs.requestRefresh(region);
         const newer = mrs.requestRefresh(region, true);
-        responses[1](fakeOk({
-            sessions: [session('new', 'r1')],
-            maxSessions: 6,
-            canCreateSession: true
-        }));
-        await newer;
-        responses[0](fakeOk({
-            sessions: [session('old', 'r1')],
-            maxSessions: 6,
-            canCreateSession: true
-        }));
+        assert.strictEqual(mrs.requestRefresh(region, true), newer);
+        await mrs.requestRefresh(region);
+        await runTimers(250);
+        assert.equal(requests.length, 1, 'hints cannot restart a slow request');
+        assert.equal(requests[0].signal.aborted, false);
+        let settled = false;
+        newer.then(() => { settled = true; });
+        requests[0].resolve(fakeOk({ sessions: [session('old', 'r1')] }));
         await older;
+        assert.equal(settled, false, 'a queued immediate refresh waits for the later snapshot');
+        assert.equal(requests.length, 2);
+        assert.equal(updates.at(-1).sessions[0].id, 'old', 'the active request can still paint useful rows');
+        requests[1].resolve(fakeOk({ sessions: [session('new', 'r1')] }));
+        await newer;
+        await runTimers(250);
+        assert.equal(requests.length, 2, 'no leftover debounce creates a third request');
+        assert.equal(updates.at(-1).sessions[0].id, 'new');
+    });
 
-        assert.deepEqual(
-            updates.at(-1).sessions.map(value => value.id),
-            ['new']);
-        mrs.stop();
+    test('immediate refresh consumes an idle debounce instead of fetching again later', async t => {
+        const { mrs, requests, runTimers } = refreshHarness();
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        await mrs.requestRefresh(region);
+        const immediate = mrs.requestRefresh(region, true);
+        requests[0].resolve(fakeOk({ sessions: [] }));
+        await immediate;
+        await runTimers(250);
+        assert.equal(requests.length, 1);
+    });
+
+    test('a slow response body remains single-flight and new follow-up hints queue only one later fetch', async t => {
+        const { mrs, requests } = refreshHarness();
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        let resolveBody;
+        const body = new Promise(resolve => { resolveBody = resolve; });
+        const first = mrs.requestRefresh(region, true);
+        requests[0].resolve({ ok: true, json: () => body });
+        await drain();
+        const second = mrs.requestRefresh(region, true);
+        assert.equal(requests.length, 1);
+        resolveBody({ sessions: [] });
+        await first;
+        assert.equal(requests.length, 2);
+        const third = mrs.requestRefresh(region, true);
+        await mrs.requestRefresh(region);
+        requests[1].resolve(fakeOk({ sessions: [] }));
+        await second;
+        assert.equal(requests.length, 3);
+        requests[2].resolve(fakeOk({ sessions: [] }));
+        await third;
+        assert.equal(requests.length, 3);
+        assert.ok(requests.every(request => !request.signal.aborted));
+    });
+
+    test('a failed region drains its queued refresh without blocking healthy regions', async t => {
+        const { mrs, requests, updates } = refreshHarness();
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        const first = mrs.requestRefresh(region, true);
+        const second = mrs.requestRefresh(region, true);
+        const healthy = mrs.requestRefresh({ id: 'r2', hostname: 'https://r2.example.com' }, true);
+        requests[1].resolve(fakeOk({ sessions: [session('healthy', 'r2')] }));
+        await healthy;
+        assert.equal(updates.at(-1).sessions[0].id, 'healthy');
+        requests[0].reject(new Error('network failed'));
+        await first;
+        assert.equal(mrs.regionState('r1'), 'stale');
+        assert.equal(requests.length, 3);
+        requests[2].resolve(fakeOk({ sessions: [session('recovered', 'r1')] }));
+        await second;
+        assert.equal(mrs.regionState('r1'), 'fresh');
+        assert.deepEqual(Array.from(updates.at(-1).sessions, row => row.id), ['healthy', 'recovered']);
+    });
+
+    test('timeout still aborts the request and a queued hint recovers after abort rejection', async t => {
+        const { mrs, requests, runTimers } = refreshHarness();
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        const first = mrs.requestRefresh(region, true);
+        const second = mrs.requestRefresh(region, true);
+        requests[0].signal.addEventListener('abort', () => requests[0].reject(new Error('aborted')));
+        await runTimers(5000);
+        await first;
+        assert.equal(requests[0].signal.aborted, true);
+        assert.equal(mrs.regionState('r1'), 'stale');
+        assert.equal(requests.length, 2);
+        requests[1].resolve(fakeOk({ sessions: [] }));
+        await second;
+        assert.equal(mrs.regionState('r1'), 'fresh');
+    });
+
+    test('an abort-resistant response cannot become fresh after its timeout', async t => {
+        const { mrs, requests, updates, runTimers } = refreshHarness();
+        t.after(() => mrs.stop());
+        const first = mrs.requestRefresh({ id: 'r1', hostname: 'https://r1.example.com' }, true);
+        await runTimers(5000);
+        assert.equal(requests[0].signal.aborted, true);
+        requests[0].resolve(fakeOk({ sessions: [session('late', 'r1')] }));
+        await first;
+        assert.equal(mrs.regionState('r1'), 'stale');
+        assert.equal(updates.at(-1).sessions.length, 0);
+    });
+
+    test('background follow-up callback errors stay handled and remain observable by immediate callers', async t => {
+        const { mrs, requests } = refreshHarness({
+            updateSessionList: () => { throw new Error('render failed'); },
+        });
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        const first = mrs.requestRefresh(region, true);
+        await mrs.requestRefresh(region);
+        const second = mrs.requestRefresh(region, true);
+        requests[0].resolve(fakeOk({ sessions: [] }));
+        await drain();
+        requests[1].resolve(fakeOk({ sessions: [] }));
+        await drain();
+        await assert.rejects(first, /render failed/);
+        await assert.rejects(second, /render failed/);
     });
 });
 
 describe('MultiRegionSessions stop()', () => {
+    test('stop cancels a queued refresh and a late pre-stop body cannot overwrite a new generation', async t => {
+        const { mrs, requests, updates, timers } = refreshHarness();
+        t.after(() => mrs.stop());
+        const region = { id: 'r1', hostname: 'https://r1.example.com' };
+        let resolveBody;
+        const body = new Promise(resolve => { resolveBody = resolve; });
+        const older = mrs.requestRefresh(region, true);
+        requests[0].resolve({ ok: true, json: () => body });
+        await drain();
+        const cancelled = mrs.requestRefresh(region, true);
+        mrs.stop();
+        await cancelled;
+        assert.equal(requests[0].signal.aborted, true);
+        const newer = mrs.requestRefresh(region, true);
+        requests[1].resolve(fakeOk({ sessions: [session('new', 'r1')] }));
+        await newer;
+        resolveBody({ sessions: [session('old', 'r1')] });
+        await older;
+        assert.equal(requests.length, 2, 'teardown discards the old generation follow-up');
+        assert.equal(updates.length, 1);
+        assert.equal(updates[0].sessions[0].id, 'new');
+        assert.equal(timers.size, 0);
+    });
+
     test('cancels pending coalesced refetch', async () => {
         let fetchCount = 0;
         const fetch = async () => { fetchCount++; return fakeOk({ sessions: [], maxSessions: 6, canCreateSession: true }); };

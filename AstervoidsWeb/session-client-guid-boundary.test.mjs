@@ -47,7 +47,7 @@ async function loadClient(guidUtils = GuidUtils) {
         ['RejoinSession', sessionResponse],
         ['UpdateObjects', () => [[[GuidUtils.guidToBytes(OBJECT_ID), 2]], 7, 1234]],
         ['CreateObject', () => null],
-        ['ReplaceObject', () => []],
+        ['ReplaceObject', () => [[], 9, 2000]],
         ['DeleteObject', () => [true, 8]],
         ['BroadcastObjectEvent', () => true]
     ]);
@@ -189,12 +189,14 @@ test('ReplaceObject converts only the deleted typed Guid, preserving string owne
     const { client, calls, replies, SyncPayload } = await loadClient();
     await client.createSession();
     const data = Object.freeze({ objectId: OBJECT_ID, ownerMemberId: MEMBER_ID });
-    replies.set('ReplaceObject', () => [[
+    replies.set('ReplaceObject', () => [[[
         GuidUtils.guidToBytes(OTHER_ID),
         GuidUtils.guidToBytes(MEMBER_ID),
         GuidUtils.guidToBytes(MEMBER_ID),
         1, SyncPayload.wrap(data), 1
-    ]]);
+    ]], 9, 1999]);
+    const notifications = [];
+    client.on('onObjectReplaced', (...args) => notifications.push(args));
     const result = await client.replaceObject(OBJECT_ID, [data], 'Session', MEMBER_ID, 2000);
 
     assert.equal(calls.at(-1).method, 'ReplaceObject');
@@ -206,6 +208,10 @@ test('ReplaceObject converts only the deleted typed Guid, preserving string owne
     assert.equal(result[0].ownerMemberId, MEMBER_ID);
     assert.equal(result[0].creatorMemberId, MEMBER_ID);
     assert.deepEqual(result[0].data, data);
+    assert.equal(notifications.length, 1);
+    assert.deepEqual(notifications[0], [
+        { deletedObjectId: OBJECT_ID, createdObjects: result }, MEMBER_ID, 9, 1999
+    ]);
 });
 
 test('DeleteObject and BroadcastObjectEvent convert IDs while preserving opaque payload bytes', async () => {

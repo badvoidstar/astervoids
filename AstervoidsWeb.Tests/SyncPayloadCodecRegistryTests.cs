@@ -56,6 +56,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
             new PositionalSchemaCodec.FieldSpec("terminalX", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalY", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
+            new PositionalSchemaCodec.FieldSpec("invulnerabilityRevision", "u32"),
+            new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
         });
 
     private static Dictionary<string, object?> ShipCreateDict() => new()
@@ -69,6 +71,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
         ["rotationSpeed"] = 0d,
         ["thrusting"] = false,
         ["invulnerable"] = 180,
+        ["invulnerabilityRevision"] = 1,
+        ["invulnerableAt"] = 1_800_000_000_000d,
         ["colorIndex"] = 1,
         ["memberId"] = "00112233-4455-6677-8899-aabbccddeeff",
         ["score"] = 0,
@@ -250,6 +254,42 @@ public class SyncPayloadCodecRegistryTests : TestBase
         decoded[0]["type"].Should().Be("generic-widget");
         Convert.ToInt64(decoded[0]["value"]).Should().Be(7);
         decoded[1]["type"].Should().Be("ship");
+    }
+
+    [Fact]
+    public void ObjectService_InvulnerabilityTimingSurvivesShipSnapshotReencode()
+    {
+        var (session, creator) = CreateTestSession();
+        var schema = ShipSchema();
+        var registry = new SyncSchemaRegistry();
+        registry.SetSessionSchemas(session.Id, new[] { schema });
+        var obj = ObjectService.CreateObject(
+            session.Id, creator.Id, ObjectScope.Member, ShipCreateDict(),
+            ownerMemberId: null, clientValidAt: null, serverReceiveTimeMs: null,
+            schemaId: schema.Id)!;
+
+        foreach (var remaining in new[] { 120, 0 })
+        {
+            var data = new Dictionary<string, object?>
+            {
+                ["invulnerable"] = remaining,
+                ["invulnerabilityRevision"] = remaining > 0 ? 1 : 2,
+                ["invulnerableAt"] = remaining > 0 ? 1_800_000_001_000.5 : 0d
+            };
+            var updatePayload = SyncPayloadCodec.EncodeDict(
+                schema.Id, data, registry, session.Id);
+            var update = SyncPayloadCodec.DecodeDict(updatePayload, session.Id, registry);
+            obj = ObjectService.UpdateObject(session.Id, obj.Id, update)!;
+            var snapshot = SyncPayloadCodec.EncodeDict(
+                obj.SchemaId, obj.Data, registry, session.Id);
+            var decoded = SyncPayloadCodec.DecodeDict(snapshot, session.Id, registry);
+
+            Convert.ToInt32(decoded["invulnerable"]).Should().Be(remaining);
+            Convert.ToInt32(decoded["invulnerabilityRevision"]).Should().Be(
+                remaining > 0 ? 1 : 2);
+            decoded["invulnerableAt"].Should().Be(data["invulnerableAt"]);
+            decoded["type"].Should().Be("ship");
+        }
     }
 
     [Fact]

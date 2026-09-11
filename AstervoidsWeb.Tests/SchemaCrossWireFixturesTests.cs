@@ -35,7 +35,8 @@ public class SchemaCrossWireFixturesTests
         ("turnControlMode", "u8"), ("turnTarget", "q16s"),
         ("turnTargetAngle", "q16_2pi"), ("turnMagnitude", "q8"), ("turnBias", "q16s"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
-        ("terminalY", "f64"), ("terminalAngle", "f64"));
+        ("terminalY", "f64"), ("terminalAngle", "f64"),
+        ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
@@ -95,7 +96,7 @@ public class SchemaCrossWireFixturesTests
             ["invulnerable"] = 120
         });
         Hex(bytes).Should().Be(
-            "fe0100" +
+            "fe010000" +
             "0080" +
             "0080" +
             "00000000" +
@@ -116,7 +117,7 @@ public class SchemaCrossWireFixturesTests
             ["thrustInput"] = 1.5
         });
 
-        Hex(bytes).Should().Be("102000" + "0000c03f" + "0000c03f");
+        Hex(bytes).Should().Be("10200000" + "0000c03f" + "0000c03f");
         var decoded = PositionalSchemaCodec.Decode(schema, bytes);
         decoded["velocityX"].Should().Be(1.5);
         decoded["thrustInput"].Should().Be(1.5);
@@ -185,10 +186,28 @@ public class SchemaCrossWireFixturesTests
             ["terminalAngle"] = Math.PI
         });
         Hex(bytes).Should().Be(
-            "0000f0" +
+            "0000f000" +
             "0000000000408f40" +
             "000000000000d03f" +
             "000000000000e83f" +
             "182d4454fb210940");
+    }
+
+    [Fact]
+    public void Fixture_ShipInvulnerability_TransitionAndCaptureTime()
+    {
+        var schema = ShipSchema();
+        var bytes = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
+        {
+            ["invulnerable"] = 180,
+            ["invulnerabilityRevision"] = 7,
+            ["invulnerableAt"] = 1000d
+        });
+        Hex(bytes).Should().Be(
+            "00010003" + "b400" + "07000000" + "0000000000408f40");
+        var decoded = PositionalSchemaCodec.Decode(schema, bytes);
+        Convert.ToInt32(decoded["invulnerable"]).Should().Be(180);
+        Convert.ToUInt32(decoded["invulnerabilityRevision"]).Should().Be(7);
+        decoded["invulnerableAt"].Should().Be(1000d);
     }
 }
