@@ -21,6 +21,7 @@ function makeHarness({ presentation, classify, type = 'counter' } = {}) {
     const adoptionFacts = [];
     let currentMemberId = 'local';
     let activeMemberIds = ['local', 'remote'];
+    let memberReads = 0;
 
     const store = {
         getObjectsByType(recordType) {
@@ -65,7 +66,10 @@ function makeHarness({ presentation, classify, type = 'counter' } = {}) {
     const runtime = createRuntime({
         store,
         getCurrentMemberId: () => currentMemberId,
-        getActiveMemberIds: () => activeMemberIds
+        getActiveMemberIds: () => {
+            memberReads++;
+            return activeMemberIds;
+        }
     });
     runtime.registerType(descriptor);
 
@@ -77,6 +81,7 @@ function makeHarness({ presentation, classify, type = 'counter' } = {}) {
         removed,
         adopted,
         adoptionFacts,
+        getMemberReads: () => memberReads,
         setCurrentMemberId: value => { currentMemberId = value; },
         setActiveMemberIds: value => { activeMemberIds = value; },
         record(id, version, scalar, ownerMemberId = 'remote') {
@@ -183,6 +188,90 @@ test('equal consumed versions suppress re-ingest while presentation still sample
     assert.equal(p.ingests.length, 1);
     assert.equal(p.samples.length, 2);
     assert.equal(h.runtime.getConsumedVersion('n'), 3);
+});
+
+test('reconciliation shares one immutable membership snapshot and refreshes it at the next pivot', () => {
+    const p = makePresentation();
+    const h = makeHarness({ presentation: p.adapter });
+    h.runtime.beginSession({ epoch: 1, snapshotObjectIds: ['first'] });
+    h.record('first', 1, 1);
+    h.record('second', 1, 2);
+    const before = h.getMemberReads();
+
+    h.runtime.reconcileType('counter', { epoch: 1 });
+    assert.equal(h.getMemberReads() - before, 1);
+    const first = p.ingests[0].facts;
+    const second = p.ingests[1].facts;
+    assert.equal(first.activeMemberIds, second.activeMemberIds);
+    assert.ok(Object.isFrozen(first.activeMemberIds));
+    assert.ok(Object.isFrozen(first));
+    assert.equal(first.joinSnapshot, true);
+    assert.equal(second.joinSnapshot, false);
+
+    h.setActiveMemberIds(['local']);
+    h.runtime.reconcileType('counter', { epoch: 1 });
+    assert.equal(h.getMemberReads() - before, 2);
+    assert.equal(p.samples.at(-1).facts.ownerIsActive, false);
+    assert.deepEqual(first.activeMemberIds, ['local', 'remote']);
+});
+
+test('cleanup snapshots map entries before callbacks add or remove other instances', () => {
+    const p = makePresentation();
+    const h = makeHarness({ presentation: p.adapter });
+    h.runtime.beginSession({ epoch: 1, snapshotObjectIds: [] });
+    h.record('first', 1, 1);
+    h.record('second', 1, 2);
+    h.runtime.reconcileType('counter', { epoch: 1 });
+    h.records.clear();
+    const originalRemove = p.adapter.remove;
+    p.adapter.remove = (...args) => {
+        originalRemove(...args);
+        if (args[0] === 'first') {
+            h.instances.delete('second');
+            h.instances.set('late', { id: 'late' });
+        }
+    };
+
+    h.runtime.reconcileType('counter', { epoch: 1 });
+    assert.deepEqual(h.removed.map(entry => entry.id), ['first', 'second']);
+    assert.ok(h.instances.has('late'), 'callback additions wait for the next pass');
+    h.runtime.reconcileType('counter', { epoch: 1 });
+    assert.equal(h.instances.size, 0);
+});
+
+test('a mutable record array is still snapshotted before adapter callbacks', () => {
+    const records = [
+        { id: 'first', type: 'counter', version: 1, data: 1 },
+        { id: 'second', type: 'counter', version: 1, data: 2 }
+    ];
+    const instances = new Map();
+    const applied = [];
+    const runtime = createRuntime({
+        store: {
+            getObjectsByType: () => records,
+            getObject: id => records.find(record => record.id === id)
+        },
+        getCurrentMemberId: () => null,
+        descriptors: [{
+            type: 'counter',
+            classify: () => 'replica',
+            getInstance: id => instances.get(id),
+            getInstances: () => instances,
+            createReplica(record) {
+                const instance = { id: record.id };
+                instances.set(record.id, instance);
+                return instance;
+            },
+            apply(instance) {
+                applied.push(instance.id);
+                if (instance.id === 'first') records.pop();
+            },
+            remove: instance => instances.delete(instance.id)
+        }]
+    });
+    runtime.beginSession({ epoch: 1 });
+    runtime.reconcileType('counter', { epoch: 1 });
+    assert.deepEqual(applied, ['first', 'second']);
 });
 
 test('migration version is metadata-only when presentation state exists', () => {

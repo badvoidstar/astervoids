@@ -303,11 +303,10 @@ test('dynamic aspect rescaling updates asteroid geometry, bounds, and velocity',
     const functionSource = indexSource.slice(functionStart, functionEnd);
 
     assert.match(functionSource, /asteroid\.radius \*= radiusRatio/);
-    assert.match(functionSource, /asteroid\.boundRadius \*= radiusRatio/);
     assert.match(functionSource, /vertex\.distance \*= radiusRatio/);
     assert.match(functionSource, /asteroid\.velocityX \*= speedRatio/);
     assert.match(functionSource, /asteroid\.velocityY \*= speedRatio/);
-    assert.match(functionSource, /asteroid\._cachedVerts = null/);
+    assert.match(functionSource, /asteroid\.rebuildShapeCache\(\)/);
     assert.match(functionSource,
         /nextScales\.radiusScale \/ previousScales\.radiusScale/);
     assert.match(functionSource,

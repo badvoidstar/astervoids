@@ -116,22 +116,25 @@ const ReplicationRuntime = (function () {
             return epoch === undefined || Object.is(epoch, sessionEpoch);
         }
 
-        function activeMembers() {
-            const value = getActiveMemberIds();
-            return Object.freeze(Array.from(value || []));
+        function memberFacts() {
+            return {
+                epoch: sessionEpoch,
+                currentMemberId: getCurrentMemberId() ?? null,
+                activeMemberIds: Object.freeze(Array.from(getActiveMemberIds() || []))
+            };
         }
 
-        function makeFacts(record, type, extra) {
-            const activeMemberIds = activeMembers();
+        function makeFacts(record, type, extra, members = memberFacts()) {
+            const { epoch, currentMemberId, activeMemberIds } = members;
             const ownerMemberId = record?.ownerMemberId ?? null;
             return Object.freeze({
-                epoch: sessionEpoch,
-                sessionEpoch,
+                epoch,
+                sessionEpoch: epoch,
                 objectId: record?.id ?? extra?.objectId,
                 type,
                 version: record?.version,
                 ownerMemberId,
-                currentMemberId: getCurrentMemberId() ?? null,
+                currentMemberId,
                 activeMemberIds,
                 ownerIsActive: ownerMemberId != null
                     && activeMemberIds.includes(ownerMemberId),
@@ -148,6 +151,9 @@ const ReplicationRuntime = (function () {
                 throw new TypeError(
                     `${descriptor.type}.getInstances must return an iterable`);
             }
+            // Map iteration already produces fresh entry pairs. Snapshot them
+            // once so removal callbacks cannot extend or skip the cleanup pass.
+            if (collection instanceof Map) return Array.from(collection);
             const result = [];
             for (const entry of collection) {
                 if (Array.isArray(entry) && entry.length >= 2) {
@@ -183,7 +189,17 @@ const ReplicationRuntime = (function () {
             ownershipTransitions.delete(id);
         }
 
-        function removeBoundObject(id, reason, context, record) {
+        function bindObject(id, type, role, instance) {
+            const binding = bindings.get(id);
+            if (binding && binding.type === type) {
+                binding.role = role;
+                binding.instance = instance;
+            } else {
+                bindings.set(id, { type, role, instance });
+            }
+        }
+
+        function removeBoundObject(id, reason, context, record, members) {
             const binding = bindings.get(id);
             const descriptor = binding && descriptors.get(binding.type);
             if (descriptor) {
@@ -191,7 +207,7 @@ const ReplicationRuntime = (function () {
                 const facts = makeFacts(
                     record || getObject(id),
                     binding.type,
-                    { objectId: id });
+                    { objectId: id }, members);
                 removePresentation(
                     descriptor, id, reason, facts, record, context);
                 if (instance != null) descriptor.remove(instance, reason, facts, context);
@@ -289,6 +305,7 @@ const ReplicationRuntime = (function () {
             if (!descriptor) throw new Error(`unregistered replication type: ${type}`);
 
             const records = Array.from(getObjectsByType(type) || []);
+            const members = memberFacts();
             const retainedIds = new Set();
             let created = 0;
             let applied = 0;
@@ -303,13 +320,13 @@ const ReplicationRuntime = (function () {
                 let binding = bindings.get(id);
                 if (binding && binding.type !== type) {
                     removeBoundObject(
-                        id, REMOVAL_REASONS.TYPE_MISSING, context, record);
+                        id, REMOVAL_REASONS.TYPE_MISSING, context, record, members);
                     binding = undefined;
                     removed++;
                 }
 
                 let instance = descriptor.getInstance(id, context);
-                const initialFacts = makeFacts(record, type);
+                const initialFacts = makeFacts(record, type, undefined, members);
                 const role = classify(descriptor, record, initialFacts, context);
 
                 if (role === 'ignore') {
@@ -334,9 +351,9 @@ const ReplicationRuntime = (function () {
 
                 const previousRole = binding?.role;
                 if (role === 'owned') {
-                    const ownedFacts = makeFacts(record, type, {
-                        joinSnapshot: joinSnapshotObjectIds.delete(id)
-                    });
+                    const ownedFacts = joinSnapshotObjectIds.delete(id)
+                        ? makeFacts(record, type, { joinSnapshot: true }, members)
+                        : initialFacts;
                     if (previousRole === 'replica') {
                         removePresentation(
                             descriptor,
@@ -362,7 +379,7 @@ const ReplicationRuntime = (function () {
                         instance = descriptor.adoptOwned(
                             record, instance, ownedFacts, context) ?? instance;
                     }
-                    bindings.set(id, { type, role, instance });
+                    bindObject(id, type, role, instance);
                     if (previousRole && previousRole !== role) {
                         descriptor.onRoleChanged?.(
                             instance, previousRole, role, ownedFacts, context);
@@ -384,7 +401,7 @@ const ReplicationRuntime = (function () {
                     }
                     created++;
                 }
-                bindings.set(id, { type, role, instance });
+                bindObject(id, type, role, instance);
 
                 let transition = ownershipTransitions.get(id);
                 if (!transition
@@ -408,11 +425,13 @@ const ReplicationRuntime = (function () {
                 if (shouldIngest) {
                     const joinSnapshot = joinSnapshotObjectIds.delete(id);
                     const preserveDirection = !!transition?.pending && !ownershipVersion;
-                    const facts = makeFacts(record, type, {
-                        joinSnapshot,
-                        preserveDirection,
-                        ownershipMigrationPending: !!transition?.pending
-                    });
+                    const facts = joinSnapshot || preserveDirection || transition?.pending
+                        ? makeFacts(record, type, {
+                            joinSnapshot,
+                            preserveDirection,
+                            ownershipMigrationPending: !!transition?.pending
+                        }, members)
+                        : initialFacts;
                     if (descriptor.presentation) {
                         descriptor.presentation.ingest(
                             id, record.data, facts, record, context);
@@ -434,9 +453,11 @@ const ReplicationRuntime = (function () {
                 }
 
                 if (descriptor.presentation?.has(id)) {
-                    const facts = presentationFacts || makeFacts(record, type, {
-                        ownershipMigrationPending: !!transition?.pending
-                    });
+                    const facts = presentationFacts || (transition?.pending
+                        ? makeFacts(record, type, {
+                            ownershipMigrationPending: true
+                        }, members)
+                        : initialFacts);
                     const sampled = descriptor.presentation.sample(
                         id, facts, record, context);
                     descriptor.apply(instance, sampled, facts, context);
@@ -454,7 +475,7 @@ const ReplicationRuntime = (function () {
                 const reason = record
                     ? REMOVAL_REASONS.TYPE_MISSING
                     : REMOVAL_REASONS.DELETED;
-                const facts = makeFacts(record, type, { objectId: id });
+                const facts = makeFacts(record, type, { objectId: id }, members);
                 removePresentation(
                     descriptor, id, reason, facts, record, context);
                 descriptor.remove(instance, reason, facts, context);
@@ -466,13 +487,19 @@ const ReplicationRuntime = (function () {
             // record disappears (for example, local-first expiry).
             // Retire any remaining binding and presentation state even when
             // getInstances no longer has an entity to enumerate.
-            for (const [id, binding] of Array.from(bindings)) {
+            let missingBindingIds;
+            for (const [id, binding] of bindings) {
                 if (binding.type !== type || retainedIds.has(id)) continue;
+                (missingBindingIds ||= []).push(id);
+            }
+            // Only missing IDs need a snapshot; keep callback mutation safety
+            // without copying every live binding at each reconciliation point.
+            for (const id of missingBindingIds || []) {
                 const record = getObject(id);
                 const reason = record
                     ? REMOVAL_REASONS.TYPE_MISSING
                     : REMOVAL_REASONS.DELETED;
-                removeBoundObject(id, reason, context, record);
+                removeBoundObject(id, reason, context, record, members);
                 removed++;
             }
 

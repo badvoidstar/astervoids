@@ -440,31 +440,19 @@ test('solo play cleans up a delayed auto-rejoin', () => {
 });
 
 test('visibility resume includes the lobby of an active session', () => {
-    const visibilityStart = html.indexOf(
-        "document.addEventListener('visibilitychange'",
-        html.indexOf('async function initMultiRegionPicker')
-    );
-    const startFunction = html.indexOf(
-        'async function startMultiRegionPicker()',
-        visibilityStart
-    );
-    assert.ok(visibilityStart >= 0 && startFunction > visibilityStart);
-
-    const visibilitySource = html.slice(visibilityStart, startFunction);
+    const visibilitySource = extractFunctionSource('handlePickerVisibilityChange');
     assert.match(
         visibilitySource,
-        /multiRegionActive && !startScreen\.classList\.contains\('hidden'\)/
+        /else if \(isSessionPickerActive\(\)\) \{[\s\S]*?activateSessionPickerUpdates\(\)/
     );
     assert.doesNotMatch(visibilitySource, /!sessionPicker\.currentSessionId/);
 
-    const startSource = html.slice(
-        startFunction,
-        html.indexOf('async function pauseMultiRegionPicker()', startFunction)
-    );
+    const startSource = extractFunctionSource('activateSessionPickerUpdates');
     assert.match(
         startSource,
-        /if \(startScreen\.classList\.contains\('hidden'\)\) return;[\s\S]*?multiRegionActive = true;[\s\S]*?if \(document\.hidden\) return;/
+        /if \(startScreen\.classList\.contains\('hidden'\)\) return;[\s\S]*?pickerUpdatesActive = true;[\s\S]*?if \(!isSessionPickerActive\(\)\) return;/
     );
+    assert.doesNotMatch(startSource, /!sessionPicker\.currentSessionId/);
 });
 
 test('successful membership helpers keep snapshot epochs and identity separate from path-specific state', () => {

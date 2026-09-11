@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -145,10 +146,17 @@ const AuthoritativeObject = evaluateModule(
     'AuthoritativeObject',
     {});
 
+const GuidUtils = evaluateModule('wwwroot/js/guid-utils.js', 'GuidUtils', {});
+
+function fixtureGuid(label) {
+    const hex = createHash('sha256').update(label).digest('hex').slice(0, 32);
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function loadSessionClient(
     connections,
     objectSyncBridge = { triggerReconciliation() {} },
-    guidUtils = { transformBinaryGuids: value => value },
+    guidUtils = GuidUtils,
     syncPayload = SyncPayload) {
     const window = { ASTERVOIDS_DEBUG: false };
     const signalR = makeSignalR(connections);
@@ -185,13 +193,14 @@ function loadObjectSync(sessionClient, window = { ASTERVOIDS_DEBUG: false }) {
 }
 
 function joinResponse(sessionId, objects = []) {
+    sessionId = GuidUtils.transformBinaryGuids(sessionId);
     return {
         sessionId,
         sessionName: sessionId,
         members: [],
         objects,
         validAts: {},
-        memberId: `member-${sessionId}`,
+        memberId: fixtureGuid(`member-${sessionId}`),
         role: 'Client',
         reconnectToken: `token-${sessionId}`,
         metadata: {}
@@ -291,7 +300,8 @@ test('SessionClient disconnect completion cannot clear a replacement connection'
 test('SessionClient serializes overlapping joins through an acknowledged leave', async () => {
     const connection = new FakeConnection();
     const joins = new Map();
-    connection.invokers.set('JoinSession', sessionId => joins.get(sessionId).promise);
+    connection.invokers.set('JoinSession', sessionId =>
+        joins.get(GuidUtils.bytesToGuid(sessionId)).promise);
     connection.invokers.set('LeaveSession', () => Promise.resolve());
     const { client } = loadSessionClient([connection]);
     await connectImmediately(client, connection);
@@ -301,24 +311,24 @@ test('SessionClient serializes overlapping joins through an acknowledged leave',
     client.on('onSessionJoined', session => joined.push(session.id));
     client.on('onSessionLeft', () => leftCallbacks++);
 
-    joins.set('old', deferred());
-    joins.set('new', deferred());
-    const oldJoin = client.joinSession('old');
-    const newJoin = client.joinSession('new');
+    joins.set(fixtureGuid('old'), deferred());
+    joins.set(fixtureGuid('new'), deferred());
+    const oldJoin = client.joinSession(fixtureGuid('old'));
+    const newJoin = client.joinSession(fixtureGuid('new'));
 
     await drainMicrotasks();
     assert.deepEqual(
         connection.invokeCalls.map(call => call.method),
         ['JoinSession']);
 
-    joins.get('old').resolve(joinResponse('old'));
-    assert.equal((await oldJoin).session.id, 'old');
+    joins.get(fixtureGuid('old')).resolve(joinResponse(fixtureGuid('old')));
+    assert.equal((await oldJoin).session.id, fixtureGuid('old'));
     await drainMicrotasks();
-    joins.get('new').resolve(joinResponse('new'));
-    assert.equal((await newJoin).session.id, 'new');
+    joins.get(fixtureGuid('new')).resolve(joinResponse(fixtureGuid('new')));
+    assert.equal((await newJoin).session.id, fixtureGuid('new'));
 
-    assert.equal(client.getCurrentSession().id, 'new');
-    assert.deepEqual(joined, ['old', 'new']);
+    assert.equal(client.getCurrentSession().id, fixtureGuid('new'));
+    assert.deepEqual(joined, [fixtureGuid('old'), fixtureGuid('new')]);
     assert.equal(leftCallbacks, 1);
     assert.deepEqual(
         connection.invokeCalls.map(call => call.method),
@@ -328,6 +338,7 @@ test('SessionClient serializes overlapping joins through an acknowledged leave',
 test('SessionClient merges member events that overtake a pending join snapshot', async () => {
     const connection = new FakeConnection();
     const joinGate = deferred();
+    const joiningMemberId = joinResponse(fixtureGuid('race')).memberId;
     connection.invokers.set('JoinSession', () => joinGate.promise);
     const { client } = loadSessionClient([connection]);
     await connectImmediately(client, connection);
@@ -340,7 +351,7 @@ test('SessionClient merges member events that overtake a pending join snapshot',
     client.on('onMemberLeft', info => callbacks.push(`left:${info.memberId}`));
     client.on('onRoleChanged', role => callbacks.push(`role:${role}`));
 
-    const joining = client.joinSession('race');
+    const joining = client.joinSession(fixtureGuid('race'));
     await drainMicrotasks();
     connection.emit(
         'OnMemberJoined',
@@ -352,7 +363,7 @@ test('SessionClient merges member events that overtake a pending join snapshot',
         'OnMemberLeft',
         {
             memberId: 'old-server',
-            promotedMemberId: 'member-race',
+            promotedMemberId: joiningMemberId,
             promotedRole: 'Server',
             deletedObjectIds: [],
             migratedObjects: []
@@ -363,20 +374,20 @@ test('SessionClient merges member events that overtake a pending join snapshot',
 
     assert.deepEqual(callbacks, [], 'member callbacks wait until the snapshot is installed');
 
-    const response = joinResponse('race');
+    const response = joinResponse(fixtureGuid('race'));
     response.members = [
         { id: 'old-server', role: 'Server' },
-        { id: 'member-race', role: 'Client' }
+        { id: joiningMemberId, role: 'Client' }
     ];
     joinGate.resolve(response);
     const result = await joining;
 
     assert.deepEqual(
         result.session.members.map(member => member.id).sort(),
-        ['late-member', 'member-race']);
+        ['late-member', joiningMemberId].sort());
     assert.equal(result.member.role, 'Server');
     assert.deepEqual(callbacks, [
-        'session:late-member,member-race',
+        `session:${['late-member', joiningMemberId].sort().join(',')}`,
         'joined:late-member',
         'left:old-server',
         'role:Server'
@@ -395,7 +406,7 @@ test('SessionClient serializes create then join without orphaning membership', a
     let createdCallbacks = 0;
     client.on('onSessionCreated', () => createdCallbacks++);
     const creating = client.createSession();
-    const joining = client.joinSession('newer');
+    const joining = client.joinSession(fixtureGuid('newer'));
     createGate.resolve({
         sessionId: 'created',
         sessionName: 'created',
@@ -407,8 +418,8 @@ test('SessionClient serializes create then join without orphaning membership', a
 
     assert.equal((await creating).session.id, 'created');
     const joined = await joining;
-    assert.equal(joined.session.id, 'newer');
-    assert.equal(client.getCurrentSession().id, 'newer');
+    assert.equal(joined.session.id, fixtureGuid('newer'));
+    assert.equal(client.getCurrentSession().id, fixtureGuid('newer'));
     assert.equal(createdCallbacks, 1);
     assert.deepEqual(
         connection.invokeCalls.map(call => call.method),
@@ -426,23 +437,27 @@ test('SessionClient proves reconnect ownership with the server-issued token', as
         await client.connect(false, 'https://regional.example.com'),
         true);
 
-    await client.joinSession('session');
+    await client.joinSession(fixtureGuid('session'));
     assert.equal(
         client.getReconnectHubHostname(),
         'https://regional.example.com');
     const freshJoinCall = connection.invokeCalls
         .filter(call => call.method === 'JoinSession')
         .at(-1);
-    assert.deepEqual(freshJoinCall.args, ['session']);
+    assert.deepEqual(freshJoinCall.args, [GuidUtils.guidToBytes(fixtureGuid('session'))]);
     client.clearSessionState();
-    await client.joinSession('session');
+    await client.joinSession(fixtureGuid('session'));
 
     const reconnectCall = connection.invokeCalls
         .filter(call => call.method === 'RejoinSession')
         .at(-1);
     assert.deepEqual(
         reconnectCall.args,
-        ['session', 'member-session', 'token-session']);
+        [
+            GuidUtils.guidToBytes(fixtureGuid('session')),
+            GuidUtils.guidToBytes(joinResponse(fixtureGuid('session')).memberId),
+            `token-${fixtureGuid('session')}`
+        ]);
 });
 
 test('SessionClient ignores delayed expiration for a replaced session', async () => {
@@ -456,18 +471,18 @@ test('SessionClient ignores delayed expiration for a replaced session', async ()
     client.on('onSessionExpired', (reason, sessionId) =>
         expirations.push({ reason, sessionId }));
 
-    await client.joinSession('old');
-    await client.joinSession('new');
-    connection.emit('OnSessionExpired', 'old', 'old expired');
+    await client.joinSession(fixtureGuid('old'));
+    await client.joinSession(fixtureGuid('new'));
+    connection.emit('OnSessionExpired', fixtureGuid('old'), 'old expired');
 
-    assert.equal(client.getCurrentSession().id, 'new');
+    assert.equal(client.getCurrentSession().id, fixtureGuid('new'));
     assert.deepEqual(expirations, []);
 
-    connection.emit('OnSessionExpired', 'new', 'new expired');
+    connection.emit('OnSessionExpired', fixtureGuid('new'), 'new expired');
     assert.equal(client.getCurrentSession(), null);
     assert.deepEqual(expirations, [{
         reason: 'new expired',
-        sessionId: 'new'
+        sessionId: fixtureGuid('new')
     }]);
 });
 
@@ -481,19 +496,23 @@ test('failed leave keeps reconnect identity available for recovery', async () =>
         Promise.resolve(joinResponse(sessionId)));
     const { client } = loadSessionClient([connection]);
     await connectImmediately(client, connection);
-    await client.joinSession('session');
+    await client.joinSession(fixtureGuid('session'));
 
     assert.equal(await client.leaveSession(), false);
-    assert.equal(client.getCurrentSession().id, 'session');
+    assert.equal(client.getCurrentSession().id, fixtureGuid('session'));
 
     client.clearSessionState();
-    await client.joinSession('session');
+    await client.joinSession(fixtureGuid('session'));
     const recovery = connection.invokeCalls
         .filter(call => call.method === 'RejoinSession')
         .at(-1);
     assert.deepEqual(
         recovery.args,
-        ['session', 'member-session', 'token-session']);
+        [
+            GuidUtils.guidToBytes(fixtureGuid('session')),
+            GuidUtils.guidToBytes(joinResponse(fixtureGuid('session')).memberId),
+            `token-${fixtureGuid('session')}`
+        ]);
 });
 
 test('SessionClient rejects session responses without reconnect credentials', async () => {
@@ -507,7 +526,7 @@ test('SessionClient rejects session responses without reconnect credentials', as
     await connectImmediately(client, connection);
 
     await assert.rejects(
-        client.joinSession('session'),
+        client.joinSession(fixtureGuid('session')),
         /missing reconnectToken/);
     assert.equal(client.getCurrentSession(), null);
 });
@@ -518,11 +537,11 @@ test('SessionClient adapts compact object DTO arrays at every wire boundary', as
         [id, owner, owner, 'Session', data, version];
     connection.invokers.set('JoinSession', sessionId =>
         Promise.resolve(joinResponse(sessionId, [
-            compact('snapshot', 1, { type: 'ship', x: 1 })
+            compact(fixtureGuid('snapshot'), 1, { type: 'ship', x: 1 })
         ])));
     connection.invokers.set('UpdateObjects', updates => {
-        assert.deepEqual(updates, [['snapshot', { x: 2 }]]);
-        return Promise.resolve([[['snapshot', 2]], 17, 123]);
+        assert.deepEqual(updates, [[GuidUtils.guidToBytes(fixtureGuid('snapshot')), { x: 2 }]]);
+        return Promise.resolve([[[GuidUtils.guidToBytes(fixtureGuid('snapshot')), 2]], 17, 123]);
     });
     connection.invokers.set('CreateObject', () =>
         Promise.resolve([compact('owned-create', 1, { type: 'bullet' }), 18, 124]));
@@ -546,8 +565,8 @@ test('SessionClient adapts compact object DTO arrays at every wire boundary', as
     client.on('onObjectEvent', value => events.push(value));
 
     await connectImmediately(client, connection);
-    const joined = await client.joinSession('session');
-    assert.equal(joined.session.objects[0].id, 'snapshot');
+    const joined = await client.joinSession(fixtureGuid('session'));
+    assert.equal(joined.session.objects[0].id, fixtureGuid('snapshot'));
     assert.equal(joined.session.objects[0].data.x, 1);
 
     connection.emit('OnObjectCreated',
@@ -558,22 +577,22 @@ test('SessionClient adapts compact object DTO arrays at every wire boundary', as
         ['created', [compact('child', 1, { type: 'asteroid' })]],
         'sender', 3, 10, 10);
     connection.emit('OnObjectEvent',
-        ['snapshot', 1, new Uint8Array([0x80])], 'sender', 4, 10, 10);
+        [fixtureGuid('snapshot'), 1, new Uint8Array([0x80])], 'sender', 4, 10, 10);
 
     assert.equal(created[0].id, 'created');
     assert.equal(updated[0][0].id, 'created');
     assert.equal(replaced[0].deletedObjectId, 'created');
     assert.equal(replaced[0].createdObjects[0].id, 'child');
-    assert.equal(events[0].objectId, 'snapshot');
+    assert.equal(events[0].objectId, fixtureGuid('snapshot'));
 
     const updateResponse = await client.updateObjects([
-        { objectId: 'snapshot', data: { x: 2 } }
+        { objectId: fixtureGuid('snapshot'), data: { x: 2 } }
     ]);
     const createResponse = await client.createObject({ type: 'bullet' }, 'Member');
-    const replacement = await client.replaceObject('snapshot', [{ type: 'asteroid' }]);
-    const deleteResponse = await client.deleteObject('snapshot');
+    const replacement = await client.replaceObject(fixtureGuid('snapshot'), [{ type: 'asteroid' }]);
+    const deleteResponse = await client.deleteObject(fixtureGuid('snapshot'));
     const reconciliation = await client.getSessionState();
-    assert.deepEqual(updateResponse.versions, { snapshot: 2 });
+    assert.deepEqual(updateResponse.versions, { [fixtureGuid('snapshot')]: 2 });
     assert.equal(updateResponse.memberSequence, 17);
     assert.equal(createResponse.objectInfo.id, 'owned-create');
     assert.equal(createResponse.memberSequence, 18);
@@ -608,11 +627,11 @@ test('SessionClient installs session schemas before decoding a join snapshot', a
     const { client } = loadSessionClient(
         [connection],
         { triggerReconciliation() {} },
-        { transformBinaryGuids: value => value },
+        GuidUtils,
         syncPayload);
 
     await connectImmediately(client, connection);
-    const joined = await client.joinSession('session');
+    const joined = await client.joinSession(fixtureGuid('session'));
 
     assert.equal(joined.session.objects[0].data.type, 'widget');
 });
@@ -634,11 +653,11 @@ test('SessionClient preserves 16-byte opaque event payloads during GUID normaliz
     const { client } = loadSessionClient(
         [connection],
         { triggerReconciliation() {} },
-        { transformBinaryGuids });
+        { ...GuidUtils, transformBinaryGuids });
     let received;
     client.on('onObjectEvent', eventInfo => { received = eventInfo; });
     await connectImmediately(client, connection);
-    await client.joinSession('session');
+    await client.joinSession(fixtureGuid('session'));
 
     const payload = new Uint8Array(16);
     payload.fill(0x2a);
@@ -671,7 +690,7 @@ test('join snapshot preserves object events delivered before JoinSession returns
     objectSync.init();
     await connectImmediately(loaded.client, connection);
 
-    const joining = loaded.client.joinSession('session');
+    const joining = loaded.client.joinSession(fixtureGuid('session'));
     await drainMicrotasks();
     connection.emit(
         'OnObjectCreated',
@@ -693,7 +712,7 @@ test('join snapshot preserves object events delivered before JoinSession returns
     );
     connection.emit('OnObjectDeleted', 'deleted-during-join', 'remote', 3, 102);
 
-    joinGate.resolve(joinResponse('session', [
+    joinGate.resolve(joinResponse(fixtureGuid('session'), [
         objectInfo('live', 1, { type: 'ship', x: 1, staticValue: 42 }, 'snapshot-owner'),
         objectInfo('snapshot-only', 1, { type: 'rock' }),
         objectInfo('deleted-during-join', 1, { type: 'ghost' })

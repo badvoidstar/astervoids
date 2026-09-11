@@ -47,8 +47,9 @@
  *
  * ## Visibility gating
  *
- * While `document.hidden`, burst timers are paused — backgrounded tabs must
- * NOT keep regions warm (would defeat the CAE scale-to-zero requirement).
+ * The picker owns start/stop, including single-region deployments. While
+ * `document.hidden`, timers and in-flight bursts are cancelled — backgrounded
+ * tabs must NOT keep regions warm (would defeat CAE scale-to-zero).
  * On `visibilitychange`-back, one immediate burst fires per region so the
  * picker is fresh by the time the user is looking.
  */
@@ -76,6 +77,7 @@ const RegionService = (function () {
     const rtt = new Map();     // regionId -> {valueMs, confidence, sampleCount, lastSampleAt, state}
     const burstTimers = new Map();  // regionId -> timeout handle
     const burstSequences = new Map();
+    const inFlightBursts = new Map(); // regionId -> AbortController
     let currentBestRegion = null;   // memoised, recomputed only when bestRegion() advantage exceeds hysteresis
     let started = false;
     let runGeneration = 0;
@@ -227,9 +229,12 @@ const RegionService = (function () {
      * timeout / non-OK response. Cache-busting query param defeats anything
      * upstream that might cache the response.
      */
-    async function pingOnce(hostname, timeoutMs) {
+    async function pingOnce(hostname, timeoutMs, signal) {
+        if (signal?.aborted) throw new Error('Region assessment stopped');
         const url = `${hostname.replace(/\/$/, '')}${CONFIG.PING_PATH}?_=${performance.now()}`;
         const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal?.addEventListener('abort', abort, { once: true });
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         const t0 = performance.now();
         try {
@@ -244,6 +249,7 @@ const RegionService = (function () {
             return performance.now() - t0;
         } finally {
             clearTimeout(timer);
+            signal?.removeEventListener('abort', abort);
         }
     }
 
@@ -255,12 +261,14 @@ const RegionService = (function () {
      * excluded from the min. Failed pings reduce the burst size; if all fail,
      * returns `minMs: null`.
      */
-    async function measureBurst(hostname, samples, timeoutMs, discardFirst) {
+    async function measureBurst(hostname, samples, timeoutMs, discardFirst, signal) {
         const times = [];
         let successfulPingCount = 0;
         for (let i = 0; i < samples; i++) {
+            if (signal?.aborted || isDocumentHidden()) break;
             try {
-                const ms = await pingOnce(hostname, timeoutMs);
+                const ms = await pingOnce(hostname, timeoutMs, signal);
+                if (signal?.aborted || isDocumentHidden()) break;
                 successfulPingCount++;
                 if (i === 0 && discardFirst) continue;
                 times.push(ms);
@@ -277,12 +285,19 @@ const RegionService = (function () {
 
     // ── Per-region burst loop ─────────────────────────────────────────────────
 
-    function scheduleNextBurst(regionId, delayMs, generation) {
+    function isDocumentHidden() {
+        return typeof document !== 'undefined' && document.hidden;
+    }
+
+    function scheduleNextBurst(regionId, delayMs, generation, isBootstrap = false) {
         if (!started || generation !== runGeneration) return;
-        if (typeof document !== 'undefined' && document.hidden) return;
+        if (isDocumentHidden()) return;
         clearBurstTimer(regionId);
         const handle = setTimeout(
-            () => runBurst(regionId, false, generation),
+            () => {
+                if (burstTimers.get(regionId) === handle) burstTimers.delete(regionId);
+                runBurst(regionId, isBootstrap, generation);
+            },
             delayMs);
         burstTimers.set(regionId, handle);
     }
@@ -297,13 +312,20 @@ const RegionService = (function () {
         for (const id of Array.from(burstTimers.keys())) clearBurstTimer(id);
     }
 
+    function cancelBursts() {
+        runGeneration++;
+        clearAllBurstTimers();
+        for (const controller of inFlightBursts.values()) controller.abort();
+        inFlightBursts.clear();
+    }
+
     function refreshBestRegion() {
         const newBest = pickBestRegion(rtt, currentBestRegion);
         if (newBest !== currentBestRegion) currentBestRegion = newBest;
     }
 
     async function runBurst(regionId, isBootstrap, generation) {
-        if (!started || generation !== runGeneration) return;
+        if (!started || generation !== runGeneration || isDocumentHidden()) return;
         const burstSequence = (burstSequences.get(regionId) ?? 0) + 1;
         burstSequences.set(regionId, burstSequence);
         const region = regions.find(r => r.id === regionId);
@@ -315,11 +337,22 @@ const RegionService = (function () {
         // Cold-start budget only for the first unattempted burst against a region.
         const timeoutMs = needsWarmup ? CONFIG.COLD_PING_TIMEOUT_MS : CONFIG.WARM_PING_TIMEOUT_MS;
         const samples = isBootstrap ? CONFIG.BOOTSTRAP_SAMPLES : CONFIG.ROLLING_SAMPLES;
-        const { minMs, successfulPingCount } = await measureBurst(
-            region.hostname, samples, timeoutMs, /*discardFirst=*/needsWarmup);
+        inFlightBursts.get(regionId)?.abort();
+        const controller = new AbortController();
+        inFlightBursts.set(regionId, controller);
+        let result;
+        try {
+            result = await measureBurst(
+                region.hostname, samples, timeoutMs, /*discardFirst=*/needsWarmup, controller.signal);
+        } finally {
+            if (inFlightBursts.get(regionId) === controller) inFlightBursts.delete(regionId);
+        }
         if (!started
             || generation !== runGeneration
+            || controller.signal.aborted
+            || isDocumentHidden()
             || burstSequences.get(regionId) !== burstSequence) return;
+        const { minMs, successfulPingCount } = result;
 
         if (minMs == null) {
             // A full failed burst concludes a still-pending assessment. Keep a
@@ -345,6 +378,7 @@ const RegionService = (function () {
         // drives the picker, so Create can use it immediately.
         refreshBestRegion();
         if (coldStart) emit('coldStart', regionId);
+        if (!started || generation !== runGeneration || isDocumentHidden()) return;
         emit('rttUpdated', regionId);
 
         scheduleNextBurst(regionId, CONFIG.BURST_INTERVAL_MS, generation);
@@ -389,8 +423,7 @@ const RegionService = (function () {
         if (generation !== loadGeneration) return;
 
         if (started) {
-            clearAllBurstTimers();
-            runGeneration++;
+            cancelBursts();
         }
 
         regions.length = 0;
@@ -428,10 +461,7 @@ const RegionService = (function () {
             const generation = runGeneration;
             for (const region of regions) {
                 const stagger = Math.floor(Math.random() * CONFIG.BURST_STAGGER_MAX_MS);
-                const handle = setTimeout(
-                    () => runBurst(region.id, true, generation),
-                    stagger);
-                burstTimers.set(region.id, handle);
+                scheduleNextBurst(region.id, stagger, generation, true);
             }
         }
     }
@@ -450,10 +480,7 @@ const RegionService = (function () {
         const generation = ++runGeneration;
         for (const r of regions) {
             const stagger = Math.floor(Math.random() * CONFIG.BURST_STAGGER_MAX_MS);
-            const handle = setTimeout(
-                () => runBurst(r.id, true, generation),
-                stagger);
-            burstTimers.set(r.id, handle);
+            scheduleNextBurst(r.id, stagger, generation, true);
         }
         // Visibility gating: closing burst timers on hide ensures backgrounded
         // tabs don't keep regions warm and defeat CAE scale-to-zero.
@@ -461,17 +488,13 @@ const RegionService = (function () {
             visibilityHandler = () => {
                 if (!started) return;
                 if (document.hidden) {
-                    clearAllBurstTimers();
+                    cancelBursts();
                 } else {
                     // Immediate burst per region so the picker is fresh by the
                     // time the user is looking, then resume the normal cadence.
                     for (const r of regions) {
                         if (!burstTimers.has(r.id)) {
-                            const generation = runGeneration;
-                            const handle = setTimeout(
-                                () => runBurst(r.id, false, generation),
-                                0);
-                            burstTimers.set(r.id, handle);
+                            scheduleNextBurst(r.id, 0, runGeneration);
                         }
                     }
                 }
@@ -481,13 +504,12 @@ const RegionService = (function () {
     }
 
     /**
-     * Stop all burst loops and detach the visibility listener. Does NOT clear
+     * Cancel all timers/requests and detach the visibility listener. Does NOT clear
      * the manifest or accumulated measurements so `start()` can resume cleanly.
      */
     function stop() {
         started = false;
-        runGeneration++;
-        clearAllBurstTimers();
+        cancelBursts();
         if (typeof document !== 'undefined' && visibilityHandler != null) {
             document.removeEventListener('visibilitychange', visibilityHandler);
             visibilityHandler = null;

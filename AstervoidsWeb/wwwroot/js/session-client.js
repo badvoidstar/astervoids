@@ -732,11 +732,11 @@ const SessionClient = (function() {
             const rawResponse = reconnecting
                 ? await context.connection.invoke(
                     'RejoinSession',
-                    sessionId,
-                    reconnecting.memberId,
+                    GuidUtils.guidToBytes(sessionId),
+                    GuidUtils.guidToBytes(reconnecting.memberId),
                     reconnecting.token)
                 : await context.connection.invoke(
-                    'JoinSession', sessionId);
+                    'JoinSession', GuidUtils.guidToBytes(sessionId));
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
@@ -951,7 +951,7 @@ const SessionClient = (function() {
                 const u = updates[i];
                 if (u && u.data !== undefined) {
                     const id = (u.schemaId === undefined || u.schemaId === null) ? 0 : u.schemaId;
-                    wrapped[i] = [u.objectId, SyncPayload.wrap(u.data, id)];
+                    wrapped[i] = [GuidUtils.guidToBytes(u.objectId), SyncPayload.wrap(u.data, id)];
                 } else {
                     wrapped[i] = u;
                 }
@@ -991,7 +991,7 @@ const SessionClient = (function() {
         const wrapped = Array.isArray(replacements)
             ? replacements.map((r, i) => SyncPayload.wrap(r, (schemaIds && schemaIds[i]) || 0))
             : replacements;
-        const created = await invokeHub('ReplaceObject', deleteObjectId, wrapped, scope, ownerMemberId, clientValidAt);
+        const created = await invokeHub('ReplaceObject', GuidUtils.guidToBytes(deleteObjectId), wrapped, scope, ownerMemberId, clientValidAt);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
@@ -1012,7 +1012,7 @@ const SessionClient = (function() {
      */
     async function deleteObject(objectId) {
         const context = captureSessionContext();
-        let response = await invokeHub('DeleteObject', objectId);
+        let response = await invokeHub('DeleteObject', GuidUtils.guidToBytes(objectId));
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
@@ -1028,7 +1028,7 @@ const SessionClient = (function() {
      */
     async function broadcastObjectEvent(objectId, eventKind, payload, clientValidAt = null) {
         const context = captureSessionContext();
-        const response = await invokeHub('BroadcastObjectEvent', objectId, eventKind, payload, clientValidAt);
+        const response = await invokeHub('BroadcastObjectEvent', GuidUtils.guidToBytes(objectId), eventKind, payload, clientValidAt);
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }

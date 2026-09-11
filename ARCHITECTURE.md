@@ -68,6 +68,10 @@ These rules are enforced purely by module structure and must not be violated whe
 
 - **Only `SessionClient` holds a `signalR.HubConnection`.** The hub URL `/sessionHub` and `MessagePackHubProtocol` are referenced nowhere outside `session-client.js`. `index.html` contains no `signalR.*` references.
 - **Only `SessionClient` calls `GuidUtils.transformBinaryGuids`.** It is applied in both the `guard()` event wrapper (all hub push callbacks) and `invokeHub()` (all RPC responses), so nothing above `SessionClient` ever observes a raw 16-byte `Uint8Array` GUID.
+- **Outbound transport IDs are binary only for typed `Guid` contracts.**
+  `SessionClient` uses `GuidUtils.guidToBytes` for join/rejoin IDs and object
+  mutation/event IDs. String-typed owner overrides, reconnect tokens, and opaque
+  payloads remain unchanged; callers above the transport keep readable IDs.
 - **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
 - **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
 - **Send rate is decoupled from frame rate.** The game calls only `ObjectSync.tick(frameTimeSec)` once per frame; `ObjectSync` internally computes `sendThreshold` from `nominalFrameTime` and flushes batched mutations independently.
@@ -173,9 +177,20 @@ The game continues to own orchestration in `wwwroot/index.html`:
   `calculateGameStateTerminal` computes immutable terminal anchors from an
   explicit server time. `syncGameState` retains ledger validation, local
   effects, game-specific serialization, and publication through `ObjectSync`.
+  Its decoded/packed ledger and calculation caches compare actual inputs,
+  including score/hit events that do not advance object versions. Private
+  ledger snapshots detect in-place mutations. Session/ownership/recovery
+  changes invalidate the cache, and cached publication still queues updates
+  against `ObjectSync`'s confirmed baseline rather than treating a local write
+  as an acknowledgement.
 - Debug snapshot publication is separate from HUD rendering, with the same
-  listener gating and update cadence. Entity collections remain ordered arrays;
-  indexing and reduced diagnostic fidelity require representative profiling.
+  listener gating and update cadence. Entity collections remain ordered arrays.
+  Asteroid/bullet reconciliation builds a reference-only ID index once at each
+  synchronous pivot; adapter creates/removals update that index for the rest of
+  the pass. Rebuilding it at the next pivot observes local expiry, asynchronous
+  ID assignment, replacement, and reset without persistent duplicate state.
+  Runtime membership facts are shared for that pass; record and cleanup
+  snapshots retain callback-mutation safety.
 
 Stationary and swept collision tests share polygon containment and
 squared-distance primitives in `collision-geometry.js`, including degenerate
@@ -183,6 +198,13 @@ edges and inclusive tangency. Fracture calculation stays in
 `asteroid-fracture.js`: parent geometry, impulse response, polygon construction,
 and disk fallback are separate stages. Parent mass is density times radius
 squared; polygon-area calibration still determines child radii.
+
+Asteroid polar vertices remain authoritative for fracture and serialization.
+`rebuildShapeCache()` derives local Cartesian offsets and the true bounding
+radius after shape/aspect changes. Movement, rotation, and viewport changes
+refresh reusable world points with one rotation transform, shared by drawing
+and collision. `getWorldVertices()` returns borrowed read-only storage, valid
+until the next refresh; consumers must not retain a pose across refreshes.
 
 Tests import production modules directly where possible. For declarations that
 remain inline, `AstervoidsWeb/test-support/inline-game.mjs` loads selected
@@ -1679,6 +1701,20 @@ this honestly:
    real sub-1500 ms sample lands. `bestRegion()` never picks a warming
    region.
 4. Once a real sample arrives, state → `'measuring'` → `'settled'`.
+
+### Picker assessment lifecycle
+
+Regional RTT bursts run only while the session picker is visible, including
+single-region deployments. Entering solo or multiplayer gameplay stops timers,
+aborts active probes, and invalidates stale continuations. Returning to the
+picker starts fresh bursts while retaining the manifest and prior measurements.
+Hidden tabs suspend picker polling/spectators and regional assessment; delayed
+bootstrap completion cannot restart them during gameplay. The joined session's
+clock synchronization remains independent and active.
+
+Session-list notifications from the active connection refresh only its region,
+just like spectator notifications. Explicit refreshes and fallback polling still
+cover all regions.
 
 ### Configuration
 
