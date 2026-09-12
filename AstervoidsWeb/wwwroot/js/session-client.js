@@ -212,6 +212,20 @@ const SessionClient = (function() {
         };
     }
 
+    function decodeObjectInfo(value) {
+        const objectInfo = normalizeObjectInfo(value);
+        WireEnum.translateObject(objectInfo);
+        SyncPayload.unwrapObjectData(objectInfo);
+        return objectInfo;
+    }
+
+    function decodeObjectInfos(objects) {
+        if (!Array.isArray(objects)) return;
+        for (let i = 0; i < objects.length; i++) {
+            objects[i] = decodeObjectInfo(objects[i]);
+        }
+    }
+
     function normalizeObjectUpdateInfo(value) {
         if (!Array.isArray(value)) return value;
         return {
@@ -250,14 +264,7 @@ const SessionClient = (function() {
     function dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt,
         handler = callbacks.onObjectReplaced) {
         event = normalizeObjectReplacedEvent(event);
-        if (event && Array.isArray(event.createdObjects)) {
-            for (let i = 0; i < event.createdObjects.length; i++) {
-                const objectInfo = normalizeObjectInfo(event.createdObjects[i]);
-                event.createdObjects[i] = objectInfo;
-                WireEnum.translateObject(objectInfo);
-                SyncPayload.unwrapObjectData(objectInfo);
-            }
-        }
+        if (event) decodeObjectInfos(event.createdObjects);
         if (handler) handler(event, senderMemberId, memberSequence, validAt);
         return event.createdObjects;
     }
@@ -297,6 +304,25 @@ const SessionClient = (function() {
             token: response.reconnectToken,
             hubHostname: currentHubHostname
         };
+    }
+
+    function completeSessionEntry(context, session, member, identity, eventName) {
+        currentSession = session;
+        currentMember = member;
+        reconnectIdentity = identity;
+        const pendingMemberEvents = applyPendingMemberEvents(context.sessionEpoch);
+        lastSessionId = session.id;
+        finishSessionTransition(context.sessionEpoch);
+
+        if (callbacks[eventName]) {
+            callbacks[eventName](session, member);
+        }
+        for (const event of pendingMemberEvents) {
+            if (!isSessionContextCurrent(context)) break;
+            dispatchMemberEvent(event);
+        }
+
+        return isSessionContextCurrent(context) ? { session, member } : null;
     }
 
     /**
@@ -529,9 +555,7 @@ const SessionClient = (function() {
         // SessionStateSnapshot) carry a parallel validAts dictionary keyed by
         // objectId so each pre-existing object keeps its own age.
         thisConnection.on('OnObjectCreated', guard((objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
-            objectInfo = normalizeObjectInfo(objectInfo);
-            WireEnum.translateObject(objectInfo);
-            SyncPayload.unwrapObjectData(objectInfo);
+            objectInfo = decodeObjectInfo(objectInfo);
             if (callbacks.onObjectCreated) {
                 callbacks.onObjectCreated(objectInfo, senderMemberId, memberSequence, validAt);
             }
@@ -677,27 +701,8 @@ const SessionClient = (function() {
             };
             const nextReconnectIdentity = reconnectIdentityFromResponse(
                 response, createdSession.id, createdMember.id);
-            currentMember = createdMember;
-            currentSession = createdSession;
-            reconnectIdentity = nextReconnectIdentity;
-            const pendingMemberEvents = applyPendingMemberEvents(thisSessionEpoch);
-
-            // console.log('[SessionClient] Session created:', currentSession.name);
-            lastSessionId = currentSession.id;
-            finishSessionTransition(thisSessionEpoch);
-
-            if (callbacks.onSessionCreated) {
-                callbacks.onSessionCreated(currentSession, currentMember);
-            }
-            for (const event of pendingMemberEvents) {
-                if (!isSessionContextCurrent(context)) break;
-                dispatchMemberEvent(event);
-            }
-
-            if (!isSessionContextCurrent(context)) {
-                return null;
-            }
-            return { session: createdSession, member: createdMember };
+            return completeSessionEntry(
+                context, createdSession, createdMember, nextReconnectIdentity, 'onSessionCreated');
         } catch (err) {
             if (!isSessionContextCurrent(context)) {
                 return null;
@@ -760,14 +765,7 @@ const SessionClient = (function() {
             if (Array.isArray(response.members)) {
                 for (const m of response.members) WireEnum.translateMember(m);
             }
-            if (Array.isArray(response.objects)) {
-                for (let i = 0; i < response.objects.length; i++) {
-                    const objectInfo = normalizeObjectInfo(response.objects[i]);
-                    response.objects[i] = objectInfo;
-                    WireEnum.translateObject(objectInfo);
-                    SyncPayload.unwrapObjectData(objectInfo);
-                }
-            }
+            decodeObjectInfos(response.objects);
 
             const joinedSession = {
                 id: response.sessionId,
@@ -783,27 +781,9 @@ const SessionClient = (function() {
             };
             const nextReconnectIdentity = reconnectIdentityFromResponse(
                 response, joinedSession.id, joinedMember.id);
-            currentSession = joinedSession;
-            currentMember = joinedMember;
-            reconnectIdentity = nextReconnectIdentity;
-            const pendingMemberEvents = applyPendingMemberEvents(thisSessionEpoch);
-
-            _log('[SessionClient] Joined session:', currentSession.name, 'as', currentMember.role);
-            lastSessionId = currentSession.id;
-            finishSessionTransition(thisSessionEpoch);
-
-            if (callbacks.onSessionJoined) {
-                callbacks.onSessionJoined(currentSession, currentMember);
-            }
-            for (const event of pendingMemberEvents) {
-                if (!isSessionContextCurrent(context)) break;
-                dispatchMemberEvent(event);
-            }
-
-            if (!isSessionContextCurrent(context)) {
-                return null;
-            }
-            return { session: joinedSession, member: joinedMember };
+            _log('[SessionClient] Joined session:', joinedSession.name, 'as', joinedMember.role);
+            return completeSessionEntry(
+                context, joinedSession, joinedMember, nextReconnectIdentity, 'onSessionJoined');
         } catch (err) {
             if (!isSessionContextCurrent(context)) {
                 return null;
@@ -924,9 +904,7 @@ const SessionClient = (function() {
         // [schemaId, Uint8Array]; unwrap so the owner-side path in object-sync.js
         // sees the same plain dict shape as remote receivers.
         if (response && response.objectInfo) {
-            response.objectInfo = normalizeObjectInfo(response.objectInfo);
-            WireEnum.translateObject(response.objectInfo);
-            SyncPayload.unwrapObjectData(response.objectInfo);
+            response.objectInfo = decodeObjectInfo(response.objectInfo);
         }
         return response;
     }
@@ -1057,14 +1035,7 @@ const SessionClient = (function() {
             if (Array.isArray(snapshot.members)) {
                 for (const m of snapshot.members) WireEnum.translateMember(m);
             }
-            if (Array.isArray(snapshot.objects)) {
-                for (let i = 0; i < snapshot.objects.length; i++) {
-                    const objectInfo = normalizeObjectInfo(snapshot.objects[i]);
-                    snapshot.objects[i] = objectInfo;
-                    WireEnum.translateObject(objectInfo);
-                    SyncPayload.unwrapObjectData(objectInfo);
-                }
-            }
+            decodeObjectInfos(snapshot.objects);
             snapshot.validAts = WireEnum.pairsToObject(snapshot.validAts);
             snapshot.memberSequences = WireEnum.pairsToObject(snapshot.memberSequences);
         }

@@ -394,6 +394,129 @@ test('SessionClient merges member events that overtake a pending join snapshot',
     ]);
 });
 
+async function sessionEntryHarness(method) {
+    const connection = new FakeConnection();
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    const sessionId = fixtureGuid('entry');
+    if (method === 'RejoinSession') {
+        connection.invokers.set('JoinSession', () => Promise.resolve(joinResponse(sessionId)));
+        await client.joinSession(sessionId);
+        client.clearSessionState();
+    }
+    const gate = deferred();
+    connection.invokers.set(method, () => gate.promise);
+    const response = joinResponse(sessionId);
+    response.role = method === 'CreateSession' ? 'Server' : 'Client';
+    response.members = [{ id: response.memberId, role: response.role }];
+    response.reconnectToken = 'replacement-reconnect-token';
+    return {
+        client, connection, gate, response,
+        eventName: method === 'CreateSession' ? 'onSessionCreated' : 'onSessionJoined',
+        enter: () => method === 'CreateSession'
+            ? client.createSession() : client.joinSession(sessionId)
+    };
+}
+
+for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
+    test(`${method} installs identity and pending members before entry callbacks`, async () => {
+        const { client, connection, gate, response, eventName, enter } = await sessionEntryHarness(method);
+        const events = [];
+        client.on(eventName, (session, member) => {
+            assert.equal(client.getCurrentSession(), session);
+            assert.equal(client.getCurrentMember(), member);
+            assert.equal(client.getLastSessionId(), session.id);
+            assert.deepEqual(session.members.map(m => m.id), [member.id, 'first', 'second']);
+            events.push('entry');
+            connection.emit('OnMemberJoined', { id: 'during-callback', role: 'Client' }, 'sender', 3, 1003);
+        });
+        client.on('onMemberJoined', member => events.push(member.id));
+        const entering = enter();
+        await drainMicrotasks();
+        for (const id of ['first', 'second']) {
+            connection.emit('OnMemberJoined', { id, role: 'Client' }, 'sender', 1, 1000);
+        }
+        assert.deepEqual(events, []);
+        gate.resolve(response);
+        const result = await entering;
+        assert.equal(result.session, client.getCurrentSession());
+        assert.equal(result.member.role, response.role);
+        assert.deepEqual(events, ['entry', 'during-callback', 'first', 'second'],
+            'transition is finished before entry callback; buffered callbacks retain their order');
+
+        client.clearSessionState();
+        connection.invokers.set('RejoinSession', () => Promise.resolve(response));
+        client.on(eventName, null);
+        await client.joinSession(response.sessionId);
+        assert.deepEqual(connection.invokeCalls.at(-1).args, [
+            GuidUtils.guidToBytes(response.sessionId),
+            GuidUtils.guidToBytes(response.memberId),
+            response.reconnectToken
+        ], 'entry installs the latest reconnect credential');
+    });
+
+    for (const resetAt of ['entry', 'member']) {
+        test(`${method} stops completion after a synchronous ${resetAt} callback reset`, async () => {
+            const { client, connection, gate, response, eventName, enter } = await sessionEntryHarness(method);
+            const events = [];
+            client.on(eventName, () => {
+                events.push('entry');
+                if (resetAt === 'entry') client.clearSessionState();
+            });
+            client.on('onMemberJoined', member => {
+                events.push(member.id);
+                if (resetAt === 'member') client.clearSessionState();
+            });
+            const entering = enter();
+            await drainMicrotasks();
+            for (const id of ['first', 'second']) {
+                connection.emit('OnMemberJoined', { id, role: 'Client' }, 'sender', 1, 1000);
+            }
+            gate.resolve(response);
+            assert.equal(await entering, null);
+            assert.equal(client.getCurrentSession(), null);
+            assert.equal(client.getCurrentMember(), null);
+            assert.deepEqual(events, resetAt === 'entry' ? ['entry'] : ['entry', 'first']);
+        });
+    }
+
+    for (const outcome of ['success', 'failure']) {
+        test(`${method} ignores a stale ${outcome} response`, async () => {
+            const { client, gate, response, eventName, enter } = await sessionEntryHarness(method);
+            const events = [];
+            client.on(eventName, () => events.push('entry'));
+            client.on('onError', () => events.push('error'));
+            const entering = enter();
+            await drainMicrotasks();
+            client.clearSessionState();
+            if (outcome === 'success') gate.resolve(response);
+            else gate.reject(new Error('stale failure'));
+            assert.equal(await entering, null);
+            assert.equal(client.getCurrentSession(), null);
+            assert.equal(client.getCurrentMember(), null);
+            assert.deepEqual(events, []);
+        });
+    }
+
+    test(`${method} preserves callback failures and can process the next transition`, async () => {
+        const { client, connection, gate, response, eventName, enter } = await sessionEntryHarness(method);
+        const error = new Error('entry callback failed');
+        const errors = [];
+        client.on(eventName, () => { throw error; });
+        client.on('onError', message => errors.push(message));
+        const entering = enter();
+        gate.resolve(response);
+        await assert.rejects(entering, actual => actual === error);
+        assert.equal(errors.length, 1);
+        assert.match(errors[0], /entry callback failed/);
+        assert.equal(client.getCurrentSession().id, response.sessionId);
+        client.on(eventName, null);
+        connection.invokers.set('LeaveSession', () => Promise.resolve());
+        assert.equal(await client.leaveSession(), true);
+        assert.equal(client.getCurrentSession(), null);
+    });
+}
+
 test('SessionClient serializes create then join without orphaning membership', async () => {
     const connection = new FakeConnection();
     const createGate = deferred();
@@ -515,92 +638,19 @@ test('failed leave keeps reconnect identity available for recovery', async () =>
         ]);
 });
 
-test('SessionClient rejects session responses without reconnect credentials', async () => {
-    const connection = new FakeConnection();
-    connection.invokers.set('JoinSession', sessionId => {
-        const response = joinResponse(sessionId);
+for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
+    test(`${method} rejects session responses without reconnect credentials`, async () => {
+        const { client, gate, response, eventName, enter } = await sessionEntryHarness(method);
+        let notified = false;
+        client.on(eventName, () => { notified = true; });
         delete response.reconnectToken;
-        return Promise.resolve(response);
+        gate.resolve(response);
+        await assert.rejects(enter(), /missing reconnectToken/);
+        assert.equal(client.getCurrentSession(), null);
+        assert.equal(client.getCurrentMember(), null);
+        assert.equal(notified, false);
     });
-    const { client } = loadSessionClient([connection]);
-    await connectImmediately(client, connection);
-
-    await assert.rejects(
-        client.joinSession(fixtureGuid('session')),
-        /missing reconnectToken/);
-    assert.equal(client.getCurrentSession(), null);
-});
-
-test('SessionClient adapts compact object DTO arrays at every wire boundary', async () => {
-    const connection = new FakeConnection();
-    const compact = (id, version, data, owner = 'owner') =>
-        [id, owner, owner, 'Session', data, version];
-    connection.invokers.set('JoinSession', sessionId =>
-        Promise.resolve(joinResponse(sessionId, [
-            compact(fixtureGuid('snapshot'), 1, { type: 'ship', x: 1 })
-        ])));
-    connection.invokers.set('UpdateObjects', updates => {
-        assert.deepEqual(updates, [[GuidUtils.guidToBytes(fixtureGuid('snapshot')), { x: 2 }]]);
-        return Promise.resolve([[[GuidUtils.guidToBytes(fixtureGuid('snapshot')), 2]], 17, 123]);
-    });
-    connection.invokers.set('CreateObject', () =>
-        Promise.resolve([compact('owned-create', 1, { type: 'bullet' }), 18, 124]));
-    connection.invokers.set('DeleteObject', () => Promise.resolve([true, 19]));
-    connection.invokers.set('ReplaceObject', () =>
-        Promise.resolve([[compact('owned-child', 1, { type: 'asteroid' })], 20, 125]));
-    connection.invokers.set('GetSessionState', () => Promise.resolve({
-        members: [],
-        objects: [compact('reconciled', 4, { type: 'gameState' })],
-        validAts: [],
-        memberSequences: []
-    }));
-    const { client } = loadSessionClient([connection]);
-    const created = [];
-    const updated = [];
-    const replaced = [];
-    const events = [];
-    client.on('onObjectCreated', value => created.push(value));
-    client.on('onObjectsUpdated', value => updated.push(value));
-    client.on('onObjectReplaced', value => replaced.push(value));
-    client.on('onObjectEvent', value => events.push(value));
-
-    await connectImmediately(client, connection);
-    const joined = await client.joinSession(fixtureGuid('session'));
-    assert.equal(joined.session.objects[0].id, fixtureGuid('snapshot'));
-    assert.equal(joined.session.objects[0].data.x, 1);
-
-    connection.emit('OnObjectCreated',
-        compact('created', 1, { type: 'asteroid' }), 'sender', 1, 10, 10);
-    connection.emit('OnObjectsUpdated',
-        [['created', { x: 2 }, 2]], 'sender', 1, 2, 10, 16, 10);
-    connection.emit('OnObjectReplaced',
-        ['created', [compact('child', 1, { type: 'asteroid' })]],
-        'sender', 3, 10, 10);
-    connection.emit('OnObjectEvent',
-        [fixtureGuid('snapshot'), 1, new Uint8Array([0x80])], 'sender', 4, 10, 10);
-
-    assert.equal(created[0].id, 'created');
-    assert.equal(updated[0][0].id, 'created');
-    assert.equal(replaced[0].deletedObjectId, 'created');
-    assert.equal(replaced[0].createdObjects[0].id, 'child');
-    assert.equal(events[0].objectId, fixtureGuid('snapshot'));
-
-    const updateResponse = await client.updateObjects([
-        { objectId: fixtureGuid('snapshot'), data: { x: 2 } }
-    ]);
-    const createResponse = await client.createObject({ type: 'bullet' }, 'Member');
-    const replacement = await client.replaceObject(fixtureGuid('snapshot'), [{ type: 'asteroid' }]);
-    const deleteResponse = await client.deleteObject(fixtureGuid('snapshot'));
-    const reconciliation = await client.getSessionState();
-    assert.deepEqual(updateResponse.versions, { [fixtureGuid('snapshot')]: 2 });
-    assert.equal(updateResponse.memberSequence, 17);
-    assert.equal(createResponse.objectInfo.id, 'owned-create');
-    assert.equal(createResponse.memberSequence, 18);
-    assert.equal(replacement[0].id, 'owned-child');
-    assert.equal(deleteResponse.success, true);
-    assert.equal(deleteResponse.memberSequence, 19);
-    assert.equal(reconciliation.objects[0].id, 'reconciled');
-});
+}
 
 test('SessionClient installs session schemas before decoding a join snapshot', async () => {
     const connection = new FakeConnection();

@@ -92,6 +92,95 @@ function assertBinaryGuid(actual, expected) {
     assert.equal(GuidUtils.bytesToGuid(actual), expected.toLowerCase());
 }
 
+for (const compact of [false, true]) {
+    for (const encoding of ['plain', 'legacy', 'positional']) {
+        test(`incoming ${compact ? 'compact' : 'keyed'} objects decode consistently with ${encoding} data`, async () => {
+            const { client, replies, handlers } = await loadClient();
+            const fields = [['type', 'str'], ['x', 'f64']];
+            const schema = SchemaCodec.normalizeSchema(29, fields);
+            SchemaCodec.clear();
+            const payload = data => encoding === 'plain' ? data
+                : encoding === 'legacy' ? [0, MsgpackCodec.encode(data)]
+                : [29, SchemaCodec.encode(schema, data)];
+            const data = { type: 'widget', x: 0.25 };
+            const expected = id => ({
+                id, creatorMemberId: MEMBER_ID, ownerMemberId: OTHER_ID,
+                scope: 'Session', data, version: 3
+            });
+            const object = id => {
+                const fields = [
+                    GuidUtils.guidToBytes(id), GuidUtils.guidToBytes(MEMBER_ID),
+                    GuidUtils.guidToBytes(OTHER_ID), 1, payload(data), 3
+                ];
+                return compact ? fields : {
+                    id: fields[0], creatorMemberId: fields[1], ownerMemberId: fields[2],
+                    scope: fields[3], data: fields[4], version: fields[5]
+                };
+            };
+            const objects = () => [object(OBJECT_ID), object(OTHER_ID)];
+            const snapshot = () => ({
+                members: [{ id: GuidUtils.guidToBytes(MEMBER_ID), role: 1 }],
+                objects: objects(),
+                validAts: [[GuidUtils.guidToBytes(OBJECT_ID), 1000]],
+                memberSequences: [[GuidUtils.guidToBytes(MEMBER_ID), 7]]
+            });
+            replies.set('JoinSession', () => ({
+                ...snapshot(),
+                sessionId: GuidUtils.guidToBytes(SESSION_ID), sessionName: 'fruit',
+                memberId: GuidUtils.guidToBytes(MEMBER_ID), role: 1,
+                reconnectToken: RECONNECT_TOKEN,
+                metadata: { schemas: [{ id: 29, fields }] }
+            }));
+            replies.set('GetSessionState', snapshot);
+            replies.set('CreateObject', () => [object(OBJECT_ID), 8, 1001]);
+            replies.set('ReplaceObject', () => [objects(), 9, 1002]);
+            const notifications = new Map();
+            for (const event of ['onObjectCreated', 'onObjectsUpdated', 'onObjectReplaced', 'onObjectEvent']) {
+                client.on(event, (...args) => notifications.set(event, args));
+            }
+
+            const joined = await client.joinSession(SESSION_ID);
+            assert.deepEqual(joined.session.objects, [expected(OBJECT_ID), expected(OTHER_ID)]);
+            assert.equal(joined.session.members[0].role, 'Client');
+            assert.deepEqual(joined.session.validAts, { [OBJECT_ID]: 1000 });
+            const reconciled = await client.getSessionState();
+            assert.deepEqual(reconciled.objects, joined.session.objects);
+            assert.deepEqual(reconciled.memberSequences, { [MEMBER_ID]: 7 });
+            assert.deepEqual(await client.createObject({}), {
+                objectInfo: expected(OBJECT_ID), memberSequence: 8, validAt: 1001
+            });
+            const replaced = await client.replaceObject(OBJECT_ID, [{}]);
+            assert.deepEqual(replaced, joined.session.objects);
+            assert.deepEqual(notifications.get('onObjectReplaced'), [
+                { deletedObjectId: OBJECT_ID, createdObjects: replaced }, MEMBER_ID, 9, 1002
+            ]);
+
+            handlers.get('OnObjectCreated')(object(OBJECT_ID), GuidUtils.guidToBytes(MEMBER_ID), 10, 1003, 1002);
+            assert.deepEqual(notifications.get('onObjectCreated'), [expected(OBJECT_ID), MEMBER_ID, 10, 1002]);
+            const replacement = compact ? [GuidUtils.guidToBytes(OBJECT_ID), objects()]
+                : { deletedObjectId: GuidUtils.guidToBytes(OBJECT_ID), createdObjects: objects() };
+            handlers.get('OnObjectReplaced')(replacement, GuidUtils.guidToBytes(MEMBER_ID), 11, 1004, 1003);
+            assert.deepEqual(notifications.get('onObjectReplaced'), [
+                { deletedObjectId: OBJECT_ID, createdObjects: joined.session.objects }, MEMBER_ID, 11, 1003
+            ]);
+            const delta = { x: 0.75 };
+            const update = compact ? [GuidUtils.guidToBytes(OBJECT_ID), payload(delta), 4]
+                : { id: GuidUtils.guidToBytes(OBJECT_ID), data: payload(delta), version: 4 };
+            handlers.get('OnObjectsUpdated')([update], GuidUtils.guidToBytes(MEMBER_ID), 12, 13, 1005, 50, 1004);
+            assert.deepEqual(notifications.get('onObjectsUpdated'), [
+                [{ id: OBJECT_ID, data: delta, version: 4 }], 1005, MEMBER_ID, 12, 13, 50, 1004
+            ], 'updates keep their sparse shape and callback argument order');
+            const eventPayload = new Uint8Array([0x80]);
+            handlers.get('OnObjectEvent')(
+                [GuidUtils.guidToBytes(OBJECT_ID), 1, eventPayload],
+                GuidUtils.guidToBytes(MEMBER_ID), 14, 1006, 1005);
+            assert.deepEqual(notifications.get('onObjectEvent'), [
+                { objectId: OBJECT_ID, eventKind: 1, payload: eventPayload }, MEMBER_ID, 14, 1005
+            ], 'generic event payloads remain opaque');
+        });
+    }
+}
+
 test('JoinSession writes a mixed-endian binary Guid and keeps public IDs as strings', async () => {
     const { client, calls } = await loadClient();
     const joined = await client.joinSession(SESSION_ID);
