@@ -1362,7 +1362,7 @@ sequenceDiagram
     participant SC as SessionClient
     participant SRV as Server
 
-    Note over OS: computeDelta(): compare current data vs lastSentData<br/>Uses shallow reference comparison (===)<br/>Nested objects must be spread into new refs
+    Note over OS: computeDelta(): compare current data vs the object's lastSentData<br/>Uses shallow reference comparison (===)<br/>Nested objects must be spread into new refs
 
     OS->>OS: delta = computeDelta(objectId, data)<br/>lastSentData NOT updated yet
 
@@ -1991,6 +1991,8 @@ astervoids/
 │       ├── srvmon/
 │       │   └── index.html      # Server monitoring page; polls /api/srvmon every 2s
 │       └── js/
+│           ├── debug-log.js                       # Shared _log/_warn/_error helpers gated on ASTERVOIDS_DEBUG.
+│           │                                      # Must load before every other script that logs.
 │           ├── session-client.js                  # SignalR lifecycle, hub RPC wrappers, stale-connection
 │           │                                      # guard(), GUID normalization. See: Client Architecture.
 │           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,
