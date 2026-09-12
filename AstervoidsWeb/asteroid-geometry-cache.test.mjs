@@ -38,7 +38,10 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapMarginX', 'wrapMarginY', 'wrapNormalized', 'drawAsteroidsBatched',
         'checkCollisions', 'checkShipAsteroidCollision', 'prepareAsteroidCollision',
-        'computeBulletImpact',
+        'computeBulletImpact', 'computeBulletAsteroidImpact', 'awardSoloAsteroidScore',
+        'resolveBulletAsteroidHit', 'resolveOwnedAsteroidHit',
+        'claimCrossOwnerAsteroidHit', 'resolveSoloAsteroidHit',
+        'confirmOwnedAsteroidHitClaims', 'retireConfirmedPendingBullets',
     ], {
         Math: math, CONFIG: config, game,
         getGameWidth: () => viewport.width,
