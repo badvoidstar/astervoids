@@ -34,8 +34,10 @@
  */
 
 const SpectatorClient = (function () {
-    const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
-    const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
+    // Shared debug helpers — see js/debug-log.js (must load first).
+    const { log: _log, warn: _warn } = typeof AstervoidsDebugLog !== 'undefined'
+        ? AstervoidsDebugLog
+        : require('./debug-log.js');
 
     // Per-region connection state. Keyed by regionId.
     //   { connection, hostname, state: 'connecting'|'open'|'reconnecting'|'closed' }

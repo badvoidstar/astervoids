@@ -4,16 +4,16 @@
  */
 
 const SessionClient = (function() {
-    const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
-    const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
-    const _error = (...a) => window.ASTERVOIDS_DEBUG && console.error(...a);
+    // Shared debug helpers — see js/debug-log.js (must load first).
+    const { log: _log, warn: _warn, error: _error } = typeof AstervoidsDebugLog !== 'undefined'
+        ? AstervoidsDebugLog
+        : require('./debug-log.js');
 
     let connection = null;
     let currentSession = null;
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
     let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
-    let reconnectAttempts = 0;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
     let connectionEpoch = 0;
@@ -421,7 +421,6 @@ const SessionClient = (function() {
                 return false;
             }
             _log('[SessionClient] Connected to session hub');
-            reconnectAttempts = 0;
 
             if (callbacks.onConnected) {
                 callbacks.onConnected();
@@ -457,7 +456,6 @@ const SessionClient = (function() {
         try {
             await stale.stop();
             if (connectionEpoch === thisConnectionEpoch) {
-                // console.log('[SessionClient] Disconnected');
             }
         } catch (err) {
             if (connectionEpoch === thisConnectionEpoch) {
@@ -492,15 +490,12 @@ const SessionClient = (function() {
         };
 
         thisConnection.onreconnecting(guard(error => {
-            // console.log('[SessionClient] Reconnecting...', error);
             if (callbacks.onReconnecting) {
                 callbacks.onReconnecting(error);
             }
         }));
 
         thisConnection.onreconnected(guard(connectionId => {
-            // console.log('[SessionClient] Reconnected:', connectionId);
-            reconnectAttempts = 0;
             // Reconcile state — invoke responses for Create/Delete/Update may have been
             // lost during the reconnection window (OthersInGroup means no broadcast fallback)
             ObjectSync.triggerReconciliation();
@@ -510,7 +505,6 @@ const SessionClient = (function() {
         }));
 
         thisConnection.onclose(guard(error => {
-            // console.log('[SessionClient] Connection closed:', error);
             connection = null;
             sessionTransitionTail = Promise.resolve();
             const closedConnectionEpoch = ++connectionEpoch;
@@ -526,7 +520,6 @@ const SessionClient = (function() {
 
         // Session events
         thisConnection.on('OnMemberJoined', guard((memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
-            // console.log('[SessionClient] Member joined:', memberInfo);
             WireEnum.translateMember(memberInfo);
             handleMemberEvent({
                 kind: 'joined',
@@ -537,7 +530,6 @@ const SessionClient = (function() {
         }, true));
 
         thisConnection.on('OnMemberLeft', guard((info, senderMemberId, memberSequence, serverTimestamp) => {
-            // console.log('[SessionClient] Member left:', info);
             if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
             handleMemberEvent({
                 kind: 'left',
@@ -599,7 +591,6 @@ const SessionClient = (function() {
 
         // Session list changed (signal only - fetch data separately)
         thisConnection.on('OnSessionsChanged', guard(() => {
-            // console.log('[SessionClient] Sessions changed signal received');
             if (callbacks.onSessionsChanged) {
                 callbacks.onSessionsChanged();
             }
@@ -681,7 +672,6 @@ const SessionClient = (function() {
             }
             const response = GuidUtils.transformBinaryGuids(rawResponse);
             if (!response) {
-                // console.log('[SessionClient] CreateSession failed - server at capacity');
                 finishSessionTransition(thisSessionEpoch);
                 return null;
             }
@@ -826,7 +816,6 @@ const SessionClient = (function() {
             }
             invalidateSession('leave', true);
 
-            // console.log('[SessionClient] Left session');
 
             if (callbacks.onSessionLeft) {
                 callbacks.onSessionLeft(leftSession);

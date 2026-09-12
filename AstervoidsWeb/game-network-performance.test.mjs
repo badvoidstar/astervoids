@@ -1,12 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
-const source = readFileSync(new URL('./wwwroot/js/object-sync.js', import.meta.url), 'utf8');
 
 function bulletHarness({ deltaEncoding = true } = {}) {
     const handlers = {};
@@ -24,8 +23,8 @@ function bulletHarness({ deltaEncoding = true } = {}) {
             };
         },
     };
-    const ObjectSync = new Function('SessionClient', 'AuthoritativeObject', 'window',
-        `${source}\nreturn ObjectSync;`)(SessionClient, AuthoritativeObject, {});
+    const ObjectSync = loadClassicModule('object-sync.js', 'ObjectSync',
+        { SessionClient, AuthoritativeObject, window: {} });
     ObjectSync.init();
     ObjectSync.configure({ deltaEncoding });
     const { Bullet, syncLocalBullets, updateLocalBullet } = loadInlineGameFunctions(
@@ -190,8 +189,8 @@ test('cancelled wave creates use existing response-first cleanup instead of inst
             return { success: true, memberSequence: 2 };
         },
     };
-    const ObjectSync = new Function('SessionClient', 'AuthoritativeObject', 'window',
-        `${source}\nreturn ObjectSync;`)(SessionClient, AuthoritativeObject, {});
+    const ObjectSync = loadClassicModule('object-sync.js', 'ObjectSync',
+        { SessionClient, AuthoritativeObject, window: {} });
     ObjectSync.init();
     const { createSyncedAsteroid } = loadInlineGameFunctions(['createSyncedAsteroid'], {
         ObjectSync, isSessionMode: () => true,

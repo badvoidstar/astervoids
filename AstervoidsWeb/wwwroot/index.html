@@ -776,6 +776,8 @@
     <script src="/js/sync-payload.js"></script>
     <!-- Debug toggle — set to true in browser console: window.ASTERVOIDS_DEBUG = true -->
     <script>window.ASTERVOIDS_DEBUG = false;</script>
+    <!-- Shared debug logging helpers — must load before any module that logs -->
+    <script src="/js/debug-log.js"></script>
     <!-- Optional injected region bootstrap for static-apex hosting -->
     <script src="/region-bootstrap.js"></script>
     <!-- Region service — discovers peer regions and measures RTT for the session picker -->
@@ -802,9 +804,8 @@
        A single-file HTML5 Canvas implementation following best practices
        ================================================================ */
 
-    const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
-    const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
-    const _error = (...a) => window.ASTERVOIDS_DEBUG && console.error(...a);
+    // Shared debug helpers — see js/debug-log.js (loaded above).
+    const { log: _log, warn: _warn, error: _error } = AstervoidsDebugLog;
 
     // ============================================
     // SECTION 0: AUDIO SYSTEM
@@ -10067,7 +10068,7 @@
                         velocityX: 'vx', velocityY: 'vy', rotationSpeed: 'rs',
                         thrusting: 'th', invulnerable: 'iv', colorIndex: 'ci',
                         memberId: 'mi', score: 'sc', hitCount: 'hc',
-                        radius: 'r', seed: 'sd', spawnTimestamp: 'sp',
+                        radius: 'r', seed: 'sd',
                         lifetime: 'lt', ownerMemberId: 'om',
                         pendingHit: 'ph', hitTargetId: 'ht', hitImpactTorque: 'hi',
                         hitBulletAngle: 'ha', hitOffsetN: 'hn',
@@ -11148,9 +11149,10 @@
     const reconnectingSince = new Map();
 
     async function initMultiRegionPicker(regions) {
-        if (!window.SpectatorClient || !window.MultiRegionSessions && false) {
-            // MultiRegionSessions lives in this same file; the SpectatorClient
-            // check guards against the script tag being absent (e.g. test page).
+        if (!window.SpectatorClient) {
+            // Guards against the spectator-client.js script tag being absent
+            // (e.g. the standalone test page): fall back to single-region
+            // REST polling instead of the push-driven multi-region picker.
             if (isSessionPickerActive()) await activateSessionPickerUpdates();
             return;
         }

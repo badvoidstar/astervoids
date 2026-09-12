@@ -100,9 +100,10 @@ const ObjectSync = (function() {
     if (!objectApplication) {
         throw new Error('authoritative-object.js must load before object-sync.js');
     }
-    const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
-    const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
-    const _error = (...a) => window.ASTERVOIDS_DEBUG && console.error(...a);
+    // Shared debug helpers — see js/debug-log.js (must load first).
+    const { log: _log, warn: _warn, error: _error } = typeof AstervoidsDebugLog !== 'undefined'
+        ? AstervoidsDebugLog
+        : require('./debug-log.js');
 
     // ── Field name compression for network traffic ─────────────────────────
     // Maps readable field names to short wire names. Applied at the sync
@@ -394,7 +395,6 @@ const ObjectSync = (function() {
         SessionClient.on('onSessionJoined', handleSessionJoined);
         SessionClient.on('onSessionLeft', handleSessionLeft);
 
-        // console.log('[ObjectSync] Initialized');
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -594,7 +594,6 @@ const ObjectSync = (function() {
             }
         }
 
-        // console.log('[ObjectSync] Loaded', objects.size, 'objects from session');
     }
 
     /**
@@ -602,7 +601,6 @@ const ObjectSync = (function() {
      */
     function handleSessionLeft() {
         resetState();
-        // console.log('[ObjectSync] Cleared all objects');
     }
 
     /**
@@ -641,15 +639,6 @@ const ObjectSync = (function() {
         // Server-time twin used by buffered lag-based delay sizing. Capturing at
         // dispatch excludes later game-loop polling from that measurement.
         const arrivalServerTime = getArrivalServerTimeMs();
-
-        // Strip any legacy spawnTimestamp field from the wire data. The
-        // current model uses validAt as the single operation timestamp;
-        // spawnTimestamp lingered on the field-compression map (`sp` → ...)
-        // but is never set or consumed by current code paths. Defensive
-        // delete in case an older client still sends it.
-        if (objectInfo.data && objectInfo.data.spawnTimestamp !== undefined) {
-            delete objectInfo.data.spawnTimestamp;
-        }
 
         const existing = objects.get(objectInfo.id);
         if (existing) {
@@ -888,7 +877,6 @@ const ObjectSync = (function() {
         reconciling = operation;
         
         try {
-            // console.log('[ObjectSync] Reconciling state...');
             const snapshot = await SessionClient.getSessionState();
             if (!isAsyncContextCurrent(context)) return;
             if (!snapshot) {
@@ -985,7 +973,6 @@ const ObjectSync = (function() {
                 }
             }
             
-            // console.log('[ObjectSync] Reconciliation complete, objects:', objects.size);
             reconciliationCount++;
             if (callbacks.onReconciliationComplete) {
                 callbacks.onReconciliationComplete();
