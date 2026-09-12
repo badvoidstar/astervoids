@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -19,13 +20,6 @@ const {
     SCHEMAS,
     selectSchemaId,
 } = require('./wwwroot/js/game-wire-schemas.js');
-
-function extractProductionFunction(name, nextMarker) {
-    const start = productionSource.indexOf(`function ${name}(`);
-    const end = productionSource.indexOf(nextMarker, start);
-    assert.ok(start >= 0 && end > start, `could not extract ${name}`);
-    return productionSource.slice(start, end);
-}
 
 function approx(actual, expected, tolerance = 1e-9) {
     assert.ok(
@@ -293,9 +287,6 @@ test('early canonical handoff preserves provisional position and derivatives', (
 });
 
 test('production relaxes winding axes regardless of the late threshold', () => {
-    const source = extractProductionFunction(
-        'createCanonicalTerminalTransition',
-        'function terminalTargetMatches');
     const current = {
         x: 1.04,
         y: 0.2,
@@ -307,36 +298,23 @@ test('production relaxes winding axes regardless of the late threshold', () => {
         accelerationY: 0.000001,
         angularAcceleration: 0.00001
     };
-    const factory = new Function(
-        'deterministicTerminalState',
-        'sampleTerminalTransition',
-        'lastRenderedPose',
-        'velocityToNormalizedDeltaX',
-        'velocityToNormalizedDeltaY',
-        'CONFIG',
-        'wrapRadiusFor',
-        'wrapMarginX',
-        'wrapMarginY',
-        'ReplicationPresentation',
-        `${source}\nreturn createCanonicalTerminalTransition;`);
-    const create = factory(
+    const { createCanonicalTerminalTransition: create } = loadInlineGameFunctions(
+        ['createCanonicalTerminalTransition'],
         {
-            directTargetIds: new Set()
-        },
-        () => current,
-        () => current,
-        value => value,
-        value => value,
-        {
-            TARGET_FPS: 1000,
-            DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
-            DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
-        },
-        () => 0.05,
-        () => 0.05,
-        () => 0.05,
-        {
-            createWrappedConvergenceTransition
+            deterministicTerminalState: { directTargetIds: new Set() },
+            sampleTerminalTransition: () => current,
+            lastRenderedPose: () => current,
+            velocityToNormalizedDeltaX: value => value,
+            velocityToNormalizedDeltaY: value => value,
+            CONFIG: {
+                TARGET_FPS: 1000,
+                DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+                DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+            },
+            wrapRadiusFor: () => 0.05,
+            wrapMarginX: () => 0.05,
+            wrapMarginY: () => 0.05,
+            ReplicationPresentation: { createWrappedConvergenceTransition }
         });
     const record = {
         id: 'asteroid',
@@ -377,27 +355,20 @@ test('production relaxes winding axes regardless of the late threshold', () => {
 });
 
 test('production provisional convergence uses half-ballistic stopping distance', () => {
-    const source = extractProductionFunction(
-        'createProvisionalTerminalTransition',
-        'function createCanonicalTerminalTransition');
-    const factory = new Function(
-        'lastRenderedPose',
-        'velocityToNormalizedDeltaX',
-        'velocityToNormalizedDeltaY',
-        'CONFIG',
-        'ReplicationPresentation',
-        `${source}\nreturn createProvisionalTerminalTransition;`);
-    const create = factory(
-        obj => ({ x: obj.x, y: obj.y, angle: obj.angle }),
-        value => value,
-        value => value,
+    const { createProvisionalTerminalTransition: create } = loadInlineGameFunctions(
+        ['createProvisionalTerminalTransition'],
         {
-            TARGET_FPS: 1000,
-            DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
-            DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
-        },
-        {
-            createMinimumJerkTransition
+            lastRenderedPose: obj => ({ x: obj.x, y: obj.y, angle: obj.angle }),
+            velocityToNormalizedDeltaX: value => value,
+            velocityToNormalizedDeltaY: value => value,
+            CONFIG: {
+                TARGET_FPS: 1000,
+                DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+                DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+            },
+            ReplicationPresentation: {
+                createMinimumJerkTransition
+            }
         });
     const entry = create({
         x: 0.1,
@@ -472,19 +443,22 @@ test('production terminal snapshots bypass live join-age projection', () => {
 });
 
 test('terminal bootstrap deferral is deterministic-only and includes late records', () => {
-    const source = extractProductionFunction(
-        'shouldDeferTerminalBootstrap',
-        '// Pause menu element reference');
     const state = {
         pendingBootstrapIds: new Set(['snapshot-object']),
         bootstrapEpoch: 123,
     };
-    const factory = new Function(
-        'deterministicTerminalState',
-        'isDeterministicMode',
-        'resolveTerminalSession',
-        'hasPersistedTerminalTarget',
-        `${source}\nreturn shouldDeferTerminalBootstrap;`);
+    const factory = (
+        deterministicTerminalState,
+        isDeterministicMode,
+        resolveTerminalSession,
+        hasPersistedTerminalTarget) => loadInlineGameFunctions(
+        ['shouldDeferTerminalBootstrap'],
+        {
+            deterministicTerminalState,
+            isDeterministicMode,
+            resolveTerminalSession,
+            hasPersistedTerminalTarget
+        }).shouldDeferTerminalBootstrap;
     const legacy = factory(state, () => false, () => ({ epoch: 123 }), () => false);
     assert.equal(legacy({ id: 'snapshot-object' }), false);
 
@@ -519,34 +493,24 @@ test('production canonical retargeting carries sampled acceleration', () => {
 });
 
 test('terminal target uses half-ballistic distance tied to terminalAt', () => {
-    const source = extractProductionFunction(
-        'buildTerminalTargetPayload',
-        'function publishOwnedTerminalTargets');
     let nowServer = 1000;
-    const factory = new Function(
-        'CONFIG',
-        'RemoteObjects',
-        'wrapRadiusFor',
-        'wrapMarginX',
-        'wrapMarginY',
-        'wrapNormalizedMod',
-        'velocityToNormalizedDeltaX',
-        'velocityToNormalizedDeltaY',
-        'normalizeTerminalAngle',
-        `${source}\nreturn buildTerminalTargetPayload;`);
-    const build = factory(
-        { TARGET_FPS: 60, DEADRECKON_MAX_FRAMES: 30 },
+    const { buildTerminalTargetPayload: build } = loadInlineGameFunctions(
+        ['buildTerminalTargetPayload'],
         {
-            serverNowMs: () => nowServer,
-            getBoundingRadius: () => 0,
-        },
-        () => 0,
-        () => 0,
-        () => 0,
-        value => ((value % 1) + 1) % 1,
-        value => value,
-        value => value,
-        value => ((value % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2));
+            CONFIG: { TARGET_FPS: 60, DEADRECKON_MAX_FRAMES: 30 },
+            RemoteObjects: {
+                serverNowMs: () => nowServer,
+                getBoundingRadius: () => 0,
+            },
+            wrapRadiusFor: () => 0,
+            wrapMarginX: () => 0,
+            wrapMarginY: () => 0,
+            wrapNormalizedMod: value => ((value % 1) + 1) % 1,
+            velocityToNormalizedDeltaX: value => value,
+            velocityToNormalizedDeltaY: value => value,
+            normalizeTerminalAngle: value =>
+                ((value % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)
+        });
     const record = {
         validAt: 1000,
         data: {
@@ -571,9 +535,6 @@ test('terminal target uses half-ballistic distance tied to terminalAt', () => {
 });
 
 test('terminal publisher retries owned targets and retires ownership races', () => {
-    const source = extractProductionFunction(
-        'publishOwnedTerminalTargets',
-        'async function deleteSyncedBullet');
     const records = new Map([
         ['ours', {
             id: 'ours',
@@ -615,35 +576,25 @@ test('terminal publisher retries owned targets and retires ownership races', () 
             Object.assign(records.get(id).data, payload);
         },
     };
-    const factory = new Function(
-        'isSessionMode',
-        'isDeterministicMode',
-        'resolveTerminalSession',
-        'deterministicTerminalState',
-        'ObjectSync',
-        'SessionClient',
-        'performance',
-        'OBJECT_TYPES',
-        'hasPersistedTerminalTarget',
-        'getKinematicInstance',
-        'buildTerminalTargetPayload',
-        `${source}\nreturn publishOwnedTerminalTargets;`);
-    const publish = factory(
-        () => true,
-        () => true,
-        () => ({ epoch: 10, terminalAt: 750 }),
-        state,
-        objectSync,
-        { getCurrentMember: () => ({ id: 'me' }) },
-        { now: () => now },
-        { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
-        record => record.data.terminalEpoch === 10,
-        () => null,
-        (instance, record) => ({
-            terminalEpoch: 10,
-            terminalX: record.id === 'ours' ? 0.3 : 0.6,
-            terminalY: 0.7,
-        }));
+    const { publishOwnedTerminalTargets: publish } = loadInlineGameFunctions(
+        ['publishOwnedTerminalTargets'],
+        {
+            isSessionMode: () => true,
+            isDeterministicMode: () => true,
+            resolveTerminalSession: () => ({ epoch: 10, terminalAt: 750 }),
+            deterministicTerminalState: state,
+            ObjectSync: objectSync,
+            SessionClient: { getCurrentMember: () => ({ id: 'me' }) },
+            performance: { now: () => now },
+            OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
+            hasPersistedTerminalTarget: record => record.data.terminalEpoch === 10,
+            getKinematicInstance: () => null,
+            buildTerminalTargetPayload: (instance, record) => ({
+                terminalEpoch: 10,
+                terminalX: record.id === 'ours' ? 0.3 : 0.6,
+                terminalY: 0.7,
+            })
+        });
 
     publish();
     assert.deepEqual(updates.map(update => update.id), ['ours']);
