@@ -1,8 +1,9 @@
 /**
  * Tests for RemoteObjects.clock — NTP-style client↔server clock-offset
- * estimator. Pure-logic helpers are mirrored here so tests are independent
- * of the browser environment. Mirror with AstervoidsWeb/wwwroot/index.html
- * (RemoteObjects.clock).
+ * estimator. These exercise the PRODUCTION helpers imported from
+ * wwwroot/js/replication-clock.js; nothing here is a mirror. (The estimator
+ * used to be inline in index.html and was mirrored; it has since been
+ * extracted, so do not re-create a mirror.)
  *
  * Run with:  node --test AstervoidsWeb/clock-offset.test.mjs
  *

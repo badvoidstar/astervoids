@@ -152,8 +152,12 @@ jq -e '.parameters.manageAcmebotPermissions.value == "${MANAGE_ACMEBOT_PERMISSIO
   infra/main.parameters.json >/dev/null || fail "azd parameter mapping for MANAGE_ACMEBOT_PERMISSIONS is missing"
 grep -Fq 'primary_region_location "$REGIONS_JSON"' .github/workflows/azure-deploy.yml \
   || fail "workflow must derive the regional deployment location from REGIONS_JSON"
-grep -Fq 'azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"' .github/workflows/azure-deploy.yml \
+grep -Fq 'CUSTOM_DOMAIN_NAME: ${{ secrets.CUSTOM_DOMAIN_NAME }}' .github/workflows/azure-deploy.yml \
+  || fail "workflow must source CUSTOM_DOMAIN_NAME from the secret"
+grep -Fq 'azd env set CUSTOM_DOMAIN_NAME "$CUSTOM_DOMAIN_NAME"' .github/workflows/azure-deploy.yml \
   || fail "workflow must clear or set CUSTOM_DOMAIN_NAME deterministically"
+grep -Fq 'validate_deployment_settings PRECHECK_SETTINGS' .github/workflows/azure-deploy.yml \
+  || fail "workflow must pre-validate deployment settings with the shared helper"
 grep -Fq 'custom_subdomain_suffix: ${{ steps.vars.outputs.custom_subdomain_suffix }}' .github/workflows/azure-deploy.yml \
   || fail "workflow must expose the public custom-subdomain suffix as a job output"
 grep -Fq 'CUSTOM_SUBDOMAIN_SUFFIX="-$SANITIZED"' .github/workflows/azure-deploy.yml \

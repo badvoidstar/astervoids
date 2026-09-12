@@ -2259,6 +2259,41 @@
         wrapY: wrapRemoteY,
         distanceBetween: remoteDistanceBetween
     });
+    /**
+     * Pure: compute the seconds to forward-extrapolate a replacement snapshot
+     * from its operation-time validAt to estimated server "now". Capped to
+     * ±MAX_EXTRAPOLATION to avoid runaway projection from a poor clock estimate.
+     */
+    function computeSpawnStaleness(serverNowMsValue, validAt) {
+        const elapsedSec = (serverNowMsValue - validAt) / 1000;
+        const cap = CONFIG.MAX_EXTRAPOLATION;
+        if (elapsedSec > cap) return cap;
+        if (elapsedSec < -cap) return -cap;
+        return elapsedSec;
+    }
+
+    /**
+     * Project a spawn data position forward (or backward) by `stalenessSec` of
+     * constant-velocity motion, applying toroidal wrap with the matching
+     * radius-aware margins. Mirrors the `_baseInterpolated` extrapolation
+     * branch so projected snapshots and subsequent interpolated snapshots
+     * remain in the same coordinate frame.
+     */
+    function projectSpawnData(data, stalenessSec) {
+        if (!stalenessSec) return data;
+        const refDim = getReferenceDimension();
+        const r = getRemoteBoundingRadius(data);
+        const vx = data.velocityX || 0;
+        const vy = data.velocityY || 0;
+        const rs = data.rotationSpeed || 0;
+        return {
+            ...data,
+            x: wrapNormalized(data.x + vx * (refDim / getGameWidth()) * stalenessSec, wrapMarginX(r)),
+            y: wrapNormalized(data.y + vy * (refDim / getGameHeight()) * stalenessSec, wrapMarginY(r)),
+            angle: (data.angle || 0) + rs * CONFIG.TARGET_FPS * stalenessSec,
+        };
+    }
+
     const RemoteObjects = {
         // Facade maps remain directly queryable by game-over and migration paths.
         states: bufferedSnapshotPolicy.states,
@@ -2687,44 +2722,6 @@
         // updateAstervoidsFromSync's adopt branch.
 
         /**
-         * Pure: compute the seconds to forward-extrapolate a replacement
-         * snapshot from its operation-time validAt to estimated server "now".
-         * Capped
-         * to ±MAX_EXTRAPOLATION to avoid runaway projection from a poor
-         * clock estimate.
-         */
-        computeSpawnStaleness(serverNowMsValue, validAt) {
-            const elapsedSec = (serverNowMsValue - validAt) / 1000;
-            const cap = CONFIG.MAX_EXTRAPOLATION;
-            if (elapsedSec > cap) return cap;
-            if (elapsedSec < -cap) return -cap;
-            return elapsedSec;
-        },
-
-        /**
-         * Project a spawn data position forward (or backward) by
-         * `stalenessSec` of constant-velocity motion, applying toroidal wrap
-         * with the matching radius-aware margins. Mirrors the
-         * `_baseInterpolated` extrapolation branch so projected snapshots
-         * and subsequent interpolated snapshots remain in the same
-         * coordinate frame.
-         */
-        projectSpawnData(data, stalenessSec) {
-            if (!stalenessSec) return data;
-            const refDim = getReferenceDimension();
-            const r = this.getBoundingRadius(data);
-            const vx = data.velocityX || 0;
-            const vy = data.velocityY || 0;
-            const rs = data.rotationSpeed || 0;
-            return {
-                ...data,
-                x: wrapNormalized(data.x + vx * (refDim / getGameWidth()) * stalenessSec, wrapMarginX(r)),
-                y: wrapNormalized(data.y + vy * (refDim / getGameHeight()) * stalenessSec, wrapMarginY(r)),
-                angle: (data.angle || 0) + rs * CONFIG.TARGET_FPS * stalenessSec,
-            };
-        },
-
-        /**
          * Historical projection helper: derive the latest buffered snapshot at
          * estimated server "now". The active ownership-migration path
          * deliberately does NOT call this. A newly promoted owner keeps the
@@ -2748,7 +2745,7 @@
                 : (performance.now() - Date.now());
             const latestValidAt = latest.time - delta + offset;
             const stalenessSec = (this.serverNowMs() - latestValidAt) / 1000;
-            return this.projectSpawnData(latest.data, stalenessSec);
+            return projectSpawnData(latest.data, stalenessSec);
         },
 
         /** Delegate buffered validAt-axis sampling to the extracted policy. */
@@ -5408,11 +5405,11 @@
                     delete record.replacementBaselinePerf;
                 } else if (record.validAt != null
                     && RemoteObjects.isClockOffsetInitialized()) {
-                    stalenessSec = RemoteObjects.computeSpawnStaleness(
+                    stalenessSec = computeSpawnStaleness(
                         RemoteObjects.serverNowMs(), record.validAt);
                 }
                 if (stalenessSec !== undefined) {
-                    const projected = RemoteObjects.projectSpawnData(record.data, stalenessSec);
+                    const projected = projectSpawnData(record.data, stalenessSec);
                     asteroid.x = projected.x;
                     asteroid.y = projected.y;
                     asteroid.angle = projected.angle;

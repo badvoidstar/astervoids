@@ -210,6 +210,9 @@ jobs:
           fi
 
       - name: Set up azd environment
+        env:
+          CUSTOM_DOMAIN_NAME: ${{ secrets.CUSTOM_DOMAIN_NAME }}
+          CUSTOM_SUBDOMAIN: ${{ secrets.CUSTOM_SUBDOMAIN }}
         run: |
           source .github/scripts/deployment-helpers.sh
           ENV_NAME="${{ steps.vars.outputs.env_name }}"
@@ -219,30 +222,28 @@ jobs:
           fi
           echo "REGIONS_JSON=$REGIONS_JSON" >> "$GITHUB_ENV"
 
-          if { [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -z "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; } ||
-            { [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; }; then
-            echo "::error::CUSTOM_DOMAIN_NAME and CUSTOM_SUBDOMAIN must either both be configured or both be empty."
-            exit 1
-          fi
-          if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+          # Single source of truth for the pairing/identity rules: the same
+          # validate_deployment_settings() that guards the later azd-sourced
+          # deploy, and the only copy covered by workflow-helpers.test.sh.
+          # Running it here still fails before any Azure resource is created.
+          declare -A PRECHECK_SETTINGS=(
+            [environmentName]="$ENV_NAME"
+            [regions]="$REGIONS_JSON"
+            [customDomainName]="$CUSTOM_DOMAIN_NAME"
+            [customSubdomain]="$CUSTOM_SUBDOMAIN"
+            [certKeyVaultSecretUrl]="$CERT_KEY_VAULT_SECRET_URL"
+            [certKeyVaultCertName]="$CERT_KEY_VAULT_CERT_NAME"
+            [certReaderIdentityId]="$CERT_READER_IDENTITY_ID"
+            [manageAcmebotPermissions]="${MANAGE_ACMEBOT_PERMISSIONS:-true}"
+          )
+          validate_deployment_settings PRECHECK_SETTINGS || exit 1
+
+          if [ -n "$CUSTOM_DOMAIN_NAME" ]; then
             echo "HAS_CUSTOM_DOMAIN=true" >> "$GITHUB_ENV"
           else
             echo "HAS_CUSTOM_DOMAIN=false" >> "$GITHUB_ENV"
           fi
-          if { [ -n "$CERT_KEY_VAULT_SECRET_URL" ] && [ -z "$CERT_KEY_VAULT_CERT_NAME" ]; } ||
-            { [ -z "$CERT_KEY_VAULT_SECRET_URL" ] && [ -n "$CERT_KEY_VAULT_CERT_NAME" ]; }; then
-            echo "::error::CERT_KEY_VAULT_SECRET_URL and CERT_KEY_VAULT_CERT_NAME must either both be configured or both be empty."
-            exit 1
-          fi
-          if [ "${{ steps.vars.outputs.is_production }}" != "true" ] &&
-            [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] &&
-            [ -n "$CERT_KEY_VAULT_SECRET_URL" ] &&
-            [ -n "$CERT_KEY_VAULT_CERT_NAME" ] &&
-            [ -z "$CERT_READER_IDENTITY_ID" ]; then
-            echo "::error::Branch BYO certificate deployments require CERT_READER_IDENTITY_ID."
-            exit 1
-          fi
-          if [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] &&
+          if [ -z "$CUSTOM_DOMAIN_NAME" ] &&
             [ -n "$CERT_KEY_VAULT_SECRET_URL" ] &&
             [ -n "$CERT_KEY_VAULT_CERT_NAME" ]; then
             echo "::warning::BYO certificate inputs are ignored because no custom domain is configured."
@@ -253,7 +254,7 @@ jobs:
 
           DEPLOYMENT_LOCATION=westus2
           if [ "$(jq 'length' <<< "$REGIONS_JSON")" -gt 0 ] &&
-            [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ]; then
+            [ -n "$CUSTOM_DOMAIN_NAME" ]; then
             DEPLOYMENT_LOCATION=$(primary_region_location "$REGIONS_JSON")
           fi
           
@@ -281,13 +282,13 @@ jobs:
           
           # Write both values even when empty so restored azd environments
           # cannot retain a removed custom-domain configuration.
-          azd env set CUSTOM_DOMAIN_NAME "${{ secrets.CUSTOM_DOMAIN_NAME }}"
+          azd env set CUSTOM_DOMAIN_NAME "$CUSTOM_DOMAIN_NAME"
           
           # Set subdomain (with branch suffix for non-production)
           if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
-            azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}"
-          elif [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
-            azd env set CUSTOM_SUBDOMAIN "${{ secrets.CUSTOM_SUBDOMAIN }}-${{ steps.vars.outputs.sanitized_branch }}"
+            azd env set CUSTOM_SUBDOMAIN "$CUSTOM_SUBDOMAIN"
+          elif [ -n "$CUSTOM_SUBDOMAIN" ]; then
+            azd env set CUSTOM_SUBDOMAIN "$CUSTOM_SUBDOMAIN-${{ steps.vars.outputs.sanitized_branch }}"
           else
             azd env set CUSTOM_SUBDOMAIN ""
           fi
