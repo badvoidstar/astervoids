@@ -465,6 +465,134 @@ const SessionClient = (function() {
     }
 
     /**
+     * Hub event table.
+     *
+     * Every entry is wrapped by the same `guard` in setupEventHandlers, so the
+     * table records only what differs per event: whether the handler is
+     * session-scoped and whether the guard may rewrite binary GUIDs in all
+     * arguments (opaque byte payloads opt out and transform their known GUID
+     * slots themselves).
+     *
+     * ValidAt is a single batch-level trailing argument on each broadcast
+     * (every object in a single broadcast shares the same owner-stamped sample
+     * time after server validation). Snapshot DTOs (JoinSessionResponse,
+     * SessionStateSnapshot) carry a parallel validAts dictionary keyed by
+     * objectId so each pre-existing object keeps its own age.
+     */
+    const HUB_EVENTS = [
+        // ── Session events ──
+        {
+            name: 'OnMemberJoined',
+            sessionScoped: true,
+            handler: (memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
+                WireEnum.translateMember(memberInfo);
+                handleMemberEvent({
+                    kind: 'joined',
+                    memberInfo,
+                    senderMemberId,
+                    memberSequence
+                });
+            }
+        },
+        {
+            name: 'OnMemberLeft',
+            sessionScoped: true,
+            handler: (info, senderMemberId, memberSequence, serverTimestamp) => {
+                if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
+                handleMemberEvent({
+                    kind: 'left',
+                    info,
+                    senderMemberId,
+                    memberSequence,
+                    roleChanged: false
+                });
+            }
+        },
+        // ── Object events ──
+        {
+            name: 'OnObjectCreated',
+            sessionScoped: true,
+            handler: (objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+                objectInfo = decodeObjectInfo(objectInfo);
+                if (callbacks.onObjectCreated) {
+                    callbacks.onObjectCreated(objectInfo, senderMemberId, memberSequence, validAt);
+                }
+            }
+        },
+        {
+            name: 'OnObjectsUpdated',
+            sessionScoped: true,
+            handler: (objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
+                if (Array.isArray(objects)) {
+                    for (let i = 0; i < objects.length; i++) {
+                        objects[i] = normalizeObjectUpdateInfo(objects[i]);
+                        SyncPayload.unwrapObjectData(objects[i]);
+                    }
+                }
+                if (callbacks.onObjectsUpdated) {
+                    callbacks.onObjectsUpdated(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs, validAt);
+                }
+            }
+        },
+        {
+            name: 'OnObjectDeleted',
+            sessionScoped: true,
+            handler: (objectId, senderMemberId, memberSequence, serverTimestamp) => {
+                if (callbacks.onObjectDeleted) {
+                    callbacks.onObjectDeleted(objectId, senderMemberId, memberSequence);
+                }
+            }
+        },
+        {
+            name: 'OnObjectReplaced',
+            sessionScoped: true,
+            handler: (event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+                dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt);
+            }
+        },
+        {
+            // Generic per-object event channel (Phase 2.1).
+            // Server relays eventInfo.payload as opaque game-encoded bytes.
+            // ObjectSync decodes and dispatches by eventKind byte.
+            name: 'OnObjectEvent',
+            sessionScoped: true,
+            transformGuids: false,
+            handler: (eventInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
+                eventInfo = normalizeObjectEventInfo(eventInfo);
+                if (eventInfo) {
+                    eventInfo.objectId = GuidUtils.transformBinaryGuids(eventInfo.objectId);
+                }
+                senderMemberId = GuidUtils.transformBinaryGuids(senderMemberId);
+                if (callbacks.onObjectEvent) {
+                    callbacks.onObjectEvent(eventInfo, senderMemberId, memberSequence, validAt);
+                }
+            }
+        },
+        // ── Session lifecycle signals ──
+        {
+            // Session list changed (signal only - fetch data separately)
+            name: 'OnSessionsChanged',
+            handler: () => {
+                if (callbacks.onSessionsChanged) {
+                    callbacks.onSessionsChanged();
+                }
+            }
+        },
+        {
+            name: 'OnSessionExpired',
+            sessionScoped: true,
+            handler: (expiredSessionId, reason) => {
+                if (!acceptsExpirationForSession(expiredSessionId)) return;
+
+                const expiredSessionEpoch = invalidateSession('sessionExpired', true);
+                if (sessionEpoch === expiredSessionEpoch && callbacks.onSessionExpired) {
+                    callbacks.onSessionExpired(reason, expiredSessionId);
+                }
+            }
+        }
+    ];
+
+    /**
      * Setup SignalR event handlers.
      * Captures a reference to the current connection so that if connect()
      * replaces it later (e.g., after a mobile background disconnect), the
@@ -489,6 +617,7 @@ const SessionClient = (function() {
             }
         };
 
+        // Transport lifecycle — distinct SignalR API, not hub methods.
         thisConnection.onreconnecting(guard(error => {
             if (callbacks.onReconnecting) {
                 callbacks.onReconnecting(error);
@@ -518,92 +647,11 @@ const SessionClient = (function() {
             }
         }));
 
-        // Session events
-        thisConnection.on('OnMemberJoined', guard((memberInfo, senderMemberId, memberSequence, serverTimestamp) => {
-            WireEnum.translateMember(memberInfo);
-            handleMemberEvent({
-                kind: 'joined',
-                memberInfo,
-                senderMemberId,
-                memberSequence
-            });
-        }, true));
-
-        thisConnection.on('OnMemberLeft', guard((info, senderMemberId, memberSequence, serverTimestamp) => {
-            if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
-            handleMemberEvent({
-                kind: 'left',
-                info,
-                senderMemberId,
-                memberSequence,
-                roleChanged: false
-            });
-        }, true));
-
-        // Object events
-        // ValidAt is now a single batch-level trailing argument on each broadcast
-        // (every object in a single broadcast shares the same owner-stamped sample
-        // time after server validation). Snapshot DTOs (JoinSessionResponse,
-        // SessionStateSnapshot) carry a parallel validAts dictionary keyed by
-        // objectId so each pre-existing object keeps its own age.
-        thisConnection.on('OnObjectCreated', guard((objectInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
-            objectInfo = decodeObjectInfo(objectInfo);
-            if (callbacks.onObjectCreated) {
-                callbacks.onObjectCreated(objectInfo, senderMemberId, memberSequence, validAt);
-            }
-        }, true));
-
-        thisConnection.on('OnObjectsUpdated', guard((objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
-            if (Array.isArray(objects)) {
-                for (let i = 0; i < objects.length; i++) {
-                    objects[i] = normalizeObjectUpdateInfo(objects[i]);
-                    SyncPayload.unwrapObjectData(objects[i]);
-                }
-            }
-            if (callbacks.onObjectsUpdated) {
-                callbacks.onObjectsUpdated(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs, validAt);
-            }
-        }, true));
-
-        thisConnection.on('OnObjectDeleted', guard((objectId, senderMemberId, memberSequence, serverTimestamp) => {
-            if (callbacks.onObjectDeleted) {
-                callbacks.onObjectDeleted(objectId, senderMemberId, memberSequence);
-            }
-        }, true));
-
-        thisConnection.on('OnObjectReplaced', guard((event, senderMemberId, memberSequence, serverTimestamp, validAt) => {
-            dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt);
-        }, true));
-
-        // Generic per-object event channel (Phase 2.1).
-        // Server relays eventInfo.payload as opaque game-encoded bytes.
-        // ObjectSync decodes and dispatches by eventKind byte.
-        thisConnection.on('OnObjectEvent', guard((eventInfo, senderMemberId, memberSequence, serverTimestamp, validAt) => {
-            eventInfo = normalizeObjectEventInfo(eventInfo);
-            if (eventInfo) {
-                eventInfo.objectId = GuidUtils.transformBinaryGuids(eventInfo.objectId);
-            }
-            senderMemberId = GuidUtils.transformBinaryGuids(senderMemberId);
-            if (callbacks.onObjectEvent) {
-                callbacks.onObjectEvent(eventInfo, senderMemberId, memberSequence, validAt);
-            }
-        }, true, false));
-
-        // Session list changed (signal only - fetch data separately)
-        thisConnection.on('OnSessionsChanged', guard(() => {
-            if (callbacks.onSessionsChanged) {
-                callbacks.onSessionsChanged();
-            }
-        }));
-
-        thisConnection.on('OnSessionExpired', guard((expiredSessionId, reason) => {
-            if (!acceptsExpirationForSession(expiredSessionId)) return;
-
-            const expiredSessionEpoch = invalidateSession('sessionExpired', true);
-            if (sessionEpoch === expiredSessionEpoch && callbacks.onSessionExpired) {
-                callbacks.onSessionExpired(reason, expiredSessionId);
-            }
-        }, true));
+        for (const event of HUB_EVENTS) {
+            thisConnection.on(
+                event.name,
+                guard(event.handler, event.sessionScoped === true, event.transformGuids !== false));
+        }
     }
 
     // ── Internal helpers ────────────────────────────────────────────────

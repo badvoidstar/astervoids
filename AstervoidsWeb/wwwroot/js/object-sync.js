@@ -189,6 +189,11 @@ const ObjectSync = (function() {
     let reconciliationCount = 0;
     let stateEpoch = 0;
     let stateRevision = 0;
+    // Both maps below are deliberately keyed by id rather than folded into the
+    // `objects` records: they describe ids that are NOT (or not yet) live.
+    // objectRevisions is a tombstone — it must outlive removeObjectLocal so a
+    // late create/update echo cannot resurrect a deleted id. Ownership
+    // migrations are parked here when they arrive before the object does.
     const objectRevisions = new Map();
     const pendingOwnershipMigrations = new Map();
     // External callers (e.g. attemptAutoRejoin) can suspend reconciliation during
@@ -205,10 +210,11 @@ const ObjectSync = (function() {
     // removing this guard allows a later reconciliation to restore server truth.
     const pendingDeletes = new Set();
     
-    // Track last server-confirmed data per object (from an update response or
-    // authoritative snapshot) so rejected or re-queued states can be diffed
-    // from an accepted baseline and one-shot producers can detect persistence.
-    const lastSentData = new Map();
+    // The last server-confirmed data for an object (from an update response or
+    // authoritative snapshot) lives on the object record as `lastSentData`, so
+    // rejected or re-queued states can be diffed from an accepted baseline and
+    // one-shot producers can detect persistence. Keeping it on the record means
+    // removeObjectLocal cannot leave a stale baseline behind.
     let deltaEncodingEnabled = false;
     // Optional clock source for owner-operation validAt times. Provided via
     // configure({ clockSource: { nowMs(), initialized() } }). When set,
@@ -406,7 +412,6 @@ const ObjectSync = (function() {
         stateEpoch++;
         objects.clear();
         typeIndex.clear();
-        lastSentData.clear();
         pendingUpdates.clear();
         pendingUrgentUpdates.clear();
         objectRevisions.clear();
@@ -492,7 +497,6 @@ const ObjectSync = (function() {
             removeFromTypeIndex(obj);
             objects.delete(objectId);
         }
-        lastSentData.delete(objectId);
         pendingUpdates.delete(objectId);
         pendingUrgentUpdates.delete(objectId);
         pendingOwnershipMigrations.delete(objectId);
@@ -565,7 +569,7 @@ const ObjectSync = (function() {
                     });
                     updateTypeIndex(existing, applied.oldType, applied.newType);
                     if (applied.changed) markObjectMutation(existing.id);
-                    lastSentData.set(existing.id, { ...existing.data });
+                    existing.lastSentData = { ...existing.data };
                     continue;
                 }
 
@@ -575,7 +579,7 @@ const ObjectSync = (function() {
                     });
                     updateTypeIndex(existing, applied.oldType, applied.newType);
                     markObjectMutation(existing.id);
-                    lastSentData.set(existing.id, { ...existing.data });
+                    existing.lastSentData = { ...existing.data };
                     continue;
                 }
 
@@ -589,7 +593,7 @@ const ObjectSync = (function() {
                     registered.validAt = va;
                 }
                 if (registered) {
-                    lastSentData.set(registered.id, { ...registered.data });
+                    registered.lastSentData = { ...registered.data };
                 }
             }
         }
@@ -918,7 +922,7 @@ const ObjectSync = (function() {
                             validAt: snapValidAt
                         });
                         updateTypeIndex(existing, applied.oldType, applied.newType);
-                        lastSentData.set(existing.id, { ...existing.data });
+                        existing.lastSentData = { ...existing.data };
                         markObjectMutation(existing.id);
                         // Reconciliation snapshots now carry the same validated
                         // server-time validAt as live broadcasts (monotonically
@@ -950,7 +954,7 @@ const ObjectSync = (function() {
                     if (snapValidAt !== undefined && snapValidAt !== null) {
                         localObj.validAt = snapValidAt;
                     }
-                    lastSentData.set(localObj.id, { ...localObj.data });
+                    localObj.lastSentData = { ...localObj.data };
                     if (callbacks.onObjectCreated) {
                         callbacks.onObjectCreated(localObj);
                     }
@@ -1185,7 +1189,7 @@ const ObjectSync = (function() {
      * in the next flush. See confirmSentData().
      */
     function computeDelta(objectId, data, forceFullSync) {
-        const prev = lastSentData.get(objectId);
+        const prev = objects.get(objectId)?.lastSentData;
         if (!prev || forceFullSync) {
             return { ...data };
         }
@@ -1236,11 +1240,14 @@ const ObjectSync = (function() {
     function confirmSentData(sentData, confirmedVersions) {
         for (const [objectId, delta] of sentData) {
             if (confirmedVersions[objectId] === undefined) continue;
-            const prev = lastSentData.get(objectId);
-            if (prev) {
-                Object.assign(prev, delta);
+            // An object deleted while its batch was in flight has no baseline
+            // to keep — ids are never reused, so nothing can consume it.
+            const obj = objects.get(objectId);
+            if (!obj) continue;
+            if (obj.lastSentData) {
+                Object.assign(obj.lastSentData, delta);
             } else {
-                lastSentData.set(objectId, { ...delta });
+                obj.lastSentData = { ...delta };
             }
         }
     }
@@ -1251,7 +1258,7 @@ const ObjectSync = (function() {
      * other values retain the normal shallow comparison semantics.
      */
     function isDataConfirmed(objectId, data) {
-        const confirmed = lastSentData.get(objectId);
+        const confirmed = objects.get(objectId)?.lastSentData;
         if (!confirmed || !data || typeof data !== 'object') return false;
         return Object.entries(data).every(
             ([key, value]) => dataValueEquals(confirmed[key], value));

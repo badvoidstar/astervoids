@@ -308,181 +308,150 @@ const ReplicationRuntime = (function () {
             return role;
         }
 
-        function reconcileType(type, context) {
-            if (!isCurrentEpoch(context)) {
-                return Object.freeze({ stale: true, created: 0, applied: 0, removed: 0 });
+        // ── reconcileType phases ────────────────────────────────────────
+        // reconcileType walks its records once and then cleans up whatever the
+        // walk did not retain. Each phase below is named so the three concerns
+        // — per-record binding, role handling, and retirement — can be read
+        // independently. The phase ORDER is observable by game simulation:
+        // records are bound and ingested before any removal runs. `counts`
+        // accumulates the summary totals across phases.
+
+        // A record whose descriptor no longer wants it: drop presentation,
+        // remove the instance, and forget the binding entirely.
+        function reconcileIgnoredRecord(descriptor, id, instance, facts, record, context, counts) {
+            removePresentation(
+                descriptor, id, REMOVAL_REASONS.ROLE_IGNORED, facts, record, context);
+            if (instance != null) {
+                descriptor.remove(
+                    instance, REMOVAL_REASONS.ROLE_IGNORED, facts, context);
+                counts.removed++;
             }
-            const descriptor = descriptors.get(type);
-            if (!descriptor) throw new Error(`unregistered replication type: ${type}`);
+            forgetObject(id);
+        }
 
-            const records = getObjectsByTypeSnapshot(type);
-            if (!Array.isArray(records)) {
-                throw new TypeError('store.getObjectsByTypeSnapshot must return an owned array');
+        // Local ownership: adopt (or re-adopt, on a replica → owned handoff)
+        // and stop interpolating. Local simulation drives the instance from here.
+        function reconcileOwnedRecord(
+            descriptor, id, type, record, instance, initialFacts, previousRole,
+            members, context, counts) {
+            const ownedFacts = joinSnapshotObjectIds.delete(id)
+                ? makeFacts(record, type, { joinSnapshot: true }, members)
+                : initialFacts;
+            if (previousRole === 'replica') {
+                removePresentation(
+                    descriptor, id, REMOVAL_REASONS.OWNERSHIP_GAINED,
+                    ownedFacts, record, context);
+                if (descriptor.adoptOwned) {
+                    instance = descriptor.adoptOwned(
+                        record, instance, ownedFacts, context) ?? instance;
+                } else if (instance != null) {
+                    descriptor.remove(
+                        instance, REMOVAL_REASONS.OWNERSHIP_GAINED, ownedFacts, context);
+                    instance = descriptor.getInstance(id, context);
+                    counts.removed++;
+                }
+            } else if ((previousRole === undefined || instance == null)
+                && descriptor.adoptOwned) {
+                instance = descriptor.adoptOwned(
+                    record, instance, ownedFacts, context) ?? instance;
             }
-            const members = memberFacts();
-            const retainedIds = new Set();
-            let created = 0;
-            let applied = 0;
-            let removed = 0;
+            bindObject(id, type, 'owned', instance);
+            if (previousRole && previousRole !== 'owned') {
+                descriptor.onRoleChanged?.(
+                    instance, previousRole, 'owned', ownedFacts, context);
+            }
+            ownershipTransitions.delete(id);
+            if (record.ownershipMigrationPending === true) {
+                record.ownershipMigrationPending = false;
+            }
+        }
 
-            for (const record of records) {
-                if (!record || record.id == null) {
-                    throw new TypeError(`${type} record must have an id`);
+        // Remote ownership: create the replica if needed, ingest the record
+        // when its version is genuinely new, then sample presentation forward.
+        function reconcileReplicaRecord(
+            descriptor, id, type, role, record, instance, initialFacts, previousRole,
+            members, context, counts) {
+            const hadReplicaState = descriptor.presentation
+                ? descriptor.presentation.has(id)
+                : previousRole === 'replica' && instance != null;
+            if (instance == null) {
+                instance = descriptor.createReplica(record, initialFacts, context);
+                if (instance == null) {
+                    throw new Error(`${type}.createReplica did not return an instance`);
                 }
-                const id = record.id;
-                retainedIds.add(id);
-                let binding = bindings.get(id);
-                if (binding && binding.type !== type) {
-                    removeBoundObject(
-                        id, REMOVAL_REASONS.TYPE_MISSING, context, record, members);
-                    binding = undefined;
-                    removed++;
+                counts.created++;
+            }
+            bindObject(id, type, role, instance);
+
+            let transition = ownershipTransitions.get(id);
+            if (!transition
+                && record.ownershipMigrationVersion != null
+                && record.ownershipMigrationVersion === record.version) {
+                transition = {
+                    version: record.ownershipMigrationVersion,
+                    pending: record.ownershipMigrationPending !== false
+                };
+                ownershipTransitions.set(id, transition);
+            }
+            const consumedVersion = consumedVersions.get(id);
+            const equalVersion = consumedVersions.has(id)
+                && Object.is(consumedVersion, record.version);
+            const ownershipVersion = transition
+                && Object.is(transition.version, record.version);
+            const shouldIngest = !(equalVersion && hadReplicaState)
+                && !(ownershipVersion && hadReplicaState);
+            let presentationFacts;
+
+            if (shouldIngest) {
+                const joinSnapshot = joinSnapshotObjectIds.delete(id);
+                const preserveDirection = !!transition?.pending && !ownershipVersion;
+                const facts = joinSnapshot || preserveDirection || transition?.pending
+                    ? makeFacts(record, type, {
+                        joinSnapshot,
+                        preserveDirection,
+                        ownershipMigrationPending: !!transition?.pending
+                    }, members)
+                    : initialFacts;
+                if (descriptor.presentation) {
+                    descriptor.presentation.ingest(
+                        id, record.data, facts, record, context);
+                    presentationFacts = facts;
+                } else {
+                    descriptor.apply(instance, record.data, facts, context);
+                    counts.applied++;
                 }
-
-                let instance = descriptor.getInstance(id, context);
-                const initialFacts = makeFacts(record, type, undefined, members);
-                const role = classify(descriptor, record, initialFacts, context);
-
-                if (role === 'ignore') {
-                    removePresentation(
-                        descriptor,
-                        id,
-                        REMOVAL_REASONS.ROLE_IGNORED,
-                        initialFacts,
-                        record,
-                        context);
-                    if (instance != null) {
-                        descriptor.remove(
-                            instance,
-                            REMOVAL_REASONS.ROLE_IGNORED,
-                            initialFacts,
-                            context);
-                        removed++;
-                    }
-                    forgetObject(id);
-                    continue;
-                }
-
-                const previousRole = binding?.role;
-                if (role === 'owned') {
-                    const ownedFacts = joinSnapshotObjectIds.delete(id)
-                        ? makeFacts(record, type, { joinSnapshot: true }, members)
-                        : initialFacts;
-                    if (previousRole === 'replica') {
-                        removePresentation(
-                            descriptor,
-                            id,
-                            REMOVAL_REASONS.OWNERSHIP_GAINED,
-                            ownedFacts,
-                            record,
-                            context);
-                        if (descriptor.adoptOwned) {
-                            instance = descriptor.adoptOwned(
-                                record, instance, ownedFacts, context) ?? instance;
-                        } else if (instance != null) {
-                            descriptor.remove(
-                                instance,
-                                REMOVAL_REASONS.OWNERSHIP_GAINED,
-                                ownedFacts,
-                                context);
-                            instance = descriptor.getInstance(id, context);
-                            removed++;
-                        }
-                    } else if ((binding == null || instance == null)
-                        && descriptor.adoptOwned) {
-                        instance = descriptor.adoptOwned(
-                            record, instance, ownedFacts, context) ?? instance;
-                    }
-                    bindObject(id, type, role, instance);
-                    if (previousRole && previousRole !== role) {
-                        descriptor.onRoleChanged?.(
-                            instance, previousRole, role, ownedFacts, context);
-                    }
-                    ownershipTransitions.delete(id);
+                consumedVersions.set(id, record.version);
+                if (preserveDirection) {
+                    transition.pending = false;
                     if (record.ownershipMigrationPending === true) {
                         record.ownershipMigrationPending = false;
                     }
-                    continue;
+                    ownershipTransitions.delete(id);
                 }
-
-                const hadReplicaState = descriptor.presentation
-                    ? descriptor.presentation.has(id)
-                    : previousRole === 'replica' && instance != null;
-                if (instance == null) {
-                    instance = descriptor.createReplica(record, initialFacts, context);
-                    if (instance == null) {
-                        throw new Error(`${type}.createReplica did not return an instance`);
-                    }
-                    created++;
-                }
-                bindObject(id, type, role, instance);
-
-                let transition = ownershipTransitions.get(id);
-                if (!transition
-                    && record.ownershipMigrationVersion != null
-                    && record.ownershipMigrationVersion === record.version) {
-                    transition = {
-                        version: record.ownershipMigrationVersion,
-                        pending: record.ownershipMigrationPending !== false
-                    };
-                    ownershipTransitions.set(id, transition);
-                }
-                const consumedVersion = consumedVersions.get(id);
-                const equalVersion = consumedVersions.has(id)
-                    && Object.is(consumedVersion, record.version);
-                const ownershipVersion = transition
-                    && Object.is(transition.version, record.version);
-                const shouldIngest = !(equalVersion && hadReplicaState)
-                    && !(ownershipVersion && hadReplicaState);
-                let presentationFacts;
-
-                if (shouldIngest) {
-                    const joinSnapshot = joinSnapshotObjectIds.delete(id);
-                    const preserveDirection = !!transition?.pending && !ownershipVersion;
-                    const facts = joinSnapshot || preserveDirection || transition?.pending
-                        ? makeFacts(record, type, {
-                            joinSnapshot,
-                            preserveDirection,
-                            ownershipMigrationPending: !!transition?.pending
-                        }, members)
-                        : initialFacts;
-                    if (descriptor.presentation) {
-                        descriptor.presentation.ingest(
-                            id, record.data, facts, record, context);
-                        presentationFacts = facts;
-                    } else {
-                        descriptor.apply(instance, record.data, facts, context);
-                        applied++;
-                    }
-                    consumedVersions.set(id, record.version);
-                    if (preserveDirection) {
-                        transition.pending = false;
-                        if (record.ownershipMigrationPending === true) {
-                            record.ownershipMigrationPending = false;
-                        }
-                        ownershipTransitions.delete(id);
-                    }
-                } else if (!equalVersion) {
-                    consumedVersions.set(id, record.version);
-                }
-
-                if (descriptor.presentation?.has(id)) {
-                    const facts = presentationFacts || (transition?.pending
-                        ? makeFacts(record, type, {
-                            ownershipMigrationPending: true
-                        }, members)
-                        : initialFacts);
-                    const sampled = descriptor.presentation.sample(
-                        id, facts, record, context);
-                    descriptor.apply(instance, sampled, facts, context);
-                    applied++;
-                }
-                if (previousRole && previousRole !== role) {
-                    descriptor.onRoleChanged?.(
-                        instance, previousRole, role, initialFacts, context);
-                }
+            } else if (!equalVersion) {
+                consumedVersions.set(id, record.version);
             }
 
+            if (descriptor.presentation?.has(id)) {
+                const facts = presentationFacts || (transition?.pending
+                    ? makeFacts(record, type, {
+                        ownershipMigrationPending: true
+                    }, members)
+                    : initialFacts);
+                const sampled = descriptor.presentation.sample(
+                    id, facts, record, context);
+                descriptor.apply(instance, sampled, facts, context);
+                counts.applied++;
+            }
+            if (previousRole && previousRole !== role) {
+                descriptor.onRoleChanged?.(
+                    instance, previousRole, role, initialFacts, context);
+            }
+        }
+
+        // Instances the game still has but this pass did not retain.
+        function retireUnreferencedInstances(
+            descriptor, type, retainedIds, members, context, counts) {
             // Snapshot only cleanup candidates before callbacks can mutate them.
             for (const [id, instance] of enumerateInstances(descriptor, context, retainedIds)) {
                 const record = getObject(id);
@@ -494,13 +463,15 @@ const ReplicationRuntime = (function () {
                     descriptor, id, reason, facts, record, context);
                 descriptor.remove(instance, reason, facts, context);
                 forgetObject(id);
-                removed++;
+                counts.removed++;
             }
+        }
 
-            // Game code may remove a local instance before the canonical
-            // record disappears (for example, local-first expiry).
-            // Retire any remaining binding and presentation state even when
-            // getInstances no longer has an entity to enumerate.
+        // Game code may remove a local instance before the canonical record
+        // disappears (for example, local-first expiry). Retire any remaining
+        // binding and presentation state even when getInstances no longer has
+        // an entity to enumerate.
+        function retireOrphanedBindings(type, retainedIds, members, context, counts) {
             let missingBindingIds;
             for (const [id, binding] of bindings) {
                 if (binding.type !== type || retainedIds.has(id)) continue;
@@ -514,16 +485,69 @@ const ReplicationRuntime = (function () {
                     ? REMOVAL_REASONS.TYPE_MISSING
                     : REMOVAL_REASONS.DELETED;
                 removeBoundObject(id, reason, context, record, members);
-                removed++;
+                counts.removed++;
             }
+        }
+
+        function reconcileType(type, context) {
+            if (!isCurrentEpoch(context)) {
+                return Object.freeze({ stale: true, created: 0, applied: 0, removed: 0 });
+            }
+            const descriptor = descriptors.get(type);
+            if (!descriptor) throw new Error(`unregistered replication type: ${type}`);
+
+            const records = getObjectsByTypeSnapshot(type);
+            if (!Array.isArray(records)) {
+                throw new TypeError('store.getObjectsByTypeSnapshot must return an owned array');
+            }
+            const members = memberFacts();
+            const retainedIds = new Set();
+            const counts = { created: 0, applied: 0, removed: 0 };
+
+            for (const record of records) {
+                if (!record || record.id == null) {
+                    throw new TypeError(`${type} record must have an id`);
+                }
+                const id = record.id;
+                retainedIds.add(id);
+                let binding = bindings.get(id);
+                if (binding && binding.type !== type) {
+                    removeBoundObject(
+                        id, REMOVAL_REASONS.TYPE_MISSING, context, record, members);
+                    binding = undefined;
+                    counts.removed++;
+                }
+
+                const instance = descriptor.getInstance(id, context);
+                const initialFacts = makeFacts(record, type, undefined, members);
+                const role = classify(descriptor, record, initialFacts, context);
+                const previousRole = binding?.role;
+
+                if (role === 'ignore') {
+                    reconcileIgnoredRecord(
+                        descriptor, id, instance, initialFacts, record, context, counts);
+                } else if (role === 'owned') {
+                    reconcileOwnedRecord(
+                        descriptor, id, type, record, instance, initialFacts,
+                        previousRole, members, context, counts);
+                } else {
+                    reconcileReplicaRecord(
+                        descriptor, id, type, role, record, instance, initialFacts,
+                        previousRole, members, context, counts);
+                }
+            }
+
+            retireUnreferencedInstances(
+                descriptor, type, retainedIds, members, context, counts);
+            retireOrphanedBindings(type, retainedIds, members, context, counts);
 
             const summary = Object.freeze({
                 stale: false,
                 type,
                 records: records.length,
-                created,
-                applied,
-                removed
+                created: counts.created,
+                applied: counts.applied,
+                removed: counts.removed
             });
             descriptor.afterReconcile?.(summary, context);
             return summary;
