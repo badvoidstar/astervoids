@@ -28,7 +28,7 @@ function bulletHarness({ deltaEncoding = true } = {}) {
     ObjectSync.init();
     ObjectSync.configure({ deltaEncoding });
     const { Bullet, syncLocalBullets, updateLocalBullet } = loadInlineGameFunctions(
-        ['Bullet', 'syncLocalBullets', 'updateLocalBullet'], {
+        ['Bullet', 'assignDefined', 'syncLocalBullets', 'updateLocalBullet'], {
             CONFIG: { BULLET_LIFETIME: 60, BULLET_RADIUS: 0.0033 },
             OBJECT_TYPES: { BULLET: 'bullet' },
             SessionClient, ObjectSync,

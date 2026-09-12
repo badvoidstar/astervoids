@@ -2213,19 +2213,22 @@
     function remoteVelocityToNormalizedY(velocity) {
         return velocity * getReferenceDimension() / getGameHeight();
     }
-    function shortestRemoteDeltaX(from, to, data) {
-        const range = 1 + 2 * wrapMarginX(getRemoteBoundingRadius(data));
+    // The X and Y variants below differ only by which axis margin they use, so
+    // each concept has exactly one body and the two axes cannot drift apart.
+    function shortestRemoteDelta(from, to, margin) {
+        const range = 1 + 2 * margin;
         let delta = to - from;
         if (delta > range / 2) delta -= range;
         else if (delta < -range / 2) delta += range;
         return delta;
     }
+    function shortestRemoteDeltaX(from, to, data) {
+        return shortestRemoteDelta(
+            from, to, wrapMarginX(getRemoteBoundingRadius(data)));
+    }
     function shortestRemoteDeltaY(from, to, data) {
-        const range = 1 + 2 * wrapMarginY(getRemoteBoundingRadius(data));
-        let delta = to - from;
-        if (delta > range / 2) delta -= range;
-        else if (delta < -range / 2) delta += range;
-        return delta;
+        return shortestRemoteDelta(
+            from, to, wrapMarginY(getRemoteBoundingRadius(data)));
     }
     function wrapRemoteX(value, data) {
         return wrapNormalized(
@@ -3018,6 +3021,21 @@
      * @param {number} margin - Extra margin beyond 0-1 before wrapping (default: 0)
      * @returns {number} Wrapped normalized position
      */
+    /**
+     * Copies each listed field from `data` to `target` when the sender
+     * included it. Sync payloads are sparse (delta encoding omits unchanged
+     * fields), so an absent key must leave the current value untouched — which
+     * is not the same as assigning `undefined`.
+     * @param {object} target - Receiving instance
+     * @param {object} data - Sparse sync payload
+     * @param {string[]} fields - Field names to copy verbatim
+     */
+    function assignDefined(target, data, fields) {
+        for (const field of fields) {
+            if (data[field] !== undefined) target[field] = data[field];
+        }
+    }
+
     function wrapNormalized(value, margin = 0) {
         const lo = -margin;
         const hi = 1 + margin;
@@ -3517,7 +3535,107 @@
      * The player-controlled spacecraft
      * All positions and velocities are normalized (0-1 range)
      */
+    /**
+     * Invulnerability countdown for one ship.
+     *
+     * Owners drive `remaining` from simulation; replicas derive it from the
+     * last capture `anchor`. `revision` is the transition key send gates
+     * compare — an ordinary countdown tick is not a transition, so it must not
+     * bump. Keeping the three values together makes those invariants local
+     * instead of spreading them across the Ship field list.
+     */
+    class ShipInvulnerability {
+        constructor() {
+            this.remaining = 0;   // Authoritative simulation ticks / sampled presentation ticks
+            this.revision = 0;
+            this.anchor = null;
+        }
+
+        set(value) {
+            const remaining = Number.isFinite(value) ? Math.max(0, value) : 0;
+            // Preserve direct assignment by spawn/reset callers, including a
+            // second reset at the same duration. Ordinary countdown ticks are
+            // not transitions; expiry is clamped to one exact zero edge.
+            if ((remaining > 0 && remaining >= this.remaining)
+                || (remaining === 0 && this.remaining > 0)) {
+                this.revision = (this.revision + 1) >>> 0;
+            }
+            this.remaining = remaining;
+            this.anchor = null;
+        }
+
+        capture() {
+            return {
+                invulnerable: this.remaining,
+                invulnerabilityRevision: this.revision,
+                // This stamps the countdown capture, not the later wire flush.
+                // Zero explicitly requests receiver validAt/arrival fallback.
+                invulnerableAt: this.remaining > 0 && RemoteObjects.clock.offsetInitialized
+                    ? RemoteObjects.serverNowMs() : 0
+            };
+        }
+
+        ingest(data, record) {
+            const previous = this.anchor;
+            const remaining = Number.isFinite(data.invulnerable)
+                ? Math.max(0, data.invulnerable) : 0;
+            const revision = Number.isInteger(data.invulnerabilityRevision)
+                ? data.invulnerabilityRevision >>> 0 : null;
+            // More than one transition also catches a respawn whose complete
+            // countdown was coalesced while a previous send was in flight.
+            const teleport = !!previous
+                && (revision !== null && previous.revision !== null
+                    ? revision !== previous.revision
+                        && (remaining > 0 || ((revision - previous.revision) >>> 0) > 1)
+                    : remaining > 0 && remaining > previous.remaining);
+            this.anchor = {
+                remaining,
+                revision,
+                at: Number.isFinite(data.invulnerableAt) && data.invulnerableAt > 0
+                    ? data.invulnerableAt : record.validAt,
+                receivedPerf: performance.now()
+            };
+            return teleport;
+        }
+
+        sample(renderTime = performance.now(), delayMs = 0) {
+            const anchor = this.anchor;
+            if (!anchor) return;
+            // Shared time corrects late joins (also once bootstrap completes).
+            // Until then, never interpret a remote UTC stamp as a local clock.
+            const baseline = RemoteObjects.clock.offsetInitialized
+                && Number.isFinite(anchor.at) && anchor.at > 0
+                ? replicationClock.validAtToMonotonicMs(anchor.at)
+                : anchor.receivedPerf;
+            const elapsedMs = Math.max(0, renderTime - Math.max(0, delayMs) - baseline);
+            this.remaining = Math.max(
+                0, anchor.remaining - elapsedMs * CONFIG.TARGET_FPS / 1000);
+            if (anchor.revision !== null) this.revision = anchor.revision;
+        }
+
+        // Reconciliation snapshots carry both fields verbatim: apply without
+        // treating them as a local transition or discarding the anchor.
+        applySnapshot(data) {
+            if (Number.isFinite(data.invulnerable)) {
+                this.remaining = Math.max(0, data.invulnerable);
+            }
+            if (Number.isInteger(data.invulnerabilityRevision)) {
+                this.revision = data.invulnerabilityRevision >>> 0;
+            }
+        }
+    }
+
     class Ship {
+        // Sync fields copied verbatim by fromSyncData. Fields needing
+        // validation or renaming (invulnerable/invulnerabilityRevision, which
+        // ShipInvulnerability owns, and turnControlMode) stay explicit there.
+        static SYNC_FIELDS = [
+            'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed',
+            'thrusting', 'thrustInput', 'brakeInput',
+            'turnTarget', 'turnTargetAngle', 'turnMagnitude', 'turnBias',
+            'colorIndex', 'memberId', 'score', 'hitCount'
+        ];
+
         constructor(x, y, colorIndex = 0) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -3542,9 +3660,7 @@
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
-            this._invulnerable = 0;        // Authoritative simulation ticks / sampled presentation ticks
-            this.invulnerabilityRevision = 0;
-            this._invulnerabilityAnchor = null;
+            this.invulnerability = new ShipInvulnerability();
             this.shootCooldown = 0;        // Frames until can shoot again
             this.colorIndex = colorIndex;  // Player color index (0-3)
             this.syncObjectId = null;      // ObjectSync ID when in session
@@ -3560,70 +3676,34 @@
             this._vertCacheRef = NaN;
         }
 
+        // Invulnerability lives in one value object; these keep the existing
+        // field-shaped API (including the wire field names) intact.
         get invulnerable() {
-            return this._invulnerable;
+            return this.invulnerability.remaining;
         }
 
         set invulnerable(value) {
-            const remaining = Number.isFinite(value) ? Math.max(0, value) : 0;
-            // Preserve direct assignment by spawn/reset callers, including a
-            // second reset at the same duration. Ordinary countdown ticks are
-            // not transitions; expiry is clamped to one exact zero edge.
-            if ((remaining > 0 && remaining >= this._invulnerable)
-                || (remaining === 0 && this._invulnerable > 0)) {
-                this.invulnerabilityRevision = (this.invulnerabilityRevision + 1) >>> 0;
-            }
-            this._invulnerable = remaining;
-            this._invulnerabilityAnchor = null;
+            this.invulnerability.set(value);
+        }
+
+        get invulnerabilityRevision() {
+            return this.invulnerability.revision;
+        }
+
+        set invulnerabilityRevision(value) {
+            this.invulnerability.revision = value;
         }
 
         captureInvulnerability() {
-            return {
-                invulnerable: this.invulnerable,
-                invulnerabilityRevision: this.invulnerabilityRevision,
-                // This stamps the countdown capture, not the later wire flush.
-                // Zero explicitly requests receiver validAt/arrival fallback.
-                invulnerableAt: this.invulnerable > 0 && RemoteObjects.clock.offsetInitialized
-                    ? RemoteObjects.serverNowMs() : 0
-            };
+            return this.invulnerability.capture();
         }
 
         ingestInvulnerability(data, record) {
-            const previous = this._invulnerabilityAnchor;
-            const remaining = Number.isFinite(data.invulnerable)
-                ? Math.max(0, data.invulnerable) : 0;
-            const revision = Number.isInteger(data.invulnerabilityRevision)
-                ? data.invulnerabilityRevision >>> 0 : null;
-            // More than one transition also catches a respawn whose complete
-            // countdown was coalesced while a previous send was in flight.
-            const teleport = !!previous
-                && (revision !== null && previous.revision !== null
-                    ? revision !== previous.revision
-                        && (remaining > 0 || ((revision - previous.revision) >>> 0) > 1)
-                    : remaining > 0 && remaining > previous.remaining);
-            this._invulnerabilityAnchor = {
-                remaining,
-                revision,
-                at: Number.isFinite(data.invulnerableAt) && data.invulnerableAt > 0
-                    ? data.invulnerableAt : record.validAt,
-                receivedPerf: performance.now()
-            };
-            return teleport;
+            return this.invulnerability.ingest(data, record);
         }
 
         sampleInvulnerability(renderTime = performance.now(), delayMs = 0) {
-            const anchor = this._invulnerabilityAnchor;
-            if (!anchor) return;
-            // Shared time corrects late joins (also once bootstrap completes).
-            // Until then, never interpret a remote UTC stamp as a local clock.
-            const baseline = RemoteObjects.clock.offsetInitialized
-                && Number.isFinite(anchor.at) && anchor.at > 0
-                ? replicationClock.validAtToMonotonicMs(anchor.at)
-                : anchor.receivedPerf;
-            const elapsedMs = Math.max(0, renderTime - Math.max(0, delayMs) - baseline);
-            this._invulnerable = Math.max(
-                0, anchor.remaining - elapsedMs * CONFIG.TARGET_FPS / 1000);
-            if (anchor.revision !== null) this.invulnerabilityRevision = anchor.revision;
+            this.invulnerability.sample(renderTime, delayMs);
         }
 
         /**
@@ -3692,34 +3772,14 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.angle !== undefined) this.angle = data.angle;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
-            if (data.thrusting !== undefined) this.thrusting = data.thrusting;
-            if (Number.isFinite(data.invulnerable)) {
-                this._invulnerable = Math.max(0, data.invulnerable);
-            }
-            if (Number.isInteger(data.invulnerabilityRevision)) {
-                this.invulnerabilityRevision = data.invulnerabilityRevision >>> 0;
-            }
-            if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
-            if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
+            // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
+            // but reconciliation snapshots include them in data, so apply when present.
+            assignDefined(this, data, Ship.SYNC_FIELDS);
+            // Fields below need validation or renaming, so they stay explicit.
+            this.invulnerability.applySnapshot(data);
             if (data.turnControlMode !== undefined) {
                 this.turnControlMode = normalizeTurnControlMode(data.turnControlMode);
             }
-            if (data.turnTarget !== undefined) this.turnTarget = data.turnTarget;
-            if (data.turnTargetAngle !== undefined) this.turnTargetAngle = data.turnTargetAngle;
-            if (data.turnMagnitude !== undefined) this.turnMagnitude = data.turnMagnitude;
-            if (data.turnBias !== undefined) this.turnBias = data.turnBias;
-            if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
-            if (data.memberId !== undefined) this.memberId = data.memberId;
-            // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
-            // but reconciliation snapshots include them in data, so apply when present.
-            if (data.score !== undefined) this.score = data.score;
-            if (data.hitCount !== undefined) this.hitCount = data.hitCount;
         }
 
         /**
@@ -3955,6 +4015,12 @@
      * Position is normalized (0-1), radius/velocity are in reference-dimension units
      */
     class Asteroid {
+        // Sync fields copied verbatim by fromSyncData. Shape (seed/vertices)
+        // is structural and only applied by the static factory.
+        static SYNC_FIELDS = [
+            'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed'
+        ];
+
         constructor(x, y, radius, velocityX, velocityY, seed = null, vertices = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -4028,12 +4094,7 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.angle !== undefined) this.angle = data.angle;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
+            assignDefined(this, data, Asteroid.SYNC_FIELDS);
         }
 
         /**
@@ -4228,6 +4289,13 @@
      * Position is normalized (0-1), velocity is in reference-dimension per second
      */
     class Bullet {
+        // Sync fields copied verbatim by fromSyncData.
+        static SYNC_FIELDS = [
+            'x', 'y', 'velocityX', 'velocityY', 'lifetime', 'colorIndex',
+            'pendingHit', 'hitTargetId', 'hitImpactTorque', 'hitBulletAngle',
+            'hitOffsetN'
+        ];
+
         constructor(x, y, velocityX, velocityY, colorIndex = 0, ownerMemberId = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -4295,17 +4363,7 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.lifetime !== undefined) this.lifetime = data.lifetime;
-            if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
-            if (data.pendingHit !== undefined) this.pendingHit = data.pendingHit;
-            if (data.hitTargetId !== undefined) this.hitTargetId = data.hitTargetId;
-            if (data.hitImpactTorque !== undefined) this.hitImpactTorque = data.hitImpactTorque;
-            if (data.hitBulletAngle !== undefined) this.hitBulletAngle = data.hitBulletAngle;
-            if (data.hitOffsetN !== undefined) this.hitOffsetN = data.hitOffsetN;
+            assignDefined(this, data, Bullet.SYNC_FIELDS);
         }
 
         /**

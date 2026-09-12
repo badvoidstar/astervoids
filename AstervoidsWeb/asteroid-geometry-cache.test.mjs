@@ -33,7 +33,7 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
     };
     const objects = new Map();
     const production = loadInlineGameFunctions([
-        'Asteroid', 'rescaleAsteroidForAspectChange', 'getReferenceDimension',
+        'Asteroid', 'assignDefined', 'rescaleAsteroidForAspectChange', 'getReferenceDimension',
         'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapMarginX', 'wrapMarginY', 'wrapNormalized', 'drawAsteroidsBatched',
