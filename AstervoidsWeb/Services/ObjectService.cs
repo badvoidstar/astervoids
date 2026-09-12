@@ -93,11 +93,11 @@ public class ObjectService : IObjectService
     /// timestamp in the accepted batch so every updated object shares one
     /// monotonic <c>ValidAt</c>.
     /// </summary>
-    public IEnumerable<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null)
+    public IReadOnlyList<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null)
     {
         var session = GetValidSession(sessionId);
         if (session == null)
-            return Enumerable.Empty<SessionObject>();
+            return [];
 
         var results = new List<SessionObject>();
         var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

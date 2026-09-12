@@ -50,7 +50,7 @@ public interface IObjectService
     /// owner-stamped sample time; it is validated (±2 s vs <paramref name="serverReceiveTimeMs"/>;
     /// monotonic vs each object's previous ValidAt) before storage.
     /// </summary>
-    IEnumerable<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null);
+    IReadOnlyList<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null);
 
     /// <summary>
     /// Deletes an object from a session, enforcing ownership atomically.
