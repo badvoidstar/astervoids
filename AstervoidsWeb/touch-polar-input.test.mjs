@@ -1,36 +1,26 @@
 // Unit tests for the polar-anchor touch scheme helpers
 // (shortestAngleDelta + computePolarStickInput). Extracts the live functions
-// from index.html so the test is always pinned to the production source —
-// mirrors touch-stick-input.test.mjs.
+// from index.html without booting the browser runtime.
 //
 // Run with: node --test AstervoidsWeb/touch-polar-input.test.mjs
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
-
-function extractFn(signaturePrefix) {
-    // Match `function NAME(args) { … }` greedily up to the next 4-space-indented
-    // closing brace (the same convention used by the other test files).
-    const re = new RegExp(
-        `function ${signaturePrefix}\\([^)]*\\) \\{[\\s\\S]*?\\n {4}\\}`
-    );
-    const m = html.match(re);
-    assert.ok(m, `${signaturePrefix} must be defined in index.html`);
-    // eslint-disable-next-line no-eval
-    return eval(`(${m[0].replace(`function ${signaturePrefix}`, 'function')})`);
-}
-
-const shortestAngleDelta = extractFn('shortestAngleDelta');
-const computePolarStickInput = extractFn('computePolarStickInput');
-const attainableTurnTarget = extractFn('attainableTurnTarget');
-const polarAnchorTangentGeometry = extractFn('polarAnchorTangentGeometry');
-const mergeTurnInputs = extractFn('mergeTurnInputs');
+const {
+    shortestAngleDelta,
+    computePolarStickInput,
+    attainableTurnTarget,
+    polarAnchorTangentGeometry,
+    mergeTurnInputs,
+} = loadInlineGameFunctions([
+    'shortestAngleDelta',
+    'computePolarStickInput',
+    'attainableTurnTarget',
+    'polarAnchorTangentGeometry',
+    'mergeTurnInputs',
+]);
 
 // Reference parameter set: 100 px stick radius (drives p2 / thrust scale),
 // 10 px dead-zone, 50 px threshold, unit gains and unit clamps. Choices keep

@@ -72,6 +72,10 @@ These rules are enforced purely by module structure and must not be violated whe
   `SessionClient` uses `GuidUtils.guidToBytes` for join/rejoin IDs and object
   mutation/event IDs. String-typed owner overrides, reconnect tokens, and opaque
   payloads remain unchanged; callers above the transport keep readable IDs.
+- **Full-object decoding is shared across receive paths.** Creation events and
+  responses, replacements, joins, and reconciliation use the same positional
+  DTO, scope, and payload decoder. Join installs session schemas first; sparse
+  update DTOs keep their separate shape.
 - **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
 - **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
 - **Send rate is decoupled from frame rate.** The game calls `ObjectSync.tick(frameTimeSec)` at its existing reconciliation pivot; ObjectSync accumulates elapsed time against its RTT-derived interval. Immediate updates retain urgency under backpressure; at most one update invocation is in flight, with no catch-up bursts after stalls.
@@ -259,6 +263,11 @@ those seams.
 #### RPC Wrappers
 
 All wrappers route through `invokeHub()`, which enforces session membership and applies `GuidUtils.transformBinaryGuids` to the result before returning it to the caller.
+
+Create and join/rejoin retain distinct RPCs and snapshot construction, then
+share session-entry completion: install validated identity, merge pending member
+events, finish the transition, and notify listeners. Epoch checks stop pending
+callback delivery and suppress the result if a listener resets the session.
 
 | Wrapper | Hub method | Wire args | Return (after GUID normalization) |
 |---|---|---|---|

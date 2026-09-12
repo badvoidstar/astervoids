@@ -3,20 +3,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
-// Extract computeAnchorVertices from the live index.html (same regex-extract
-// pattern used by ship-input-ramp.test.mjs and touch-stick-input.test.mjs).
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(join(__dirname, 'wwwroot/index.html'), 'utf8');
-const fnMatch = html.match(
-    /function computeAnchorVertices\(dx, dy, halfWidth, halfHeight\) \{[\s\S]*?\n {4}\}/
-);
-assert.ok(fnMatch, 'computeAnchorVertices must be defined in index.html');
-// eslint-disable-next-line no-eval
-const computeAnchorVertices = eval(`(${fnMatch[0].replace('function computeAnchorVertices', 'function')})`);
+const { computeAnchorVertices } = loadInlineGameFunctions(['computeAnchorVertices']);
 
 const H = 100; // square half-extent used in most tests for readable arithmetic.
 

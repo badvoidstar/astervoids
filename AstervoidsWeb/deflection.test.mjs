@@ -5,9 +5,7 @@
  *
  * Run with:  node --test AstervoidsWeb/deflection.test.mjs
  *
- * The pure math is mirrored here so tests don't need a browser environment.
- * Keep this in sync with the function of the same name in
- * AstervoidsWeb/wwwroot/index.html.
+ * Loads the production helper without booting the browser runtime.
  *
  * Properties verified:
  *   1. Receding / no-relative-motion fragments get zero impulse.
@@ -28,32 +26,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
-// ─── Mirror of computeDeflectionImpulse ─────────────────────────────────────
-function computeDeflectionImpulse(rx, ry, vx, vy, R_sum, T, scale) {
-    if (!(scale > 0) || !(T > 0) || !(R_sum > 0)) return { dvx: 0, dvy: 0 };
-    const v2 = vx * vx + vy * vy;
-    if (v2 < 1e-18) return { dvx: 0, dvy: 0 };
-    const tClose = -(rx * vx + ry * vy) / v2;
-    if (tClose <= 0) return { dvx: 0, dvy: 0 };
-    const cx = rx + vx * tClose;
-    const cy = ry + vy * tClose;
-    const dClose = Math.hypot(cx, cy);
-    const targetMiss = scale * R_sum;
-    if (dClose >= targetMiss) return { dvx: 0, dvy: 0 };
-    let nx, ny;
-    if (dClose > 1e-12) {
-        nx = cx / dClose;
-        ny = cy / dClose;
-    } else {
-        const vMag = Math.sqrt(v2);
-        nx = -vy / vMag;
-        ny =  vx / vMag;
-    }
-    const tEff = Math.max(tClose, T);
-    const dvMag = (targetMiss - dClose) / tEff;
-    return { dvx: dvMag * nx, dvy: dvMag * ny };
-}
+const { computeDeflectionImpulse } = loadInlineGameFunctions(['computeDeflectionImpulse']);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 /** Closest-approach distance between fragment (rx,ry,vx,vy) and ship at origin. */
