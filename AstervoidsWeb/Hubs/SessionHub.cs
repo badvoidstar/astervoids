@@ -70,6 +70,11 @@ public class SessionHub : Hub
     /// Estimates the serialized byte size of hub method arguments using MessagePack.
     /// Used for per-member bandwidth tracking in <see cref="ServerMetricsService"/>.
     /// Best-effort: returns 0 on any serialization error so monitoring never breaks hub functionality.
+    ///
+    /// Reserved for cold paths (create/join/leave/create-object/delete/replace/event).
+    /// The per-flush <c>UpdateObjects</c> path must not use this: serializing purely to
+    /// measure duplicates the work SignalR is about to do and allocates a throwaway
+    /// buffer on every flush. It uses <see cref="WireSizeEstimator"/> instead.
     /// </summary>
     private static long EstimatePayloadBytes(params object?[] args)
     {
@@ -137,9 +142,21 @@ public class SessionHub : Hub
     /// </summary>
     private async Task BroadcastToOthersAsync(Session session, Guid excludeMemberId, string method, params object?[] args)
     {
-        var bytes = EstimatePayloadBytes(args);
+        await BroadcastToOthersAsync(
+            session, excludeMemberId, EstimatePayloadBytes(args), method, args);
+    }
+
+    /// <summary>
+    /// <see cref="BroadcastToOthersAsync(Session, Guid, string, object?[])"/> with a
+    /// caller-supplied payload estimate. Used by the per-flush update path, which
+    /// computes its size arithmetically via <see cref="WireSizeEstimator"/> rather than
+    /// serializing the arguments a second time purely to measure them.
+    /// </summary>
+    private async Task BroadcastToOthersAsync(
+        Session session, Guid excludeMemberId, long estimatedBytes, string method, params object?[] args)
+    {
         var recipients = session.Members.Keys.Where(id => id != excludeMemberId);
-        _metrics.OnBroadcastToMembers(recipients, bytes);
+        _metrics.OnBroadcastToMembers(recipients, estimatedBytes);
         // SendCoreAsync, NOT SendAsync — the latter has no params object?[] overload, so
         // SendCoreAsync(method, args) would resolve to SendAsync(string, object?) and wrap
         // the entire args array as a single client argument, breaking handlers that
@@ -792,20 +809,30 @@ public class SessionHub : Hub
         var member = operation.Member;
         var session = operation.Session;
 
-        _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(updates, senderSequence, senderSendIntervalMs, clientValidAt));
-
         // Phase 3 envelope: decode each request's SyncPayload to the dict
         // shape the service consumes. We cache the original SyncPayload by
         // objectId so the broadcast can echo the SAME bytes the sender sent
         // (avoids a wasteful decode-then-reencode round-trip and preserves
         // any compactness the sender's encoder achieved).
-        var updatesList = updates.ToList();
-        var requestPayloadByObjectId = updatesList
-            .GroupBy(u => u.ObjectId)
-            .ToDictionary(g => g.Key, g => g.Last().Data);
-        var serviceUpdates = updatesList
-            .Select(u => new ObjectUpdate(u.ObjectId, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)))
-            .ToList();
+        //
+        // Single pass: the dictionary write is last-write-wins, matching the
+        // previous GroupBy(...).Last() semantics for duplicate ids in one batch.
+        // Materialized before the metrics estimate so the IEnumerable is only
+        // ever enumerated once.
+        var updatesList = updates as IReadOnlyList<ObjectUpdateRequest> ?? updates.ToList();
+        var requestPayloadByObjectId = new Dictionary<Guid, SyncPayload>(updatesList.Count);
+        var serviceUpdates = new List<ObjectUpdate>(updatesList.Count);
+        for (int i = 0; i < updatesList.Count; i++)
+        {
+            var u = updatesList[i];
+            requestPayloadByObjectId[u.ObjectId] = u.Data;
+            serviceUpdates.Add(new ObjectUpdate(
+                u.ObjectId, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)));
+        }
+
+        _metrics.OnHubInvocation(member.Id, WireSizeEstimator.UpdateObjectsRequest(
+            updatesList, senderSequence, senderSendIntervalMs, clientValidAt));
+
         var updatedObjects = _objectService.UpdateObjects(member.SessionId, member.Id, serviceUpdates, clientValidAt, serverTimestamp);
 
         long memberSequence = 0;
@@ -827,7 +854,10 @@ public class SessionHub : Hub
             // batch, so the value remains monotonic for every updated object.
             var batchValidAt = updatedObjects[0].ValidAt;
 
-            await BroadcastToOthersAsync(session, member.Id, "OnObjectsUpdated",
+            var broadcastBytes = WireSizeEstimator.ObjectsUpdatedBroadcast(
+                updateInfos, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, batchValidAt);
+
+            await BroadcastToOthersAsync(session, member.Id, broadcastBytes, "OnObjectsUpdated",
                 updateInfos, member.Id, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, batchValidAt);
         }
 
