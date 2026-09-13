@@ -861,7 +861,23 @@ public class SessionHub : Hub
                 updateInfos, member.Id, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, batchValidAt);
         }
 
-        var versions = updatedObjects.Select(o => new GuidLongPair(o.Id, o.Version)).ToArray();
+        // Positional acknowledgement: entry i is the version assigned to request
+        // element i, or 0 when that element was not applied.
+        //
+        // ObjectService.UpdateObjects preserves request order and returns an
+        // order-preserving *subsequence* of the requested updates (it appends one
+        // result per accepted update, in iteration order). That invariant lets the
+        // two lists be aligned with a single forward walk, and it stays correct when
+        // one batch carries the same object id more than once — each occurrence is
+        // applied separately and is matched to its own request index in order.
+        var versions = new long[updatesList.Count];
+        int accepted = 0;
+        for (int i = 0; i < updatesList.Count && accepted < updatedObjects.Count; i++)
+        {
+            if (updatesList[i].ObjectId != updatedObjects[accepted].Id) continue;
+            versions[i] = updatedObjects[accepted].Version;
+            accepted++;
+        }
         return new UpdateObjectsResponse(versions, memberSequence, serverTimestamp);
     }
 

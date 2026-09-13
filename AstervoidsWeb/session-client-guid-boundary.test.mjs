@@ -41,7 +41,10 @@ async function loadClient(guidUtils = GuidUtils) {
         ['CreateSession', sessionResponse],
         ['JoinSession', sessionResponse],
         ['RejoinSession', sessionResponse],
-        ['UpdateObjects', () => [[[GuidUtils.guidToBytes(OBJECT_ID), 2]], 7, 1234]],
+        // Versions are positional: entry i acknowledges request element i, and 0
+        // marks an element the server did not apply. The request in the
+        // UpdateObjects test sends OBJECT_ID first, so only index 0 is accepted.
+        ['UpdateObjects', () => [[2, 0, 0, 0], 7, 1234]],
         ['CreateObject', () => null],
         ['ReplaceObject', () => [[], 9, 2000]],
         ['DeleteObject', () => [true, 8]],

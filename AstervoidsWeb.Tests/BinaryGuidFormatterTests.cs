@@ -233,7 +233,7 @@ public class BinaryGuidFormatterTests
             Options);
         var updateResponse = MessagePackSerializer.Serialize(
             new UpdateObjectsResponse(
-                new[] { new GuidLongPair(id, 2) },
+                new long[] { 2 },
                 3,
                 4),
             Options);

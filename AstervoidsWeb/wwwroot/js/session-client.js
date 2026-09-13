@@ -981,13 +981,41 @@ const SessionClient = (function() {
             throw staleOperationError();
         }
         response = normalizeUpdateObjectsResponse(response);
-        // Phase 1 wire-shape: response.versions is GuidLongPair[] on the wire (each
-        // entry deserialized as [guidString, long]). Game code expects a string-keyed
-        // object so it can do `versions[id]` and `Object.entries(versions)`.
+        // response.versions is positional on the wire: entry i is the version
+        // assigned to updates[i], or 0 when the server did not apply it. The id
+        // is omitted precisely because we already know it at each index. Game
+        // code expects a string-keyed object so it can do `versions[id]` and
+        // `Object.entries(versions)`, so fold it back here — the transport layer
+        // owns the wire shape, ObjectSync keeps seeing the logical one.
         if (response) {
-            response.versions = WireEnum.pairsToObject(response.versions);
+            response.versions = versionsByObjectId(response.versions, updates);
         }
         return response;
+    }
+
+    /**
+     * Folds the positional UpdateObjects acknowledgement back into a
+     * {objectId: version} object. Entries with version 0 (not applied) are
+     * omitted so callers keep treating "absent" as "not confirmed" and re-send.
+     * @param {number[]} versions - Positional versions aligned to `updates`.
+     * @param {Array} updates - The request array that produced this response.
+     */
+    function versionsByObjectId(versions, updates) {
+        const byId = {};
+        if (!Array.isArray(versions) || !Array.isArray(updates)) return byId;
+        const count = Math.min(versions.length, updates.length);
+        for (let i = 0; i < count; i++) {
+            const version = versions[i];
+            if (!(version > 0)) continue;
+            const objectId = updates[i]?.objectId;
+            if (objectId === undefined || objectId === null) continue;
+            // A batch may legitimately carry an id more than once; the last
+            // occurrence holds the newest version, matching server apply order.
+            if (byId[objectId] === undefined || version > byId[objectId]) {
+                byId[objectId] = version;
+            }
+        }
+        return byId;
     }
 
     /**

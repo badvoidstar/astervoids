@@ -812,7 +812,7 @@ sequenceDiagram
     par Broadcast to others
         HUB->>OTH: OnObjectsUpdated(<br/>  updateInfos[{Id, Data, Version}],<br/>  member.Id,<br/>  senderSequence,<br/>  memberSequence,<br/>  serverTimestamp,<br/>  clientTimestamp,<br/>  senderSendIntervalMs)
     and Response to caller
-        HUB-->>C: UpdateObjectsResponse(<br/>  versions: {objectId → version},<br/>  memberSequence,<br/>  serverTimestamp)
+        HUB-->>C: UpdateObjectsResponse(<br/>  versions: long[] positional, 0 = not applied,<br/>  memberSequence,<br/>  serverTimestamp)
     end
 
     Note over C: clientTimestamp echoed back in broadcast<br/>→ null for others (RTT discriminator)<br/>→ original value in response
@@ -1542,6 +1542,20 @@ The surrounding hot DTOs also use integer MessagePack keys:
 | `ObjectEventInfo` | `[objectId, eventKind, payloadBytes]` |
 | create/update/delete responses | `[result, memberSequence, timestamp?]` |
 
+`UpdateObjectsResponse.Versions` is **positional**, not keyed: entry `i` is the
+version assigned to request element `i`, or `0` when that element was not
+applied (unknown object, or owned by another member). `SessionObject.Version`
+starts at 1 and only increments, so `0` is an unambiguous rejection sentinel.
+The object id is omitted because the caller already knows which id it sent at
+each index, which takes a three-object acknowledgement from 72 B to 15 B.
+
+The alignment holds because `ObjectService.UpdateObjects` returns an
+order-preserving *subsequence* of the requested updates, so the hub matches the
+two lists with a single forward walk. A batch that repeats an object id applies
+each occurrence separately, and each occurrence is acknowledged at its own
+request index; `session-client.js` keeps the highest version when folding such a
+batch back to `{objectId: version}`.
+
 `session-client.js` converts these arrays to named objects immediately at every
 invoke, live-event, snapshot, replacement, and reconciliation boundary.
 
@@ -1659,7 +1673,7 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 | full replay-capable ship update DTO (including countdown timing) | 65–75 B |
 | three-asteroid update batch | 90–105 B |
 | seven-object mixed steady-state batch | 248–268 B |
-| three-version update acknowledgement | 72 B |
+| three-version update acknowledgement | 15 B |
 | aliased ship-state object event | 35–45 B |
 
 The full ship fixture grows by 13 B for explicit countdown timing; unchanged

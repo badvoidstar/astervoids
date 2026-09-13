@@ -118,9 +118,27 @@ public record ReplaceObjectResponse(
     [property: Key(1)] long MemberSequence,
     [property: Key(2)] long ValidAt);
 
+/// <summary>
+/// Wire envelope for the <c>UpdateObjects</c> acknowledgement.
+///
+/// <para>
+/// <c>Versions</c> is positional: entry <c>i</c> is the server-assigned version
+/// for request element <c>i</c>, or <c>0</c> when that update was not applied
+/// (unknown object, or not owned by the caller). <see cref="SessionObject"/>
+/// versions start at 1 and only increment, so 0 is an unambiguous "rejected"
+/// sentinel.
+/// </para>
+///
+/// <para>
+/// Positional correspondence removes the object id from the acknowledgement
+/// entirely — the caller already knows which id it sent at each index. Each
+/// entry drops from a 24 B <c>GuidLongPair</c> to a 1–3 B integer, which is
+/// roughly a 90% reduction on a hot path that runs on every flush.
+/// </para>
+/// </summary>
 [MessagePackObject]
 public record UpdateObjectsResponse(
-    [property: Key(0)] GuidLongPair[] Versions,
+    [property: Key(0)] long[] Versions,
     [property: Key(1)] long MemberSequence,
     [property: Key(2)] long ServerTimestamp);
 
