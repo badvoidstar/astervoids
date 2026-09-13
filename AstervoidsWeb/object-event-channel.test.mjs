@@ -8,31 +8,22 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
+import { loadClassicModule } from './test-support/classic-module.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 
 function loadObjectSync(stubs) {
-    // Stubs we feed into the global before evaluating object-sync.js.
-    const globals = {
+    // Stubs we feed into the module scope before evaluating object-sync.js.
+    return loadClassicModule('object-sync.js', 'ObjectSync', {
         SessionClient: stubs.SessionClient,
         MsgpackCodec,
         AuthoritativeObject,
         signalR: { HubConnectionState: { Connected: 'Connected', Reconnecting: 'Reconnecting' } },
-        window: { ASTERVOIDS_DEBUG: false },
-        console
-    };
-    const src = readFileSync(resolve(__dirname, 'wwwroot/js/object-sync.js'), 'utf8');
-    const moduleHost = { exports: {} };
-    const fn = new Function(...Object.keys(globals), 'module', src + '\nmodule.exports = ObjectSync;');
-    fn(...Object.values(globals), moduleHost);
-    return moduleHost.exports;
+        window: { ASTERVOIDS_DEBUG: false }
+    });
 }
 
 function makeSessionClientStub() {

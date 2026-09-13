@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -129,24 +130,11 @@ const SyncPayload = {
     unwrapObjectData: () => {}
 };
 
-function evaluateModule(relativePath, exportName, globals) {
-    const source = readFileSync(resolve(here, relativePath), 'utf8');
-    const moduleHost = { exports: {} };
-    const fn = new Function(
-        ...Object.keys(globals),
-        'module',
-        `${source}\nmodule.exports = ${exportName};`
-    );
-    fn(...Object.values(globals), moduleHost);
-    return moduleHost.exports;
-}
+const evaluateModule = loadClassicModule;
 
-const AuthoritativeObject = evaluateModule(
-    'wwwroot/js/authoritative-object.js',
-    'AuthoritativeObject',
-    {});
+const AuthoritativeObject = evaluateModule('authoritative-object.js', 'AuthoritativeObject', {});
 
-const GuidUtils = evaluateModule('wwwroot/js/guid-utils.js', 'GuidUtils', {});
+const GuidUtils = evaluateModule('guid-utils.js', 'GuidUtils', {});
 
 function fixtureGuid(label) {
     const hex = createHash('sha256').update(label).digest('hex').slice(0, 32);
@@ -160,7 +148,7 @@ function loadSessionClient(
     syncPayload = SyncPayload) {
     const window = { ASTERVOIDS_DEBUG: false };
     const signalR = makeSignalR(connections);
-    const client = evaluateModule('wwwroot/js/session-client.js', 'SessionClient', {
+    const client = evaluateModule('session-client.js', 'SessionClient', {
         window,
         console,
         signalR,
@@ -178,7 +166,7 @@ function loadSessionClient(
 }
 
 function loadObjectSync(sessionClient, window = { ASTERVOIDS_DEBUG: false }) {
-    return evaluateModule('wwwroot/js/object-sync.js', 'ObjectSync', {
+    return evaluateModule('object-sync.js', 'ObjectSync', {
         window,
         console,
         SessionClient: sessionClient,

@@ -132,6 +132,27 @@ public record SessionDestroyCondition(
     bool RequireEmpty = false);
 
 /// <summary>
+/// Service result convention.
+///
+/// Two shapes are used deliberately, and which one applies is determined by
+/// whether the operation can fail for a reason the caller must relay:
+///
+/// • <b>Explicit <c>Success</c> + <c>ErrorMessage</c></b>
+///   (<see cref="CreateSessionResult"/>, <see cref="JoinSessionResult"/>) — the
+///   operation has multiple distinguishable rejection causes (capacity, stale
+///   token, wrong lifecycle state) and the hub forwards the reason to the client.
+///   When <c>Success</c> is <c>true</c> the payload properties are non-null.
+///
+/// • <b>Nullable result</b> (<see cref="LeaveSessionResult"/>) — the only failure
+///   is "there was nothing to do", which carries no reason worth relaying, so
+///   absence <i>is</i> the outcome and a <c>Success</c> flag would always be
+///   <c>true</c> when the object exists.
+///
+/// Do not add an <c>ErrorMessage</c> to a nullable result or return <c>null</c>
+/// from a result that has a <c>Success</c> flag; either mixes the two rules.
+/// </summary>
+
+/// <summary>
 /// Result of a member leaving a session.
 /// Contains both membership changes (promotion) and object disposal (deleted/migrated
 /// objects) so the hub can broadcast a single coherent <c>OnMemberLeft</c> event.

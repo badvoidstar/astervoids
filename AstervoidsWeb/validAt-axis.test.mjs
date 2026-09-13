@@ -8,6 +8,9 @@
  *   - bracket-search clamp/extrapolate on snapshots keyed by validAt
  *   - getMigrationSeed:           leading-edge projection for ownership handoff
  *
+ * The spawn-bridge pose itself is NOT mirrored: it is loaded from
+ * index.html via test-support/inline-game.mjs.
+ *
  * The behaviour these tests verify is the design goal of the unification:
  * network jitter must NOT shift snapshot positions in the bracket, and
  * spawn / migration handoff must be continuous on the receiver without
@@ -18,6 +21,16 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+
+// Bridge-pose math comes from production, not a mirror.
+const { computeReplacementBridgePose } = loadInlineGameFunctions(
+    ['computeReplacementBridgePose'], {
+        CONFIG: { TARGET_FPS: 60 },
+        AstervoidsWireCodec: {
+            hasAsteroidVertices: v => Array.isArray(v) && v.length > 0
+        }
+    });
 
 // ── Pure-logic mirrors of RemoteObjects helpers ───────────────────────────
 
@@ -397,71 +410,35 @@ test('wallToPerfDelta refresh sequence: monotonic snapshot times preserved', () 
 // ── Spawn-bridge: parent → child continuity ──────────────────────────────
 
 /**
- * Mirror of the spawn-bridge integration callback in connectToSessionHub.
+ * Spawn-bridge integration harness.
  *
- * Synthesizes a bridge snapshot (parent's interpolated x/y/angle + child's
- * velocity/identity) and installs both bridge and authority into the child's
- * snapshot ring in monotonic time order.
+ * Calls the production `computeReplacementBridgePose` from index.html to
+ * synthesize the bridge snapshot, then installs both bridge and authority into
+ * the child's snapshot ring in monotonic time order — the same ordering
+ * `installBufferedReplacementBridges` uses.
+ *
+ * Unit-scale velScale (1) keeps these axis tests in a single coordinate space.
  *
  * Returns { bridgeData, bridgeValidAt } so tests can assert against the
  * bridge values directly.
  */
 function installSpawnBridge(parentState, childState, childData, childValidAt, baseDelay, clock) {
-    const targetFps = 60;
     const renderTime = clock.perfNow();
     const parentInterp = getInterpolated(parentState, renderTime, baseDelay);
     if (!parentInterp) return null;
     const bridgeValidAt = Math.round(clock.serverNowMs() - baseDelay);
-    const timeDiffSec = (childValidAt - bridgeValidAt) / 1000;
     const bridgeIsBeforeAuth = bridgeValidAt <= childValidAt;
-    // bridgeV serves dual roles:
-    //   - back-projection anchor for bridge.x/y from the child's authoritative
-    //     COM to where the fragment was at bridge.time;
-    //   - bridge snapshot velocity used for Hermite tangent (LAN bracket) and
-    //     for extrapolation past the bridge (high-latency).
-    let bridgeVx = bridgeIsBeforeAuth
-        ? (parentInterp.velocityX || 0)
-        : (childData.velocityX || 0);
-    let bridgeVy = bridgeIsBeforeAuth
-        ? (parentInterp.velocityY || 0)
-        : (childData.velocityY || 0);
-    const isFractureChild = Array.isArray(childData.vertices) && childData.vertices.length > 0;
-    let bridgeX;
-    let bridgeY;
-    let bridgeAngle;
-    if (isFractureChild && bridgeIsBeforeAuth) {
-        const parentVx = parentInterp.velocityX || 0;
-        const parentVy = parentInterp.velocityY || 0;
-        const angularSpeed = (parentInterp.rotationSpeed || 0) * targetFps;
-        const rotationDelta = -angularSpeed * timeDiffSec;
-        const parentAtSplitX = parentInterp.x + parentVx * timeDiffSec;
-        const parentAtSplitY = parentInterp.y + parentVy * timeDiffSec;
-        const centroidX = (childData.x || 0) - parentAtSplitX;
-        const centroidY = (childData.y || 0) - parentAtSplitY;
-        const cos = Math.cos(rotationDelta);
-        const sin = Math.sin(rotationDelta);
-        const bridgeCentroidX = centroidX * cos - centroidY * sin;
-        const bridgeCentroidY = centroidX * sin + centroidY * cos;
-        bridgeX = parentInterp.x + bridgeCentroidX;
-        bridgeY = parentInterp.y + bridgeCentroidY;
-        bridgeAngle = rotationDelta;
-        bridgeVx = parentVx - angularSpeed * bridgeCentroidY;
-        bridgeVy = parentVy + angularSpeed * bridgeCentroidX;
-    } else {
-        bridgeX = (childData.x || 0) - bridgeVx * timeDiffSec;
-        bridgeY = (childData.y || 0) - bridgeVy * timeDiffSec;
-        bridgeAngle = isFractureChild
-            ? (childData.angle || 0)
-                - (childData.rotationSpeed || 0) * targetFps * timeDiffSec
-            : parentInterp.angle;
-    }
     const bridgeData = {
         ...childData,
-        x: bridgeX,
-        y: bridgeY,
-        velocityX: bridgeVx,
-        velocityY: bridgeVy,
-        angle: bridgeAngle,
+        ...computeReplacementBridgePose(
+            { x: 0, y: 0, ...childData },
+            parentInterp,
+            {
+                timeDiffSec: (childValidAt - bridgeValidAt) / 1000,
+                bridgeIsBeforeAuth,
+                velScaleX: 1,
+                velScaleY: 1
+            })
     };
     if (bridgeIsBeforeAuth) {
         // LAN: bridge older than authority — install bridge first.

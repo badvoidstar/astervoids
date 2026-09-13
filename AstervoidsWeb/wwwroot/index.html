@@ -776,6 +776,8 @@
     <script src="/js/sync-payload.js"></script>
     <!-- Debug toggle — set to true in browser console: window.ASTERVOIDS_DEBUG = true -->
     <script>window.ASTERVOIDS_DEBUG = false;</script>
+    <!-- Shared debug logging helpers — must load before any module that logs -->
+    <script src="/js/debug-log.js"></script>
     <!-- Optional injected region bootstrap for static-apex hosting -->
     <script src="/region-bootstrap.js"></script>
     <!-- Region service — discovers peer regions and measures RTT for the session picker -->
@@ -802,9 +804,8 @@
        A single-file HTML5 Canvas implementation following best practices
        ================================================================ */
 
-    const _log = (...a) => window.ASTERVOIDS_DEBUG && console.log(...a);
-    const _warn = (...a) => window.ASTERVOIDS_DEBUG && console.warn(...a);
-    const _error = (...a) => window.ASTERVOIDS_DEBUG && console.error(...a);
+    // Shared debug helpers — see js/debug-log.js (loaded above).
+    const { log: _log, warn: _warn, error: _error } = AstervoidsDebugLog;
 
     // ============================================
     // SECTION 0: AUDIO SYSTEM
@@ -2212,19 +2213,22 @@
     function remoteVelocityToNormalizedY(velocity) {
         return velocity * getReferenceDimension() / getGameHeight();
     }
-    function shortestRemoteDeltaX(from, to, data) {
-        const range = 1 + 2 * wrapMarginX(getRemoteBoundingRadius(data));
+    // The X and Y variants below differ only by which axis margin they use, so
+    // each concept has exactly one body and the two axes cannot drift apart.
+    function shortestRemoteDelta(from, to, margin) {
+        const range = 1 + 2 * margin;
         let delta = to - from;
         if (delta > range / 2) delta -= range;
         else if (delta < -range / 2) delta += range;
         return delta;
     }
+    function shortestRemoteDeltaX(from, to, data) {
+        return shortestRemoteDelta(
+            from, to, wrapMarginX(getRemoteBoundingRadius(data)));
+    }
     function shortestRemoteDeltaY(from, to, data) {
-        const range = 1 + 2 * wrapMarginY(getRemoteBoundingRadius(data));
-        let delta = to - from;
-        if (delta > range / 2) delta -= range;
-        else if (delta < -range / 2) delta += range;
-        return delta;
+        return shortestRemoteDelta(
+            from, to, wrapMarginY(getRemoteBoundingRadius(data)));
     }
     function wrapRemoteX(value, data) {
         return wrapNormalized(
@@ -2255,6 +2259,41 @@
         wrapY: wrapRemoteY,
         distanceBetween: remoteDistanceBetween
     });
+    /**
+     * Pure: compute the seconds to forward-extrapolate a replacement snapshot
+     * from its operation-time validAt to estimated server "now". Capped to
+     * ±MAX_EXTRAPOLATION to avoid runaway projection from a poor clock estimate.
+     */
+    function computeSpawnStaleness(serverNowMsValue, validAt) {
+        const elapsedSec = (serverNowMsValue - validAt) / 1000;
+        const cap = CONFIG.MAX_EXTRAPOLATION;
+        if (elapsedSec > cap) return cap;
+        if (elapsedSec < -cap) return -cap;
+        return elapsedSec;
+    }
+
+    /**
+     * Project a spawn data position forward (or backward) by `stalenessSec` of
+     * constant-velocity motion, applying toroidal wrap with the matching
+     * radius-aware margins. Mirrors the `_baseInterpolated` extrapolation
+     * branch so projected snapshots and subsequent interpolated snapshots
+     * remain in the same coordinate frame.
+     */
+    function projectSpawnData(data, stalenessSec) {
+        if (!stalenessSec) return data;
+        const refDim = getReferenceDimension();
+        const r = getRemoteBoundingRadius(data);
+        const vx = data.velocityX || 0;
+        const vy = data.velocityY || 0;
+        const rs = data.rotationSpeed || 0;
+        return {
+            ...data,
+            x: wrapNormalized(data.x + vx * (refDim / getGameWidth()) * stalenessSec, wrapMarginX(r)),
+            y: wrapNormalized(data.y + vy * (refDim / getGameHeight()) * stalenessSec, wrapMarginY(r)),
+            angle: (data.angle || 0) + rs * CONFIG.TARGET_FPS * stalenessSec,
+        };
+    }
+
     const RemoteObjects = {
         // Facade maps remain directly queryable by game-over and migration paths.
         states: bufferedSnapshotPolicy.states,
@@ -2683,44 +2722,6 @@
         // updateAstervoidsFromSync's adopt branch.
 
         /**
-         * Pure: compute the seconds to forward-extrapolate a replacement
-         * snapshot from its operation-time validAt to estimated server "now".
-         * Capped
-         * to ±MAX_EXTRAPOLATION to avoid runaway projection from a poor
-         * clock estimate.
-         */
-        computeSpawnStaleness(serverNowMsValue, validAt) {
-            const elapsedSec = (serverNowMsValue - validAt) / 1000;
-            const cap = CONFIG.MAX_EXTRAPOLATION;
-            if (elapsedSec > cap) return cap;
-            if (elapsedSec < -cap) return -cap;
-            return elapsedSec;
-        },
-
-        /**
-         * Project a spawn data position forward (or backward) by
-         * `stalenessSec` of constant-velocity motion, applying toroidal wrap
-         * with the matching radius-aware margins. Mirrors the
-         * `_baseInterpolated` extrapolation branch so projected snapshots
-         * and subsequent interpolated snapshots remain in the same
-         * coordinate frame.
-         */
-        projectSpawnData(data, stalenessSec) {
-            if (!stalenessSec) return data;
-            const refDim = getReferenceDimension();
-            const r = this.getBoundingRadius(data);
-            const vx = data.velocityX || 0;
-            const vy = data.velocityY || 0;
-            const rs = data.rotationSpeed || 0;
-            return {
-                ...data,
-                x: wrapNormalized(data.x + vx * (refDim / getGameWidth()) * stalenessSec, wrapMarginX(r)),
-                y: wrapNormalized(data.y + vy * (refDim / getGameHeight()) * stalenessSec, wrapMarginY(r)),
-                angle: (data.angle || 0) + rs * CONFIG.TARGET_FPS * stalenessSec,
-            };
-        },
-
-        /**
          * Historical projection helper: derive the latest buffered snapshot at
          * estimated server "now". The active ownership-migration path
          * deliberately does NOT call this. A newly promoted owner keeps the
@@ -2744,7 +2745,7 @@
                 : (performance.now() - Date.now());
             const latestValidAt = latest.time - delta + offset;
             const stalenessSec = (this.serverNowMs() - latestValidAt) / 1000;
-            return this.projectSpawnData(latest.data, stalenessSec);
+            return projectSpawnData(latest.data, stalenessSec);
         },
 
         /** Delegate buffered validAt-axis sampling to the extracted policy. */
@@ -3017,6 +3018,21 @@
      * @param {number} margin - Extra margin beyond 0-1 before wrapping (default: 0)
      * @returns {number} Wrapped normalized position
      */
+    /**
+     * Copies each listed field from `data` to `target` when the sender
+     * included it. Sync payloads are sparse (delta encoding omits unchanged
+     * fields), so an absent key must leave the current value untouched — which
+     * is not the same as assigning `undefined`.
+     * @param {object} target - Receiving instance
+     * @param {object} data - Sparse sync payload
+     * @param {string[]} fields - Field names to copy verbatim
+     */
+    function assignDefined(target, data, fields) {
+        for (const field of fields) {
+            if (data[field] !== undefined) target[field] = data[field];
+        }
+    }
+
     function wrapNormalized(value, margin = 0) {
         const lo = -margin;
         const hi = 1 + margin;
@@ -3516,7 +3532,107 @@
      * The player-controlled spacecraft
      * All positions and velocities are normalized (0-1 range)
      */
+    /**
+     * Invulnerability countdown for one ship.
+     *
+     * Owners drive `remaining` from simulation; replicas derive it from the
+     * last capture `anchor`. `revision` is the transition key send gates
+     * compare — an ordinary countdown tick is not a transition, so it must not
+     * bump. Keeping the three values together makes those invariants local
+     * instead of spreading them across the Ship field list.
+     */
+    class ShipInvulnerability {
+        constructor() {
+            this.remaining = 0;   // Authoritative simulation ticks / sampled presentation ticks
+            this.revision = 0;
+            this.anchor = null;
+        }
+
+        set(value) {
+            const remaining = Number.isFinite(value) ? Math.max(0, value) : 0;
+            // Preserve direct assignment by spawn/reset callers, including a
+            // second reset at the same duration. Ordinary countdown ticks are
+            // not transitions; expiry is clamped to one exact zero edge.
+            if ((remaining > 0 && remaining >= this.remaining)
+                || (remaining === 0 && this.remaining > 0)) {
+                this.revision = (this.revision + 1) >>> 0;
+            }
+            this.remaining = remaining;
+            this.anchor = null;
+        }
+
+        capture() {
+            return {
+                invulnerable: this.remaining,
+                invulnerabilityRevision: this.revision,
+                // This stamps the countdown capture, not the later wire flush.
+                // Zero explicitly requests receiver validAt/arrival fallback.
+                invulnerableAt: this.remaining > 0 && RemoteObjects.clock.offsetInitialized
+                    ? RemoteObjects.serverNowMs() : 0
+            };
+        }
+
+        ingest(data, record) {
+            const previous = this.anchor;
+            const remaining = Number.isFinite(data.invulnerable)
+                ? Math.max(0, data.invulnerable) : 0;
+            const revision = Number.isInteger(data.invulnerabilityRevision)
+                ? data.invulnerabilityRevision >>> 0 : null;
+            // More than one transition also catches a respawn whose complete
+            // countdown was coalesced while a previous send was in flight.
+            const teleport = !!previous
+                && (revision !== null && previous.revision !== null
+                    ? revision !== previous.revision
+                        && (remaining > 0 || ((revision - previous.revision) >>> 0) > 1)
+                    : remaining > 0 && remaining > previous.remaining);
+            this.anchor = {
+                remaining,
+                revision,
+                at: Number.isFinite(data.invulnerableAt) && data.invulnerableAt > 0
+                    ? data.invulnerableAt : record.validAt,
+                receivedPerf: performance.now()
+            };
+            return teleport;
+        }
+
+        sample(renderTime = performance.now(), delayMs = 0) {
+            const anchor = this.anchor;
+            if (!anchor) return;
+            // Shared time corrects late joins (also once bootstrap completes).
+            // Until then, never interpret a remote UTC stamp as a local clock.
+            const baseline = RemoteObjects.clock.offsetInitialized
+                && Number.isFinite(anchor.at) && anchor.at > 0
+                ? replicationClock.validAtToMonotonicMs(anchor.at)
+                : anchor.receivedPerf;
+            const elapsedMs = Math.max(0, renderTime - Math.max(0, delayMs) - baseline);
+            this.remaining = Math.max(
+                0, anchor.remaining - elapsedMs * CONFIG.TARGET_FPS / 1000);
+            if (anchor.revision !== null) this.revision = anchor.revision;
+        }
+
+        // Reconciliation snapshots carry both fields verbatim: apply without
+        // treating them as a local transition or discarding the anchor.
+        applySnapshot(data) {
+            if (Number.isFinite(data.invulnerable)) {
+                this.remaining = Math.max(0, data.invulnerable);
+            }
+            if (Number.isInteger(data.invulnerabilityRevision)) {
+                this.revision = data.invulnerabilityRevision >>> 0;
+            }
+        }
+    }
+
     class Ship {
+        // Sync fields copied verbatim by fromSyncData. Fields needing
+        // validation or renaming (invulnerable/invulnerabilityRevision, which
+        // ShipInvulnerability owns, and turnControlMode) stay explicit there.
+        static SYNC_FIELDS = [
+            'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed',
+            'thrusting', 'thrustInput', 'brakeInput',
+            'turnTarget', 'turnTargetAngle', 'turnMagnitude', 'turnBias',
+            'colorIndex', 'memberId', 'score', 'hitCount'
+        ];
+
         constructor(x, y, colorIndex = 0) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -3541,9 +3657,7 @@
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
-            this._invulnerable = 0;        // Authoritative simulation ticks / sampled presentation ticks
-            this.invulnerabilityRevision = 0;
-            this._invulnerabilityAnchor = null;
+            this.invulnerability = new ShipInvulnerability();
             this.shootCooldown = 0;        // Frames until can shoot again
             this.colorIndex = colorIndex;  // Player color index (0-3)
             this.syncObjectId = null;      // ObjectSync ID when in session
@@ -3559,70 +3673,34 @@
             this._vertCacheRef = NaN;
         }
 
+        // Invulnerability lives in one value object; these keep the existing
+        // field-shaped API (including the wire field names) intact.
         get invulnerable() {
-            return this._invulnerable;
+            return this.invulnerability.remaining;
         }
 
         set invulnerable(value) {
-            const remaining = Number.isFinite(value) ? Math.max(0, value) : 0;
-            // Preserve direct assignment by spawn/reset callers, including a
-            // second reset at the same duration. Ordinary countdown ticks are
-            // not transitions; expiry is clamped to one exact zero edge.
-            if ((remaining > 0 && remaining >= this._invulnerable)
-                || (remaining === 0 && this._invulnerable > 0)) {
-                this.invulnerabilityRevision = (this.invulnerabilityRevision + 1) >>> 0;
-            }
-            this._invulnerable = remaining;
-            this._invulnerabilityAnchor = null;
+            this.invulnerability.set(value);
+        }
+
+        get invulnerabilityRevision() {
+            return this.invulnerability.revision;
+        }
+
+        set invulnerabilityRevision(value) {
+            this.invulnerability.revision = value;
         }
 
         captureInvulnerability() {
-            return {
-                invulnerable: this.invulnerable,
-                invulnerabilityRevision: this.invulnerabilityRevision,
-                // This stamps the countdown capture, not the later wire flush.
-                // Zero explicitly requests receiver validAt/arrival fallback.
-                invulnerableAt: this.invulnerable > 0 && RemoteObjects.clock.offsetInitialized
-                    ? RemoteObjects.serverNowMs() : 0
-            };
+            return this.invulnerability.capture();
         }
 
         ingestInvulnerability(data, record) {
-            const previous = this._invulnerabilityAnchor;
-            const remaining = Number.isFinite(data.invulnerable)
-                ? Math.max(0, data.invulnerable) : 0;
-            const revision = Number.isInteger(data.invulnerabilityRevision)
-                ? data.invulnerabilityRevision >>> 0 : null;
-            // More than one transition also catches a respawn whose complete
-            // countdown was coalesced while a previous send was in flight.
-            const teleport = !!previous
-                && (revision !== null && previous.revision !== null
-                    ? revision !== previous.revision
-                        && (remaining > 0 || ((revision - previous.revision) >>> 0) > 1)
-                    : remaining > 0 && remaining > previous.remaining);
-            this._invulnerabilityAnchor = {
-                remaining,
-                revision,
-                at: Number.isFinite(data.invulnerableAt) && data.invulnerableAt > 0
-                    ? data.invulnerableAt : record.validAt,
-                receivedPerf: performance.now()
-            };
-            return teleport;
+            return this.invulnerability.ingest(data, record);
         }
 
         sampleInvulnerability(renderTime = performance.now(), delayMs = 0) {
-            const anchor = this._invulnerabilityAnchor;
-            if (!anchor) return;
-            // Shared time corrects late joins (also once bootstrap completes).
-            // Until then, never interpret a remote UTC stamp as a local clock.
-            const baseline = RemoteObjects.clock.offsetInitialized
-                && Number.isFinite(anchor.at) && anchor.at > 0
-                ? replicationClock.validAtToMonotonicMs(anchor.at)
-                : anchor.receivedPerf;
-            const elapsedMs = Math.max(0, renderTime - Math.max(0, delayMs) - baseline);
-            this._invulnerable = Math.max(
-                0, anchor.remaining - elapsedMs * CONFIG.TARGET_FPS / 1000);
-            if (anchor.revision !== null) this.invulnerabilityRevision = anchor.revision;
+            this.invulnerability.sample(renderTime, delayMs);
         }
 
         /**
@@ -3691,34 +3769,14 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.angle !== undefined) this.angle = data.angle;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
-            if (data.thrusting !== undefined) this.thrusting = data.thrusting;
-            if (Number.isFinite(data.invulnerable)) {
-                this._invulnerable = Math.max(0, data.invulnerable);
-            }
-            if (Number.isInteger(data.invulnerabilityRevision)) {
-                this.invulnerabilityRevision = data.invulnerabilityRevision >>> 0;
-            }
-            if (data.thrustInput !== undefined) this.thrustInput = data.thrustInput;
-            if (data.brakeInput !== undefined) this.brakeInput = data.brakeInput;
+            // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
+            // but reconciliation snapshots include them in data, so apply when present.
+            assignDefined(this, data, Ship.SYNC_FIELDS);
+            // Fields below need validation or renaming, so they stay explicit.
+            this.invulnerability.applySnapshot(data);
             if (data.turnControlMode !== undefined) {
                 this.turnControlMode = normalizeTurnControlMode(data.turnControlMode);
             }
-            if (data.turnTarget !== undefined) this.turnTarget = data.turnTarget;
-            if (data.turnTargetAngle !== undefined) this.turnTargetAngle = data.turnTargetAngle;
-            if (data.turnMagnitude !== undefined) this.turnMagnitude = data.turnMagnitude;
-            if (data.turnBias !== undefined) this.turnBias = data.turnBias;
-            if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
-            if (data.memberId !== undefined) this.memberId = data.memberId;
-            // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
-            // but reconciliation snapshots include them in data, so apply when present.
-            if (data.score !== undefined) this.score = data.score;
-            if (data.hitCount !== undefined) this.hitCount = data.hitCount;
         }
 
         /**
@@ -3954,6 +4012,12 @@
      * Position is normalized (0-1), radius/velocity are in reference-dimension units
      */
     class Asteroid {
+        // Sync fields copied verbatim by fromSyncData. Shape (seed/vertices)
+        // is structural and only applied by the static factory.
+        static SYNC_FIELDS = [
+            'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed'
+        ];
+
         constructor(x, y, radius, velocityX, velocityY, seed = null, vertices = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -4027,12 +4091,7 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.angle !== undefined) this.angle = data.angle;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.rotationSpeed !== undefined) this.rotationSpeed = data.rotationSpeed;
+            assignDefined(this, data, Asteroid.SYNC_FIELDS);
         }
 
         /**
@@ -4227,6 +4286,13 @@
      * Position is normalized (0-1), velocity is in reference-dimension per second
      */
     class Bullet {
+        // Sync fields copied verbatim by fromSyncData.
+        static SYNC_FIELDS = [
+            'x', 'y', 'velocityX', 'velocityY', 'lifetime', 'colorIndex',
+            'pendingHit', 'hitTargetId', 'hitImpactTorque', 'hitBulletAngle',
+            'hitOffsetN'
+        ];
+
         constructor(x, y, velocityX, velocityY, colorIndex = 0, ownerMemberId = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
@@ -4294,17 +4360,7 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            if (data.x !== undefined) this.x = data.x;
-            if (data.y !== undefined) this.y = data.y;
-            if (data.velocityX !== undefined) this.velocityX = data.velocityX;
-            if (data.velocityY !== undefined) this.velocityY = data.velocityY;
-            if (data.lifetime !== undefined) this.lifetime = data.lifetime;
-            if (data.colorIndex !== undefined) this.colorIndex = data.colorIndex;
-            if (data.pendingHit !== undefined) this.pendingHit = data.pendingHit;
-            if (data.hitTargetId !== undefined) this.hitTargetId = data.hitTargetId;
-            if (data.hitImpactTorque !== undefined) this.hitImpactTorque = data.hitImpactTorque;
-            if (data.hitBulletAngle !== undefined) this.hitBulletAngle = data.hitBulletAngle;
-            if (data.hitOffsetN !== undefined) this.hitOffsetN = data.hitOffsetN;
+            assignDefined(this, data, Bullet.SYNC_FIELDS);
         }
 
         /**
@@ -5349,11 +5405,11 @@
                     delete record.replacementBaselinePerf;
                 } else if (record.validAt != null
                     && RemoteObjects.isClockOffsetInitialized()) {
-                    stalenessSec = RemoteObjects.computeSpawnStaleness(
+                    stalenessSec = computeSpawnStaleness(
                         RemoteObjects.serverNowMs(), record.validAt);
                 }
                 if (stalenessSec !== undefined) {
-                    const projected = RemoteObjects.projectSpawnData(record.data, stalenessSec);
+                    const projected = projectSpawnData(record.data, stalenessSec);
                     asteroid.x = projected.x;
                     asteroid.y = projected.y;
                     asteroid.angle = projected.angle;
@@ -7030,6 +7086,163 @@
      * Asteroid mutation remains asteroid-owner-authoritative. Cosmetic cues
      * acknowledge the claim/confirmation flow but never resolve a hit.
      */
+    // Impact geometry for a bullet striking an asteroid, in the asteroid's
+    // relative frame (offset and relative velocity).
+    function computeBulletAsteroidImpact(bullet, asteroid) {
+        return computeBulletImpact(
+            asteroid.radius,
+            bullet.x - asteroid.x,
+            bullet.y - asteroid.y,
+            bullet.velocityX - asteroid.velocityX,
+            bullet.velocityY - asteroid.velocityY);
+    }
+
+    // Solo scoring, including threshold-crossing extra lives. Counting awards
+    // from the score totals (rather than incrementing on each crossing) keeps a
+    // single large score jump from skipping an award.
+    function awardSoloAsteroidScore(points) {
+        const previousScore = game.score;
+        game.score += points;
+        const newScoreLifeAwards = Math.max(
+            0,
+            countExtraLivesForScore(game.score, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD)
+            - countExtraLivesForScore(previousScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD));
+        if (newScoreLifeAwards > 0) {
+            game.lives += newScoreLifeAwards;
+            announceExtraLifeAward();
+        }
+    }
+
+    // Resolves one confirmed bullet/asteroid overlap. Ordering inside each
+    // branch is collision-visible and must be preserved.
+    function resolveBulletAsteroidHit(bullet, bulletIndex, asteroid, asteroidIndex, myMemberId) {
+        if (!isSessionMode()) {
+            resolveSoloAsteroidHit(bullet, bulletIndex, asteroid, asteroidIndex);
+            return;
+        }
+        // Check if we own this asteroid
+        const asteroidSyncObj = asteroid.syncObjectId ? ObjectSync.getObject(asteroid.syncObjectId) : null;
+        const asteroidOwner = asteroidSyncObj?.ownerMemberId;
+        if (asteroidOwner === myMemberId) {
+            resolveOwnedAsteroidHit(bullet, bulletIndex, asteroid);
+        } else {
+            claimCrossOwnerAsteroidHit(bullet, asteroid);
+        }
+    }
+
+    // Same owner: resolve gameplay locally. There is no pendingHit transition
+    // for peers to observe, so emit the target-owned cue before ordered
+    // delete/replace.
+    function resolveOwnedAsteroidHit(bullet, bulletIndex, asteroid) {
+        const points = asteroid.getPoints();
+        const impact = computeBulletAsteroidImpact(bullet, asteroid);
+        // The asteroid-owned event runs locally before send. On a successful
+        // connection-ordered broadcast, peers receive it before the subsequent
+        // replacement; a rejected/failed event can remain local-only.
+        emitOwnedAsteroidImpactCue(asteroid, bullet, impact);
+        const removedBullet = game.bullets.splice(bulletIndex, 1)[0];
+        if (removedBullet.syncObjectId) {
+            deleteSyncedBullet(removedBullet);
+        }
+        // Split sends to server — OnObjectReplaced handles asteroid state for all clients
+        splitAsteroid(asteroid, null, impact, game.ship);
+        // Self-award score on own ship
+        if (game.ship) {
+            game.ship.score = (game.ship.score || 0) + points;
+            emitShipStateChanged();
+        }
+    }
+
+    // Cross-owner claim: hide the local bullet, show the shooter cue
+    // immediately, and publish target-relative hit data on the bullet. Only the
+    // asteroid owner can confirm by replacing/deleting the target.
+    function claimCrossOwnerAsteroidHit(bullet, asteroid) {
+        bullet.pendingHit = true;
+        bullet.hitTargetId = asteroid.syncObjectId;
+        bullet.pendingPoints = asteroid.getPoints();
+        const impact = computeBulletAsteroidImpact(bullet, asteroid);
+        bullet.hitImpactTorque = impact.impactTorque;
+        bullet.hitBulletAngle = impact.bulletAngle;
+        bullet.hitOffsetN = impact.offsetN;
+        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+        if (bullet.syncObjectId) {
+            ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
+        }
+    }
+
+    // Solo mode — process locally. The cue starts before either splice so it
+    // can capture the still-live bullet and asteroid poses.
+    function resolveSoloAsteroidHit(bullet, bulletIndex, asteroid, asteroidIndex) {
+        const impact = computeBulletAsteroidImpact(bullet, asteroid);
+        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+        game.bullets.splice(bulletIndex, 1);
+        game.astervoids.splice(asteroidIndex, 1);
+        awardSoloAsteroidScore(asteroid.getPoints());
+        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
+                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+        AudioSystem.playExplosion(explosionSize);
+        splitAsteroid(asteroid, null, impact, game.ship);
+    }
+
+    // Asteroid owner confirms remote pendingHit claims targeting its objects.
+    function confirmOwnedAsteroidHitClaims(myMemberId) {
+        const bulletObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.BULLET);
+        for (const bulletObj of bulletObjects) {
+            if (!bulletObj.data?.pendingHit || !bulletObj.data?.hitTargetId) continue;
+            if (bulletObj.data?.ownerMemberId === myMemberId) continue; // skip own bullets
+            if (game.multiplayer.processedPendingBullets.has(bulletObj.id)) continue;
+
+            // Check if we own the target asteroid
+            const targetSyncObj = ObjectSync.getObject(bulletObj.data.hitTargetId);
+            if (!targetSyncObj || targetSyncObj.ownerMemberId !== myMemberId) continue;
+
+            // Find the asteroid in our local state
+            const asteroid = game.astervoids.find(a => a.syncObjectId === bulletObj.data.hitTargetId);
+            if (!asteroid) continue; // Already destroyed
+
+            // Mark as processed to prevent duplicate splits during server round-trip
+            game.multiplayer.processedPendingBullets.add(bulletObj.id);
+
+            // Split asteroid with split attribution for bullet owner confirmation
+            const impact = {
+                bulletAngle: bulletObj.data.hitBulletAngle || 0,
+                offsetN: bulletObj.data.hitOffsetN || 0,
+                impactTorque: bulletObj.data.hitImpactTorque || 0
+            };
+            splitAsteroid(asteroid, bulletObj.data.ownerMemberId, impact, getShipByMemberId(bulletObj.data.ownerMemberId));
+        }
+
+        // Clean up processed bullets that no longer exist
+        for (const bulletId of game.multiplayer.processedPendingBullets) {
+            if (!ObjectSync.getObject(bulletId)) {
+                game.multiplayer.processedPendingBullets.delete(bulletId);
+            }
+        }
+    }
+
+    // Bullet owner treats authoritative target removal/replacement as
+    // confirmation, awards its score, and retires the hidden bullet.
+    function retireConfirmedPendingBullets(myMemberId) {
+        for (let i = game.bullets.length - 1; i >= 0; i--) {
+            const bullet = game.bullets[i];
+            if (!bullet.pendingHit || bullet.ownerMemberId !== myMemberId) continue;
+
+            // Check if target asteroid still exists
+            const targetObj = bullet.hitTargetId ? ObjectSync.getObject(bullet.hitTargetId) : null;
+            if (targetObj) continue;
+            // Asteroid gone — bullet hit was processed (or asteroid destroyed by other means)
+            const points = bullet.pendingPoints || CONFIG.POINTS_SMALL;
+            if (game.ship) {
+                game.ship.score = (game.ship.score || 0) + points;
+                emitShipStateChanged();
+            }
+            const removedBullet = game.bullets.splice(i, 1)[0];
+            if (removedBullet.syncObjectId) {
+                deleteSyncedBullet(removedBullet);
+            }
+        }
+    }
+
     function checkCollisions() {
         const myMemberId = SessionClient.getCurrentMember()?.id;
         const bulletPxRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
@@ -7079,86 +7292,7 @@
 
                 if (AstervoidsCollision.sweptCirclePolygonCollision(
                     bulletStart, bulletEnd, prepared.vertices ??= asteroid.getWorldVertices())) {
-                    if (isSessionMode()) {
-                        // Check if we own this asteroid
-                        const asteroidSyncObj = asteroid.syncObjectId ? ObjectSync.getObject(asteroid.syncObjectId) : null;
-                        const asteroidOwner = asteroidSyncObj?.ownerMemberId;
-                        
-                        if (asteroidOwner === myMemberId) {
-                            // Same owner: resolve gameplay locally. There is no
-                            // pendingHit transition for peers to observe, so emit
-                            // the target-owned cue before ordered delete/replace.
-                            const points = asteroid.getPoints();
-                            const offsetX = bullet.x - asteroid.x;
-                            const offsetY = bullet.y - asteroid.y;
-                            const relVelX = bullet.velocityX - asteroid.velocityX;
-                            const relVelY = bullet.velocityY - asteroid.velocityY;
-                            const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
-                            // The asteroid-owned event runs locally before send.
-                            // On a successful connection-ordered broadcast, peers
-                            // receive it before the subsequent replacement; a
-                            // rejected/failed event can remain local-only.
-                            emitOwnedAsteroidImpactCue(asteroid, bullet, impact);
-                            const removedBullet = game.bullets.splice(i, 1)[0];
-                            if (removedBullet.syncObjectId) {
-                                deleteSyncedBullet(removedBullet);
-                            }
-                            // Split sends to server — OnObjectReplaced handles asteroid state for all clients
-                            splitAsteroid(asteroid, null, impact, game.ship);
-                            // Self-award score on own ship
-                            if (game.ship) {
-                                game.ship.score = (game.ship.score || 0) + points;
-                                emitShipStateChanged();
-                            }
-                        } else {
-                            // Cross-owner claim: hide the local bullet, show the
-                            // shooter cue immediately, and publish target-relative
-                            // hit data on the bullet. Only the asteroid owner can
-                            // confirm by replacing/deleting the target.
-                            bullet.pendingHit = true;
-                            bullet.hitTargetId = asteroid.syncObjectId;
-                            bullet.pendingPoints = asteroid.getPoints();
-                            const offsetX = bullet.x - asteroid.x;
-                            const offsetY = bullet.y - asteroid.y;
-                            const relVelX = bullet.velocityX - asteroid.velocityX;
-                            const relVelY = bullet.velocityY - asteroid.velocityY;
-                            const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
-                            bullet.hitImpactTorque = impact.impactTorque;
-                            bullet.hitBulletAngle = impact.bulletAngle;
-                            bullet.hitOffsetN = impact.offsetN;
-                            CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
-                            if (bullet.syncObjectId) {
-                                ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
-                            }
-                        }
-                    } else {
-                        // Solo mode — process locally
-                        const offsetX = bullet.x - asteroid.x;
-                        const offsetY = bullet.y - asteroid.y;
-                        const relVelX = bullet.velocityX - asteroid.velocityX;
-                        const relVelY = bullet.velocityY - asteroid.velocityY;
-                        const impact = computeBulletImpact(asteroid.radius, offsetX, offsetY, relVelX, relVelY);
-                        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
-                        game.bullets.splice(i, 1);
-                        game.astervoids.splice(j, 1);
-                        const previousScore = game.score;
-                        game.score += asteroid.getPoints();
-                        const newScoreLifeAwards = Math.max(
-                            0,
-                            countExtraLivesForScore(
-                                game.score, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD)
-                            - countExtraLivesForScore(
-                                previousScore, CONFIG.EXTRA_LIFE_SCORE_THRESHOLD));
-                        if (newScoreLifeAwards > 0) {
-                            game.lives += newScoreLifeAwards;
-                            announceExtraLifeAward();
-                        }
-                        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
-                                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-                        AudioSystem.playExplosion(explosionSize);
-                        splitAsteroid(asteroid, null, impact, game.ship);
-                    }
-                    
+                    resolveBulletAsteroidHit(bullet, i, asteroid, j, myMemberId);
                     break;  // Bullet can only hit one asteroid
                 }
             }
@@ -7173,60 +7307,8 @@
         
         // Asteroid owner confirms remote pendingHit claims targeting its objects.
         if (isSessionMode()) {
-            const bulletObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.BULLET);
-            for (const bulletObj of bulletObjects) {
-                if (!bulletObj.data?.pendingHit || !bulletObj.data?.hitTargetId) continue;
-                if (bulletObj.data?.ownerMemberId === myMemberId) continue; // skip own bullets
-                if (game.multiplayer.processedPendingBullets.has(bulletObj.id)) continue;
-                
-                // Check if we own the target asteroid
-                const targetSyncObj = ObjectSync.getObject(bulletObj.data.hitTargetId);
-                if (!targetSyncObj || targetSyncObj.ownerMemberId !== myMemberId) continue;
-                
-                // Find the asteroid in our local state
-                const asteroid = game.astervoids.find(a => a.syncObjectId === bulletObj.data.hitTargetId);
-                if (!asteroid) continue; // Already destroyed
-                
-                // Mark as processed to prevent duplicate splits during server round-trip
-                game.multiplayer.processedPendingBullets.add(bulletObj.id);
-                
-                // Split asteroid with split attribution for bullet owner confirmation
-                const impact = {
-                    bulletAngle: bulletObj.data.hitBulletAngle || 0,
-                    offsetN: bulletObj.data.hitOffsetN || 0,
-                    impactTorque: bulletObj.data.hitImpactTorque || 0
-                };
-                splitAsteroid(asteroid, bulletObj.data.ownerMemberId, impact, getShipByMemberId(bulletObj.data.ownerMemberId));
-            }
-            
-            // Clean up processed bullets that no longer exist
-            for (const bulletId of game.multiplayer.processedPendingBullets) {
-                if (!ObjectSync.getObject(bulletId)) {
-                    game.multiplayer.processedPendingBullets.delete(bulletId);
-                }
-            }
-            
-            // Bullet owner treats authoritative target removal/replacement as
-            // confirmation, awards its score, and retires the hidden bullet.
-            for (let i = game.bullets.length - 1; i >= 0; i--) {
-                const bullet = game.bullets[i];
-                if (!bullet.pendingHit || bullet.ownerMemberId !== myMemberId) continue;
-                
-                // Check if target asteroid still exists
-                const targetObj = bullet.hitTargetId ? ObjectSync.getObject(bullet.hitTargetId) : null;
-                if (!targetObj) {
-                    // Asteroid gone — bullet hit was processed (or asteroid destroyed by other means)
-                    const points = bullet.pendingPoints || CONFIG.POINTS_SMALL;
-                    if (game.ship) {
-                        game.ship.score = (game.ship.score || 0) + points;
-                        emitShipStateChanged();
-                    }
-                    const removedBullet = game.bullets.splice(i, 1)[0];
-                    if (removedBullet.syncObjectId) {
-                        deleteSyncedBullet(removedBullet);
-                    }
-                }
-            }
+            confirmOwnedAsteroidHitClaims(myMemberId);
+            retireConfirmedPendingBullets(myMemberId);
         }
     }
 
@@ -9757,6 +9839,282 @@
     }
 
     // Connect to session hub
+    // ── Session hub event handlers ──────────────────────────────────────
+    // Bodies for the ObjectSync subscriptions installed by
+    // connectToSessionHub. They live at top level so the connect routine
+    // stays wiring-only and each handler can be exercised directly.
+
+    function handleShipStateChangedEvent(objectId, payload) {
+        const obj = ObjectSync.getObject(objectId);
+        if (!obj || !obj.data) return;
+        if (payload.score !== undefined) obj.data.score = payload.score;
+        if (payload.hitCount !== undefined) obj.data.hitCount = payload.hitCount;
+        CollisionEffects.startShipHit(objectId, payload, obj.data.colorIndex || 0);
+    }
+
+    // The event identifies an asteroid the sender owns. Rebuild the cue from
+    // relative impact geometry and this receiver's displayed target pose, so
+    // deterministic arrival lag or a buffered interpolation delay does not
+    // import sender coords.
+    function handleAsteroidImpactCue(objectId, payload) {
+        const obj = ObjectSync.getObject(objectId);
+        if (obj?.data?.type !== OBJECT_TYPES.ASTEROID
+            || typeof payload?.cueId !== 'string'
+            || !payload.cueId) {
+            return;
+        }
+        const asteroid = game.astervoids.find(a => a.syncObjectId === objectId);
+        const target = asteroid || {
+            syncObjectId: objectId,
+            x: obj.data.x,
+            y: obj.data.y,
+            radius: obj.data.radius
+        };
+        CollisionEffects.startAsteroidHit({
+            _impactCueKey: `asteroid:event:${payload.cueId}`,
+            hitTargetId: objectId,
+            hitBulletAngle: payload.bulletAngle,
+            hitOffsetN: payload.offsetN,
+            colorIndex: payload.colorIndex || 0,
+            x: target.x,
+            y: target.y
+        }, target, {
+            bulletAngle: payload.bulletAngle,
+            offsetN: payload.offsetN
+        });
+    }
+
+    // Detect GameState creation (replaces onGameStarted event)
+    function handleGameStateObjectCreated(obj) {
+        if (obj.data?.type === OBJECT_TYPES.GAME_STATE && sessionPicker.currentSessionId) {
+            sessionPicker.gameStarted = true;
+            updatePickerButtons();
+        }
+    }
+
+    // Replacement always resolves target-bound cosmetic cues. Deterministic
+    // children inherit the parent's receiver-side baseline; buffered remotes
+    // use the synthetic bridge below.
+    function handleObjectReplaced(deletedObjectId, createdObjects, batchValidAt) {
+        CollisionEffects.resolveTarget(deletedObjectId);
+        const renderTime = performance.now();
+        if (isDeterministicMode()) {
+            adoptDeterministicReplacementBaseline(
+                deletedObjectId, createdObjects, batchValidAt, renderTime);
+            return;
+        }
+        installBufferedReplacementBridges(
+            deletedObjectId, createdObjects, batchValidAt, renderTime);
+    }
+
+    function adoptDeterministicReplacementBaseline(
+        deletedObjectId, createdObjects, batchValidAt, renderTime) {
+        const parentState = DeadReckon.states.get(deletedObjectId);
+        const parentAsteroid = game.astervoids.find(
+            asteroid => asteroid.syncObjectId === deletedObjectId);
+        const localBaselinePerf = parentAsteroid?.replacementStartedPerf;
+        if (parentAsteroid) {
+            delete parentAsteroid.replacementStartedPerf;
+        }
+        const replacementBaselinePerf =
+            localBaselinePerf
+            ?? ReplicationPresentation.calculateReplacementBaselinePerf(
+                parentState, batchValidAt, renderTime);
+        if (!Number.isFinite(replacementBaselinePerf)) return;
+        for (const child of createdObjects) {
+            const record = ObjectSync.getObject(child.id);
+            if (record) {
+                record.replacementBaselinePerf =
+                    Math.min(renderTime, replacementBaselinePerf);
+            }
+        }
+    }
+
+    // A new child otherwise has one sample at the authoritative collision time,
+    // while the parent was displayed on a delayed timeline. Add a second child
+    // sample anchored to the parent's last displayed transform. When the bridge
+    // predates authority, Hermite interpolation spans bridge -> authority. When
+    // it is newer, the bridge becomes the extrapolation base on the child
+    // trajectory. The latter softens the install-time jump but does not
+    // guarantee zero later correction.
+    //
+    // Locally-owned children are skipped because local physics, not
+    // RemoteObjects, drives their pose. Synthetic samples never feed adaptive-
+    // delay estimation; their time already depends on the current delay and
+    // would create positive feedback.
+    function installBufferedReplacementBridges(
+        deletedObjectId, createdObjects, batchValidAt, renderTime) {
+        if (!RemoteObjects.isClockOffsetInitialized()) return;
+        if (batchValidAt == null) return;
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const parentInterp = RemoteObjects.getInterpolated(deletedObjectId, renderTime);
+        if (!parentInterp) return;
+
+        // Velocity-based back-projection scales for normalized x/y.
+        const refDim = getReferenceDimension();
+        const velScaleX = refDim / getGameWidth();
+        const velScaleY = refDim / getGameHeight();
+
+        for (const child of createdObjects) {
+            // Skip locally-owned children — local game physics drives their
+            // position, not the interpolator.
+            if (child.ownerMemberId === myMemberId) continue;
+            // All children in a Replace broadcast share the same
+            // server-validated replacement-operation validAt.
+            const childValidAt = batchValidAt;
+            // Bridge anchor in server-time: "where the renderer is currently
+            // displaying objects from this owner".
+            const delay = RemoteObjects.getDelayForMember(child.ownerMemberId);
+            const bridgeValidAt = Math.round(RemoteObjects.serverNowMs() - delay);
+            const bridgeIsBeforeAuth = bridgeValidAt <= childValidAt;
+            const bridgeData = {
+                ...child.data,
+                ...computeReplacementBridgePose(child.data, parentInterp, {
+                    timeDiffSec: (childValidAt - bridgeValidAt) / 1000,
+                    bridgeIsBeforeAuth,
+                    velScaleX,
+                    velScaleY
+                })
+            };
+            if (bridgeIsBeforeAuth) {
+                // LAN: bridge older than authority → bridge first. Bridge
+                // snapshot is synthetic (validAt back-projected from current
+                // delay); EXCLUDED from adaptive-delay sampling to prevent
+                // positive feedback (delay estimate would otherwise feed itself
+                // on every spawn).
+                RemoteObjects.updateState(child.id, bridgeData, child.ownerMemberId, bridgeValidAt, null, false);
+                RemoteObjects.updateState(child.id, child.data, child.ownerMemberId, childValidAt, child.arrivalServerTime);
+            } else {
+                // High latency: authority older than bridge → authority first.
+                RemoteObjects.updateState(child.id, child.data, child.ownerMemberId, childValidAt, child.arrivalServerTime);
+                RemoteObjects.updateState(child.id, bridgeData, child.ownerMemberId, bridgeValidAt, null, false);
+            }
+            // Pre-set lastVersions so repositionBufferedRemotesAtRest's
+            // settle() (and any other out-of-band buffered consumer) doesn't
+            // treat this version as unseen. Also tell replicationRuntime the
+            // version is already consumed so its own next reconcile does not
+            // re-ingest it (which would blow away the bridge sample we just
+            // installed).
+            RemoteObjects.lastVersions.set(child.id, child.version);
+            replicationRuntime.markVersionConsumed(
+                child.id, child.version,
+                { epoch: SessionClient.getSessionEpoch() });
+        }
+    }
+
+    // Pose for the synthetic bridge snapshot of one replacement child, given
+    // the parent's currently displayed (interpolated) transform. Pure function
+    // of its inputs — no ObjectSync/RemoteObjects access.
+    function computeReplacementBridgePose(childData, parentInterp, timing) {
+        const { timeDiffSec, bridgeIsBeforeAuth, velScaleX, velScaleY } = timing;
+        // Velocity used both as the back-projection anchor for bridge.x/y and
+        // as the bridge snapshot's velocity:
+        //   - LAN (bridge before auth): pre-split state — fragment was moving
+        //     with PARENT's velocity. Storing parent's velocity also makes the
+        //     Hermite tangent at the bridge end match parent's motion, so the
+        //     bracket [bridge, auth] smoothly transitions from parent_vel at
+        //     t=0 to child_vel at t=1.
+        //   - High-latency (bridge after auth): post-split state — fragment is
+        //     already on its child trajectory. Storing child's velocity drives
+        //     the extrapolation past the bridge (which becomes the latest
+        //     snapshot) along the authoritative trajectory.
+        let bridgeVx = bridgeIsBeforeAuth
+            ? (parentInterp.velocityX || 0)
+            : (childData.velocityX || 0);
+        let bridgeVy = bridgeIsBeforeAuth
+            ? (parentInterp.velocityY || 0)
+            : (childData.velocityY || 0);
+
+        // Angle override is conditional: fracture children store vertices
+        // already in world-aligned frame (parent rotation pre-applied) and use
+        // angle=0 structurally. Overriding their angle with parentInterp.angle
+        // would DOUBLE-rotate the rendered polygon during the bridge interval.
+        // Disk children (no vertices array, polygon regenerated from seed)
+        // carry angle = parent's angle at collision and DO benefit from a
+        // parentInterp.angle bridge for smooth angular continuity.
+        const isFractureChild =
+            AstervoidsWireCodec.hasAsteroidVertices(childData.vertices);
+        let bridgeX;
+        let bridgeY;
+        let bridgeAngle;
+        if (isFractureChild && bridgeIsBeforeAuth) {
+            // Reconstruct the fragment's pre-split rigid transform. Its
+            // explicit vertices and centroid are stored in the split-time world
+            // frame, so rotate both back by the parent's intervening angular
+            // motion. The centroid's rigid-body velocity supplies the matching
+            // Hermite tangent at the bridge end.
+            const parentVx = parentInterp.velocityX || 0;
+            const parentVy = parentInterp.velocityY || 0;
+            const angularSpeed =
+                (parentInterp.rotationSpeed || 0) * CONFIG.TARGET_FPS;
+            const rotationDelta = -angularSpeed * timeDiffSec;
+            const parentAtSplitX =
+                parentInterp.x + parentVx * velScaleX * timeDiffSec;
+            const parentAtSplitY =
+                parentInterp.y + parentVy * velScaleY * timeDiffSec;
+            const centroidX = (childData.x - parentAtSplitX) / velScaleX;
+            const centroidY = (childData.y - parentAtSplitY) / velScaleY;
+            const cos = Math.cos(rotationDelta);
+            const sin = Math.sin(rotationDelta);
+            const bridgeCentroidX = centroidX * cos - centroidY * sin;
+            const bridgeCentroidY = centroidX * sin + centroidY * cos;
+            bridgeX = parentInterp.x + bridgeCentroidX * velScaleX;
+            bridgeY = parentInterp.y + bridgeCentroidY * velScaleY;
+            bridgeAngle = rotationDelta;
+            bridgeVx = parentVx - angularSpeed * bridgeCentroidY;
+            bridgeVy = parentVy + angularSpeed * bridgeCentroidX;
+        } else {
+            // Disk children have no centroid offset. A bridge newer than
+            // authority follows the child's post-split path.
+            bridgeX = childData.x - bridgeVx * velScaleX * timeDiffSec;
+            bridgeY = childData.y - bridgeVy * velScaleY * timeDiffSec;
+            bridgeAngle = isFractureChild
+                ? (childData.angle || 0)
+                    - (childData.rotationSpeed || 0)
+                    * CONFIG.TARGET_FPS * timeDiffSec
+                : parentInterp.angle;
+        }
+        return {
+            x: bridgeX,
+            y: bridgeY,
+            velocityX: bridgeVx,
+            velocityY: bridgeVy,
+            angle: bridgeAngle
+        };
+    }
+
+    // Handle reconciliation failure after auto-reconnect: the transport
+    // reconnected but the server already processed our disconnect (member
+    // removed). Trigger full rejoin to restore session membership.
+    function handleReconciliationFailed() {
+        if (!isSessionMode()) return;
+        _warn('[Session] Reconciliation failed — server no longer recognizes this connection. Triggering full rejoin.');
+        const lostSessionId = sessionPicker.currentSessionId || SessionClient.getLastSessionId();
+        if (lostSessionId) {
+            // Re-freeze gameplay: onConnected may have unfrozen the game,
+            // but the session is broken. Keep the player frozen until rejoin.
+            if (game.state === 'playing' || game.state === 'waveDelay') {
+                game.connectionLost = true;
+                reconnectingOverlay.classList.add('visible');
+            }
+            // Clear stale session state so SessionClient knows we're not in a session
+            SessionClient.clearSessionState();
+            attemptAutoRejoin(lostSessionId);
+        } else {
+            returnToStartScreen('Session lost during reconnection');
+        }
+    }
+
+    // Unfreeze after successful reconciliation (deferred from onConnected
+    // to avoid a brief stale-state flicker while reconciliation is pending)
+    function handleReconciliationComplete() {
+        if (game.connectionLost && SessionClient.isInSession()) {
+            game.connectionLost = false;
+            game.lastFrameTime = 0;
+            reconnectingOverlay.classList.remove('visible');
+        }
+    }
+
     async function connectToSessionHub(force = false, hubHostname = '', refreshSessions = true) {
         setPickerConnectionState('connecting');
         updatePickerConnectionStatus();
@@ -9779,267 +10137,17 @@
                 }
                 ObjectSync.setSchemaIdSelector(selectWireoptSchemaId);
                 // Phase 2.3: game-defined, low-frequency per-object events.
+                // Handler bodies are top-level functions (see "Session hub
+                // event handlers" above) so this routine stays pure wiring.
                 ObjectSync.registerEventKind(EVENT_KIND.SHIP_STATE_CHANGED, EVENT_KIND_BYTE.SHIP_STATE_CHANGED);
-                ObjectSync.on(`objectEvent:${EVENT_KIND.SHIP_STATE_CHANGED}`, (objectId, payload) => {
-                    const obj = ObjectSync.getObject(objectId);
-                    if (obj && obj.data) {
-                        if (payload.score !== undefined) obj.data.score = payload.score;
-                        if (payload.hitCount !== undefined) obj.data.hitCount = payload.hitCount;
-                        CollisionEffects.startShipHit(
-                            objectId,
-                            payload,
-                            obj.data.colorIndex || 0);
-                    }
-                });
+                ObjectSync.on(`objectEvent:${EVENT_KIND.SHIP_STATE_CHANGED}`, handleShipStateChangedEvent);
                 ObjectSync.registerEventKind(EVENT_KIND.ASTEROID_IMPACT_CUE, EVENT_KIND_BYTE.ASTEROID_IMPACT_CUE);
-                ObjectSync.on(`objectEvent:${EVENT_KIND.ASTEROID_IMPACT_CUE}`, (objectId, payload) => {
-                    // The event identifies an asteroid the sender owns. Rebuild
-                    // the cue from relative impact geometry and this receiver's
-                    // displayed target pose, so deterministic arrival lag or a
-                    // buffered interpolation delay does not import sender coords.
-                    const obj = ObjectSync.getObject(objectId);
-                    if (obj?.data?.type !== OBJECT_TYPES.ASTEROID
-                        || typeof payload?.cueId !== 'string'
-                        || !payload.cueId) {
-                        return;
-                    }
-                    const asteroid = game.astervoids.find(a => a.syncObjectId === objectId);
-                    const target = asteroid || {
-                        syncObjectId: objectId,
-                        x: obj.data.x,
-                        y: obj.data.y,
-                        radius: obj.data.radius
-                    };
-                    CollisionEffects.startAsteroidHit({
-                        _impactCueKey: `asteroid:event:${payload.cueId}`,
-                        hitTargetId: objectId,
-                        hitBulletAngle: payload.bulletAngle,
-                        hitOffsetN: payload.offsetN,
-                        colorIndex: payload.colorIndex || 0,
-                        x: target.x,
-                        y: target.y
-                    }, target, {
-                        bulletAngle: payload.bulletAngle,
-                        offsetN: payload.offsetN
-                    });
-                });
+                ObjectSync.on(`objectEvent:${EVENT_KIND.ASTEROID_IMPACT_CUE}`, handleAsteroidImpactCue);
                 ObjectSync.on('onBatchReceived', (serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp) => RemoteObjects.recordPacketArrival(serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp));
-                // Detect GameState creation (replaces onGameStarted event)
-                ObjectSync.on('onObjectCreated', (obj) => {
-                    if (obj.data?.type === OBJECT_TYPES.GAME_STATE && sessionPicker.currentSessionId) {
-                        sessionPicker.gameStarted = true;
-                        updatePickerButtons();
-                    }
-                });
-                // Replacement always resolves target-bound cosmetic cues.
-                // Deterministic children inherit the parent's receiver-side
-                // baseline; buffered remotes use the synthetic bridge below.
-                //
-                // A new child otherwise has one sample at the authoritative
-                // collision time, while the parent was displayed on a delayed
-                // timeline. Add a second child sample anchored to the parent's
-                // last displayed transform. When the bridge predates authority,
-                // Hermite interpolation spans bridge -> authority. When it is
-                // newer, the bridge becomes the extrapolation base on the child
-                // trajectory. The latter softens the install-time jump but does
-                // not guarantee zero later correction.
-                //
-                // Locally-owned children are skipped because local physics, not
-                // RemoteObjects, drives their pose. Synthetic samples never feed
-                // adaptive-delay estimation; their time already depends on the
-                // current delay and would create positive feedback.
-                ObjectSync.on('onObjectReplaced', (deletedObjectId, createdObjects, batchValidAt) => {
-                    CollisionEffects.resolveTarget(deletedObjectId);
-                    const renderTime = performance.now();
-                    if (isDeterministicMode()) {
-                        const parentState = DeadReckon.states.get(deletedObjectId);
-                        const parentAsteroid = game.astervoids.find(
-                            asteroid => asteroid.syncObjectId === deletedObjectId);
-                        const localBaselinePerf = parentAsteroid?.replacementStartedPerf;
-                        if (parentAsteroid) {
-                            delete parentAsteroid.replacementStartedPerf;
-                        }
-                        const replacementBaselinePerf =
-                            localBaselinePerf
-                            ?? ReplicationPresentation.calculateReplacementBaselinePerf(
-                                parentState, batchValidAt, renderTime);
-                        if (Number.isFinite(replacementBaselinePerf)) {
-                            for (const child of createdObjects) {
-                                const record = ObjectSync.getObject(child.id);
-                                if (record) {
-                                    record.replacementBaselinePerf =
-                                        Math.min(renderTime, replacementBaselinePerf);
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    if (!RemoteObjects.isClockOffsetInitialized()) return;
-                    if (batchValidAt == null) return;
-                    const myMemberId = SessionClient.getCurrentMember()?.id;
-                    const parentInterp = RemoteObjects.getInterpolated(deletedObjectId, renderTime);
-                    if (!parentInterp) return;
-
-                    // Velocity-based back-projection scales for normalized x/y.
-                    const refDim = getReferenceDimension();
-                    const velScaleX = refDim / getGameWidth();
-                    const velScaleY = refDim / getGameHeight();
-
-                    for (const child of createdObjects) {
-                        // Skip locally-owned children — local game physics drives
-                        // their position, not the interpolator.
-                        if (child.ownerMemberId === myMemberId) continue;
-                        // All children in a Replace broadcast share the same
-                        // server-validated replacement-operation validAt.
-                        const childValidAt = batchValidAt;
-                        // Bridge anchor in server-time: "where the renderer is
-                        // currently displaying objects from this owner".
-                        const delay = RemoteObjects.getDelayForMember(child.ownerMemberId);
-                        const bridgeValidAt = Math.round(RemoteObjects.serverNowMs() - delay);
-                        const timeDiffSec = (childValidAt - bridgeValidAt) / 1000;
-                        const bridgeIsBeforeAuth = bridgeValidAt <= childValidAt;
-
-                        // Velocity used both as the back-projection anchor for
-                        // bridge.x/y and as the bridge snapshot's velocity:
-                        //   - LAN (bridge before auth): pre-split state — fragment
-                        //     was moving with PARENT's velocity. Storing parent's
-                        //     velocity also makes the Hermite tangent at the bridge
-                        //     end match parent's motion, so the bracket [bridge,
-                        //     auth] smoothly transitions from parent_vel at t=0 to
-                        //     child_vel at t=1.
-                        //   - High-latency (bridge after auth): post-split state —
-                        //     fragment is already on its child trajectory. Storing
-                        //     child's velocity drives the extrapolation past the
-                        //     bridge (which becomes the latest snapshot) along the
-                        //     authoritative trajectory.
-                        let bridgeVx = bridgeIsBeforeAuth
-                            ? (parentInterp.velocityX || 0)
-                            : (child.data.velocityX || 0);
-                        let bridgeVy = bridgeIsBeforeAuth
-                            ? (parentInterp.velocityY || 0)
-                            : (child.data.velocityY || 0);
-
-                        // Angle override is conditional: fracture children store
-                        // vertices already in world-aligned frame (parent rotation
-                        // pre-applied) and use angle=0 structurally. Overriding
-                        // their angle with parentInterp.angle would DOUBLE-rotate
-                        // the rendered polygon during the bridge interval. Disk
-                        // children (no vertices array, polygon regenerated from
-                        // seed) carry angle = parent's angle at collision and DO
-                        // benefit from a parentInterp.angle bridge for smooth
-                        // angular continuity.
-                        const isFractureChild =
-                            AstervoidsWireCodec.hasAsteroidVertices(child.data.vertices);
-                        let bridgeX;
-                        let bridgeY;
-                        let bridgeAngle;
-                        if (isFractureChild && bridgeIsBeforeAuth) {
-                            // Reconstruct the fragment's pre-split rigid transform.
-                            // Its explicit vertices and centroid are stored in the
-                            // split-time world frame, so rotate both back by the
-                            // parent's intervening angular motion. The centroid's
-                            // rigid-body velocity supplies the matching Hermite
-                            // tangent at the bridge end.
-                            const parentVx = parentInterp.velocityX || 0;
-                            const parentVy = parentInterp.velocityY || 0;
-                            const angularSpeed =
-                                (parentInterp.rotationSpeed || 0) * CONFIG.TARGET_FPS;
-                            const rotationDelta = -angularSpeed * timeDiffSec;
-                            const parentAtSplitX =
-                                parentInterp.x + parentVx * velScaleX * timeDiffSec;
-                            const parentAtSplitY =
-                                parentInterp.y + parentVy * velScaleY * timeDiffSec;
-                            const centroidX =
-                                (child.data.x - parentAtSplitX) / velScaleX;
-                            const centroidY =
-                                (child.data.y - parentAtSplitY) / velScaleY;
-                            const cos = Math.cos(rotationDelta);
-                            const sin = Math.sin(rotationDelta);
-                            const bridgeCentroidX =
-                                centroidX * cos - centroidY * sin;
-                            const bridgeCentroidY =
-                                centroidX * sin + centroidY * cos;
-                            bridgeX = parentInterp.x + bridgeCentroidX * velScaleX;
-                            bridgeY = parentInterp.y + bridgeCentroidY * velScaleY;
-                            bridgeAngle = rotationDelta;
-                            bridgeVx = parentVx - angularSpeed * bridgeCentroidY;
-                            bridgeVy = parentVy + angularSpeed * bridgeCentroidX;
-                        } else {
-                            // Disk children have no centroid offset. A bridge newer
-                            // than authority follows the child's post-split path.
-                            bridgeX =
-                                child.data.x - bridgeVx * velScaleX * timeDiffSec;
-                            bridgeY =
-                                child.data.y - bridgeVy * velScaleY * timeDiffSec;
-                            bridgeAngle = isFractureChild
-                                ? (child.data.angle || 0)
-                                    - (child.data.rotationSpeed || 0)
-                                    * CONFIG.TARGET_FPS * timeDiffSec
-                                : parentInterp.angle;
-                        }
-                        const bridgeData = {
-                            ...child.data,
-                            x: bridgeX,
-                            y: bridgeY,
-                            velocityX: bridgeVx,
-                            velocityY: bridgeVy,
-                            angle: bridgeAngle,
-                        };
-                        if (bridgeIsBeforeAuth) {
-                            // LAN: bridge older than authority → bridge first.
-                            // Bridge snapshot is synthetic (validAt back-projected
-                            // from current delay); EXCLUDED from adaptive-delay
-                            // sampling to prevent positive feedback (delay
-                            // estimate would otherwise feed itself on every spawn).
-                            RemoteObjects.updateState(child.id, bridgeData, child.ownerMemberId, bridgeValidAt, null, false);
-                            RemoteObjects.updateState(child.id, child.data, child.ownerMemberId, childValidAt, child.arrivalServerTime);
-                        } else {
-                            // High latency: authority older than bridge → authority first.
-                            RemoteObjects.updateState(child.id, child.data, child.ownerMemberId, childValidAt, child.arrivalServerTime);
-                            RemoteObjects.updateState(child.id, bridgeData, child.ownerMemberId, bridgeValidAt, null, false);
-                        }
-                        // Pre-set lastVersions so repositionBufferedRemotesAtRest's
-                        // settle() (and any other out-of-band buffered consumer)
-                        // doesn't treat this version as unseen. Also tell
-                        // replicationRuntime the version is already consumed so
-                        // its own next reconcile does not re-ingest it (which
-                        // would blow away the bridge sample we just installed).
-                        RemoteObjects.lastVersions.set(child.id, child.version);
-                        replicationRuntime.markVersionConsumed(
-                            child.id, child.version,
-                            { epoch: SessionClient.getSessionEpoch() });
-                    }
-                });
-                // Handle reconciliation failure after auto-reconnect: the transport
-                // reconnected but the server already processed our disconnect (member
-                // removed). Trigger full rejoin to restore session membership.
-                ObjectSync.on('onReconciliationFailed', () => {
-                    if (!isSessionMode()) return;
-                    _warn('[Session] Reconciliation failed — server no longer recognizes this connection. Triggering full rejoin.');
-                    const lostSessionId = sessionPicker.currentSessionId || SessionClient.getLastSessionId();
-                    if (lostSessionId) {
-                        // Re-freeze gameplay: onConnected may have unfrozen the game,
-                        // but the session is broken. Keep the player frozen until rejoin.
-                        if (game.state === 'playing' || game.state === 'waveDelay') {
-                            game.connectionLost = true;
-                            reconnectingOverlay.classList.add('visible');
-                        }
-                        // Clear stale session state so SessionClient knows we're not in a session
-                        SessionClient.clearSessionState();
-                        attemptAutoRejoin(lostSessionId);
-                    } else {
-                        returnToStartScreen('Session lost during reconnection');
-                    }
-                });
-                // Unfreeze after successful reconciliation (deferred from onConnected
-                // to avoid a brief stale-state flicker while reconciliation is pending)
-                ObjectSync.on('onReconciliationComplete', () => {
-                    if (game.connectionLost && SessionClient.isInSession()) {
-                        game.connectionLost = false;
-                        game.lastFrameTime = 0;
-                        reconnectingOverlay.classList.remove('visible');
-                    }
-                });
+                ObjectSync.on('onObjectCreated', handleGameStateObjectCreated);
+                ObjectSync.on('onObjectReplaced', handleObjectReplaced);
+                ObjectSync.on('onReconciliationFailed', handleReconciliationFailed);
+                ObjectSync.on('onReconciliationComplete', handleReconciliationComplete);
                 // Remote creates are not projected to owner "now": buffered mode keys
                 // the first sample on validAt and initially clamps its buffer;
                 // deterministic mode arrival-anchors lifecycle state. A local
@@ -10067,7 +10175,7 @@
                         velocityX: 'vx', velocityY: 'vy', rotationSpeed: 'rs',
                         thrusting: 'th', invulnerable: 'iv', colorIndex: 'ci',
                         memberId: 'mi', score: 'sc', hitCount: 'hc',
-                        radius: 'r', seed: 'sd', spawnTimestamp: 'sp',
+                        radius: 'r', seed: 'sd',
                         lifetime: 'lt', ownerMemberId: 'om',
                         pendingHit: 'ph', hitTargetId: 'ht', hitImpactTorque: 'hi',
                         hitBulletAngle: 'ha', hitOffsetN: 'hn',
@@ -11148,9 +11256,10 @@
     const reconnectingSince = new Map();
 
     async function initMultiRegionPicker(regions) {
-        if (!window.SpectatorClient || !window.MultiRegionSessions && false) {
-            // MultiRegionSessions lives in this same file; the SpectatorClient
-            // check guards against the script tag being absent (e.g. test page).
+        if (!window.SpectatorClient) {
+            // Guards against the spectator-client.js script tag being absent
+            // (e.g. the standalone test page): fall back to single-region
+            // REST polling instead of the push-driven multi-region picker.
             if (isSessionPickerActive()) await activateSessionPickerUpdates();
             return;
         }

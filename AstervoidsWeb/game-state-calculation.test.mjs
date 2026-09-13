@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const require = createRequire(import.meta.url);
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
@@ -634,7 +635,6 @@ test('recovery snapshots invalidate aggregation without replaying already-consum
 
 test('real ObjectSync retries unconfirmed cached GameState after failed, empty, and rejected responses',
     async () => {
-        const source = readFileSync(new URL('./wwwroot/js/object-sync.js', import.meta.url), 'utf8');
         const authoritativeObject = require('./wwwroot/js/authoritative-object.js');
         for (const failure of [null, { versions: {} }, new Error('network failure')]) {
             const handlers = {};
@@ -652,8 +652,11 @@ test('real ObjectSync retries unconfirmed cached GameState after failed, empty, 
                     return failure;
                 },
             };
-            const objectSync = new Function('SessionClient', 'AuthoritativeObject', 'window',
-                `${source}\nreturn ObjectSync;`)(client, authoritativeObject, { ASTERVOIDS_DEBUG: false });
+            const objectSync = loadClassicModule('object-sync.js', 'ObjectSync', {
+                SessionClient: client,
+                AuthoritativeObject: authoritativeObject,
+                window: { ASTERVOIDS_DEBUG: false }
+            });
             objectSync.init();
             objectSync.configure({ deltaEncoding: true });
             handlers.onSessionJoined({ objects: [

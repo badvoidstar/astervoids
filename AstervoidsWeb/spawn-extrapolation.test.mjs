@@ -19,12 +19,16 @@
  *
  * Run with:  node --test AstervoidsWeb/spawn-extrapolation.test.mjs
  *
- * Mirror with AstervoidsWeb/wwwroot/index.html (RemoteObjects).
+ * `computeSpawnStaleness` and `projectSpawnData` are the PRODUCTION inline
+ * functions, loaded via test-support/inline-game.mjs — not mirrors. Geometry
+ * dependencies are injected as a square viewport so the reference-dimension
+ * scale factor is 1 and position assertions stay arithmetic.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const { SHARED_DEFAULTS } = require('./wwwroot/js/game-config.js');
@@ -36,34 +40,38 @@ const CONFIG = {
     TARGET_FPS: SHARED_DEFAULTS.TARGET_FPS,
 };
 
-// ── Pure-logic mirrors of RemoteObjects helpers ───────────────────────────
+// ── Production helpers under test ─────────────────────────────────────────
+// A square viewport makes refDim / gameWidth === refDim / gameHeight === 1,
+// so projection reduces to position + velocity × staleness. Bounding radius
+// is 0 by default, which keeps wrap margins at 0; the wrap test below
+// overrides it to exercise the radius-aware margin path.
+let boundingRadius = 0;
 
-/** Mirror of RemoteObjects.computeSpawnStaleness (clamped to ±MAX_EXTRAPOLATION). */
-function computeSpawnStaleness(serverNowMsValue, validAt) {
-    const elapsedSec = (serverNowMsValue - validAt) / 1000;
-    const cap = CONFIG.MAX_EXTRAPOLATION;
-    if (elapsedSec > cap) return cap;
-    if (elapsedSec < -cap) return -cap;
-    return elapsedSec;
-}
+const {
+    computeSpawnStaleness,
+    projectSpawnData,
+    wrapNormalized,
+    wrapMarginX,
+    wrapMarginY,
+} = loadInlineGameFunctions(
+    ['computeSpawnStaleness', 'projectSpawnData', 'wrapNormalized',
+        'wrapMarginX', 'wrapMarginY'],
+    {
+        CONFIG,
+        getGameWidth: () => 1000,
+        getGameHeight: () => 1000,
+        getReferenceDimension: () => 1000,
+        getRemoteBoundingRadius: () => boundingRadius,
+    });
 
 /**
- * Simplified mirror of RemoteObjects.projectSpawnData. The production
- * version applies toroidal wrap; this test mirror skips wrap to keep
- * arithmetic assertions simple. Wrap behavior is exercised separately
- * inside the wrap-skip test below using a stand-in helper.
+ * projectSpawnData returns the SAME object reference when staleness is falsy
+ * (a deliberate allocation-free fast path). Tests that then mutate or compare
+ * keys use this helper to keep the old copy-on-read expectation explicit.
  */
-function projectSpawnDataNoWrap(data, stalenessSec) {
-    if (!stalenessSec) return { ...data };
-    const vx = data.velocityX || 0;
-    const vy = data.velocityY || 0;
-    const rs = data.rotationSpeed || 0;
-    return {
-        ...data,
-        x: (data.x || 0) + vx * stalenessSec,
-        y: (data.y || 0) + vy * stalenessSec,
-        angle: (data.angle || 0) + rs * CONFIG.TARGET_FPS * stalenessSec,
-    };
+function projectSpawnDataCopy(data, stalenessSec) {
+    const result = projectSpawnData(data, stalenessSec);
+    return result === data ? { ...data } : result;
 }
 
 /**
@@ -138,50 +146,93 @@ test('computeSpawnStaleness: at exactly the cap returns the cap', () => {
 
 test('projectSpawnData: zero staleness returns data unchanged', () => {
     const data = { x: 0.5, y: 0.5, velocityX: 100, velocityY: 50, angle: 0.7, rotationSpeed: 0.1 };
-    const result = projectSpawnDataNoWrap(data, 0);
+    const result = projectSpawnDataCopy(data, 0);
     assert.deepEqual(result, data);
 });
 
 test('projectSpawnData: forward projection moves x/y by velocity × staleness', () => {
-    const data = { x: 10, y: 20, velocityX: 100, velocityY: -50, angle: 0, rotationSpeed: 0 };
-    const result = projectSpawnDataNoWrap(data, 0.5);
-    assert.equal(result.x, 60, 'x = 10 + 100 * 0.5');
-    assert.equal(result.y, -5, 'y = 20 + (-50) * 0.5');
+    const data = { x: 0.1, y: 0.2, velocityX: 0.5, velocityY: -0.2, angle: 0, rotationSpeed: 0 };
+    const result = projectSpawnDataCopy(data, 0.5);
+    assert.equal(result.x, 0.1 + 0.5 * 0.5, 'x = 0.1 + 0.5 * 0.5');
+    assert.equal(result.y, 0.2 + -0.2 * 0.5, 'y = 0.2 + (-0.2) * 0.5');
 });
 
 test('projectSpawnData: backward projection (negative staleness) reverses motion', () => {
-    const data = { x: 10, y: 20, velocityX: 100, velocityY: -50, angle: 0, rotationSpeed: 0 };
-    const result = projectSpawnDataNoWrap(data, -0.2);
-    assert.equal(result.x, -10, 'x = 10 + 100 * -0.2');
-    assert.equal(result.y, 30, 'y = 20 + (-50) * -0.2');
+    const data = { x: 0.5, y: 0.2, velocityX: 0.5, velocityY: -0.2, angle: 0, rotationSpeed: 0 };
+    const result = projectSpawnDataCopy(data, -0.2);
+    assert.equal(result.x, 0.5 + 0.5 * -0.2, 'x = 0.5 + 0.5 * -0.2');
+    assert.equal(result.y, 0.2 + -0.2 * -0.2, 'y = 0.2 + (-0.2) * -0.2');
 });
 
 test('projectSpawnData: angle advances by rotationSpeed × TARGET_FPS × staleness', () => {
     // rotationSpeed is per-frame; multiplied by TARGET_FPS to convert to per-sec.
     const data = { x: 0, y: 0, velocityX: 0, velocityY: 0, angle: 1.0, rotationSpeed: 0.1 };
-    const result = projectSpawnDataNoWrap(data, 0.5);
+    const result = projectSpawnDataCopy(data, 0.5);
     // angle = 1.0 + 0.1 * 60 * 0.5 = 1.0 + 3.0 = 4.0
     assert.equal(result.angle, 4.0);
 });
 
 test('projectSpawnData: missing velocity/angle/rotation fields default to 0', () => {
-    const data = { x: 5, y: 5 };
-    const result = projectSpawnDataNoWrap(data, 0.5);
-    assert.equal(result.x, 5);
-    assert.equal(result.y, 5);
+    const data = { x: 0.5, y: 0.5 };
+    const result = projectSpawnDataCopy(data, 0.5);
+    assert.equal(result.x, 0.5);
+    assert.equal(result.y, 0.5);
     assert.equal(result.angle, 0);
 });
 
 test('projectSpawnData: preserves non-motion fields (id, ownerMemberId, etc.)', () => {
     const data = {
-        x: 1, y: 1, velocityX: 100, velocityY: 0,
+        x: 0.1, y: 0.1, velocityX: 0.2, velocityY: 0,
         angle: 0, rotationSpeed: 0,
         id: 'asteroid-42', ownerMemberId: 'member-A', radius: 0.05,
     };
-    const result = projectSpawnDataNoWrap(data, 0.5);
+    const result = projectSpawnDataCopy(data, 0.5);
     assert.equal(result.id, 'asteroid-42');
     assert.equal(result.ownerMemberId, 'member-A');
     assert.equal(result.radius, 0.05);
+});
+
+test('projectSpawnData: wraps past the far edge using the radius-aware margin', () => {
+    // Previously unreachable: the deleted test mirror skipped wrap entirely, so
+    // the production toroidal branch had no direct coverage here.
+    boundingRadius = 0.05;
+    try {
+        const margin = wrapMarginX(0.05);
+        const data = { x: 0.9, y: 0.5, velocityX: 0.4, velocityY: 0, radius: 0.05 };
+        const result = projectSpawnData(data, 0.5);
+        // 0.9 + 0.2 = 1.1, which is beyond 1 + margin, so it re-enters at the left.
+        assert.equal(result.x, wrapNormalized(1.1, margin));
+        assert.ok(result.x <= 0, 'wrapped position re-enters at the left edge');
+        assert.equal(result.y, 0.5, 'y is unaffected by an x-only wrap');
+    } finally {
+        boundingRadius = 0;
+    }
+});
+
+test('projectSpawnData: radius margin keeps a partly off-screen object unwrapped', () => {
+    boundingRadius = 0.05;
+    try {
+        const data = { x: 0.98, y: 0.5, velocityX: 0.04, velocityY: 0, radius: 0.05 };
+        const result = projectSpawnData(data, 0.5);
+        // 1.0 sits inside the 1 + margin bound, so the object stays put and
+        // finishes leaving the screen before reappearing.
+        assert.equal(result.x, 1.0);
+    } finally {
+        boundingRadius = 0;
+    }
+});
+
+test('projectSpawnData: wraps on the y axis using wrapMarginY', () => {
+    boundingRadius = 0.05;
+    try {
+        const margin = wrapMarginY(0.05);
+        const data = { x: 0.5, y: 0.02, velocityX: 0, velocityY: -0.4, radius: 0.05 };
+        const result = projectSpawnData(data, 0.5);
+        assert.equal(result.y, wrapNormalized(0.02 - 0.2, margin));
+        assert.ok(result.y > 0.5, 'wrapped position re-enters near the bottom edge');
+    } finally {
+        boundingRadius = 0;
+    }
 });
 
 // ── computeSpawnStaleness + projectSpawnData composed ─────────────────────
@@ -191,13 +242,13 @@ test('compose: spawn projection uses clamped staleness', () => {
     // a runaway projection (would teleport asteroid 10× its expected distance).
     const serverNow = 11000;
     const validAt = 1000; // 10 seconds old
-    const data = { x: 0, y: 0, velocityX: 100, velocityY: 0 };
+    const data = { x: 0, y: 0, velocityX: 0.1, velocityY: 0 };
 
     const staleness = computeSpawnStaleness(serverNow, validAt);
     assert.equal(staleness, CONFIG.MAX_EXTRAPOLATION);
 
-    const projected = projectSpawnDataNoWrap(data, staleness);
-    assert.equal(projected.x, 100 * CONFIG.MAX_EXTRAPOLATION);
+    const projected = projectSpawnDataCopy(data, staleness);
+    assert.equal(projected.x, 0.1 * CONFIG.MAX_EXTRAPOLATION);
 });
 
 // ── Single-snapshot velocity extrapolation (production fallback path) ─────
@@ -237,18 +288,18 @@ test('singleSnapExtrapolate: returns null for null snap', () => {
 // ── Continuity invariant: spawn projection and bracket extrapolation match ─
 
 test('continuity: receiver bracket-extrapolates to same x as local-owner spawn projection', () => {
-    // The owner authors a snap at validAt=1000 with x=0.5, vx=100.
+    // The owner authors a snap at validAt=1000 with x=0.2, vx=0.5.
     // The local owner adopts the asteroid at serverNow=1300 (300ms RTT)
-    // and forward-projects: x = 0.5 + 100 * 0.3 = 30.5.
+    // and forward-projects: x = 0.2 + 0.5 * 0.3 = 0.35.
     // A receiver renders the same snap at the same server-time moment
     // (renderTime equivalent to serverNow=1300) and bracket-extrapolates:
-    // also x = 0.5 + 100 * 0.3 = 30.5. Both arrive at the same position.
+    // also x = 0.2 + 0.5 * 0.3 = 0.35. Both arrive at the same position.
     const validAt = 1000;
     const serverNow = 1300;
-    const data = { x: 0.5, y: 0, velocityX: 100, velocityY: 0, angle: 0, rotationSpeed: 0 };
+    const data = { x: 0.2, y: 0, velocityX: 0.5, velocityY: 0, angle: 0, rotationSpeed: 0 };
 
     const staleness = computeSpawnStaleness(serverNow, validAt);
-    const projected = projectSpawnDataNoWrap(data, staleness);
+    const projected = projectSpawnDataCopy(data, staleness);
 
     // Bracket extrapolation arm: snap.time on perf.now axis; assume perf.now == server-time
     // for this test (offset=0, delta=0). Then snap.time = 1000, targetTime = 1300.
@@ -305,9 +356,10 @@ test('adopt gate: orphan stale by >MAX_EXTRAPOLATION would teleport if projected
     const serverNow = 9000; // 8s idle
     const staleness = computeSpawnStaleness(serverNow, validAt);
     assert.equal(staleness, CONFIG.MAX_EXTRAPOLATION);
-    const data = { x: 0.5, y: 0, velocityX: 200, velocityY: 0, angle: 0, rotationSpeed: 0 };
-    const projected = projectSpawnDataNoWrap(data, staleness);
-    assert.equal(projected.x, 0.5 + 200 * CONFIG.MAX_EXTRAPOLATION);
+    const data = { x: 0.1, y: 0, velocityX: 0.2, velocityY: 0, angle: 0, rotationSpeed: 0 };
+    const projected = projectSpawnDataCopy(data, staleness);
+    // 0.4 of the play field — a visible teleport for an object that never moved.
+    assert.equal(projected.x, 0.1 + 0.2 * CONFIG.MAX_EXTRAPOLATION);
     // The gate prevents this: runtime identifies an initial snapshot record.
     assert.equal(shouldSpawnProject(
         { id: 'orphan-idle', validAt },

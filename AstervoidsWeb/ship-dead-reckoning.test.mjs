@@ -311,7 +311,7 @@ const {
     velocityToNormalizedDeltaX,
     velocityToNormalizedDeltaY,
 } = loadInlineGameFunctions([
-    'Ship',
+    'Ship', 'ShipInvulnerability', 'assignDefined',
     'normalizeTurnControlMode',
     'getShipTurnSpeed',
     'shortestAngleDelta',

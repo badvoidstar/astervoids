@@ -1362,7 +1362,7 @@ sequenceDiagram
     participant SC as SessionClient
     participant SRV as Server
 
-    Note over OS: computeDelta(): compare current data vs lastSentData<br/>Uses shallow reference comparison (===)<br/>Nested objects must be spread into new refs
+    Note over OS: computeDelta(): compare current data vs the object's lastSentData<br/>Uses shallow reference comparison (===)<br/>Nested objects must be spread into new refs
 
     OS->>OS: delta = computeDelta(objectId, data)<br/>lastSentData NOT updated yet
 
@@ -1859,177 +1859,25 @@ Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
 wildcard cert covers all per-region / per-branch ACA subdomains, while the
 apex hostname is bound on the Static Web App entrypoint.
 
-#### One-time setup (~10 min)
+#### Setup, permissions, and rotation
 
-Steps 1 and 3 below are manual (one-time external setup that doesn't fit
-bicep). Steps 2, 4, and 5 are bicep-managed only when a production BYO
-deployment supplies the custom-domain pair and certificate URL/name, omits
-`CERT_READER_IDENTITY_ID`, and leaves `MANAGE_ACMEBOT_PERMISSIONS=true` (the
-default). That explicit ACMEbot path provisions `id-acme-cert-reader` in
-`rg-production`, grants ACMEbot DNS Zone Contributor on the production DNS
-zone, and grants the cert reader Key Vault Certificate User on the ACMEbot KV.
-Production deployments without BYO certificate inputs do not reference
-ACMEbot resources. The deployment identity needs User Access Administrator or
-Owner at the production and certificate-Key-Vault scopes for this opt-in path,
-because it creates role assignments; use an externally managed reader identity
-instead when the normal Contributor role should remain sufficient.
+The one-time ACMEbot setup, the bicep-managed vs. externally managed
+permission paths, and the cert-rotation cadence are operational procedures
+rather than architectural contracts. They live in
+[CICD_SETUP.md → BYO wildcard certificate (ACMEbot) runbook](CICD_SETUP.md#byo-wildcard-certificate-acmebot-runbook).
 
-```bash
-# 1. [MANUAL, ONE-TIME] Deploy ACMEbot via its ARM template (use the README button):
-#    https://github.com/shibayan/keyvault-acmebot
-#    Pick: subscription, resource group (default: sg-acmebot), Key Vault name (default: kv-astervoids).
-#    Configure: DNS provider = Azure DNS, mailbox for Let's Encrypt notifications.
-#
-#    Enabling Easy Auth (REQUIRED before the dashboard works — the ARM
-#    template does NOT auto-enable it; visiting the dashboard pre-auth
-#    returns 401 with a JSON error body):
-#
-#      a. In the Azure Portal: Function App → Authentication → Add
-#         identity provider → Microsoft.
-#      b. App registration: "Create new app registration" with name
-#         `<acmebot-function-app>-easyauth`.
-#         IMPORTANT: pick "Workforce" tenant (default) — NOT "Customers"
-#         (B2C is a separate product and the Function App can't use it).
-#      c. Restrict access: "Require authentication". Unauthenticated
-#         request action: "HTTP 401 Unauthorized".
-#      d. After it saves, go to Entra ID → App registrations → find
-#         the new `<acmebot-function-app>-easyauth` app:
-#           • Authentication → enable "ID tokens (used for implicit
-#             and hybrid flows)" checkbox. Save. Without this you'll
-#             hit AADSTS700054 (response_type 'id_token' is not enabled).
-#           • Manifest → confirm `accessTokenAcceptedVersion: 2` and
-#             that the Function App's authsettingsV2 uses the v2 issuer
-#             URL `https://login.microsoftonline.com/<tenant-id>/v2.0`.
-#             (The Portal sometimes wires the v1 URL by default; v1
-#             rejects v2 tokens and you'll get login-loop 401s.)
-#           • Certificates & secrets → "New client secret" → 6-month
-#             expiry. Copy the value.
-#           • In the Function App → Configuration, set
-#             `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` to that value.
-#             (The portal stores it on the Authentication blade but
-#             also exposes it as an app setting under this name.)
-#
-#      Calendar reminder: rotate `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET`
-#      before the 6-month expiry, or the dashboard locks you out. The
-#      scheduled workflow `.github/workflows/check-easy-auth-secret.yml`
-#      checks weekly and auto-opens a GitHub issue (with the rotation
-#      runbook from `.github/ISSUE_TEMPLATE/easy-auth-secret-rotation.md`)
-#      when < 30 days remain — set the repo variable `EASYAUTH_APP_ID` to
-#      the app reg's client ID to enable it.
+The contract this document pins down is narrower:
 
-# 2. [BICEP-MANAGED — provided here for disaster recovery only]
-#    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
-#    so it can write _acme-challenge TXT records for the DNS-01 challenge.
-DNS_ZONE_RG=rg-production
-DNS_ZONE_NAME=<your-domain.com>
-ACMEBOT_IDENTITY_ID=$(az functionapp identity show \
-  --resource-group sg-acmebot --name func-astervoids \
-  --query principalId -o tsv)
-az role assignment create \
-  --assignee "$ACMEBOT_IDENTITY_ID" \
-  --role "DNS Zone Contributor" \
-  --scope "$(az network dns zone show \
-    --resource-group "$DNS_ZONE_RG" --name "$DNS_ZONE_NAME" --query id -o tsv)"
-
-# 3. [MANUAL, ONE-TIME] Issue the wildcard cert via the ACMEbot dashboard:
-#    Open https://<acmebot-function-app>.azurewebsites.net/
-#    (the Polymind fork serves the dashboard at the ROOT URL, NOT /dashboard
-#    as the upstream wiki says — visiting /dashboard returns 404 / blank).
-#    Sign in with the Entra ID account that has access to the app reg from step 1.
-#    Click "Add" → enter "*.<your-domain.com>" → wait ~2 min.
-#    Cert lands in Key Vault as a secret (name it `wildcard-<sanitised-domain>`,
-#    where dots are replaced with dashes — e.g. wildcard-example-com).
-
-# 4. [BICEP-MANAGED — provided here for disaster recovery only]
-#    User-assigned identity that production CAEs use to read the cert from KV.
-az identity create \
-  --resource-group rg-production \
-  --name id-acme-cert-reader \
-  --location <primary-region>
-
-# 5. [BICEP-MANAGED — provided here for disaster recovery only]
-#    Grant the identity 'Key Vault Certificate User' role on the KV.
-CERT_READER_PRINCIPAL_ID=$(az identity show \
-  --resource-group rg-production --name id-acme-cert-reader \
-  --query principalId -o tsv)
-KV_NAME=kv-astervoids
-KV_ID=$(az keyvault show --name "$KV_NAME" --query id -o tsv)
-az role assignment create \
-  --assignee-object-id "$CERT_READER_PRINCIPAL_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Key Vault Certificate User" \
-  --scope "$KV_ID"
-
-# 6. [REQUIRED, ONE-TIME] Get the cert's Key Vault secret URL (versionless so renewals pick up automatically):
-KV_NAME=kv-astervoids
-CERT_NAME=wildcard-<sanitised-domain>  # whatever you named it in step 3
-CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
-
-# 7. [REQUIRED, ONE-TIME] Set GitHub repo variables so the workflow knows where to find everything.
-#    CERT_READER_IDENTITY_ID is OPTIONAL only for the explicit production
-#    ACMEbot path (MANAGE_ACMEBOT_PERMISSIONS=true). It IS required for branch
-#    deploys because the bootstrap step must attach the identity to the shared
-#    CAE before it creates the certificate:
-CERT_READER_IDENTITY_ID=$(az identity show \
-  --resource-group rg-production --name id-acme-cert-reader \
-  --query id -o tsv)
-gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
-gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
-gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
-gh variable set MANAGE_ACMEBOT_PERMISSIONS --body true
-```
-
-##### Opting out of bicep-managed ACMEbot permissions
-
-If you'd rather manage the cert reader identity and role assignments
-yourself (e.g. they live in a different subscription or you have a
-stricter least-privilege flow), set
-`MANAGE_ACMEBOT_PERMISSIONS=false` in the selected azd environment or GitHub
-repository variable. Bicep then expects:
-  - `certReaderIdentityId` param (or `CERT_READER_IDENTITY_ID` env var
-    that the workflow forwards) to be set to an existing identity's
-    resource ID.
-  - The identity already has Key Vault Certificate User on the BYO cert KV.
-  - ACMEbot already has DNS Zone Contributor on the production DNS zone.
-
-##### Cleaning up duplicate role assignments after first bicep-managed deploy
-
-If you previously ran steps 2, 4, and 5 manually (random-GUID-named role
-assignments), the first deploy with `manageAcmebotPermissions=true`
-creates a SECOND, deterministically-named assignment alongside each
-manual one. Both are functionally equivalent. To clean up:
-
-```bash
-# List both assignments for the cert reader on the KV — keep the one with
-# the deterministic GUID matching guid(scope, principalId, roleId), delete
-# the random-named one. Same drill for ACMEbot's DNS Zone Contributor.
-az role assignment list \
-  --assignee "$CERT_READER_PRINCIPAL_ID" \
-  --scope "$KV_ID" \
-  --query "[].{name:name,role:roleDefinitionName}" -o table
-az role assignment delete --ids <random-guid-assignment-id>
-```
-
-After step 7, the next deploy of `main` will:
-- Provision a `Microsoft.App/managedEnvironments/certificates` resource on every region's CAE referencing the KV secret URL + the reader identity.
-- Bind `<subdomain>.<domain>` on every region's container app with `bindingType: SniEnabled` pointing at that cert resource.
-- The legacy "Configure Custom Domain" workflow step short-circuits (`env.CERT_KEY_VAULT_SECRET_URL != ''` guard) — no DigiCert managed-cert provisioning happens.
-
-Same wildcard cert covers every branch deploy too (e.g. `astervoids-mybranch.<domain>` matches `*.<domain>`), so branch deploys also skip the cert provisioning wait — typically saving 5-7 minutes per branch deploy.
-
-#### Cert rotation
-
-ACMEbot rotates the cert in KV every ~60 days. Container Apps doesn't
-auto-detect new KV cert versions, so a rotation isn't picked up until the
-next deploy. Two practical options:
-
-1. **Redeploy on the next push to main** (typical). The bicep re-reads the
-   KV cert and updates the CAE cert resource.
-2. **Scheduled GitHub Action** (`on: schedule: cron: '0 4 * * 1'`) that
-   runs `az deployment sub create` once a week to pick up rotations.
-
-If you forget for >90 days, the cert expires and `<subdomain>.<domain>`
-serves a stale cert until you redeploy.
+- Multi-region production **requires** `CUSTOM_DOMAIN_NAME`,
+  `CUSTOM_SUBDOMAIN`, and the `CERT_KEY_VAULT_SECRET_URL` /
+  `CERT_KEY_VAULT_CERT_NAME` pair; incomplete input is rejected before any
+  Azure resource is created.
+- Bicep provisions one
+  `Microsoft.App/managedEnvironments/certificates` per region's CAE from the
+  Key Vault secret URL, and binds `<subdomain>.<domain>` on each region's
+  container app with `bindingType: SniEnabled`.
+- The same wildcard cert covers branch hostnames, so branch deploys skip
+  DigiCert managed-cert provisioning entirely.
 
 ### Key files
 
@@ -2143,6 +1991,8 @@ astervoids/
 │       ├── srvmon/
 │       │   └── index.html      # Server monitoring page; polls /api/srvmon every 2s
 │       └── js/
+│           ├── debug-log.js                       # Shared _log/_warn/_error helpers gated on ASTERVOIDS_DEBUG.
+│           │                                      # Must load before every other script that logs.
 │           ├── session-client.js                  # SignalR lifecycle, hub RPC wrappers, stale-connection
 │           │                                      # guard(), GUID normalization. See: Client Architecture.
 │           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,

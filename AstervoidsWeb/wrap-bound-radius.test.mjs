@@ -24,7 +24,7 @@ const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 const OBJECT_TYPES = { ASTEROID: 'asteroid', SHIP: 'ship', BULLET: 'bullet' };
 const viewport = { width: 1920, height: 1080 };
 const production = loadInlineGameFunctions([
-    'Asteroid', 'wrapNormalized', 'wrapMarginX', 'wrapMarginY',
+    'Asteroid', 'assignDefined', 'wrapNormalized', 'wrapMarginX', 'wrapMarginY',
     'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY', 'getRemoteBoundingRadius',
 ], {
     CONFIG,

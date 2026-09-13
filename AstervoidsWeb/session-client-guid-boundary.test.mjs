@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const require = createRequire(import.meta.url);
 const GuidUtils = require('./wwwroot/js/guid-utils.js');
@@ -17,11 +17,7 @@ const OTHER_ID = '00000000-0000-0000-0000-000000000000';
 // Even a GUID-shaped credential is opaque, not a typed Guid parameter.
 const RECONNECT_TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function loadModule(file, name, globals) {
-    const source = readFileSync(new URL(`./wwwroot/js/${file}`, import.meta.url), 'utf8');
-    return new Function(...Object.keys(globals), `${source}\nreturn ${name};`)(
-        ...Object.values(globals));
-}
+const loadModule = loadClassicModule;
 
 async function loadClient(guidUtils = GuidUtils) {
     const window = { ASTERVOIDS_DEBUG: false, SchemaCodec };

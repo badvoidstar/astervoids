@@ -144,7 +144,7 @@ public class SessionHub : Hub
         // SendCoreAsync(method, args) would resolve to SendAsync(string, object?) and wrap
         // the entire args array as a single client argument, breaking handlers that
         // expect multiple positional arguments.
-        await Clients.OthersInGroup(session.Id.ToString()).SendCoreAsync(method, args);
+        await Clients.OthersInGroup(session.GroupName).SendCoreAsync(method, args);
     }
 
     /// <summary>
@@ -157,7 +157,7 @@ public class SessionHub : Hub
         var bytes = EstimatePayloadBytes(args);
         _metrics.OnBroadcastToMembers(session.Members.Keys, bytes);
         // SendCoreAsync — see BroadcastToOthersAsync for the rationale.
-        await Clients.Group(session.Id.ToString()).SendCoreAsync(method, args);
+        await Clients.Group(session.GroupName).SendCoreAsync(method, args);
     }
 
     private async Task BroadcastSessionsChangedBestEffortAsync()
@@ -172,6 +172,26 @@ public class SessionHub : Hub
         }
     }
 
+    /// <summary>
+    /// Removes <see cref="Context"/>'s connection from a session group without
+    /// letting a transport failure mask the error that triggered the rollback.
+    /// Shared by the create-session and join-session compensation paths.
+    /// </summary>
+    private async Task RemoveFromSessionGroupBestEffortAsync(
+        Session session,
+        string failureMessage,
+        Guid memberId)
+    {
+        try
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, session.GroupName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, failureMessage, memberId, session.Id);
+        }
+    }
+
     private async Task RollbackCommittedJoinAsync(
         Session session,
         Guid memberId,
@@ -180,19 +200,10 @@ public class SessionHub : Hub
         var departure = _sessionService.LeaveSession(Context.ConnectionId);
         _metrics.RemoveMember(memberId);
 
-        try
-        {
-            await Groups.RemoveFromGroupAsync(
-                Context.ConnectionId, session.Id.ToString());
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "Failed to remove rolled-back member {MemberId} from session group {SessionId}",
-                memberId,
-                session.Id);
-        }
+        await RemoveFromSessionGroupBestEffortAsync(
+            session,
+            "Failed to remove rolled-back member {MemberId} from session group {SessionId}",
+            memberId);
 
         if (departure is { RemainingMemberIds.Count: > 0 })
         {
@@ -355,23 +366,14 @@ public class SessionHub : Hub
 
         try
         {
-            await Groups.AddToGroupAsync(
-                Context.ConnectionId, session.Id.ToString());
+            await Groups.AddToGroupAsync(Context.ConnectionId, session.GroupName);
         }
         catch (Exception ex)
         {
-            try
-            {
-                await Groups.RemoveFromGroupAsync(
-                    Context.ConnectionId, session.Id.ToString());
-            }
-            catch (Exception removeException)
-            {
-                _logger.LogWarning(
-                    removeException,
-                    "Failed to remove creator connection from rolled-back session group {SessionId}",
-                    session.Id);
-            }
+            await RemoveFromSessionGroupBestEffortAsync(
+                session,
+                "Failed to remove rolled-back creator {MemberId} from session group {SessionId}",
+                creator.Id);
             _sessionService.LeaveSession(Context.ConnectionId);
             _sessionService.ForceDestroySession(
                 session.Id,
@@ -469,7 +471,7 @@ public class SessionHub : Hub
             try
             {
                 await Groups.RemoveFromGroupAsync(
-                    eviction.EvictedConnectionId, session.Id.ToString());
+                    eviction.EvictedConnectionId, session.GroupName);
             }
             catch (Exception ex)
             {
@@ -524,8 +526,7 @@ public class SessionHub : Hub
         GuidLongPair[] validAts;
         try
         {
-            await Groups.AddToGroupAsync(
-                Context.ConnectionId, session.Id.ToString());
+            await Groups.AddToGroupAsync(Context.ConnectionId, session.GroupName);
             (members, objects, validAts, _) = ToSessionSnapshot(session);
         }
         catch
@@ -613,7 +614,7 @@ public class SessionHub : Hub
             return;
         }
 
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, result.SessionId.ToString());
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, current.Value.Session.GroupName);
 
         if (!result.SessionDestroyed && result.RemainingMemberIds.Count > 0)
         {
@@ -805,7 +806,7 @@ public class SessionHub : Hub
         var serviceUpdates = updatesList
             .Select(u => new ObjectUpdate(u.ObjectId, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)))
             .ToList();
-        var updatedObjects = _objectService.UpdateObjects(member.SessionId, member.Id, serviceUpdates, clientValidAt, serverTimestamp).ToList();
+        var updatedObjects = _objectService.UpdateObjects(member.SessionId, member.Id, serviceUpdates, clientValidAt, serverTimestamp);
 
         long memberSequence = 0;
         if (updatedObjects.Count > 0)
@@ -814,10 +815,12 @@ public class SessionHub : Hub
             // Build broadcast payload from the cached request payloads (verbatim
             // bytes from the sender) — no need to re-encode the dict the service
             // already merged into obj.Data.
-            var updateInfos = updatedObjects
-                .Where(o => requestPayloadByObjectId.ContainsKey(o.Id))
-                .Select(o => new ObjectUpdateInfo(o.Id, requestPayloadByObjectId[o.Id], o.Version))
-                .ToList();
+            var updateInfos = new List<ObjectUpdateInfo>(updatedObjects.Count);
+            foreach (var o in updatedObjects)
+            {
+                if (requestPayloadByObjectId.TryGetValue(o.Id, out var payload))
+                    updateInfos.Add(new ObjectUpdateInfo(o.Id, payload, o.Version));
+            }
 
             // ValidAt is a single batch-level trailing argument. ObjectService
             // resolves it against the newest prior timestamp in the accepted

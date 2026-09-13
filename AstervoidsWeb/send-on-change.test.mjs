@@ -5,10 +5,10 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { createBallisticGate } = require('./wwwroot/js/replication-send-policy.js');
 
-// Mirrors the inline owner-side `SendGate` send-on-change suppression in
-// wwwroot/index.html (the game layer). Per repo convention (see
-// deterministic-sim.test.mjs / config-overrides.test.mjs) pure inline logic is
-// re-implemented here and asserted, since index.html is not importable.
+// Exercises the PRODUCTION ballistic send gate imported above from
+// wwwroot/js/replication-send-policy.js. The gate used to be inline in
+// index.html and mirrored here; it has since been extracted, so this file is
+// no longer a mirror — do not re-create one.
 //
 // SendGate decides, on the OWNER, whether a fresh authoritative packet for a
 // ballistic object would improve the remote's exact dead-reckoned prediction.

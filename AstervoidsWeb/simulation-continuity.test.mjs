@@ -16,23 +16,10 @@ const { createRuntime } = require('./wwwroot/js/replication-runtime.js');
 const { integrateRateAngularPredictionFrames } = require(
     './wwwroot/js/replication-presentation.js');
 
-function extractProductionFunction(name, nextName) {
-    const start = productionSource.indexOf(`    function ${name}(`);
-    const end = productionSource.indexOf(`\n    function ${nextName}(`, start);
-    assert.ok(start >= 0 && end > start, `could not extract production function ${name}`);
-    return productionSource.slice(start, end);
-}
-
-const joinBaselineSource = extractProductionFunction(
-    'getDeterministicJoinBaselinePerf',
-    'createKinematicPresentation');
-
 function loadJoinBaselineHelper(dependencies) {
-    const names = Object.keys(dependencies);
-    const factory = new Function(
-        ...names,
-        `${joinBaselineSource}\nreturn getDeterministicJoinBaselinePerf;`);
-    return factory(...names.map((name) => dependencies[name]));
+    return loadInlineGameFunctions(
+        ['getDeterministicJoinBaselinePerf'],
+        dependencies).getDeterministicJoinBaselinePerf;
 }
 
 const FRAME_MS = 1000 / 60;
@@ -1363,22 +1350,73 @@ test('production migration gating skips ownership-only versions only after repli
 test('production kinematic presentation delegates to DeadReckon/RemoteObjects by mode', () => {
     // createKinematicPresentation is the production glue between
     // ReplicationRuntime's generic has/ingest/sample/remove contract and the
-    // two concrete presentation models. Verify the actual extracted source
-    // switches on isDeterministicMode() for every one of those methods.
-    const start = productionSource.indexOf('    function createKinematicPresentation() {');
-    const end = productionSource.indexOf('\n    const kinematicPresentation = createKinematicPresentation();');
-    assert.ok(start >= 0 && end > start);
-    const source = productionSource.slice(start, end);
-    assert.match(source, /has\(id\) \{\s*return isDeterministicMode\(\)/);
-    const { createKinematicPresentation } = loadInlineGameFunctions(['createKinematicPresentation']);
-    // Ship transition capture precedes both modes; the branch belongs to
-    // ingest, but need not be its first statement.
-    assert.match(
-        createKinematicPresentation().ingest.toString(),
-        /if \(isDeterministicMode\(\)\) \{/);
-    assert.match(source, /sample\(id, facts, record, context\) \{\s*if \(isDeterministicMode\(\)\) \{/);
-    assert.match(source, /remove\(id, reason, facts, record, context\) \{\s*RemoteObjects\.remove\(id\);\s*DeadReckon\.remove\(id\);/);
-    assert.match(source, /reset\(facts, context\) \{\s*RemoteObjects\.clear\(\);\s*DeadReckon\.clear\(\);/);
+    // two concrete presentation models. Execute every method in both modes
+    // and assert which model actually received the call.
+    let deterministic = true;
+    const calls = [];
+    const makeModel = name => ({
+        states: new Map(),
+        lastVersions: new Map(),
+        updateState: (...args) => calls.push([name, 'updateState', args[0]]),
+        getReckoned: () => ({ from: name }),
+        getInterpolated: () => ({ from: name }),
+        remove: id => calls.push([name, 'remove', id]),
+        clear: () => calls.push([name, 'clear']),
+    });
+    const DeadReckon = makeModel('DeadReckon');
+    const RemoteObjects = makeModel('RemoteObjects');
+    const { createKinematicPresentation } = loadInlineGameFunctions(
+        ['createKinematicPresentation'],
+        {
+            isDeterministicMode: () => deterministic,
+            resolveTerminalSession: () => null,
+            DeadReckon,
+            RemoteObjects,
+            OBJECT_TYPES: { SHIP: 'ship' },
+            game: { multiplayer: { remoteShips: new Map() } },
+            getDeterministicIngestBaselinePerf: () => 0,
+            calculateShipRateAngularPredictionWindow: () => null,
+            currentKinematicData: () => null,
+        });
+    const presentation = createKinematicPresentation();
+    const facts = { type: 'asteroid' };
+    const record = { version: 7, validAt: 100, data: { fallback: true } };
+    const context = { renderTime: 0 };
+
+    // has() reads the active model's state map.
+    DeadReckon.states.set('a', true);
+    assert.equal(presentation.has('a'), true, 'deterministic reads DeadReckon');
+    deterministic = false;
+    assert.equal(presentation.has('a'), false, 'buffered reads RemoteObjects');
+    RemoteObjects.states.set('a', true);
+    assert.equal(presentation.has('a'), true);
+
+    // ingest()/sample() dispatch to the model matching the mode.
+    presentation.ingest('a', { x: 1 }, facts, record, context);
+    assert.deepEqual(calls.at(-1), ['RemoteObjects', 'updateState', 'a']);
+    assert.deepEqual(presentation.sample('a', facts, record, context),
+        { from: 'RemoteObjects' });
+    assert.equal(RemoteObjects.lastVersions.get('a'), 7,
+        'buffered sample mirrors the record version');
+
+    deterministic = true;
+    presentation.ingest('a', { x: 1 }, facts, record, context);
+    assert.deepEqual(calls.at(-1), ['DeadReckon', 'updateState', 'a']);
+    assert.deepEqual(presentation.sample('a', facts, record, context),
+        { from: 'DeadReckon' });
+    assert.equal(DeadReckon.lastVersions.get('a'), 7,
+        'deterministic sample mirrors the record version');
+
+    // remove()/reset() are mode-independent: both models must be cleared so a
+    // mode switch cannot resurrect stale presentation state.
+    calls.length = 0;
+    presentation.remove('a', 'deleted', facts, record, context);
+    assert.deepEqual(calls,
+        [['RemoteObjects', 'remove', 'a'], ['DeadReckon', 'remove', 'a']]);
+    calls.length = 0;
+    presentation.reset(facts, context);
+    assert.deepEqual(calls,
+        [['RemoteObjects', 'clear'], ['DeadReckon', 'clear']]);
 });
 
 test('intentional ship respawn is an explicit snap across the RTT/jitter matrix', async (t) => {
