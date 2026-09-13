@@ -132,8 +132,10 @@ public record ReplaceObjectResponse(
 /// <para>
 /// Positional correspondence removes the object id from the acknowledgement
 /// entirely — the caller already knows which id it sent at each index. Each
-/// entry drops from a 24 B <c>GuidLongPair</c> to a 1–3 B integer, which is
-/// roughly a 90% reduction on a hot path that runs on every flush.
+/// entry drops from a 24 B <c>GuidLongPair</c> to a 1–3 B integer. Measured
+/// over the whole message that is a 71–83% reduction for batches of 3–20
+/// objects; the message-level figure is below the per-entry saving because
+/// <c>MemberSequence</c> and <c>ServerTimestamp</c> are fixed overhead.
 /// </para>
 /// </summary>
 [MessagePackObject]
