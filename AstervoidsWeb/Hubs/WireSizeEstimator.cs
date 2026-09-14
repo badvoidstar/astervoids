@@ -105,7 +105,7 @@ internal static class WireSizeEstimator
         for (int i = 0; i < updates.Count; i++)
         {
             var update = updates[i];
-            total += ArrayHeader(2) + GuidBytes + Payload(update.Data);
+            total += ArrayHeader(2) + Int(update.Handle) + Payload(update.Data);
         }
         return total
             + Int(senderSequence)
@@ -129,7 +129,7 @@ internal static class WireSizeEstimator
         for (int i = 0; i < updates.Count; i++)
         {
             var update = updates[i];
-            total += ArrayHeader(3) + GuidBytes + Payload(update.Data) + Int(update.Version);
+            total += ArrayHeader(3) + Int(update.Handle) + Payload(update.Data) + Int(update.Version);
         }
         return total
             + GuidBytes                     // senderMemberId

@@ -285,7 +285,7 @@ public class SessionHub : Hub
     /// </summary>
     private ObjectInfo ToObjectInfo(SessionObject o) =>
         new(o.Id, o.CreatorMemberId, o.OwnerMemberId, o.Scope,
-            SyncPayloadCodec.EncodeDict(o.SchemaId, o.Data, _schemaRegistry, o.SessionId), o.Version);
+            SyncPayloadCodec.EncodeDict(o.SchemaId, o.Data, _schemaRegistry, o.SessionId), o.Version, o.Handle);
 
     /// <summary>
     /// Takes a consistent point-in-time snapshot of a session's members and objects.
@@ -811,23 +811,23 @@ public class SessionHub : Hub
 
         // Phase 3 envelope: decode each request's SyncPayload to the dict
         // shape the service consumes. We cache the original SyncPayload by
-        // objectId so the broadcast can echo the SAME bytes the sender sent
+        // handle so the broadcast can echo the SAME bytes the sender sent
         // (avoids a wasteful decode-then-reencode round-trip and preserves
         // any compactness the sender's encoder achieved).
         //
         // Single pass: the dictionary write is last-write-wins, matching the
-        // previous GroupBy(...).Last() semantics for duplicate ids in one batch.
-        // Materialized before the metrics estimate so the IEnumerable is only
-        // ever enumerated once.
+        // previous GroupBy(...).Last() semantics for duplicate handles in one
+        // batch. Materialized before the metrics estimate so the IEnumerable is
+        // only ever enumerated once.
         var updatesList = updates as IReadOnlyList<ObjectUpdateRequest> ?? updates.ToList();
-        var requestPayloadByObjectId = new Dictionary<Guid, SyncPayload>(updatesList.Count);
+        var requestPayloadByHandle = new Dictionary<int, SyncPayload>(updatesList.Count);
         var serviceUpdates = new List<ObjectUpdate>(updatesList.Count);
         for (int i = 0; i < updatesList.Count; i++)
         {
             var u = updatesList[i];
-            requestPayloadByObjectId[u.ObjectId] = u.Data;
+            requestPayloadByHandle[u.Handle] = u.Data;
             serviceUpdates.Add(new ObjectUpdate(
-                u.ObjectId, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)));
+                u.Handle, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)));
         }
 
         _metrics.OnHubInvocation(member.Id, WireSizeEstimator.UpdateObjectsRequest(
@@ -845,8 +845,8 @@ public class SessionHub : Hub
             var updateInfos = new List<ObjectUpdateInfo>(updatedObjects.Count);
             foreach (var o in updatedObjects)
             {
-                if (requestPayloadByObjectId.TryGetValue(o.Id, out var payload))
-                    updateInfos.Add(new ObjectUpdateInfo(o.Id, payload, o.Version));
+                if (requestPayloadByHandle.TryGetValue(o.Handle, out var payload))
+                    updateInfos.Add(new ObjectUpdateInfo(o.Handle, payload, o.Version));
             }
 
             // ValidAt is a single batch-level trailing argument. ObjectService
@@ -868,13 +868,13 @@ public class SessionHub : Hub
         // order-preserving *subsequence* of the requested updates (it appends one
         // result per accepted update, in iteration order). That invariant lets the
         // two lists be aligned with a single forward walk, and it stays correct when
-        // one batch carries the same object id more than once — each occurrence is
+        // one batch carries the same handle more than once — each occurrence is
         // applied separately and is matched to its own request index in order.
         var versions = new long[updatesList.Count];
         int accepted = 0;
         for (int i = 0; i < updatesList.Count && accepted < updatedObjects.Count; i++)
         {
-            if (updatesList[i].ObjectId != updatedObjects[accepted].Id) continue;
+            if (updatesList[i].Handle != updatedObjects[accepted].Handle) continue;
             versions[i] = updatedObjects[accepted].Version;
             accepted++;
         }

@@ -43,6 +43,7 @@ public interface IObjectService
 
     /// <summary>
     /// Batch updates multiple objects owned by the specified member.
+    /// Each entry addresses its target by session-scoped handle.
     /// Ownership is validated atomically inside the session lock; hub-layer pre-filtering
     /// is not required for correctness.
     ///
@@ -113,12 +114,14 @@ public record ReplacementObjectSpec(
 );
 
 /// <summary>
-/// Represents a batch update for an object. The owner-stamped sample time is
-/// supplied at the call level on <c>SessionHub.UpdateObjects</c> and shared by
-/// every entry in the batch (a single owner tick produces the whole batch).
+/// Represents a batch update for an object, addressed by its session-scoped
+/// <see cref="SessionObject.Handle"/> — the identity the hot wire path carries in
+/// place of the 18-byte binary GUID. The owner-stamped sample time is supplied at
+/// the call level on <c>SessionHub.UpdateObjects</c> and shared by every entry in
+/// the batch (a single owner tick produces the whole batch).
 /// </summary>
 public record ObjectUpdate(
-    Guid ObjectId,
+    int Handle,
     Dictionary<string, object?> Data
 );
 

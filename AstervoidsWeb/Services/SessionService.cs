@@ -554,7 +554,7 @@ public class SessionService : ISessionService
 
             if (obj.Scope == ObjectScope.Member)
             {
-                if (session.Objects.TryRemove(obj.Id, out _))
+                if (session.RemoveObject(obj.Id, out _))
                     deletedIds.Add(obj.Id);
             }
             else if (obj.Scope == ObjectScope.Session && remainingMemberIds.Count > 0)

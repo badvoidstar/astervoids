@@ -12,6 +12,19 @@ public class SessionObject
     public Guid Id { get; init; } = Guid.NewGuid();
 
     /// <summary>
+    /// Session-scoped integer handle, allocated by <see cref="Session.AllocateObjectHandle"/>
+    /// when the object is added to a session. Starts at 1 and only increases, so 0 is an
+    /// unambiguous "no handle" sentinel.
+    ///
+    /// This is the object's identity on the hot wire paths (<c>UpdateObjects</c> request
+    /// and <c>OnObjectsUpdated</c> broadcast), where a 1–3 byte integer replaces the
+    /// 18-byte binary <see cref="Id"/>. Handles are unique within a session but say
+    /// nothing across sessions; <see cref="Id"/> remains the globally unique identity
+    /// carried by every <c>ObjectInfo</c>, which is how clients learn the mapping.
+    /// </summary>
+    public int Handle { get; set; }
+
+    /// <summary>
     /// The session this object belongs to.
     /// </summary>
     public Guid SessionId { get; init; }
