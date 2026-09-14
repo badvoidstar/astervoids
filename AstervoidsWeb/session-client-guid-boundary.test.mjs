@@ -14,6 +14,15 @@ const SESSION_ID = '00112233-4455-6677-8899-aabbccddeeff';
 const MEMBER_ID = 'fedcba98-7654-3210-fedc-ba9876543210';
 const OBJECT_ID = '12345678-90ab-cdef-1234-567890abcdef';
 const OTHER_ID = '00000000-0000-0000-0000-000000000000';
+// Session-scoped object handles. The server allocates them and publishes them on
+// every ObjectInfo; the hot update legs address objects by handle instead of by
+// GUID, so the client has to learn the mapping from ordinary traffic.
+const HANDLES = {
+    [OBJECT_ID]: 5,
+    [OTHER_ID]: 6,
+    [MEMBER_ID]: 7,
+    [SESSION_ID]: 8
+};
 // Even a GUID-shaped credential is opaque, not a typed Guid parameter.
 const RECONNECT_TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
@@ -84,6 +93,21 @@ async function loadClient(guidUtils = GuidUtils) {
     return { client, calls, replies, handlers, SyncPayload };
 }
 
+/**
+ * Teach the client a handle→id mapping the way the server does: on an
+ * ObjectInfo. The hot update legs are addressed by handle, so nothing can be
+ * sent for — or resolved to — an object the client was never told about.
+ */
+function teachHandles(handlers, objectIds) {
+    for (const objectId of objectIds) {
+        handlers.get('OnObjectCreated')([
+            GuidUtils.guidToBytes(objectId), GuidUtils.guidToBytes(MEMBER_ID),
+            GuidUtils.guidToBytes(MEMBER_ID), 1, [0, MsgpackCodec.encode({})], 1,
+            HANDLES[objectId]
+        ], GuidUtils.guidToBytes(MEMBER_ID), 1, 1000, 1000);
+    }
+}
+
 function assertBinaryGuid(actual, expected) {
     assert.ok(actual instanceof Uint8Array);
     assert.equal(actual.length, 16);
@@ -104,16 +128,16 @@ for (const compact of [false, true]) {
             const data = { type: 'widget', x: 0.25 };
             const expected = id => ({
                 id, creatorMemberId: MEMBER_ID, ownerMemberId: OTHER_ID,
-                scope: 'Session', data, version: 3
+                scope: 'Session', data, version: 3, handle: HANDLES[id]
             });
             const object = id => {
                 const fields = [
                     GuidUtils.guidToBytes(id), GuidUtils.guidToBytes(MEMBER_ID),
-                    GuidUtils.guidToBytes(OTHER_ID), 1, payload(data), 3
+                    GuidUtils.guidToBytes(OTHER_ID), 1, payload(data), 3, HANDLES[id]
                 ];
                 return compact ? fields : {
                     id: fields[0], creatorMemberId: fields[1], ownerMemberId: fields[2],
-                    scope: fields[3], data: fields[4], version: fields[5]
+                    scope: fields[3], data: fields[4], version: fields[5], handle: fields[6]
                 };
             };
             const objects = () => [object(OBJECT_ID), object(OTHER_ID)];
@@ -163,8 +187,10 @@ for (const compact of [false, true]) {
                 { deletedObjectId: OBJECT_ID, createdObjects: joined.session.objects }, MEMBER_ID, 11, 1003
             ]);
             const delta = { x: 0.75 };
-            const update = compact ? [GuidUtils.guidToBytes(OBJECT_ID), payload(delta), 4]
-                : { id: GuidUtils.guidToBytes(OBJECT_ID), data: payload(delta), version: 4 };
+            // Updates address the object by handle; the client resolves it back
+            // to the id the game speaks using the mapping the snapshot taught.
+            const update = compact ? [HANDLES[OBJECT_ID], payload(delta), 4]
+                : { handle: HANDLES[OBJECT_ID], data: payload(delta), version: 4 };
             handlers.get('OnObjectsUpdated')([update], GuidUtils.guidToBytes(MEMBER_ID), 12, 13, 1005, 50, 1004);
             assert.deepEqual(notifications.get('onObjectsUpdated'), [
                 [{ id: OBJECT_ID, data: delta, version: 4 }], 1005, MEMBER_ID, 12, 13, 50, 1004
@@ -219,9 +245,10 @@ test('RejoinSession writes both typed IDs as binary but leaves the reconnect tok
     assert.equal(rejoined.member.id, MEMBER_ID);
 });
 
-test('UpdateObjects converts every DTO ID without rewriting or mutating game data', async () => {
-    const { client, calls, SyncPayload } = await loadClient();
+test('UpdateObjects addresses objects by handle without rewriting or mutating game data', async () => {
+    const { client, calls, handlers, SyncPayload } = await loadClient();
     await client.createSession();
+    teachHandles(handlers, [OBJECT_ID, OTHER_ID, MEMBER_ID, SESSION_ID]);
     const genericData = Object.freeze({
         objectId: MEMBER_ID,
         ownerMemberId: OTHER_ID,
@@ -243,7 +270,8 @@ test('UpdateObjects converts every DTO ID without rewriting or mutating game dat
     assert.deepEqual(args.slice(1), [17, 50, 123456]);
     assert.equal(args[0].length, 4);
     for (let i = 0; i < updates.length; i++) {
-        assertBinaryGuid(args[0][i][0], updates[i].objectId);
+        assert.equal(args[0][i][0], HANDLES[updates[i].objectId],
+            'the wire slot carries the session handle, not the object GUID');
         assert.equal(updates[i].objectId, [OBJECT_ID, OTHER_ID, MEMBER_ID, SESSION_ID][i]);
     }
     assert.deepEqual(SyncPayload.unwrap(args[0][0][1]), genericData);
@@ -330,7 +358,6 @@ test('typed Guid arguments reject invalid IDs rather than falling back to string
     await client.createSession();
     const count = calls.length;
     for (const operation of [
-        () => client.updateObjects([{ objectId: OBJECT_ID, data: {} }, { objectId: 'bad', data: {} }]),
         () => client.deleteObject('bad'),
         () => client.replaceObject('bad', [{}]),
         () => client.broadcastObjectEvent('bad', 1, null)
@@ -348,30 +375,149 @@ test('missing outbound Guid support fails instead of silently sending strings', 
     assert.equal(calls.length, 0);
 });
 
-test('binary IDs cost 18 instead of 38 bytes and reduce a normal bullet update from 51 to 31', async () => {
-    const { client, calls } = await loadClient();
+test('an update for an object with no session handle is dropped instead of sent', async () => {
+    // A handle is the only way to address an object on the hot path, so an id
+    // the server never announced (or has since deleted) cannot be sent at all.
+    // The acknowledgement must therefore fold against what actually went on the
+    // wire, not against the caller's request array.
+    const { client, calls, handlers } = await loadClient();
     await client.createSession();
+    teachHandles(handlers, [OBJECT_ID]);
+
+    const response = await client.updateObjects([
+        { objectId: OTHER_ID, data: { x: 0.1 } },
+        { objectId: OBJECT_ID, data: { x: 0.2 } }
+    ]);
+
+    const { method, args } = calls.at(-1);
+    assert.equal(method, 'UpdateObjects');
+    assert.equal(args[0].length, 1, 'only addressable updates reach the hub');
+    assert.equal(args[0][0][0], HANDLES[OBJECT_ID]);
+    assert.deepEqual(response.versions, { [OBJECT_ID]: 2 },
+        'version 2 acknowledges wire slot 0, which is the object that was sent');
+});
+
+test('a deleted object stops being addressable and a replacement child becomes addressable', async () => {
+    const { client, calls, replies, handlers, SyncPayload } = await loadClient();
+    await client.createSession();
+    teachHandles(handlers, [OBJECT_ID]);
+
+    // A replacement retires the parent handle and teaches the children's.
+    replies.set('ReplaceObject', () => [[[
+        GuidUtils.guidToBytes(OTHER_ID), GuidUtils.guidToBytes(MEMBER_ID),
+        GuidUtils.guidToBytes(MEMBER_ID), 1, SyncPayload.wrap({}), 1, HANDLES[OTHER_ID]
+    ]], 9, 1999]);
+    await client.replaceObject(OBJECT_ID, [{}]);
+
+    await client.updateObjects([
+        { objectId: OBJECT_ID, data: { x: 0.1 } },
+        { objectId: OTHER_ID, data: { x: 0.2 } }
+    ]);
+    assert.deepEqual(calls.at(-1).args[0].map(entry => entry[0]), [HANDLES[OTHER_ID]],
+        'the replaced parent is no longer addressable, the child is');
+
+    // An explicit delete retires the handle too.
+    await client.deleteObject(OTHER_ID);
+    await client.updateObjects([{ objectId: OTHER_ID, data: { x: 0.3 } }]);
+    assert.deepEqual(calls.at(-1).args[0], [], 'a deleted object cannot be addressed');
+});
+
+test('a session transition drops every handle it learned', async () => {
+    const { client, calls, handlers } = await loadClient();
+    await client.createSession();
+    teachHandles(handlers, [OBJECT_ID]);
+
+    // Handles are only meaningful inside the session that allocated them, so
+    // rejoining must not carry them across.
+    client.clearSessionState();
+    await client.joinSession(SESSION_ID);
+
+    await client.updateObjects([{ objectId: OBJECT_ID, data: { x: 0.1 } }]);
+    assert.deepEqual(calls.at(-1).args[0], [],
+        'a handle from the previous session must not address an object in this one');
+});
+
+test('an update for an unlearned handle is replayed once its create arrives', async () => {
+    const { client, handlers } = await loadClient();
+    await client.createSession();
+    const batches = [];
+    client.on('onObjectsUpdated', (...args) => batches.push(args));
+
+    // The create broadcast has not arrived yet, so the handle means nothing.
+    handlers.get('OnObjectsUpdated')(
+        [[HANDLES[OBJECT_ID], [0, MsgpackCodec.encode({ x: 0.75 })], 4]],
+        GuidUtils.guidToBytes(MEMBER_ID), 12, 13, 1005, 50, 1004);
+    assert.equal(batches.length, 0, 'an unresolvable update is parked, not guessed at');
+
+    teachHandles(handlers, [OBJECT_ID]);
+
+    assert.equal(batches.length, 1, 'the parked update is delivered once the create lands');
+    assert.deepEqual(batches[0][0], [{ id: OBJECT_ID, data: { x: 0.75 }, version: 4 }]);
+    assert.deepEqual(batches[0].slice(1), [1005, MEMBER_ID, 12, 13, 50, 1004],
+        'the replay keeps the metadata the batch arrived with');
+});
+
+test('a snapshot supersedes parked updates rather than replaying them over it', async () => {
+    const { client, replies, handlers } = await loadClient();
+    await client.createSession();
+    const batches = [];
+    client.on('onObjectsUpdated', (...args) => batches.push(args));
+
+    handlers.get('OnObjectsUpdated')(
+        [[HANDLES[OBJECT_ID], [0, MsgpackCodec.encode({ x: 0.75 })], 4]],
+        GuidUtils.guidToBytes(MEMBER_ID), 12, 13, 1005, 50, 1004);
+
+    replies.set('GetSessionState', () => ({
+        members: [{ id: GuidUtils.guidToBytes(MEMBER_ID), role: 1 }],
+        objects: [[
+            GuidUtils.guidToBytes(OBJECT_ID), GuidUtils.guidToBytes(MEMBER_ID),
+            GuidUtils.guidToBytes(MEMBER_ID), 1, [0, MsgpackCodec.encode({ x: 0.9 })], 9,
+            HANDLES[OBJECT_ID]
+        ]],
+        validAts: [],
+        memberSequences: []
+    }));
+    const snapshot = await client.getSessionState();
+
+    assert.equal(snapshot.objects[0].handle, HANDLES[OBJECT_ID]);
+    assert.equal(batches.length, 0,
+        'the snapshot is newer than anything parked, so the stale delta is discarded');
+});
+
+test('a session handle costs 1-3 bytes instead of 18 and trims a bullet update from 31 to 14', async () => {
+    const { client, calls, handlers } = await loadClient();
+    await client.createSession();
+    teachHandles(handlers, [OBJECT_ID]);
     await client.updateObjects([{
         objectId: OBJECT_ID,
         schemaId: WireSchemas.SCHEMA_BY_OBJECT_TYPE.bullet,
         data: { x: 0.5, y: 0.25, lifetime: 42 }
     }]);
     const update = calls.at(-1).args[0][0];
-    assertBinaryGuid(update[0], OBJECT_ID);
+    assert.equal(update[0], HANDLES[OBJECT_ID]);
     assert.equal(update[1][0], 3);
     assert.equal(update[1][1].length, 8);
-    const binaryId = MsgpackCodec.encode(update[0]);
+
+    const handleId = MsgpackCodec.encode(update[0]);
+    const binaryId = MsgpackCodec.encode(GuidUtils.guidToBytes(OBJECT_ID));
     const stringId = MsgpackCodec.encode(OBJECT_ID);
     assert.deepEqual(Array.from(binaryId.slice(0, 2)), [0xc4, 16]);
     assert.deepEqual(Array.from(stringId.slice(0, 2)), [0xd9, 36]);
+    assert.equal(handleId.length, 1);
     assert.equal(binaryId.length, 18);
     assert.equal(stringId.length, 38);
+    // Handles are never reused, so a long session works its way up through the
+    // integer widths. Even at the top of the uint16 range it stays three bytes.
+    assert.equal(MsgpackCodec.encode(1000).length, 3);
+    assert.equal(MsgpackCodec.encode(65535).length, 3);
 
     // Per ObjectUpdateRequest, excluding the shared batch/SignalR framing.
-    const before = MsgpackCodec.encode([OBJECT_ID, update[1]]);
-    const after = MsgpackCodec.encode(update);
-    assert.equal(before.length, 51);
-    assert.equal(after.length, 31);
-    assert.deepEqual(MsgpackCodec.decode(after), update);
-    assert.deepEqual(before.slice(39), after.slice(19), 'only the ID encoding changes');
+    const withStringId = MsgpackCodec.encode([OBJECT_ID, update[1]]);
+    const withBinaryId = MsgpackCodec.encode([GuidUtils.guidToBytes(OBJECT_ID), update[1]]);
+    const withHandle = MsgpackCodec.encode(update);
+    assert.equal(withStringId.length, 51);
+    assert.equal(withBinaryId.length, 31);
+    assert.equal(withHandle.length, 14);
+    assert.deepEqual(MsgpackCodec.decode(withHandle), update);
+    assert.deepEqual(withBinaryId.slice(19), withHandle.slice(2), 'only the ID encoding changes');
 });
