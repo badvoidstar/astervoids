@@ -861,7 +861,7 @@ public class SessionHubTests
 
         var updates = new List<ObjectUpdateRequest>
         {
-            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
         };
 
         // Act
@@ -906,7 +906,7 @@ public class SessionHubTests
 
         var updates = new List<ObjectUpdateRequest>
         {
-            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
         };
 
         var response = await hub.UpdateObjects(
@@ -946,7 +946,7 @@ public class SessionHubTests
 
         var updates = new List<ObjectUpdateRequest>
         {
-            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
         };
 
         var response = await hub.UpdateObjects(updates);
@@ -1036,8 +1036,8 @@ public class SessionHubTests
 
         var updates = new List<ObjectUpdateRequest>
         {
-            new(first.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
-            new(second.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.25 })),
+            new(first.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
+            new(second.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.25 })),
         };
 
         var response = await hub.UpdateObjects(updates);
@@ -1070,16 +1070,16 @@ public class SessionHubTests
         var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 });
         var updates = new List<ObjectUpdateRequest>
         {
-            new(Guid.NewGuid(), payload),   // unknown object
-            new(owned.Id, payload),         // accepted
-            new(foreign.Id, payload),       // not owned by caller
+            new(0, payload),                // unknown handle
+            new(owned.Handle, payload),     // accepted
+            new(foreign.Handle, payload),   // not owned by caller
         };
 
         var response = await hub.UpdateObjects(updates);
 
         response.Should().NotBeNull();
         response!.Versions.Should().HaveCount(3);
-        response.Versions[0].Should().Be(0, "unknown objects are not applied");
+        response.Versions[0].Should().Be(0, "unknown handles are not applied");
         response.Versions[1].Should().Be(owned.Version + 1, "the accepted update keeps its own index");
         response.Versions[2].Should().Be(0, "objects owned by another member are not applied");
     }
@@ -1112,8 +1112,8 @@ public class SessionHubTests
 
         var updates = new List<ObjectUpdateRequest>
         {
-            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
-            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.75 })),
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.75 })),
         };
 
         var response = await hub.UpdateObjects(updates);
@@ -1123,6 +1123,91 @@ public class SessionHubTests
         response.Versions[0].Should().Be(obj.Version + 1);
         response.Versions[1].Should().Be(obj.Version + 2,
             "the second occurrence is applied on top of the first");
+    }
+
+    // ── Session-scoped object handles on the wire ──────────────────────────────
+
+    [Fact]
+    public async Task CreateObject_ShouldPublishTheHandleAlongsideTheId()
+    {
+        // Clients learn the handle→id mapping from ordinary ObjectInfo traffic,
+        // so the create response (and the broadcast built from the same
+        // projection) must carry it.
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+
+        var hub = CreateHub("connection-1");
+        var response = await hub.CreateObject(
+            SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["type"] = "asteroid" }),
+            scope: "Session");
+
+        response.Should().NotBeNull();
+        var stored = _objectService.GetObject(session.Id, response!.ObjectInfo.Id)!;
+        response.ObjectInfo.Handle.Should().Be(stored.Handle).And.BeGreaterThan(0);
+    }
+
+    [Fact]
+    public async Task UpdateObjects_ShouldBroadcastHandlesRatherThanObjectIds()
+    {
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        _sessionService.JoinSession(session.Id, "connection-2");
+        var obj = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+
+        object?[]? capturedArgs = null;
+        var clientProxy = new Mock<IClientProxy>();
+        clientProxy
+            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((_, a, _) => capturedArgs = a)
+            .Returns(Task.CompletedTask);
+
+        var hub = CreateHubWithProxy("connection-1", clientProxy);
+
+        await hub.UpdateObjects(
+        [
+            new(obj.Handle, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 }))
+        ]);
+
+        capturedArgs.Should().NotBeNull();
+        var broadcast = capturedArgs![0].Should().BeAssignableTo<IEnumerable<ObjectUpdateInfo>>().Subject.ToList();
+        broadcast.Should().ContainSingle();
+        broadcast[0].Handle.Should().Be(obj.Handle,
+            "receivers resolve the object from the handle they were taught at create time");
+        broadcast[0].Version.Should().Be(obj.Version + 1);
+    }
+
+    [Fact]
+    public async Task UpdateObjects_ShouldRejectAStaleHandleWithoutDisturbingItsNeighbours()
+    {
+        // Handles are never reused, so an update addressed to a deleted object
+        // simply fails to resolve — it must not shift the positional ack.
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        var deleted = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+        var live = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+        _objectService.DeleteObject(session.Id, deleted.Id, creator.Id);
+
+        var hub = CreateHub("connection-1");
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 });
+
+        var response = await hub.UpdateObjects(
+        [
+            new(deleted.Handle, payload),
+            new(live.Handle, payload)
+        ]);
+
+        response.Should().NotBeNull();
+        response!.Versions.Should().HaveCount(2);
+        response.Versions[0].Should().Be(0, "the deleted object's handle no longer resolves");
+        response.Versions[1].Should().Be(live.Version + 1, "the live update keeps its own index");
     }
 
     private SessionHub CreateHubWithProxy(

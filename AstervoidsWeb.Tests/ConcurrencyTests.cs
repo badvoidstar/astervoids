@@ -146,8 +146,8 @@ public class ConcurrencyTests : TestBase
             new Dictionary<string, object?> { ["x"] = 0 });
 
         // Act — two concurrent updates from the same owner
-        var update1 = new ObjectUpdate(obj!.Id, new Dictionary<string, object?> { ["x"] = 100 });
-        var update2 = new ObjectUpdate(obj.Id, new Dictionary<string, object?> { ["x"] = 200 });
+        var update1 = new ObjectUpdate(obj!.Handle, new Dictionary<string, object?> { ["x"] = 100 });
+        var update2 = new ObjectUpdate(obj.Handle, new Dictionary<string, object?> { ["x"] = 200 });
 
         var task1 = Task.Run(() => ObjectService.UpdateObjects(session.Id, creator.Id, [update1]).ToList());
         var task2 = Task.Run(() => ObjectService.UpdateObjects(session.Id, creator.Id, [update2]).ToList());
@@ -206,7 +206,7 @@ public class ConcurrencyTests : TestBase
         // Act — server leaves (asteroid migrates to client) THEN server tries to update
         SessionService.LeaveSession("connection-1");
 
-        var update = new ObjectUpdate(asteroid!.Id, new Dictionary<string, object?> { ["x"] = 99.0 });
+        var update = new ObjectUpdate(asteroid!.Handle, new Dictionary<string, object?> { ["x"] = 99.0 });
         var updateResult = ObjectService.UpdateObjects(session.Id, server.Id, [update]).ToList();
 
         // Assert — update must be rejected because server.Id no longer owns the asteroid
@@ -432,7 +432,7 @@ public class ConcurrencyTests : TestBase
         // Act — all mutating operations should return null / empty without throwing
         var createResult = ObjectService.CreateObject(sessionId, creator.Id, ObjectScope.Session);
         var updateResult = ObjectService.UpdateObjects(sessionId, creator.Id,
-            [new ObjectUpdate(Guid.NewGuid(), new Dictionary<string, object?> { ["x"] = 1 })]).ToList();
+            [new ObjectUpdate(1, new Dictionary<string, object?> { ["x"] = 1 })]).ToList();
         var deleteResult = ObjectService.DeleteObject(sessionId, Guid.NewGuid(), creator.Id);
         var replaceResult = ObjectService.ReplaceObject(sessionId, Guid.NewGuid(), creator.Id,
             [new ReplacementObjectSpec(ObjectScope.Session, new Dictionary<string, object?>())]);
@@ -459,7 +459,7 @@ public class ConcurrencyTests : TestBase
             session.Id,
             creator.Id,
             [new ObjectUpdate(
-                obj.Id,
+                obj.Handle,
                 new Dictionary<string, object?> { ["x"] = 2 })]);
         var deleted = ObjectService.DeleteObject(
             session.Id, obj.Id, creator.Id);

@@ -165,17 +165,19 @@ public class BinaryGuidFormatterTests
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
             ObjectScope.Session,
             SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["type"] = "ship", ["x"] = 1.5 }),
-            42L);
+            42L, 7);
 
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<ObjectInfo>(bytes, Options);
 
-        bytes[0].Should().Be(0x96, "ObjectInfo must remain a six-slot fixarray");
+        bytes[0].Should().Be(0x97, "ObjectInfo must remain a seven-slot fixarray");
         result.Id.Should().Be(dto.Id);
         result.CreatorMemberId.Should().Be(dto.CreatorMemberId);
         result.OwnerMemberId.Should().Be(dto.OwnerMemberId);
         result.Scope.Should().Be(dto.Scope);
         result.Version.Should().Be(dto.Version);
+        result.Handle.Should().Be(dto.Handle,
+            "the session-scoped handle travels with every ObjectInfo so receivers can address updates by it");
         // Phase 3 envelope: Data is now wrapped, so verify the inner dict round-trips too.
         var innerDict = SyncPayloadCodec.DecodeDict(result.Data);
         innerDict["type"].Should().Be("ship");
@@ -200,7 +202,7 @@ public class BinaryGuidFormatterTests
     {
         var created = new ObjectInfo(
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
-            ObjectScope.Session, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["type"] = "asteroid" }), 1L);
+            ObjectScope.Session, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["type"] = "asteroid" }), 1L, 3);
 
         var dto = new ObjectReplacedEvent(Guid.NewGuid(), new List<ObjectInfo> { created });
         var bytes = MessagePackSerializer.Serialize(dto, Options);
@@ -220,14 +222,14 @@ public class BinaryGuidFormatterTests
             ["x"] = 0.5
         });
         var updateInfo = MessagePackSerializer.Serialize(
-            new ObjectUpdateInfo(id, payload, 2), Options);
+            new ObjectUpdateInfo(9, payload, 2), Options);
         var updateRequest = MessagePackSerializer.Serialize(
-            new ObjectUpdateRequest(id, payload), Options);
+            new ObjectUpdateRequest(9, payload), Options);
         var eventInfo = MessagePackSerializer.Serialize(
             new ObjectEventInfo(id, 1, new byte[] { 0x80 }), Options);
         var createResponse = MessagePackSerializer.Serialize(
             new CreateObjectResponse(
-                new ObjectInfo(id, id, id, ObjectScope.Member, payload, 1),
+                new ObjectInfo(id, id, id, ObjectScope.Member, payload, 1, 9),
                 2,
                 3),
             Options);
@@ -255,7 +257,7 @@ public class BinaryGuidFormatterTests
         var member = new MemberInfo(Guid.NewGuid(), MemberRole.Client, DateTime.UtcNow);
         var obj = new ObjectInfo(
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
-            ObjectScope.Member, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>()), 1L);
+            ObjectScope.Member, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>()), 1L, 4);
 
         var dto = new JoinSessionResponse(
             Guid.NewGuid(), "Banana", Guid.NewGuid(), MemberRole.Client,
@@ -298,7 +300,7 @@ public class BinaryGuidFormatterTests
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
             ObjectScope.Session,
             SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["type"] = "ship", ["x"] = 100.0, ["y"] = 200.0 }),
-            42L);
+            42L, 7);
 
         // Binary GUIDs
         var binaryBytes = MessagePackSerializer.Serialize(dto, Options);

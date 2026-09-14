@@ -431,7 +431,7 @@ public class ServerPromotionTests : TestBase
         var newMemberId = rejoinResult.Member!.Id;
 
         var updated = ObjectService.UpdateObjects(session.Id, newMemberId,
-            [new ObjectUpdate(obj!.Id, new Dictionary<string, object?> { ["wave"] = 5 })]).ToList();
+            [new ObjectUpdate(obj!.Handle, new Dictionary<string, object?> { ["wave"] = 5 })]).ToList();
 
         // Assert — update succeeds (ownership is correct)
         updated.Should().HaveCount(1);
@@ -606,7 +606,7 @@ public class ServerPromotionTests : TestBase
             session.Id, "new-conn", server.Id, server.ReconnectToken);
         var newMemberId = rejoinResult.Member!.Id;
         var updated = ObjectService.UpdateObjects(session.Id, newMemberId,
-            [new ObjectUpdate(gs!.Id, new Dictionary<string, object?> { ["wave"] = 5 })]).ToList();
+            [new ObjectUpdate(gs!.Handle, new Dictionary<string, object?> { ["wave"] = 5 })]).ToList();
 
         // Assert — update succeeds
         updated.Should().HaveCount(1);
