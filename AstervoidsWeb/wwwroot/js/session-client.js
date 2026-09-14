@@ -217,33 +217,34 @@ const SessionClient = (function() {
     const handlesByObjectId = new Map();
     const objectIdsByHandle = new Map();
 
-    // Updates for a handle we have not learned yet. This is the create/update
-    // reordering window: the server applies an update only to an object that
-    // already exists, but the create broadcast and the update broadcast are
-    // enqueued by different hub invocations, so a receiver can observe them out
-    // of order. Parked entries are replayed once the handle is learned from a
-    // live create, and dropped when a snapshot supersedes them.
-    const parkedUpdatesByHandle = new Map();
-    // Parked entries ready to replay, in arrival order.
-    let parkedUpdatesReady = [];
-    // Bound on parked entries. The window this covers is one broadcast, so the
-    // map should never hold more than a single batch; the cap exists so a peer
-    // that keeps sending handles we never learn cannot grow it without limit.
-    const MAX_PARKED_UPDATES = 64;
+    // Batches whose entries address a handle we have not learned yet. This is the
+    // create/update reordering window: the server applies an update only to an
+    // object that already exists, but the create broadcast and the update
+    // broadcast are enqueued by different hub invocations, so a receiver can
+    // observe them out of order.
+    //
+    // Parking is all-or-nothing per batch, and that is load-bearing rather than
+    // merely simpler. ObjectSync derives its lost-event detection from the
+    // per-member sequence carried by each dispatched batch. Dispatching the
+    // resolvable half of a batch would advance that sequence and hide the fact
+    // that the rest of the batch never arrived — so a parked batch is never
+    // partially delivered, and an un-delivered batch always leaves a sequence
+    // gap that forces reconciliation. Every path that discards a parked batch is
+    // safe for exactly that reason.
+    const parkedBatches = [];
+    // Parked batches whose handles are now all known, in arrival order.
+    let parkedBatchesReady = [];
+    // Bound on parked batches. The window this covers is a single broadcast, so
+    // in practice at most one batch is ever parked; the cap exists so a peer that
+    // keeps sending handles we never learn cannot grow this without limit.
+    const MAX_PARKED_BATCHES = 8;
 
     function rememberObjectHandle(objectInfo, fromSnapshot = false) {
         const handle = objectInfo?.handle;
         if (!(handle > 0) || typeof objectInfo.id !== 'string') return;
         handlesByObjectId.set(objectInfo.id, handle);
         objectIdsByHandle.set(handle, objectInfo.id);
-
-        const parked = parkedUpdatesByHandle.get(handle);
-        if (parked === undefined) return;
-        parkedUpdatesByHandle.delete(handle);
-        // A snapshot carries state at least as new as anything parked, and the
-        // caller applies it after this returns — replaying an older delta over
-        // it would only risk resurrecting stale fields.
-        if (!fromSnapshot) parkedUpdatesReady.push(parked);
+        resolveParkedBatches(handle, fromSnapshot);
     }
 
     function forgetObjectHandle(objectId) {
@@ -251,45 +252,91 @@ const SessionClient = (function() {
         if (handle === undefined) return;
         handlesByObjectId.delete(objectId);
         objectIdsByHandle.delete(handle);
-        parkedUpdatesByHandle.delete(handle);
+        // A batch addressing a handle that no longer resolves can never become
+        // deliverable, so drop it rather than let it occupy the cap.
+        dropParkedBatches(handle);
     }
 
     function clearObjectHandles() {
         handlesByObjectId.clear();
         objectIdsByHandle.clear();
-        parkedUpdatesByHandle.clear();
-        parkedUpdatesReady = [];
+        parkedBatches.length = 0;
+        parkedBatchesReady = [];
     }
 
-    function parkObjectUpdate(handle, update, dispatch) {
-        if (parkedUpdatesByHandle.size >= MAX_PARKED_UPDATES
-            && !parkedUpdatesByHandle.has(handle)) {
-            // Drop the oldest so a stream of unknown handles cannot displace the
-            // recent ones, which are the only ones likely to be resolved.
-            const oldest = parkedUpdatesByHandle.keys().next();
-            if (!oldest.done) parkedUpdatesByHandle.delete(oldest.value);
+    function parkObjectBatch(updates, dispatch) {
+        if (parkedBatches.length >= MAX_PARKED_BATCHES) {
+            // Drop the oldest: the recent batches are the ones still likely to
+            // be resolved by an in-flight create.
+            parkedBatches.shift();
         }
-        // Only the newest update per handle is worth keeping: updates are
-        // deltas over server state, and the object does not exist locally yet,
-        // so an older delta can add nothing the newer one lacks.
-        parkedUpdatesByHandle.set(handle, { update, dispatch });
+        const handles = new Set();
+        for (const update of updates) handles.add(update.handle);
+        parkedBatches.push({ updates, handles, dispatch });
     }
 
     /**
-     * Replays updates that were parked for handles since learned from a live
-     * create. Called after the create itself has been dispatched so the object
-     * exists before its delta arrives. The replayed batch keeps the metadata it
-     * arrived with (sequences, validAt); it is one broadcast late, which is the
-     * same window the reordering opened.
+     * Re-partitions parked batches after `handle` became known.
+     *
+     * A batch moves to the ready queue once every handle it addresses resolves.
+     * When the handle was taught by a snapshot the batch is discarded instead:
+     * the snapshot is authoritative as of its capture point, and its objects are
+     * applied by the caller after this returns, so replaying a delta over it here
+     * would race that application. Anything the snapshot predates is recovered by
+     * the sequence gap the un-delivered batch leaves behind.
+     */
+    function resolveParkedBatches(handle, fromSnapshot) {
+        if (parkedBatches.length === 0) return;
+        const remaining = [];
+        for (const batch of parkedBatches) {
+            if (!batch.handles.has(handle)) {
+                remaining.push(batch);
+                continue;
+            }
+            if (fromSnapshot) continue;
+            let ready = true;
+            for (const parkedHandle of batch.handles) {
+                if (!objectIdsByHandle.has(parkedHandle)) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready) parkedBatchesReady.push(batch);
+            else remaining.push(batch);
+        }
+        replaceParkedBatches(remaining);
+    }
+
+    function dropParkedBatches(handle) {
+        if (parkedBatches.length === 0) return;
+        replaceParkedBatches(parkedBatches.filter(batch => !batch.handles.has(handle)));
+    }
+
+    function replaceParkedBatches(batches) {
+        if (batches.length === parkedBatches.length) return;
+        parkedBatches.length = 0;
+        for (const batch of batches) parkedBatches.push(batch);
+    }
+
+    /**
+     * Replays batches parked for handles since learned from a live create. Called
+     * after the create itself has been dispatched so every object exists before
+     * its delta arrives. A replayed batch keeps the metadata it arrived with
+     * (sequences, validAt); it is one broadcast late, which is the same window
+     * the reordering opened.
      */
     function deliverParkedUpdates() {
-        if (parkedUpdatesReady.length === 0) return;
-        const ready = parkedUpdatesReady;
-        parkedUpdatesReady = [];
-        for (const parked of ready) {
-            const objectId = objectIdsByHandle.get(parked.update.handle);
-            if (objectId === undefined) continue;
-            parked.dispatch([toObjectUpdate(parked.update, objectId)]);
+        if (parkedBatchesReady.length === 0) return;
+        const ready = parkedBatchesReady;
+        parkedBatchesReady = [];
+        for (const batch of ready) {
+            const resolved = [];
+            for (const update of batch.updates) {
+                const objectId = objectIdsByHandle.get(update.handle);
+                if (objectId === undefined) continue;
+                resolved.push(toObjectUpdate(update, objectId));
+            }
+            if (resolved.length > 0) batch.dispatch(resolved);
         }
     }
 
@@ -647,17 +694,24 @@ const SessionClient = (function() {
                     dispatch(objects);
                     return;
                 }
-                const resolved = [];
+                const decoded = [];
+                let anyUnknown = false;
                 for (let i = 0; i < objects.length; i++) {
                     const update = normalizeObjectUpdateInfo(objects[i]);
                     SyncPayload.unwrapObjectData(update);
-                    const objectId = objectIdsByHandle.get(update?.handle);
-                    if (objectId === undefined) {
-                        if (update && update.handle > 0) parkObjectUpdate(update.handle, update, dispatch);
-                        continue;
-                    }
-                    resolved.push(toObjectUpdate(update, objectId));
+                    if (!update || !(update.handle > 0)) continue;
+                    decoded.push(update);
+                    if (!objectIdsByHandle.has(update.handle)) anyUnknown = true;
                 }
+                if (anyUnknown) {
+                    // Park the whole batch rather than delivering the half we can
+                    // address: a partial delivery would advance the sender's
+                    // sequence and mask the loss of the rest.
+                    parkObjectBatch(decoded, dispatch);
+                    return;
+                }
+                const resolved = decoded.map(update =>
+                    toObjectUpdate(update, objectIdsByHandle.get(update.handle)));
                 if (resolved.length > 0) dispatch(resolved);
             }
         },
