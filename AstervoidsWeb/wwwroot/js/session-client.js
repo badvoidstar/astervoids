@@ -651,11 +651,6 @@ const SessionClient = (function() {
                 for (let i = 0; i < objects.length; i++) {
                     const update = normalizeObjectUpdateInfo(objects[i]);
                     SyncPayload.unwrapObjectData(update);
-                    if (update && update.id !== undefined) {
-                        // Already in logical form (legacy/test fixture shape).
-                        resolved.push(update);
-                        continue;
-                    }
                     const objectId = objectIdsByHandle.get(update?.handle);
                     if (objectId === undefined) {
                         if (update && update.handle > 0) parkObjectUpdate(update.handle, update, dispatch);
@@ -1075,6 +1070,7 @@ const SessionClient = (function() {
         // sees the same plain dict shape as remote receivers.
         if (response && response.objectInfo) {
             response.objectInfo = decodeObjectInfo(response.objectInfo);
+            deliverParkedUpdates();
         }
         return response;
     }
