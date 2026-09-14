@@ -195,9 +195,23 @@ function joinResponse(sessionId, objects = []) {
     };
 }
 
+// Mirrors the server's session-scoped handle allocation: every ObjectInfo carries
+// one, and it is the identity hot-path updates address. Stable per id so a test can
+// name the handle of an object it also names by id.
+const handlesById = new Map();
+function handleFor(id) {
+    let handle = handlesById.get(id);
+    if (handle === undefined) {
+        handle = handlesById.size + 1;
+        handlesById.set(id, handle);
+    }
+    return handle;
+}
+
 function objectInfo(id, version, data, ownerMemberId = 'owner') {
     return {
         id,
+        handle: handleFor(id),
         version,
         data,
         ownerMemberId,
@@ -740,7 +754,7 @@ test('join snapshot preserves object events delivered before JoinSession returns
     );
     connection.emit(
         'OnObjectsUpdated',
-        [{ id: 'live', version: 3, data: { x: 3 } }],
+        [{ handle: handleFor('live'), version: 3, data: { x: 3 } }],
         'remote',
         1,
         2,
@@ -1164,7 +1178,7 @@ test('delayed replacement cannot resurrect deleted children or rewind updates an
     h.objectSync.on('onObjectReplaced', (_, infos) => { anchored = infos.map(obj => obj.id); });
     const replacing = h.objectSync.replaceObject(h.parentId, children.map(child => child.data));
     h.connection.emit('OnObjectsUpdated',
-        [{ id: 'updated', data: { value: 4 }, version: 4 }], 'other', 1, 1, 4000, 50, 3990);
+        [{ handle: handleFor('updated'), data: { value: 4 }, version: 4 }], 'other', 1, 1, 4000, 50, 3990);
     h.connection.emit('OnObjectDeleted', 'deleted', 'other', 2, 4001);
     h.objectSync.handleMemberDeparture(['departed']);
     h.objectSync.handleOwnershipMigration([
@@ -1184,7 +1198,14 @@ test('delayed replacement cannot resurrect deleted children or rewind updates an
     assert.equal(h.objectSync.getObject('migrated').ownerMemberId, 'new-owner');
     assert.equal(h.objectSync.getObject('migrated').version, 2);
     assert.equal(h.objectSync.getObject('migrated').ownershipMigrationPending, true);
-    assert.deepEqual(anchored, ['fresh'], 'older spawn anchors never replace newer presentation');
+    // 'updated' is anchored here because its update addressed a handle the client had
+    // not learned yet, so SessionClient parked it and replayed it immediately after the
+    // replacement taught the handle: at anchor time the child really is a fresh spawn.
+    // The replayed delta still lands on top of the anchor (asserted above), so the
+    // guarantee the assertion protects — an older spawn anchor never replaces newer
+    // presentation — holds for every child whose state the client already knew.
+    assert.deepEqual(anchored, ['updated', 'fresh'],
+        'older spawn anchors never replace newer presentation');
 });
 
 for (const reset of ['clear', 'session']) {

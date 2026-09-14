@@ -47,7 +47,7 @@ graph TB
     RR["ReplicationRuntime  (replication-runtime.js)<br/>Replica lifecycle · Version consumption<br/>Join markers · Ownership transitions"]
     POL["Replication policies<br/>replication-clock.js · replication-presentation.js<br/>replication-send-policy.js"]
     OS["ObjectSync  (object-sync.js)<br/>Object registry · Delta encoding · Batched flush<br/>Per-member sequencing · Reconciliation · Schema dispatch"]
-    SC["SessionClient  (session-client.js)<br/>SignalR lifecycle · Hub RPC wrappers<br/>Stale-connection guard() · GUID normalization"]
+    SC["SessionClient  (session-client.js)<br/>SignalR lifecycle · Hub RPC wrappers<br/>Stale-connection guard() · GUID normalization<br/>Object handle ↔ GUID translation"]
     GU["GuidUtils  (guid-utils.js)<br/>bytesToGuid · transformBinaryGuids"]
     HUB["/sessionHub<br/>ASP.NET Core SignalR — MessagePack"]
 
@@ -1502,8 +1502,8 @@ flowchart TB
     subgraph "SignalR transport (binary MessagePack)"
         direction TB
         MP["AddMessagePackProtocol with CompositeResolver:<br/>• BinaryGuidResolver (16-byte binary GUIDs)<br/>• annotated positional DTOs<br/>• ContractlessStandardResolver for outer response records<br/>• MessagePackSecurity.UntrustedData"]
-        DTO["Hot object DTOs are integer-key arrays:<br/>ObjectInfo · updates · requests · replacements · events.<br/>SyncPayload is [schemaId, dataBytes]."]
-        JSGUID["SessionClient normalizes compact arrays to named JS objects,<br/>transforms binary GUIDs to strings, then unwraps SyncPayload.<br/>Game/ObjectSync code keeps an ergonomic object contract."]
+        DTO["Hot object DTOs are integer-key arrays:<br/>ObjectInfo · updates · requests · replacements · events.<br/>Updates address objects by session-scoped handle.<br/>SyncPayload is [schemaId, dataBytes]."]
+        JSGUID["SessionClient normalizes compact arrays to named JS objects,<br/>resolves handles back to GUIDs, transforms binary GUIDs to strings,<br/>then unwraps SyncPayload.<br/>Game/ObjectSync code keeps an ergonomic object contract."]
     end
 
     subgraph "REST API (camelCase JSON)"
@@ -1535,26 +1535,67 @@ The surrounding hot DTOs also use integer MessagePack keys:
 
 | DTO | Wire shape |
 | --- | --- |
-| `ObjectInfo` | `[id, creatorId, ownerId, scope, syncPayload, version]` |
-| `ObjectUpdateInfo` | `[id, syncPayload, version]` |
-| `ObjectUpdateRequest` | `[id, syncPayload]` |
+| `ObjectInfo` | `[id, creatorId, ownerId, scope, syncPayload, version, handle]` |
+| `ObjectUpdateInfo` | `[handle, syncPayload, version]` |
+| `ObjectUpdateRequest` | `[handle, syncPayload]` |
 | `ObjectReplacedEvent` | `[deletedObjectId, createdObjects]` |
 | `ObjectEventInfo` | `[objectId, eventKind, payloadBytes]` |
 | create/update/delete responses | `[result, memberSequence, timestamp?]` |
 
+### Session-scoped object handles
+
+The two hot legs — the `UpdateObjects` request and the `OnObjectsUpdated`
+broadcast — address objects by a **session-scoped integer handle** instead of
+the 18-byte binary GUID. The handle costs 1–3 bytes, so a compact asteroid
+delta drops from ~31 B to ~16 B on both legs; with the GUID repeated in the
+request and again in the broadcast, it was the single largest remaining field
+on the uplink.
+
+- `Session.AllocateObjectHandle()` hands out `1, 2, 3, …` per session. Handles
+  are **never reused**, so `0` is an unambiguous "no handle" sentinel and an
+  in-flight update addressed to a dead handle can only fail to resolve — it can
+  never land on a different object.
+- `Session` keeps a `handle → Guid` index next to the object map. Every add and
+  remove goes through `AddObject` / `RemoveObject` so the two cannot drift.
+- The handle is **published, not negotiated**: it rides on every `ObjectInfo`
+  alongside the GUID, so create responses, `OnObjectCreated`, replacement
+  children, the join response and every reconciliation snapshot teach it. There
+  is no mapping message, and a reconnect resync needs no special handling.
+- Everything outside those two legs keeps the GUID — `DeleteObject`,
+  `ReplaceObject`, `BroadcastObjectEvent`, `MemberLeftInfo.deletedObjectIds`
+  and the `validAts` / `memberSequences` pair arrays are all cold paths where
+  the extra bytes do not repeat per frame.
+
+`session-client.js` owns the translation, so `ObjectSync` and game code keep
+speaking GUIDs:
+
+- It learns `handle ↔ id` from every decoded `ObjectInfo` and forgets the
+  mapping on delete, replacement of the parent, and member departure. A session
+  transition clears the whole map, since handles mean nothing outside the
+  session that allocated them.
+- On send it maps `objectId → handle`, dropping any update whose object it has
+  never been told about (the ack is then folded against the array that actually
+  went on the wire, not the caller's request array).
+- On receive it resolves `handle → objectId`. An update for a handle it has not
+  learned yet is **parked** (newest per handle, bounded) and replayed once a
+  live create teaches the handle; a snapshot that teaches the handle discards
+  the parked entry instead, because the snapshot is already newer. This
+  replaces the old "create a provisional object from an update for an unknown
+  id" fallback, which a handle cannot express.
+
 `UpdateObjectsResponse.Versions` is **positional**, not keyed: entry `i` is the
-version assigned to request element `i`, or `0` when that element was not
-applied (unknown object, or owned by another member). `SessionObject.Version`
+version assigned to wire element `i`, or `0` when that element was not
+applied (unknown handle, or owned by another member). `SessionObject.Version`
 starts at 1 and only increments, so `0` is an unambiguous rejection sentinel.
 The object id is omitted because the caller already knows which id it sent at
 each index, which takes a three-object acknowledgement from 72 B to 15 B.
 
 The alignment holds because `ObjectService.UpdateObjects` returns an
 order-preserving *subsequence* of the requested updates, so the hub matches the
-two lists with a single forward walk. A batch that repeats an object id applies
-each occurrence separately, and each occurrence is acknowledged at its own
-request index; `session-client.js` keeps the highest version when folding such a
-batch back to `{objectId: version}`.
+two lists with a single forward walk on the handle. A batch that repeats an
+object applies each occurrence separately, and each occurrence is acknowledged
+at its own request index; `session-client.js` keeps the highest version when
+folding such a batch back to `{objectId: version}`.
 
 `session-client.js` converts these arrays to named objects immediately at every
 invoke, live-event, snapshot, replacement, and reconciliation boundary.
@@ -2008,7 +2049,8 @@ astervoids/
 │           ├── debug-log.js                       # Shared _log/_warn/_error helpers gated on ASTERVOIDS_DEBUG.
 │           │                                      # Must load before every other script that logs.
 │           ├── session-client.js                  # SignalR lifecycle, hub RPC wrappers, stale-connection
-│           │                                      # guard(), GUID normalization. See: Client Architecture.
+│           │                                      # guard(), GUID normalization, object handle translation.
+│           │                                      # See: Client Architecture.
 │           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,
 │           │                                      # per-member sequencing, reconciliation, and schema dispatch.
 │           │                                      # See: Client Architecture.

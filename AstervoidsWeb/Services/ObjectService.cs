@@ -52,8 +52,8 @@ public class ObjectService : IObjectService
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var validAt = ValidAtPolicy.Resolve(clientValidAt, receive);
-            var obj = NewSessionObject(sessionId, creatorMemberId, effectiveOwner, scope, data, validAt, schemaId);
-            session.Objects.TryAdd(obj.Id, obj);
+            var obj = NewSessionObject(session, creatorMemberId, effectiveOwner, scope, data, validAt, schemaId);
+            session.AddObject(obj);
             return Snapshot(obj);
         }
     }
@@ -87,11 +87,12 @@ public class ObjectService : IObjectService
     /// <summary>
     /// Batch-updates multiple objects owned by <paramref name="ownerMemberId"/>.
     ///
-    /// Objects not owned by the caller are silently skipped.  Successfully updated
-    /// objects are returned. The call-level timestamp goes through the ±2 s
-    /// server-time sanity check, then is clamped against the newest previous
-    /// timestamp in the accepted batch so every updated object shares one
-    /// monotonic <c>ValidAt</c>.
+    /// Updates address their target by session-scoped <c>Handle</c> rather than by GUID —
+    /// that is the identity the hot wire path carries. Unknown handles and objects not
+    /// owned by the caller are silently skipped.  Successfully updated objects are
+    /// returned. The call-level timestamp goes through the ±2 s server-time sanity check,
+    /// then is clamped against the newest previous timestamp in the accepted batch so
+    /// every updated object shares one monotonic <c>ValidAt</c>.
     /// </summary>
     public IReadOnlyList<SessionObject> UpdateObjects(Guid sessionId, Guid ownerMemberId, IEnumerable<ObjectUpdate> updates, long? callLevelClientValidAt = null, long? serverReceiveTimeMs = null)
     {
@@ -112,7 +113,7 @@ public class ObjectService : IObjectService
             var acceptedUpdates = new List<(SessionObject Object, ObjectUpdate Update)>();
             foreach (var update in updates)
             {
-                if (!session.Objects.TryGetValue(update.ObjectId, out var obj))
+                if (!session.TryGetObjectByHandle(update.Handle, out var obj) || obj == null)
                     continue;
 
                 // Ownership check inside the lock — not TOCTOU-prone
@@ -162,7 +163,7 @@ public class ObjectService : IObjectService
             if (obj.OwnerMemberId != ownerMemberId)
                 return null;
 
-            return session.Objects.TryRemove(objectId, out var removed)
+            return session.RemoveObject(objectId, out var removed) && removed != null
                 ? Snapshot(removed)
                 : null;
         }
@@ -210,13 +211,13 @@ public class ObjectService : IObjectService
                     ? spec.OwnerOverride.Value
                     : ownerMemberId;
 
-                var obj = NewSessionObject(sessionId, ownerMemberId, effectiveOwner, spec.Scope, spec.Data, validAt, spec.SchemaId);
-                session.Objects.TryAdd(obj.Id, obj);
+                var obj = NewSessionObject(session, ownerMemberId, effectiveOwner, spec.Scope, spec.Data, validAt, spec.SchemaId);
+                session.AddObject(obj);
                 created.Add(obj);
             }
 
             // Delete the original — we already verified ownership above
-            session.Objects.TryRemove(deleteObjectId, out _);
+            session.RemoveObject(deleteObjectId, out _);
 
             return created.Select(Snapshot).ToList();
         }
@@ -276,12 +277,13 @@ public class ObjectService : IObjectService
     }
 
     /// <summary>
-    /// Constructs a fresh <see cref="SessionObject"/>, defensively cloning <paramref name="data"/>
-    /// so caller mutations after the call cannot corrupt the stored object. Caller is responsible
-    /// for inserting it into <c>session.Objects</c>.
+    /// Constructs a fresh <see cref="SessionObject"/> with a freshly allocated session-scoped
+    /// handle, defensively cloning <paramref name="data"/> so caller mutations after the call
+    /// cannot corrupt the stored object. Caller is responsible for inserting it via
+    /// <see cref="Session.AddObject"/>, which indexes the handle.
     /// </summary>
     private static SessionObject NewSessionObject(
-        Guid sessionId,
+        Session session,
         Guid creatorMemberId,
         Guid ownerMemberId,
         ObjectScope scope,
@@ -290,7 +292,8 @@ public class ObjectService : IObjectService
         byte schemaId = 0)
         => new()
         {
-            SessionId = sessionId,
+            SessionId = session.Id,
+            Handle = session.AllocateObjectHandle(),
             CreatorMemberId = creatorMemberId,
             OwnerMemberId = ownerMemberId,
             Scope = scope,
@@ -305,6 +308,7 @@ public class ObjectService : IObjectService
         => new()
         {
             Id = obj.Id,
+            Handle = obj.Handle,
             SessionId = obj.SessionId,
             CreatorMemberId = obj.CreatorMemberId,
             OwnerMemberId = obj.OwnerMemberId,

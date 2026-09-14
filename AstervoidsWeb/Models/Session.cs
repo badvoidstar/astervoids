@@ -70,8 +70,67 @@ public class Session
     /// Individual reads are thread-safe without <see cref="SyncRoot"/>; all mutations
     /// (including <see cref="SessionObject.Data"/> replacement and version bumps) require
     /// <see cref="SyncRoot"/>.
+    ///
+    /// Membership changes must go through <see cref="AddObject"/> / <see cref="RemoveObject"/>
+    /// so the handle index stays consistent with this dictionary.
     /// </summary>
     public ConcurrentDictionary<Guid, SessionObject> Objects { get; } = new();
+
+    /// <summary>
+    /// Handle → object id index backing <see cref="TryGetObjectByHandle"/>.
+    /// Maintained alongside <see cref="Objects"/> by <see cref="AddObject"/> and
+    /// <see cref="RemoveObject"/>.
+    ///
+    /// Deliberately maps to the id rather than the object: lookups resolve through
+    /// <see cref="Objects"/>, so a stale index entry can only fail to resolve — it can
+    /// never revive an object that was removed from the authoritative dictionary.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, Guid> _objectIdsByHandle = new();
+
+    private int _lastObjectHandle;
+
+    /// <summary>
+    /// Allocates the next session-scoped object handle. Starts at 1 and only increases,
+    /// so 0 is an unambiguous "no handle" sentinel and a handle is never reused within a
+    /// session (a late update addressed to a deleted object cannot land on a new one).
+    /// </summary>
+    public int AllocateObjectHandle() => Interlocked.Increment(ref _lastObjectHandle);
+
+    /// <summary>
+    /// Adds an object and indexes its <see cref="SessionObject.Handle"/>.
+    /// Must be called while holding <see cref="SyncRoot"/>.
+    /// </summary>
+    public bool AddObject(SessionObject obj)
+    {
+        if (!Objects.TryAdd(obj.Id, obj))
+            return false;
+        _objectIdsByHandle[obj.Handle] = obj.Id;
+        return true;
+    }
+
+    /// <summary>
+    /// Removes an object and its handle index entry.
+    /// Must be called while holding <see cref="SyncRoot"/>.
+    /// </summary>
+    public bool RemoveObject(Guid objectId, out SessionObject? removed)
+    {
+        if (!Objects.TryRemove(objectId, out removed))
+            return false;
+        _objectIdsByHandle.TryRemove(removed.Handle, out _);
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves a session-scoped handle to its object. Returns false for an unknown
+    /// handle, or for one whose object has since been removed.
+    /// Must be called while holding <see cref="SyncRoot"/> for compound check-then-act use.
+    /// </summary>
+    public bool TryGetObjectByHandle(int handle, out SessionObject? obj)
+    {
+        obj = null;
+        return _objectIdsByHandle.TryGetValue(handle, out var objectId)
+            && Objects.TryGetValue(objectId, out obj);
+    }
 
     /// <summary>
     /// Timestamp when the session was created.

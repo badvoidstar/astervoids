@@ -4,9 +4,12 @@ import { createRequire } from 'node:module';
 import { loadClassicModule } from './test-support/classic-module.mjs';
 
 // The UpdateObjects acknowledgement is positional on the wire: entry i is the
-// version assigned to request element i, and 0 marks an element the server did
+// version assigned to wire element i, and 0 marks an element the server did
 // not apply. SessionClient owns that wire shape and folds it back into the
 // {objectId: version} form ObjectSync consumes, so these tests pin the fold.
+//
+// Updates are addressed by session-scoped handle, so each object has to be
+// announced before it can be updated; the session snapshot below does that.
 
 const require = createRequire(import.meta.url);
 const GuidUtils = require('./wwwroot/js/guid-utils.js');
@@ -20,12 +23,18 @@ const MEMBER_ID = 'fedcba98-7654-3210-fedc-ba9876543210';
 const A_ID = '11111111-1111-1111-1111-111111111111';
 const B_ID = '22222222-2222-2222-2222-222222222222';
 const C_ID = '33333333-3333-3333-3333-333333333333';
+const HANDLES = { [A_ID]: 11, [B_ID]: 12, [C_ID]: 13 };
 
 async function loadClient() {
     const window = { ASTERVOIDS_DEBUG: false, SchemaCodec };
     const SyncPayload = loadClassicModule('sync-payload.js', 'SyncPayload', {
         window, MsgpackCodec
     });
+    const objectInfo = objectId => [
+        GuidUtils.guidToBytes(objectId), GuidUtils.guidToBytes(MEMBER_ID),
+        GuidUtils.guidToBytes(MEMBER_ID), 1, [0, MsgpackCodec.encode({})], 1,
+        HANDLES[objectId]
+    ];
     const sessionResponse = () => ({
         sessionId: GuidUtils.guidToBytes(SESSION_ID),
         sessionName: 'fruit',
@@ -33,7 +42,7 @@ async function loadClient() {
         role: 1,
         reconnectToken: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
         members: [{ id: GuidUtils.guidToBytes(MEMBER_ID), role: 1 }],
-        objects: [],
+        objects: [objectInfo(A_ID), objectInfo(B_ID), objectInfo(C_ID)],
         validAts: [],
         metadata: { schemas: WireSchemas.SCHEMAS }
     });
@@ -41,6 +50,7 @@ async function loadClient() {
     const ack = { value: [[], 0, 0] };
     const replies = new Map([
         ['CreateSession', sessionResponse],
+        ['JoinSession', sessionResponse],
         ['UpdateObjects', () => ack.value]
     ]);
     const connection = {
@@ -70,7 +80,9 @@ async function loadClient() {
         ObjectSync: { triggerReconciliation() {} }
     });
     assert.equal(await client.connect(), true);
-    await client.createSession();
+    // Join rather than create: a create response carries no objects, and the
+    // client can only address objects whose handles it has been taught.
+    await client.joinSession(SESSION_ID);
     return { client, ack };
 }
 

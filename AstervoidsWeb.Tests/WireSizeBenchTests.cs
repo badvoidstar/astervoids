@@ -23,6 +23,15 @@ public class WireSizeBenchTests
 
     private static int Size<T>(T value) => MessagePackSerializer.Serialize(value, Options).Length;
 
+    /// <summary>
+    /// Session-scoped object handle used by every sample. Handles are allocated
+    /// per session and never reused, so a long-lived session reaches four digits;
+    /// 1000 encodes as a 3-byte uint16, the widest realistic case. Budgets below
+    /// therefore never flatter the handle against the 18-byte binary GUID it
+    /// replaced on the hot paths.
+    /// </summary>
+    private const int SampleHandle = 1000;
+
     // ── Representative payloads ────────────────────────────────────────────────
 
     private static ObjectInfo SampleAsteroidInfo() => new(
@@ -42,7 +51,8 @@ public class WireSizeBenchTests
             ["rotationSpeed"] = 0.02,
             ["seed"] = 12345
         }),
-        Version: 1L);
+        Version: 1L,
+        Handle: SampleHandle);
 
     private static ObjectInfo SampleShipInfo() => new(
         Id: Guid.NewGuid(),
@@ -65,10 +75,11 @@ public class WireSizeBenchTests
             ["score"] = 0,
             ["hitCount"] = 0
         }),
-        Version: 1L);
+        Version: 1L,
+        Handle: SampleHandle);
 
     private static ObjectUpdateInfo SampleAsteroidUpdate() => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>
         {
             ["x"] = 0.523,
@@ -78,7 +89,7 @@ public class WireSizeBenchTests
         Version: 42L);
 
     private static ObjectUpdateInfo SampleShipUpdate() => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>
         {
             ["x"] = 0.523,
@@ -96,7 +107,7 @@ public class WireSizeBenchTests
         Version: 42L);
 
     private static ObjectUpdateInfo SampleBulletUpdate() => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>
         {
             ["x"] = 0.523,
@@ -208,7 +219,8 @@ public class WireSizeBenchTests
         // Expected ranges accommodate slight variation per Guid (binary GUIDs are fixed 18 B).
         var size = Size(SampleAsteroidInfo());
         // Legacy schema-0 data retained as a comparison baseline; ObjectInfo
-        // itself is now a compact six-slot array.
+        // itself is now a compact seven-slot array (the GUID id plus the
+        // session-scoped handle the hot paths address it by).
         size.Should().BeInRange(195, 205, "schema-0 asteroid create comparison");
     }
 
@@ -223,21 +235,21 @@ public class WireSizeBenchTests
     public void Baseline_AsteroidUpdate_PerFrame()
     {
         var size = Size(SampleAsteroidUpdate());
-        size.Should().BeInRange(58, 66, "schema-0 asteroid update comparison");
+        size.Should().BeInRange(43, 51, "schema-0 asteroid update comparison");
     }
 
     [Fact]
     public void Baseline_ShipUpdate_PerFrame()
     {
         var size = Size(SampleShipUpdate());
-        size.Should().BeInRange(142, 152, "schema-0 ship update comparison");
+        size.Should().BeInRange(127, 137, "schema-0 ship update comparison");
     }
 
     [Fact]
     public void Baseline_BulletUpdate_PerFrame_WithPendingHit()
     {
         var size = Size(SampleBulletUpdate());
-        size.Should().BeInRange(195, 225, "schema-0 pending-hit comparison");
+        size.Should().BeInRange(180, 210, "schema-0 pending-hit comparison");
     }
 
     // ── Batch-level baselines (one OnObjectsUpdated broadcast) ────────────────
@@ -254,7 +266,7 @@ public class WireSizeBenchTests
             SampleAsteroidUpdate()
         };
         var size = Size(batch);
-        size.Should().BeInRange(180, 195, "three schema-0 asteroid updates");
+        size.Should().BeInRange(135, 150, "three schema-0 asteroid updates");
     }
 
     [Fact]
@@ -269,7 +281,7 @@ public class WireSizeBenchTests
             SampleBulletUpdate(), SampleBulletUpdate()
         };
         var size = Size(batch);
-        size.Should().BeInRange(775, 800, "mixed schema-0 comparison batch");
+        size.Should().BeInRange(670, 695, "mixed schema-0 comparison batch");
     }
 
     // ── Snapshot baselines (rare path; one-shot per join) ─────────────────────
@@ -372,7 +384,7 @@ public class WireSizeBenchTests
     // ── Production quantized schema baselines ──────────────────────────────────
 
     private static ObjectUpdateInfo SampleAsteroidUpdateQuantized() => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: new SyncPayload(2, PositionalSchemaCodec.Encode(AsteroidSchema, new Dictionary<string, object?>
         {
             ["x"] = 0.523,
@@ -382,7 +394,7 @@ public class WireSizeBenchTests
         Version: 42L);
 
     private static ObjectUpdateInfo SampleShipUpdateQuantized() => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: new SyncPayload(1, PositionalSchemaCodec.Encode(ShipSchema, new Dictionary<string, object?>
         {
             ["x"] = 0.523,
@@ -406,7 +418,7 @@ public class WireSizeBenchTests
         Version: 42L);
 
     private static ObjectUpdateInfo SampleBulletUpdateQuantized(bool pendingHit = false) => new(
-        Id: Guid.NewGuid(),
+        Handle: SampleHandle,
         Data: new SyncPayload(3, PositionalSchemaCodec.Encode(BulletSchema, pendingHit
             ? new Dictionary<string, object?>
             {
@@ -428,23 +440,23 @@ public class WireSizeBenchTests
     public void Production_AsteroidUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleAsteroidUpdateQuantized());
-        size.Should().BeInRange(29, 35, "asteroid positional x/y/angle delta");
+        size.Should().BeInRange(14, 20, "asteroid positional x/y/angle delta");
     }
 
     [Fact]
     public void Production_ShipUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleShipUpdateQuantized());
-        size.Should().BeInRange(65, 75, "full replay-capable ship update with countdown timing");
+        size.Should().BeInRange(50, 60, "full replay-capable ship update with countdown timing");
     }
 
     [Fact]
     public void Production_BulletUpdates_ArePositional()
     {
         Size(SampleBulletUpdateQuantized()).Should().BeInRange(
-            29, 35, "ballistic bullet delta");
+            14, 20, "ballistic bullet delta");
         Size(SampleBulletUpdateQuantized(pendingHit: true)).Should().BeInRange(
-            50, 60, "pending-hit bullet delta");
+            35, 45, "pending-hit bullet delta");
     }
 
     [Fact]
@@ -457,7 +469,7 @@ public class WireSizeBenchTests
             SampleAsteroidUpdateQuantized()
         };
         var size = Size(batch);
-        size.Should().BeInRange(90, 105, "three compact asteroid deltas");
+        size.Should().BeInRange(45, 60, "three compact asteroid deltas");
     }
 
     [Fact]
@@ -471,7 +483,7 @@ public class WireSizeBenchTests
             SampleBulletUpdateQuantized(), SampleBulletUpdateQuantized()
         };
         var size = Size(batch);
-        size.Should().BeInRange(248, 268, "mixed steady-state positional batch with ship timing");
+        size.Should().BeInRange(150, 175, "mixed steady-state positional batch with ship timing");
     }
 
     [Fact]

@@ -93,6 +93,18 @@ public class WireSizeEstimatorTests
 
     // ── DTO shapes ─────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Session-scoped handles for sample updates, cycling through the
+    /// MessagePack integer widths (fixint, uint8, uint32) so a batch never
+    /// measures a single encoding width.
+    /// </summary>
+    private static int HandleAt(int index) => (index % 3) switch
+    {
+        0 => 1 + index,
+        1 => 200 + index,
+        _ => 70000 + index
+    };
+
     [Fact]
     public void Payload_MatchesSerializedSyncPayload()
     {
@@ -117,7 +129,7 @@ public class WireSizeEstimatorTests
     public void UpdateObjectsRequest_MatchesSerializedArgumentTuple(int count)
     {
         var updates = Enumerable.Range(0, count)
-            .Select(_ => new ObjectUpdateRequest(Guid.NewGuid(), new SyncPayload(2, new byte[8])))
+            .Select(i => new ObjectUpdateRequest(HandleAt(i), new SyncPayload(2, new byte[8])))
             .ToList();
 
         long? senderSequence = 4200;
@@ -140,7 +152,7 @@ public class WireSizeEstimatorTests
     {
         var updates = new List<ObjectUpdateRequest>
         {
-            new(Guid.NewGuid(), new SyncPayload(2, new byte[8])),
+            new(HandleAt(0), new SyncPayload(2, new byte[8])),
         };
 
         var estimated = WireSizeEstimator.UpdateObjectsRequest(updates, null, null, null);
@@ -157,7 +169,7 @@ public class WireSizeEstimatorTests
     public void ObjectsUpdatedBroadcast_MatchesSerializedArgumentTuple(int count)
     {
         var updates = Enumerable.Range(0, count)
-            .Select(i => new ObjectUpdateInfo(Guid.NewGuid(), new SyncPayload(2, new byte[8]), 12000 + i))
+            .Select(i => new ObjectUpdateInfo(HandleAt(i), new SyncPayload(2, new byte[8]), 12000 + i))
             .ToList();
 
         var senderMemberId = Guid.NewGuid();
@@ -188,9 +200,9 @@ public class WireSizeEstimatorTests
         // to confirm per-element data lengths are summed rather than assumed.
         var updates = new List<ObjectUpdateInfo>
         {
-            new(Guid.NewGuid(), new SyncPayload(2, new byte[8]), 1),
-            new(Guid.NewGuid(), new SyncPayload(1, new byte[33]), 300),
-            new(Guid.NewGuid(), new SyncPayload(3, new byte[260]), 70000),
+            new(1, new SyncPayload(2, new byte[8]), 1),
+            new(200, new SyncPayload(1, new byte[33]), 300),
+            new(70000, new SyncPayload(3, new byte[260]), 70000),
         };
 
         var estimated = WireSizeEstimator.ObjectsUpdatedBroadcast(updates, null, 1, 2, null, 3);

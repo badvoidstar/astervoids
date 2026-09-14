@@ -126,8 +126,8 @@ public class ObjectServiceTests : TestBase
 
         var updates = new List<ObjectUpdate>
         {
-            new(obj1!.Id, new Dictionary<string, object?> { ["x"] = 100 }),
-            new(obj2!.Id, new Dictionary<string, object?> { ["x"] = 200 })
+            new(obj1!.Handle, new Dictionary<string, object?> { ["x"] = 100 }),
+            new(obj2!.Handle, new Dictionary<string, object?> { ["x"] = 200 })
         };
 
         // Act
@@ -177,6 +177,90 @@ public class ObjectServiceTests : TestBase
 
         // Assert
         objects.Should().HaveCount(3);
+    }
+
+    // ── Session-scoped object handles ─────────────────────────────────────────
+
+    [Fact]
+    public void CreateObject_ShouldAllocateIncreasingHandlesWithinASession()
+    {
+        var (session, creator) = CreateTestSession();
+
+        var first = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session)!;
+        var second = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session)!;
+
+        first.Handle.Should().BeGreaterThan(0, "zero is the client-side 'no handle' sentinel");
+        second.Handle.Should().BeGreaterThan(first.Handle,
+            "handles are allocated monotonically so a late update cannot land on a newer object");
+    }
+
+    [Fact]
+    public void CreateObject_ShouldNotReuseTheHandleOfADeletedObject()
+    {
+        var (session, creator) = CreateTestSession();
+        var deleted = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session)!;
+        ObjectService.DeleteObject(session.Id, deleted.Id, creator.Id);
+
+        var replacement = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session)!;
+
+        replacement.Handle.Should().NotBe(deleted.Handle,
+            "an in-flight update addressed to a dead handle must never hit a different object");
+    }
+
+    [Fact]
+    public void UpdateObjects_ShouldRejectTheHandleOfADeletedObject()
+    {
+        var (session, creator) = CreateTestSession();
+        var obj = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["x"] = 0 })!;
+        ObjectService.DeleteObject(session.Id, obj.Id, creator.Id);
+
+        var updated = ObjectService.UpdateObjects(session.Id, creator.Id,
+            [new ObjectUpdate(obj.Handle, new Dictionary<string, object?> { ["x"] = 1 })]).ToList();
+
+        updated.Should().BeEmpty("a handle stops resolving the moment its object leaves the session");
+    }
+
+    [Fact]
+    public void ReplaceObject_ShouldGiveEveryChildItsOwnHandle()
+    {
+        var (session, creator) = CreateTestSession();
+        var parent = ObjectService.CreateObject(session.Id, creator.Id, ObjectScope.Session)!;
+
+        var children = ObjectService.ReplaceObject(session.Id, parent.Id, creator.Id,
+        [
+            new ReplacementObjectSpec(ObjectScope.Session, new Dictionary<string, object?> { ["x"] = 1 }),
+            new ReplacementObjectSpec(ObjectScope.Session, new Dictionary<string, object?> { ["x"] = 2 })
+        ])!;
+
+        children.Select(child => child.Handle).Should().OnlyHaveUniqueItems();
+        children.Should().OnlyContain(child => child.Handle > parent.Handle,
+            "children are created after the parent, so they take later handles");
+        ObjectService.UpdateObjects(session.Id, creator.Id,
+            [new ObjectUpdate(parent.Handle, new Dictionary<string, object?> { ["x"] = 9 })])
+            .Should().BeEmpty("the replaced parent's handle no longer resolves");
+    }
+
+    [Fact]
+    public void Handles_ShouldBeScopedToTheirOwnSession()
+    {
+        var (sessionA, creatorA) = CreateTestSession("connection-a");
+        var (sessionB, creatorB) = CreateTestSession("connection-b");
+        var objectA = ObjectService.CreateObject(sessionA.Id, creatorA.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["x"] = 0 })!;
+        var objectB = ObjectService.CreateObject(sessionB.Id, creatorB.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["x"] = 0 })!;
+
+        objectB.Handle.Should().Be(objectA.Handle,
+            "each session numbers its own objects from one");
+
+        var updated = ObjectService.UpdateObjects(sessionB.Id, creatorB.Id,
+            [new ObjectUpdate(objectB.Handle, new Dictionary<string, object?> { ["x"] = 7 })]).ToList();
+
+        updated.Should().ContainSingle().Which.Id.Should().Be(objectB.Id,
+            "a handle only ever addresses an object inside its own session");
+        ObjectService.GetObject(sessionA.Id, objectA.Id)!.Data["x"].Should().Be(0,
+            "the same handle in another session must be untouched");
     }
 
     [Fact]
@@ -545,8 +629,8 @@ public class ObjectServiceTests : TestBase
             session.Id, creator.Id,
             new List<ObjectUpdate>
             {
-                new(obj1.Id, new Dictionary<string, object?> { ["x"] = 10.0 }),
-                new(obj2.Id, new Dictionary<string, object?> { ["x"] = 20.0 })
+                new(obj1.Handle, new Dictionary<string, object?> { ["x"] = 10.0 }),
+                new(obj2.Handle, new Dictionary<string, object?> { ["x"] = 20.0 })
             },
             callLevelClientValidAt: callLevelStamp,
             serverReceiveTimeMs: receiveUpdate).ToList();

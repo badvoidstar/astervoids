@@ -19,7 +19,7 @@ public class ReplacementWireTests
 
     private static ObjectInfo Child(int value) => new(
         Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), ObjectScope.Session,
-        SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["counter"] = value }), 1);
+        SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["counter"] = value }), 1, value);
 
     private static int WireSize(HubMessage message)
     {
@@ -46,7 +46,7 @@ public class ReplacementWireTests
         decoded.CreatedObjects.Select(child => child.Id).Should().Equal(children.Select(child => child.Id));
         decoded.MemberSequence.Should().Be(7);
         decoded.ValidAt.Should().Be(response.ValidAt);
-        bytes.Length.Should().Be(162,
+        bytes.Length.Should().Be(164,
             "the two-child response payload budget excludes SignalR and transport framing");
         bytes.Length.Should().Be(
             MessagePackSerializer.Serialize(children, SerializerOptions).Length + 11,
@@ -68,10 +68,10 @@ public class ReplacementWireTests
             "1", new ReplaceObjectResponse(children, 7, validAt)));
 
         completion.Should().Be(oldCompletion + 11);
-        oldCompletion.Should().Be(159);
-        oldEcho.Should().Be(232);
-        completion.Should().Be(170, "two small generic children fit in one compact completion");
-        (oldCompletion + oldEcho - completion).Should().Be(221,
+        oldCompletion.Should().Be(161);
+        oldEcho.Should().Be(234);
+        completion.Should().Be(172, "two small generic children fit in one compact completion");
+        (oldCompletion + oldEcho - completion).Should().Be(223,
             "the sender no longer receives an invocation containing the same children");
     }
 }

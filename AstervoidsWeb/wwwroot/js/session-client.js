@@ -66,6 +66,7 @@ const SessionClient = (function() {
         pendingSessionTransition = { kind, epoch, targetSessionId, memberEvents: [] };
         currentSession = null;
         currentMember = null;
+        clearObjectHandles();
         if (clearLastSession) {
             lastSessionId = null;
             reconnectIdentity = null;
@@ -85,6 +86,7 @@ const SessionClient = (function() {
         pendingSessionTransition = null;
         currentSession = null;
         currentMember = null;
+        clearObjectHandles();
         if (clearLastSession) {
             lastSessionId = null;
             reconnectIdentity = null;
@@ -200,6 +202,148 @@ const SessionClient = (function() {
             && pendingSessionTransition.targetSessionId === expiredSessionId;
     }
 
+    // ── Session-scoped object handles ───────────────────────────────────────
+    //
+    // Hot-path wire entries (UpdateObjects requests, OnObjectsUpdated broadcasts)
+    // address objects by the server-allocated session-scoped integer handle
+    // instead of the 18-byte binary GUID. Every ObjectInfo the server sends
+    // carries both identities, so the map below is learned from ordinary traffic
+    // — create responses, OnObjectCreated, replacement children, and the join /
+    // reconciliation snapshots that follow a reconnect.
+    //
+    // The map is transport state: game code and ObjectSync keep speaking GUIDs.
+    // Handles are only meaningful within one session, so a session transition
+    // clears them.
+    const handlesByObjectId = new Map();
+    const objectIdsByHandle = new Map();
+
+    // Batches whose entries address a handle we have not learned yet. This is the
+    // create/update reordering window: the server applies an update only to an
+    // object that already exists, but the create broadcast and the update
+    // broadcast are enqueued by different hub invocations, so a receiver can
+    // observe them out of order.
+    //
+    // Parking is all-or-nothing per batch, and that is load-bearing rather than
+    // merely simpler. ObjectSync derives its lost-event detection from the
+    // per-member sequence carried by each dispatched batch. Dispatching the
+    // resolvable half of a batch would advance that sequence and hide the fact
+    // that the rest of the batch never arrived — so a parked batch is never
+    // partially delivered, and an un-delivered batch always leaves a sequence
+    // gap that forces reconciliation. Every path that discards a parked batch is
+    // safe for exactly that reason.
+    const parkedBatches = [];
+    // Parked batches whose handles are now all known, in arrival order.
+    let parkedBatchesReady = [];
+    // Bound on parked batches. The window this covers is a single broadcast, so
+    // in practice at most one batch is ever parked; the cap exists so a peer that
+    // keeps sending handles we never learn cannot grow this without limit.
+    const MAX_PARKED_BATCHES = 8;
+
+    function rememberObjectHandle(objectInfo, fromSnapshot = false) {
+        const handle = objectInfo?.handle;
+        if (!(handle > 0) || typeof objectInfo.id !== 'string') return;
+        handlesByObjectId.set(objectInfo.id, handle);
+        objectIdsByHandle.set(handle, objectInfo.id);
+        resolveParkedBatches(handle, fromSnapshot);
+    }
+
+    function forgetObjectHandle(objectId) {
+        const handle = handlesByObjectId.get(objectId);
+        if (handle === undefined) return;
+        handlesByObjectId.delete(objectId);
+        objectIdsByHandle.delete(handle);
+        // A batch addressing a handle that no longer resolves can never become
+        // deliverable, so drop it rather than let it occupy the cap.
+        dropParkedBatches(handle);
+    }
+
+    function clearObjectHandles() {
+        handlesByObjectId.clear();
+        objectIdsByHandle.clear();
+        parkedBatches.length = 0;
+        parkedBatchesReady = [];
+    }
+
+    function parkObjectBatch(updates, dispatch) {
+        if (parkedBatches.length >= MAX_PARKED_BATCHES) {
+            // Drop the oldest: the recent batches are the ones still likely to
+            // be resolved by an in-flight create.
+            parkedBatches.shift();
+        }
+        const handles = new Set();
+        for (const update of updates) handles.add(update.handle);
+        parkedBatches.push({ updates, handles, dispatch });
+    }
+
+    /**
+     * Re-partitions parked batches after `handle` became known.
+     *
+     * A batch moves to the ready queue once every handle it addresses resolves.
+     * When the handle was taught by a snapshot the batch is discarded instead:
+     * the snapshot is authoritative as of its capture point, and its objects are
+     * applied by the caller after this returns, so replaying a delta over it here
+     * would race that application. Anything the snapshot predates is recovered by
+     * the sequence gap the un-delivered batch leaves behind.
+     */
+    function resolveParkedBatches(handle, fromSnapshot) {
+        if (parkedBatches.length === 0) return;
+        const remaining = [];
+        for (const batch of parkedBatches) {
+            if (!batch.handles.has(handle)) {
+                remaining.push(batch);
+                continue;
+            }
+            if (fromSnapshot) continue;
+            let ready = true;
+            for (const parkedHandle of batch.handles) {
+                if (!objectIdsByHandle.has(parkedHandle)) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready) parkedBatchesReady.push(batch);
+            else remaining.push(batch);
+        }
+        replaceParkedBatches(remaining);
+    }
+
+    function dropParkedBatches(handle) {
+        if (parkedBatches.length === 0) return;
+        replaceParkedBatches(parkedBatches.filter(batch => !batch.handles.has(handle)));
+    }
+
+    function replaceParkedBatches(batches) {
+        if (batches.length === parkedBatches.length) return;
+        parkedBatches.length = 0;
+        for (const batch of batches) parkedBatches.push(batch);
+    }
+
+    /**
+     * Replays batches parked for handles since learned from a live create. Called
+     * after the create itself has been dispatched so every object exists before
+     * its delta arrives. A replayed batch keeps the metadata it arrived with
+     * (sequences, validAt); it is one broadcast late, which is the same window
+     * the reordering opened.
+     */
+    function deliverParkedUpdates() {
+        if (parkedBatchesReady.length === 0) return;
+        const ready = parkedBatchesReady;
+        parkedBatchesReady = [];
+        for (const batch of ready) {
+            const resolved = [];
+            for (const update of batch.updates) {
+                const objectId = objectIdsByHandle.get(update.handle);
+                if (objectId === undefined) continue;
+                resolved.push(toObjectUpdate(update, objectId));
+            }
+            if (resolved.length > 0) batch.dispatch(resolved);
+        }
+    }
+
+    function toObjectUpdate(update, objectId) {
+        return { id: objectId, data: update.data, version: update.version };
+    }
+
     function normalizeObjectInfo(value) {
         if (!Array.isArray(value)) return value;
         return {
@@ -208,28 +352,30 @@ const SessionClient = (function() {
             ownerMemberId: value[2],
             scope: value[3],
             data: value[4],
-            version: value[5]
+            version: value[5],
+            handle: value[6]
         };
     }
 
-    function decodeObjectInfo(value) {
+    function decodeObjectInfo(value, fromSnapshot = false) {
         const objectInfo = normalizeObjectInfo(value);
         WireEnum.translateObject(objectInfo);
         SyncPayload.unwrapObjectData(objectInfo);
+        rememberObjectHandle(objectInfo, fromSnapshot);
         return objectInfo;
     }
 
-    function decodeObjectInfos(objects) {
+    function decodeObjectInfos(objects, fromSnapshot = false) {
         if (!Array.isArray(objects)) return;
         for (let i = 0; i < objects.length; i++) {
-            objects[i] = decodeObjectInfo(objects[i]);
+            objects[i] = decodeObjectInfo(objects[i], fromSnapshot);
         }
     }
 
     function normalizeObjectUpdateInfo(value) {
         if (!Array.isArray(value)) return value;
         return {
-            id: value[0],
+            handle: value[0],
             data: value[1],
             version: value[2]
         };
@@ -264,8 +410,12 @@ const SessionClient = (function() {
     function dispatchObjectReplacement(event, senderMemberId, memberSequence, validAt,
         handler = callbacks.onObjectReplaced) {
         event = normalizeObjectReplacedEvent(event);
-        if (event) decodeObjectInfos(event.createdObjects);
+        if (event) {
+            forgetObjectHandle(event.deletedObjectId);
+            decodeObjectInfos(event.createdObjects);
+        }
         if (handler) handler(event, senderMemberId, memberSequence, validAt);
+        deliverParkedUpdates();
         return event.createdObjects;
     }
 
@@ -498,7 +648,14 @@ const SessionClient = (function() {
             name: 'OnMemberLeft',
             sessionScoped: true,
             handler: (info, senderMemberId, memberSequence, serverTimestamp) => {
-                if (info) info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
+                if (info) {
+                    info.promotedRole = WireEnum.roleFromWire(info.promotedRole);
+                    // Member-scoped objects of the departing member are gone;
+                    // their handles will never be addressed again.
+                    if (Array.isArray(info.deletedObjectIds)) {
+                        for (const objectId of info.deletedObjectIds) forgetObjectHandle(objectId);
+                    }
+                }
                 handleMemberEvent({
                     kind: 'left',
                     info,
@@ -517,27 +674,52 @@ const SessionClient = (function() {
                 if (callbacks.onObjectCreated) {
                     callbacks.onObjectCreated(objectInfo, senderMemberId, memberSequence, validAt);
                 }
+                deliverParkedUpdates();
             }
         },
         {
             name: 'OnObjectsUpdated',
             sessionScoped: true,
             handler: (objects, senderMemberId, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, validAt) => {
-                if (Array.isArray(objects)) {
-                    for (let i = 0; i < objects.length; i++) {
-                        objects[i] = normalizeObjectUpdateInfo(objects[i]);
-                        SyncPayload.unwrapObjectData(objects[i]);
+                // Entries arrive as [handle, payload, version]. Resolve each
+                // handle to the object id ObjectSync and the game speak, and
+                // park the ones whose create we have not seen yet.
+                const dispatch = resolved => {
+                    if (callbacks.onObjectsUpdated) {
+                        callbacks.onObjectsUpdated(resolved, serverTimestamp, senderMemberId,
+                            senderSequence, memberSequence, senderSendIntervalMs, validAt);
                     }
+                };
+                if (!Array.isArray(objects)) {
+                    dispatch(objects);
+                    return;
                 }
-                if (callbacks.onObjectsUpdated) {
-                    callbacks.onObjectsUpdated(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs, validAt);
+                const decoded = [];
+                let anyUnknown = false;
+                for (let i = 0; i < objects.length; i++) {
+                    const update = normalizeObjectUpdateInfo(objects[i]);
+                    SyncPayload.unwrapObjectData(update);
+                    if (!update || !(update.handle > 0)) continue;
+                    decoded.push(update);
+                    if (!objectIdsByHandle.has(update.handle)) anyUnknown = true;
                 }
+                if (anyUnknown) {
+                    // Park the whole batch rather than delivering the half we can
+                    // address: a partial delivery would advance the sender's
+                    // sequence and mask the loss of the rest.
+                    parkObjectBatch(decoded, dispatch);
+                    return;
+                }
+                const resolved = decoded.map(update =>
+                    toObjectUpdate(update, objectIdsByHandle.get(update.handle)));
+                if (resolved.length > 0) dispatch(resolved);
             }
         },
         {
             name: 'OnObjectDeleted',
             sessionScoped: true,
             handler: (objectId, senderMemberId, memberSequence, serverTimestamp) => {
+                forgetObjectHandle(objectId);
                 if (callbacks.onObjectDeleted) {
                     callbacks.onObjectDeleted(objectId, senderMemberId, memberSequence);
                 }
@@ -803,7 +985,7 @@ const SessionClient = (function() {
             if (Array.isArray(response.members)) {
                 for (const m of response.members) WireEnum.translateMember(m);
             }
-            decodeObjectInfos(response.objects);
+            decodeObjectInfos(response.objects, true);
 
             const joinedSession = {
                 id: response.sessionId,
@@ -942,6 +1124,7 @@ const SessionClient = (function() {
         // sees the same plain dict shape as remote receivers.
         if (response && response.objectInfo) {
             response.objectInfo = decodeObjectInfo(response.objectInfo);
+            deliverParkedUpdates();
         }
         return response;
     }
@@ -963,17 +1146,32 @@ const SessionClient = (function() {
         // before invoking. Avoid mutating the caller's request objects so callers
         // can keep using their `update.data` references for local bookkeeping.
         // Phase 4: each update may carry an explicit schemaId; default 0.
+        // Each entry addresses its object by session-scoped handle rather than
+        // by GUID, so `sent` records which request each wire slot came from —
+        // the positional acknowledgement is indexed against the wire array.
         let wrapped = updates;
+        let sent = updates;
         if (Array.isArray(updates)) {
-            wrapped = new Array(updates.length);
+            wrapped = [];
+            sent = [];
             for (let i = 0; i < updates.length; i++) {
                 const u = updates[i];
                 if (u && u.data !== undefined) {
+                    const handle = handlesByObjectId.get(u.objectId);
+                    if (handle === undefined) {
+                        // No handle means the server never told us about this
+                        // object (or it has been deleted). Nothing addressable
+                        // to send; leaving it out of the acknowledgement keeps
+                        // "absent" meaning "not confirmed, re-send".
+                        _warn('[SessionClient] Skipping update for object with no session handle:', u.objectId);
+                        continue;
+                    }
                     const id = (u.schemaId === undefined || u.schemaId === null) ? 0 : u.schemaId;
-                    wrapped[i] = [GuidUtils.guidToBytes(u.objectId), SyncPayload.wrap(u.data, id)];
+                    wrapped.push([handle, SyncPayload.wrap(u.data, id)]);
                 } else {
-                    wrapped[i] = u;
+                    wrapped.push(u);
                 }
+                sent.push(u);
             }
         }
         let response = await invokeHub('UpdateObjects', wrapped, senderSequence, senderSendIntervalMs, clientValidAt);
@@ -982,13 +1180,14 @@ const SessionClient = (function() {
         }
         response = normalizeUpdateObjectsResponse(response);
         // response.versions is positional on the wire: entry i is the version
-        // assigned to updates[i], or 0 when the server did not apply it. The id
-        // is omitted precisely because we already know it at each index. Game
-        // code expects a string-keyed object so it can do `versions[id]` and
-        // `Object.entries(versions)`, so fold it back here — the transport layer
-        // owns the wire shape, ObjectSync keeps seeing the logical one.
+        // assigned to the request we sent at index i, or 0 when the server did
+        // not apply it. The object identity is omitted precisely because we
+        // already know it at each index. Game code expects a string-keyed object
+        // so it can do `versions[id]` and `Object.entries(versions)`, so fold it
+        // back here — the transport layer owns the wire shape, ObjectSync keeps
+        // seeing the logical one.
         if (response) {
-            response.versions = versionsByObjectId(response.versions, updates);
+            response.versions = versionsByObjectId(response.versions, sent);
         }
         return response;
     }
@@ -997,17 +1196,19 @@ const SessionClient = (function() {
      * Folds the positional UpdateObjects acknowledgement back into a
      * {objectId: version} object. Entries with version 0 (not applied) are
      * omitted so callers keep treating "absent" as "not confirmed" and re-send.
-     * @param {number[]} versions - Positional versions aligned to `updates`.
-     * @param {Array} updates - The request array that produced this response.
+     * @param {number[]} versions - Positional versions aligned to `sent`.
+     * @param {Array} sent - The requests actually placed on the wire, in wire
+     *   order. Requests skipped for want of a session handle are not in it, so
+     *   the index alignment with `versions` holds.
      */
-    function versionsByObjectId(versions, updates) {
+    function versionsByObjectId(versions, sent) {
         const byId = {};
-        if (!Array.isArray(versions) || !Array.isArray(updates)) return byId;
-        const count = Math.min(versions.length, updates.length);
+        if (!Array.isArray(versions) || !Array.isArray(sent)) return byId;
+        const count = Math.min(versions.length, sent.length);
         for (let i = 0; i < count; i++) {
             const version = versions[i];
             if (!(version > 0)) continue;
-            const objectId = updates[i]?.objectId;
+            const objectId = sent[i]?.objectId;
             if (objectId === undefined || objectId === null) continue;
             // A batch may legitimately carry an id more than once; the last
             // occurrence holds the newest version, matching server apply order.
@@ -1065,6 +1266,11 @@ const SessionClient = (function() {
         if (!isSessionContextCurrent(context)) {
             throw staleOperationError();
         }
+        // The handle is dead either way: on success the server dropped the
+        // object, and on failure this client has already removed it locally
+        // (delete is local-first). A later snapshot re-teaches the mapping if
+        // the object turns out to still exist.
+        forgetObjectHandle(objectId);
         return normalizeDeleteObjectResponse(response);
     }
 
@@ -1100,7 +1306,7 @@ const SessionClient = (function() {
             if (Array.isArray(snapshot.members)) {
                 for (const m of snapshot.members) WireEnum.translateMember(m);
             }
-            decodeObjectInfos(snapshot.objects);
+            decodeObjectInfos(snapshot.objects, true);
             snapshot.validAts = WireEnum.pairsToObject(snapshot.validAts);
             snapshot.memberSequences = WireEnum.pairsToObject(snapshot.memberSequences);
         }

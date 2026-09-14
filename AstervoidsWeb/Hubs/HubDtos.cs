@@ -80,6 +80,15 @@ public record MemberLeftInfo(
 // SchemaId=0 carries a generic MessagePack map; nonzero IDs select registered
 // positional schemas. The server treats the encoded bytes as opaque outside
 // the sync-layer encode/decode boundary.
+/// <summary>
+/// Full object state. Carries both identities: <see cref="Id"/> is the globally
+/// unique GUID every other DTO and the game layer address objects by, and
+/// <see cref="Handle"/> is the session-scoped integer the hot paths use instead
+/// (see <see cref="ObjectUpdateRequest"/>). Every <c>ObjectInfo</c> a client
+/// receives — create response, <c>OnObjectCreated</c>, replacement children, join
+/// and reconciliation snapshots — teaches it one handle→id mapping, so no separate
+/// mapping message is needed and a reconnect resync re-teaches the whole session.
+/// </summary>
 [MessagePackObject]
 public record ObjectInfo(
     [property: Key(0)] Guid Id,
@@ -87,17 +96,43 @@ public record ObjectInfo(
     [property: Key(2)] Guid OwnerMemberId,
     [property: Key(3)] ObjectScope Scope,
     [property: Key(4)] SyncPayload Data,
-    [property: Key(5)] long Version);
+    [property: Key(5)] long Version,
+    [property: Key(6)] int Handle);
 
+/// <summary>
+/// One object's state in an <c>OnObjectsUpdated</c> broadcast, addressed by
+/// session-scoped <see cref="Handle"/> rather than GUID. See
+/// <see cref="ObjectUpdateRequest"/> for the sizing rationale; the saving applies
+/// once per receiving member here, so it scales with session size.
+/// </summary>
 [MessagePackObject]
 public record ObjectUpdateInfo(
-    [property: Key(0)] Guid Id,
+    [property: Key(0)] int Handle,
     [property: Key(1)] SyncPayload Data,
     [property: Key(2)] long Version);
 
+/// <summary>
+/// One object's pending data in an <c>UpdateObjects</c> invocation.
+///
+/// <para>
+/// <see cref="Handle"/> is the session-scoped integer allocated by
+/// <see cref="Session.AllocateObjectHandle"/>, not the object's GUID. A binary GUID
+/// costs 18 B (bin8 header + 16 payload bytes) on every entry of every flush; a
+/// handle costs 1 B up to 127, 2 B up to 255 and 3 B up to 65535, so a typical
+/// steady-state session pays 1–2 B. This is the only object-identity slot on the
+/// uplink, which is the scarcest direction on cellular links.
+/// </para>
+///
+/// <para>
+/// Handles are unique within a session and never reused, so an update that arrives
+/// after its target was deleted resolves to nothing rather than to another object.
+/// Unknown handles are skipped exactly like unknown ids were, and are reported as
+/// rejected (version 0) in the positional acknowledgement.
+/// </para>
+/// </summary>
 [MessagePackObject]
 public record ObjectUpdateRequest(
-    [property: Key(0)] Guid ObjectId,
+    [property: Key(0)] int Handle,
     [property: Key(1)] SyncPayload Data);
 
 [MessagePackObject]
@@ -124,14 +159,14 @@ public record ReplaceObjectResponse(
 /// <para>
 /// <c>Versions</c> is positional: entry <c>i</c> is the server-assigned version
 /// for request element <c>i</c>, or <c>0</c> when that update was not applied
-/// (unknown object, or not owned by the caller). <see cref="SessionObject"/>
+/// (unknown handle, or not owned by the caller). <see cref="SessionObject"/>
 /// versions start at 1 and only increment, so 0 is an unambiguous "rejected"
 /// sentinel.
 /// </para>
 ///
 /// <para>
-/// Positional correspondence removes the object id from the acknowledgement
-/// entirely — the caller already knows which id it sent at each index. Each
+/// Positional correspondence removes the object identity from the acknowledgement
+/// entirely — the caller already knows which object it sent at each index. Each
 /// entry drops from a 24 B <c>GuidLongPair</c> to a 1–3 B integer. Measured
 /// over the whole message that is a 71–83% reduction for batches of 3–20
 /// objects; the message-level figure is below the per-entry saving because
