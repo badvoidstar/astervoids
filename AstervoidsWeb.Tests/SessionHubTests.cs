@@ -1012,6 +1012,119 @@ public class SessionHubTests
         _objectService.GetSessionObjects(session.Id).Should().HaveCount(2);
     }
 
+    // ── Positional UpdateObjects acknowledgement ───────────────────────────────
+    //
+    // Versions[i] is the version assigned to request element i, or 0 when that
+    // element was not applied. The alignment relies on ObjectService returning an
+    // order-preserving subsequence of the requested updates, so these cover the
+    // mixed accept/reject and duplicate-id cases that exercise that invariant.
+
+    [Fact]
+    public async Task UpdateObjects_ShouldReturnVersionsPositionallyAlignedToRequest()
+    {
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        var first = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+        var second = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+
+        var hub = CreateHub("connection-1");
+
+        var updates = new List<ObjectUpdateRequest>
+        {
+            new(first.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
+            new(second.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.25 })),
+        };
+
+        var response = await hub.UpdateObjects(updates);
+
+        response.Should().NotBeNull();
+        response!.Versions.Should().HaveCount(2, "one entry per request element");
+        response.Versions[0].Should().Be(first.Version + 1);
+        response.Versions[1].Should().Be(second.Version + 1);
+    }
+
+    [Fact]
+    public async Task UpdateObjects_ShouldReportZeroForUnappliedUpdates()
+    {
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        var joinResult = _sessionService.JoinSession(session.Id, "connection-2");
+        var other = joinResult.Member!;
+
+        var owned = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+        // Owned by the other member, so the caller's update must be rejected.
+        var foreign = _objectService.CreateObject(
+            session.Id, other.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+
+        var hub = CreateHub("connection-1");
+
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 });
+        var updates = new List<ObjectUpdateRequest>
+        {
+            new(Guid.NewGuid(), payload),   // unknown object
+            new(owned.Id, payload),         // accepted
+            new(foreign.Id, payload),       // not owned by caller
+        };
+
+        var response = await hub.UpdateObjects(updates);
+
+        response.Should().NotBeNull();
+        response!.Versions.Should().HaveCount(3);
+        response.Versions[0].Should().Be(0, "unknown objects are not applied");
+        response.Versions[1].Should().Be(owned.Version + 1, "the accepted update keeps its own index");
+        response.Versions[2].Should().Be(0, "objects owned by another member are not applied");
+    }
+
+    [Fact]
+    public async Task UpdateObjects_ShouldReturnEmptyVersions_WhenNothingApplied()
+    {
+        _sessionService.CreateSession("connection-1");
+        var hub = CreateHub("connection-1");
+
+        var response = await hub.UpdateObjects(new List<ObjectUpdateRequest>());
+
+        response.Should().NotBeNull();
+        response!.Versions.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task UpdateObjects_ShouldGiveEachDuplicateIdItsOwnVersion()
+    {
+        // A batch carrying the same id twice applies twice, so each request index
+        // must receive its own successive version rather than sharing one.
+        var createResult = _sessionService.CreateSession("connection-1");
+        var session = createResult.Session!;
+        var creator = createResult.Creator!;
+        var obj = _objectService.CreateObject(
+            session.Id, creator.Id, Models.ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" })!;
+
+        var hub = CreateHub("connection-1");
+
+        var updates = new List<ObjectUpdateRequest>
+        {
+            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.5 })),
+            new(obj.Id, SyncPayloadCodec.EncodeDict(new Dictionary<string, object?> { ["x"] = 0.75 })),
+        };
+
+        var response = await hub.UpdateObjects(updates);
+
+        response.Should().NotBeNull();
+        response!.Versions.Should().HaveCount(2);
+        response.Versions[0].Should().Be(obj.Version + 1);
+        response.Versions[1].Should().Be(obj.Version + 2,
+            "the second occurrence is applied on top of the first");
+    }
+
     private SessionHub CreateHubWithProxy(
         string connectionId,
         Mock<IClientProxy> proxy)

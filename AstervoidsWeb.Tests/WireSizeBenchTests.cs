@@ -315,17 +315,37 @@ public class WireSizeBenchTests
     [Fact]
     public void Baseline_UpdateObjectsResponse_3Versions()
     {
-        var versions = new[]
-        {
-            new GuidLongPair(Guid.NewGuid(), 10),
-            new GuidLongPair(Guid.NewGuid(), 11),
-            new GuidLongPair(Guid.NewGuid(), 12)
-        };
+        var versions = new long[] { 10, 11, 12 };
         var dto = new UpdateObjectsResponse(versions, 42L, 1_700_000_000_000L);
         var size = Size(dto);
-        // Binary GuidLongPair entries plus a three-slot response array reduce the
-        // original 184-byte contract to 72 bytes.
-        size.Should().Be(72, "compact UpdateObjectsResponse with three versions");
+        // Positional acknowledgement: the object id is dropped from every entry
+        // because the caller already knows which id it sent at each index. Each
+        // 24 B GuidLongPair collapses to a 1-3 B integer, taking the response
+        // from 72 bytes to 15 (the original string-keyed contract was 184).
+        size.Should().Be(15, "positional UpdateObjectsResponse with three versions");
+    }
+
+    [Fact]
+    public void Baseline_UpdateObjectsResponse_ScalesWithBatchSize()
+    {
+        // The acknowledgement is sent on every flush, so its growth per object
+        // matters more than its absolute size. Measure the superseded
+        // GuidLongPair form alongside it so the saving stays self-verifying
+        // rather than resting on a hand-copied historical constant.
+        var versions = new long[20];
+        var pairs = new GuidLongPair[20];
+        for (int i = 0; i < versions.Length; i++)
+        {
+            versions[i] = 12000 + i;
+            pairs[i] = new GuidLongPair(Guid.NewGuid(), 12000 + i);
+        }
+
+        var positional = Size(new UpdateObjectsResponse(versions, 42L, 1_700_000_000_000L));
+        var keyed = Size(pairs) - Size(versions) + positional;
+
+        positional.Should().Be(74, "positional UpdateObjectsResponse with twenty versions");
+        keyed.Should().Be(454, "the superseded GuidLongPair form at the same batch size");
+        positional.Should().BeLessThan(keyed / 5, "dropping the per-entry GUID saves over 80%");
     }
 
     // ── Phase 2.1 — generic OnObjectEvent broadcast ────────────────────────────

@@ -7533,6 +7533,51 @@
     }
 
     /**
+     * Batch-draw a list of bullets, merging all bullets that share a stroke
+     * color into a single beginPath/stroke pair. Unlike asteroids, bullets are
+     * tinted per owner, so paths can only merge within a color — with at most
+     * four members that collapses up to MAX_BULLETS*4 stroke calls into <= 4.
+     * Produces identical visuals to looping bullet.draw(ctx) individually.
+     * @param {CanvasRenderingContext2D} ctx - Canvas context
+     * @param {Bullet[]} bullets - Bullets to render
+     */
+    function drawBulletsBatched(ctx, bullets) {
+        if (!bullets || bullets.length === 0) return;
+        // Radius is owner-independent, so it is resolved once per frame
+        // instead of once per bullet.
+        const pixelRadius = fromNormalizedSize(CONFIG.BULLET_RADIUS);
+        ctx.lineWidth = 2;
+        // The palette is tiny (one color per member), so each pass claims the
+        // next not-yet-drawn color and emits every bullet sharing it.
+        const drawnColors = [];
+        for (let start = 0; start < bullets.length; start++) {
+            const first = bullets[start];
+            // pendingHit bullets are optimistically hidden until the hit is
+            // confirmed — matches Bullet.draw.
+            if (first.pendingHit) continue;
+            const color = SHIP_COLORS[first.colorIndex] || CONFIG.STROKE_COLOR;
+            if (drawnColors.includes(color)) continue;
+            drawnColors.push(color);
+
+            ctx.strokeStyle = color;
+            ctx.beginPath();
+            for (let i = start; i < bullets.length; i++) {
+                const bullet = bullets[i];
+                if (bullet.pendingHit) continue;
+                if ((SHIP_COLORS[bullet.colorIndex] || CONFIG.STROKE_COLOR) !== color) continue;
+                const pixelX = fromNormalizedX(bullet.x);
+                const pixelY = fromNormalizedY(bullet.y);
+                // arc() extends the current subpath, so without an explicit
+                // moveTo to the arc's 0-radian start point each circle would be
+                // joined to the previous one by a stray chord.
+                ctx.moveTo(pixelX + pixelRadius, pixelY);
+                ctx.arc(pixelX, pixelY, pixelRadius, 0, Math.PI * 2);
+            }
+            ctx.stroke();
+        }
+    }
+
+    /**
      * Movement-anchor overlays for the rectilinear and polar analog schemes
      * (CONFIG.ANALOG_ANCHOR_VISUAL_ENABLED):
      *
@@ -8617,8 +8662,7 @@
 
             // Draw game entities (now in gameplay coordinates)
             drawAsteroidsBatched(ctx, game.astervoids);
-            game.bullets.forEach(bullet => bullet.draw(ctx));
-
+            drawBulletsBatched(ctx, game.bullets);
             // Draw ships
             if (game.state !== 'start') {
                 // Draw remote ships in multiplayer (including during lobby live preview)
