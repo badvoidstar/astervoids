@@ -14,6 +14,49 @@ const ReplicationSendPolicy = (function () {
         return value;
     }
 
+    /**
+     * Heartbeat deadline, quantized onto a fixed wall-clock grid.
+     *
+     * Unaligned deadlines (`lastSentMs + heartbeatMs`) inherit the phase of
+     * whenever each object last changed, so re-anchors trickle across the
+     * transport's flush opportunities one or two objects at a time. Each of
+     * those tiny batches still pays the full hub-frame envelope, and the
+     * resulting packet rate rises with the device's display refresh rate,
+     * because a finer frame grid services an arbitrary deadline sooner.
+     * Quantizing makes every object's heartbeat land on the same instant, so
+     * they coalesce into one batch regardless of refresh rate.
+     *
+     * The grid is anchored to the caller's LOCAL monotonic clock
+     * (`performance.now()`, whose origin is this document's navigation time),
+     * deliberately NOT the NTP-synced server clock: a shared server-time grid
+     * would make every member of a session burst on the same boundary and
+     * correlate server fan-out and ingress queueing. Per-document origins keep
+     * senders naturally decorrelated.
+     *
+     * `floor((lastSentMs + heartbeatMs) / heartbeatMs) * heartbeatMs` lies in
+     * `(lastSentMs, lastSentMs + heartbeatMs]`, which gives two properties:
+     *   - the aligned deadline can only fire EARLIER than the unaligned one, so
+     *     receiver-visible staleness never regresses; and
+     *   - consecutive heartbeat deadlines stay at least `heartbeatMs` apart
+     *     (firing at or after a grid point pushes the next one a full period
+     *     out), so the heartbeat packet rate is unchanged.
+     *
+     * This decides only WHEN state becomes eligible. It does not know about
+     * frames or about the transport's flush cadence, which remains the sole
+     * authority on when bytes leave.
+     *
+     * Degenerate/unset periods fall back to the plain elapsed comparison so a
+     * missing or non-positive configuration behaves exactly as before.
+     */
+    function heartbeatDue(nowMs, lastSentMs, heartbeatMs) {
+        if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0) {
+            return (nowMs - lastSentMs) >= heartbeatMs;
+        }
+        const deadline =
+            Math.floor((lastSentMs + heartbeatMs) / heartbeatMs) * heartbeatMs;
+        return nowMs >= deadline;
+    }
+
     function createBallisticGate(options) {
         const config = options?.config;
         const isDeterministic = requireFunction(
@@ -61,7 +104,8 @@ const ReplicationSendPolicy = (function () {
             } else if (Math.abs(normalized.x - baseline.prevX) > config.SEND_ON_CHANGE_WRAP_JUMP
                 || Math.abs(normalized.y - baseline.prevY) > config.SEND_ON_CHANGE_WRAP_JUMP) {
                 reason = 'wrap';
-            } else if ((now - baseline.lastSentMs) >= config.SEND_ON_CHANGE_HEARTBEAT_MS) {
+            } else if (heartbeatDue(
+                now, baseline.lastSentMs, config.SEND_ON_CHANGE_HEARTBEAT_MS)) {
                 reason = 'heartbeat';
             }
 
@@ -188,7 +232,8 @@ const ReplicationSendPolicy = (function () {
                 || !!ship.thrusting !== baseline.thrusting
                 || !Object.is(getTransitionKey(ship), baseline.transitionKey)) {
                 reason = 'intent-change';
-            } else if ((now - baseline.lastSentMs) >= config.SEND_ON_CHANGE_HEARTBEAT_MS) {
+            } else if (heartbeatDue(
+                now, baseline.lastSentMs, config.SEND_ON_CHANGE_HEARTBEAT_MS)) {
                 reason = 'heartbeat';
             }
 
@@ -215,6 +260,7 @@ const ReplicationSendPolicy = (function () {
     }
 
     return {
+        heartbeatDue,
         createBallisticGate,
         createControlEdgeGate,
         createShipGate
