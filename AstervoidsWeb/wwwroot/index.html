@@ -8358,7 +8358,10 @@
         fpsTracker.sample(elapsed);
 
         // Auxiliary work first, so control intent sampled this frame is visible to
-        // the simulation steps below instead of trailing them by a frame.
+        // the simulation steps below. The separate rAF loops this replaced happened
+        // to run in that order too, but only because they were registered earlier in
+        // the document than the gameLoop kickoff — reordering the file would have
+        // silently cost a frame of input latency. Here the order is structural.
         runFrameCallbacks();
         
         // Calculate delta time multiplier (1.0 = one frame at 60fps = 16.67ms)
