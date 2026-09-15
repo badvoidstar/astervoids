@@ -69,19 +69,35 @@ public static class WebSocketCompressionExtensions
     {
         ArgumentNullException.ThrowIfNull(app);
 
-        return app.Use(async (context, next) =>
-        {
-            var webSockets = context.Features.Get<IHttpWebSocketFeature>();
-            if (webSockets is not null
-                && webSockets.IsWebSocketRequest
-                && context.Request.Path.StartsWithSegments(path))
+        // Branch on the path so neither the WebSocket middleware nor this decorator
+        // costs anything on ordinary requests — /api/ping in particular is held to a
+        // tight latency budget because it backs cold-start RTT measurement.
+        return app.UseWhen(
+            context => context.Request.Path.StartsWithSegments(path),
+            branch =>
             {
-                context.Features.Set<IHttpWebSocketFeature>(
-                    new CompressingWebSocketFeature(webSockets));
-            }
+                // Kestrel supplies only IHttpUpgradeFeature; IHttpWebSocketFeature is
+                // created by UseWebSockets. MapHub runs its own UseWebSockets inside
+                // the endpoint's sub-pipeline, which executes after all outer
+                // middleware — so without this call there is no feature here to
+                // decorate, the decorator below silently does nothing, and no
+                // compression is negotiated. WebSocketMiddleware skips creation when a
+                // feature is already present, so SignalR's copy becomes a no-op and the
+                // decorator ends up wrapping the feature SignalR truly accepts through.
+                branch.UseWebSockets();
 
-            await next(context);
-        });
+                branch.Use(async (context, next) =>
+                {
+                    var webSockets = context.Features.Get<IHttpWebSocketFeature>();
+                    if (webSockets is not null && webSockets.IsWebSocketRequest)
+                    {
+                        context.Features.Set<IHttpWebSocketFeature>(
+                            new CompressingWebSocketFeature(webSockets));
+                    }
+
+                    await next(context);
+                });
+            });
     }
 
     /// <summary>

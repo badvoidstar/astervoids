@@ -1580,6 +1580,15 @@ frames are too small to compress on their own. Two consequences matter:
 - It is purely a transport-layer concern. No DTO, schema, or client code is
   aware of it, and a peer or proxy that does not offer the extension simply
   negotiates it away.
+- `UseWebSocketCompression` installs `UseWebSockets` inside its own path
+  branch, and must keep doing so. Kestrel exposes only `IHttpUpgradeFeature`;
+  the `IHttpWebSocketFeature` the decorator wraps is created by
+  `UseWebSockets`, and the copy `MapHub` runs lives in the endpoint's
+  sub-pipeline, which executes *after* all outer middleware. Without the
+  branch-local call there is nothing to decorate and compression is silently
+  never negotiated. `TestServer` supplies that feature on its own, so only the
+  real-Kestrel handshake tests in `WebSocketCompressionTests.cs` can detect
+  the regression.
 - `ServerMetricsService` TX/RX byte counters remain **pre-compression**
   estimates of the MessagePack payload, so `/api/srvmon` numbers are unchanged
   by it and stay comparable with the `WireSizeBenchTests.cs` budgets.
@@ -2053,6 +2062,12 @@ correctness dependency.
 Both representations share the content-hash validator, so `Vary:
 Accept-Encoding` accompanies the Brotli response. Range requests bypass the
 cache and are served from the identity representation.
+
+Set `StaticAssets:Precompress` to `false` to skip the warm-up entirely, trading
+bandwidth for ~213 KiB of resident memory and the startup CPU burst. Test hosts
+default it off (`AstervoidsWebFactory`): the suite starts many hosts, and
+paying ~1.4 s of Brotli quality-11 CPU per host perturbs the wall-clock budget
+asserted by `PingBudgetTests`.
 
 ## Project Structure
 

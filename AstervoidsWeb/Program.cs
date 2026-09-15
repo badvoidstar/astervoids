@@ -201,8 +201,15 @@ if (!string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
 // must not delay startup either, because the regional endpoints above are registered
 // first specifically so they can answer cold-start RTT probes immediately. Until an
 // entry is ready, requests fall through to the ordinary static-file path unchanged.
+//
+// Disable via StaticAssets:Precompress to trade ~213 KiB of resident memory and a CPU
+// burst at startup for bandwidth; responses still compress dynamically either way.
+// Test hosts turn it off by default: a suite that starts many hosts would otherwise
+// pay the burst once per host, and that background load perturbs the wall-clock
+// budget asserted in PingBudgetTests.
 var precompressedAssets = new StaticAssetCompressionCache();
-if (!string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
+if (builder.Configuration.GetValue("StaticAssets:Precompress", true)
+    && !string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
 {
     var compressionLogger = app.Services
         .GetRequiredService<ILoggerFactory>()
@@ -311,8 +318,10 @@ app.UseStaticFiles(new StaticFileOptions
 // Map SignalR hub. RequireCors so cross-origin spectator connections from
 // peer regions can negotiate + open the WebSocket.
 //
-// permessage-deflate is negotiated for this path only, and must be registered before
-// the endpoint that accepts the socket.
+// permessage-deflate is negotiated for this path only. The helper installs the
+// WebSocket middleware on a path branch as well, because MapHub's own copy runs
+// inside the endpoint sub-pipeline — too late to decorate. See
+// Hubs/WebSocketCompressionMiddleware.cs.
 app.UseWebSocketCompression("/sessionHub");
 app.MapHub<SessionHub>("/sessionHub").RequireCors("RegionalApi");
 
