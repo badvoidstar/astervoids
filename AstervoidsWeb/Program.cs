@@ -228,10 +228,10 @@ if (!string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
 app.Use(async (context, next) =>
 {
     var method = context.Request.Method;
+    var path = context.Request.Path.Value ?? "";
     if ((method == HttpMethods.Get || method == HttpMethods.Head)
-        && etags.TryGetValue(context.Request.Path.Value ?? "", out var etag))
+        && etags.TryGetValue(path, out var etag))
     {
-        var path = context.Request.Path.Value ?? "";
         context.Response.Headers.ETag = etag;
         context.Response.Headers.CacheControl = "no-cache";
 

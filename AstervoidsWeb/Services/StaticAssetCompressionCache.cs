@@ -104,7 +104,7 @@ public sealed class StaticAssetCompressionCache
         foreach (var (requestPath, filePath, _) in candidates)
         {
             if (cancellationToken.IsCancellationRequested) return;
-            if (totalBytes >= MaximumTotalBytes) return;
+            if (totalBytes >= MaximumTotalBytes) break;
 
             try
             {
