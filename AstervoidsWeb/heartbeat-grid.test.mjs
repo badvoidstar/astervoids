@@ -187,6 +187,7 @@ async function run({ displayHz, txMs, objectCount = 5, durationMs = 6000 }) {
         MAX_SIM_STEPS_PER_FRAME: 5,
         MAX_ACCUMULATED_MS: 250,
         fpsTracker: { sample() {} },
+        runFrameCallbacks() {},
         isSessionMode: () => true,
         isDeterministicMode: () => true,
         renderScene() {},
