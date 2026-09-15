@@ -105,10 +105,12 @@ builder.Services.AddCors(options =>
 
 //
 // Wire format optimization notes:
-// - WebSocket per-message compression (permessage-deflate) is NOT available through
-//   SignalR's API. SignalR manages WebSocket connections internally and does not expose
-//   the DangerousEnableCompression flag from WebSocketAcceptContext. HTTP-level
-//   compression is handled above via response compression middleware.
+// - WebSocket per-message compression (permessage-deflate) IS enabled, via
+//   UseWebSocketCompression below. SignalR's own options don't expose it, but its
+//   transport accepts through IHttpWebSocketFeature, which can be decorated for the
+//   hub path. See Hubs/WebSocketCompressionMiddleware.cs for the measurements and the
+//   CRIME/BREACH reasoning. HTTP-level compression is separate, handled above via the
+//   response compression middleware.
 // - MessagePack protocol gives ~25-30% smaller payloads vs JSON.
 //   Hub DTOs are annotated with [MessagePackObject] + [Key("camelCaseName")] so the
 //   binary wire format uses camelCase property names, preserving the existing JS client
@@ -228,6 +230,10 @@ app.UseStaticFiles();
 
 // Map SignalR hub. RequireCors so cross-origin spectator connections from
 // peer regions can negotiate + open the WebSocket.
+//
+// permessage-deflate is negotiated for this path only, and must be registered before
+// the endpoint that accepts the socket.
+app.UseWebSocketCompression("/sessionHub");
 app.MapHub<SessionHub>("/sessionHub").RequireCors("RegionalApi");
 
 // Server monitoring metrics API endpoint
