@@ -186,7 +186,17 @@ The game continues to own orchestration in `wwwroot/index.html`:
   reconciliation points remain separate; hidden-tab timing is not the
   deterministic foreground accumulator.
 - `calculateGameState` computes score awards, damage, and historical
-  player-count bonuses from explicit inputs without mutating them.
+  player-count bonuses from explicit inputs without mutating them. The
+  player-count bonus is identity-based, not a concurrent-ship count: every
+  participant that has ever published a ship is recorded in the persisted
+  `countedParticipants` ledger, and `peakShipCount` is the high-water count of
+  participants already paid. The first participant plays on the base lives and
+  each later one adds exactly one, so the award depends on the player rather
+  than on who else happens to be aboard, who owns the GameState object, or how
+  much the session has churned. Ships publish a `participantId` that survives
+  the evict-and-re-register of a rejoin (`SessionClient.getParticipantId`), so a
+  reconnect is never paid twice; a ship without one is skipped rather than
+  attributed to its (unstable) owning member.
   `calculateGameStateTerminal` computes immutable terminal anchors from an
   explicit server time. `syncGameState` retains ledger validation, local
   effects, game-specific serialization, and publication through `ObjectSync`.
@@ -1784,10 +1794,10 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 
 | SchemaId | Type | Fields (positional, all optional per payload) |
 | --- | --- | --- |
-| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time |
+| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; peak ships; game-over/terminal times |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger |
 
 Every known gameplay type uses exactly one superset schema for create, update,
 replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
@@ -1815,8 +1825,9 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
   metadata so every client regenerates identical geometry. Explicit fracture
   geometry uses four bytes per vertex: q16 wrapped angle followed by q16
   normalized distance.
-- **GameState ledgers:** processed hit/score maps are sorted by GUID and encoded
-  as fixed 20-byte entries (16-byte binary GUID + little-endian uint32 count).
+- **GameState ledgers:** processed hit/score maps and the counted-participant
+  map are sorted by GUID and encoded as fixed 20-byte entries (16-byte binary
+  GUID + little-endian uint32 count).
   `ObjectSync` compares byte arrays by content so repacking an unchanged map
   does not defeat delta suppression or confirmation tracking.
 - **Object events:** payload maps are field-aliased, MessagePack-encoded once by
