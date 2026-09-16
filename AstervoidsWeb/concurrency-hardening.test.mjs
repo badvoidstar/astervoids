@@ -1417,7 +1417,9 @@ test('elapsed scheduler adapts interval changes, ignores invalid RTT, and resets
     sync.updateSendRate(50);
     sync.tick(0.01);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].interval, 50);
+    assert.equal(calls[0].interval, sync.getEffectiveSendIntervalMs(),
+        'the wire advertises the achievable interval, not the requested one');
+    assert.equal(sync.getSendRate(), 20, 'the 50ms RTT was adopted as the request');
     for (const rtt of [NaN, Infinity, -1]) sync.updateSendRate(rtt);
     assert.equal(sync.getSendRate(), 20);
     await drainMicrotasks();

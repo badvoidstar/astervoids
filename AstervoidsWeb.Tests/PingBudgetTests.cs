@@ -21,6 +21,7 @@ namespace AstervoidsWeb.Tests;
 /// overhead on a slow CI runner but tight enough that adding a service
 /// dependency (e.g. `metrics.Record()`) or a DI lookup would push it over.
 /// </summary>
+[Collection(LatencySensitiveCollection.Name)]
 public class PingBudgetTests : IClassFixture<PingBudgetTests.Factory>
 {
     public sealed class Factory : AstervoidsWebFactory

@@ -90,6 +90,15 @@ These rules are enforced purely by module structure and must not be violated whe
 - **Serialization has one seam.** Entity `toSyncData`, `toUpdateData`, and
   `fromSyncData` methods plus the schema selector remain authoritative; runtime
   descriptors do not duplicate wire mappings.
+- **The game owns exactly one `requestAnimationFrame` driver.** `gameLoop` is
+  the only self-scheduling rAF callback. Auxiliary per-frame work (analog stick
+  sampling, mobile HUD refresh) registers through `addFrameCallback` and runs
+  at the top of the frame, before `ObjectSync.tick` and the simulation steps, so
+  input sampled this frame is visible to this frame's steps. Callbacks are
+  isolated so a throwing callback cannot stall the loop. This keeps the browser
+  to one animation callback per frame on the most constrained devices, and it
+  keeps auxiliary work correctly suspended when the hidden-tab interval
+  fallback takes over.
 
 > These are the client-side analogues of the server-side lock ordering described in the [Thread Safety](#sessionservice-thread-safety) section.
 
@@ -1062,6 +1071,89 @@ Once elapsed eligibility is reached, it remains latched across adaptive interval
 increases until serviced. Legacy `minFrameTime` configuration remains accepted
 and validated, but elapsed scheduling never invents time for short/zero ticks.
 
+### Advertised send cadence
+
+`senderSendIntervalMs` is the cadence a sender claims on every batch. It is the
+**achievable** interval, not the requested TX above: a batch can only be released
+on a game-owned tick and the accumulator does not carry surplus time forward, so
+the real period is `ceil(TX / tickInterval) × tickInterval`. A 10fps client asked
+for 50 ms sends every 100 ms; a backgrounded tab, whose timers the browser clamps
+to ~1 s, sends every ~1 s while still requesting 50 ms.
+
+Advertising the request instead would be a claim the sender cannot keep, and
+receivers act on it. They seed adaptive delay from it before enough lag samples
+exist, size the dead-reckoning prediction window with it, and — most
+consequentially — reject observed packet intervals wider than twice its value as
+outliers. A sender that overstates its rate by more than 2× has *all* of its
+intervals discarded, so the interval variance that feeds steady-state buffering
+never accumulates for the objects it owns. Because session-scoped objects
+concentrate under one owner, a single degraded member can under-buffer a shared
+object set for every other member in the session, while itself seeing nothing
+wrong.
+
+`ObjectSync` therefore derives the value from a smoothed estimate of tick
+spacing:
+
+- **Smoothed, not instantaneous.** Frame jitter would otherwise move the claim
+  every batch, disturbing receivers' gates and a wire field that is otherwise
+  constant and nearly free to compress.
+- **Clamped at 1 s**, per sample and again on the result, so a GC pause or a
+  suspended machine cannot advertise a stall as a cadence and inflate buffering
+  session-wide. The clamp never reduces the claim below the configured request.
+- **Derived on read**, never written back into `nominalFrameTime`, which would
+  couple it to adaptive RTT updates into a feedback loop.
+
+Quantization only ever rounds up, so the advertised interval is always ≥ TX and
+this can add buffering but never remove it. `getSendRate()` continues to report
+the request; `getEffectiveSendIntervalMs()` reports the claim, and debug
+telemetry uses the latter so `tx:` matches the wire.
+`AstervoidsWeb/send-interval-advertisement.test.mjs` pins the advertised value to
+the spacing actually achieved across a display-cadence × TX matrix, along with
+the clamp, the smoothing, and the unticked-sender fallback.
+
+### Heartbeat grid alignment
+
+Send-on-change gates fall back to a periodic heartbeat so idle objects still
+refresh. That heartbeat deadline is quantized onto a fixed monotonic grid
+(`heartbeatDue` in `replication-send-policy.js`): the next deadline is
+`floor((lastSentMs + HEARTBEAT) / HEARTBEAT) × HEARTBEAT` rather than
+`lastSentMs + HEARTBEAT`. Objects whose sends drifted apart therefore converge
+onto shared deadlines and ride the same flush, instead of each holding an
+independent phase that forces its own packet. `HEARTBEAT` is the fixed
+`CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS` (250 ms), shared by the ballistic and ship
+gates. `AstervoidsWeb/heartbeat-grid.test.mjs` holds the claims below.
+
+Three properties make this safe:
+
+- **Latency never regresses.** The aligned deadline lies in
+  `(lastSent, lastSent + HEARTBEAT]`, so a heartbeat can only fire earlier than
+  the unaligned one, never later.
+- **Steady-state rate is unchanged.** Firing at or after a grid point pushes the
+  next deadline a full period out, so a settled object still heartbeats once per
+  period.
+- **Frame scheduling stays out of the policy layer.** The gate reads only the
+  injected `nowMs`; `ObjectSync` remains the sole authority over when bytes
+  leave, and its cap-no-carry flush accumulator still makes the effective send
+  period `ceil(TX / displayFrameInterval) × displayFrameInterval`.
+
+The grid is deliberately anchored to the caller's **local monotonic** clock: both
+gates inject `nowMs: () => performance.now()`, whose origin is that document's
+navigation time. Neither shared-time alternative is safe here. The NTP-style
+synchronized server clock and `Date.now()` are both *common* axes, so quantizing
+against either would put every member of a session on the same 250 ms boundary
+and correlate server fan-out and ingress queueing — the opposite of the intent.
+`Date.now()` is additionally slewable, which would drag deadlines around under
+NTP correction. Per-document `performance.now()` origins keep senders naturally
+decorrelated and immune to slewing. The grid period is the fixed heartbeat
+constant and must not become per-device or derived from measured FPS — that
+would re-couple send rate to frame rate.
+
+The effect is largest where packet count, not payload size, is the cost:
+alignment collapses per-object phases into shared flushes, so flush rate and
+battery cost stop varying with the sender's display refresh rate, and observers
+see a more regular packet interval (lower `intervalStddev`, hence a shorter
+turn-prediction horizon in `calculateRateAngularPredictionWindow`).
+
 Ship invulnerability remains authoritative in simulation ticks. The game schema
 appends `invulnerabilityRevision` (`u32`) and `invulnerableAt` (`f64` server-time
 capture timestamp) to the existing counter. Respawn/reset and expiry advance the
@@ -1524,6 +1616,37 @@ flowchart TB
 
 ## Networking: Compact Wire Protocol
 
+Hub frames are additionally compressed in transit by WebSocket
+`permessage-deflate` (RFC 7692), enabled for the `/sessionHub` path only by
+`UseWebSocketCompression` in `Program.cs`. Context takeover is left enabled on
+both directions — the shared compression window across messages is what makes
+the saving possible, because individual hot-path frames are small enough that
+compressing them in isolation recovers only a fraction of it. Server window bits
+are 12, which costs nothing measurable: a sweep over production-encoded frames is
+flat from 11 through 15 bits, because gameplay state drifts continuously and the
+dominant match is against the previous frame rather than anything far back. The
+~112 KiB less deflate state per connection that 12 holds is therefore free, and it
+is charged per connection because takeover retains that state for the connection's
+lifetime. `AstervoidsWeb/websocket-deflate-window.test.mjs` holds both claims. See
+the `WebSocketCompressionMiddleware` remarks for the measured figures. Two
+consequences matter:
+
+- It is purely a transport-layer concern. No DTO, schema, or client code is
+  aware of it, and a peer or proxy that does not offer the extension simply
+  negotiates it away.
+- `UseWebSocketCompression` installs `UseWebSockets` inside its own path
+  branch, and must keep doing so. Kestrel exposes only `IHttpUpgradeFeature`;
+  the `IHttpWebSocketFeature` the decorator wraps is created by
+  `UseWebSockets`, and the copy `MapHub` runs lives in the endpoint's
+  sub-pipeline, which executes *after* all outer middleware. Without the
+  branch-local call there is nothing to decorate and compression is silently
+  never negotiated. `TestServer` supplies that feature on its own, so only the
+  real-Kestrel handshake tests in `WebSocketCompressionTests.cs` can detect
+  the regression.
+- `ServerMetricsService` TX/RX byte counters remain **pre-compression**
+  estimates of the MessagePack payload, so `/api/srvmon` numbers are unchanged
+  by it and stay comparable with the `WireSizeBenchTests.cs` budgets.
+
 The hot-path object payload (`ObjectInfo.Data`, `ObjectUpdateInfo.Data`,
 `ObjectUpdateRequest.Data`) does not flow as a `Dictionary<string, object?>`
 on the wire. It is wrapped in the positional
@@ -1971,6 +2094,35 @@ The contract this document pins down is narrower:
   per-region failure isolation, 250 ms push coalescing,
   visibility-driven `stop()`, cold-region non-blocking render.
 
+## Static Asset Delivery
+
+Startup hashes every `wwwroot` file and serves the hash as the `ETag`, with
+`Cache-Control: no-cache` so browsers revalidate on each launch. The hash is
+re-applied in `StaticFileOptions.OnPrepareResponse`, because the static-file
+middleware would otherwise stamp its own last-modified/length validator — which
+changes on every container build even for byte-identical files, forcing a full
+re-download after each deploy.
+
+Text assets are additionally cached as maximum-quality Brotli encodings
+(`StaticAssetCompressionCache`). Quality 11 is roughly 28% smaller than the
+quality-1 encoding the response-compression middleware produces on the request
+path, but far too slow to run per request, so the cache is warmed on a
+background task **after** the host is listening. This preserves the
+deliberate ordering in `Program.cs` that lets regional endpoints answer
+cold-start RTT probes immediately. Until an entry is ready, requests fall
+through to the ordinary response-compression path, so the cache is never a
+correctness dependency.
+
+Both representations share the content-hash validator, so `Vary:
+Accept-Encoding` accompanies the Brotli response. Range requests bypass the
+cache and are served from the identity representation.
+
+Set `StaticAssets:Precompress` to `false` to skip the warm-up entirely, trading
+bandwidth for ~213 KiB of resident memory and the startup CPU burst. Test hosts
+default it off (`AstervoidsWebFactory`): the suite starts many hosts, and
+paying ~1.4 s of Brotli quality-11 CPU per host perturbs the wall-clock budget
+asserted by `PingBudgetTests`.
+
 ## Project Structure
 
 ```
@@ -2029,13 +2181,16 @@ astervoids/
 │   │   ├── ObjectService.cs            # Object CRUD + ReplaceObject; ownership and
 │   │   │                               # lifecycle enforced atomically under Session.SyncRoot
 │   │   ├── SessionCleanupService.cs    # Background service: expires empty / long-lived sessions
-│   │   └── ServerMetricsService.cs     # Singleton; CPU/memory/GC/connections/per-member
-│   │                                   # TX/RX/reconciliation/reconnect; powers /api/srvmon
+│   │   ├── ServerMetricsService.cs     # Singleton; CPU/memory/GC/connections/per-member
+│   │   │                               # TX/RX/reconciliation/reconnect; powers /api/srvmon
+│   │   └── StaticAssetCompressionCache.cs  # Maximum-quality Brotli encodings of text assets,
+│   │                                   # warmed in the background after startup
 │   │
 │   ├── Hubs/
 │   │   ├── SessionHub.cs       # SignalR hub: game-agnostic session/object API.
 │   │   │                       # Includes MessagePack payload-size estimation for metrics.
-│   │   └── HubDtos.cs          # [MessagePackObject] request/response DTOs (camelCase keys)
+│   │   ├── HubDtos.cs          # [MessagePackObject] request/response DTOs (camelCase keys)
+│   │   └── WebSocketCompressionMiddleware.cs  # Negotiates permessage-deflate on /sessionHub
 │   │
 │   └── wwwroot/
 │       ├── index.html          # Single-file game: HTML5 Canvas + CSS + JS runtime

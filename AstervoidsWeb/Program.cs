@@ -3,6 +3,7 @@ using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Services;
+using Microsoft.Net.Http.Headers;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -105,10 +106,12 @@ builder.Services.AddCors(options =>
 
 //
 // Wire format optimization notes:
-// - WebSocket per-message compression (permessage-deflate) is NOT available through
-//   SignalR's API. SignalR manages WebSocket connections internally and does not expose
-//   the DangerousEnableCompression flag from WebSocketAcceptContext. HTTP-level
-//   compression is handled above via response compression middleware.
+// - WebSocket per-message compression (permessage-deflate) IS enabled, via
+//   UseWebSocketCompression below. SignalR's own options don't expose it, but its
+//   transport accepts through IHttpWebSocketFeature, which can be decorated for the
+//   hub path. See Hubs/WebSocketCompressionMiddleware.cs for the measurements and the
+//   CRIME/BREACH reasoning. HTTP-level compression is separate, handled above via the
+//   response compression middleware.
 // - MessagePack protocol gives ~25-30% smaller payloads vs JSON.
 //   Hub DTOs are annotated with [MessagePackObject] + [Key("camelCaseName")] so the
 //   binary wire format uses camelCase property names, preserving the existing JS client
@@ -191,17 +194,50 @@ if (!string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
     }
 }
 
+// Maximum-quality Brotli encodings of the text assets, built off the request path once
+// the server is already listening. Quality 11 is ~28% smaller than the quality-1
+// encoding the response-compression middleware produces (296.6 KiB -> 213.2 KiB across
+// this asset set), but costs ~1.4s of CPU, so it cannot be done per request — and it
+// must not delay startup either, because the regional endpoints above are registered
+// first specifically so they can answer cold-start RTT probes immediately. Until an
+// entry is ready, requests fall through to the ordinary static-file path unchanged.
+//
+// Disable via StaticAssets:Precompress to trade ~213 KiB of resident memory and a CPU
+// burst at startup for bandwidth; responses still compress dynamically either way.
+// Test hosts turn it off by default: a suite that starts many hosts would otherwise
+// pay the burst once per host, and that background load perturbs the wall-clock
+// budget asserted in PingBudgetTests.
+var precompressedAssets = new StaticAssetCompressionCache();
+if (builder.Configuration.GetValue("StaticAssets:Precompress", true)
+    && !string.IsNullOrEmpty(webRoot) && Directory.Exists(webRoot))
+{
+    var compressionLogger = app.Services
+        .GetRequiredService<ILoggerFactory>()
+        .CreateLogger(nameof(StaticAssetCompressionCache));
+    var assetPaths = etags.Keys.ToArray();
+    var stopping = app.Lifetime.ApplicationStopping;
+
+    app.Lifetime.ApplicationStarted.Register(() =>
+        _ = Task.Run(
+            () => precompressedAssets.Warm(webRoot, assetPaths, compressionLogger, stopping),
+            stopping));
+}
+
 // ETag + Cache-Control middleware.
 // Placed after UseDefaultFiles (so "/" is already rewritten to "/index.html")
 // and before UseStaticFiles (which serves the body on 200 responses).
 // - Sets Cache-Control: no-cache so the browser revalidates on every launch.
 // - Returns 304 when If-None-Match matches the content-hash ETag (no body transfer).
+// - Serves the maximum-quality Brotli encoding when one has been built (see
+//   StaticAssetCompressionCache). The ETag is the identity content hash and is shared
+//   by both encodings, so Vary: Accept-Encoding is required for cache correctness.
 // - Non-static paths (SignalR, API) are not in the etags table and pass through unchanged.
 app.Use(async (context, next) =>
 {
     var method = context.Request.Method;
+    var path = context.Request.Path.Value ?? "";
     if ((method == HttpMethods.Get || method == HttpMethods.Head)
-        && etags.TryGetValue(context.Request.Path.Value ?? "", out var etag))
+        && etags.TryGetValue(path, out var etag))
     {
         context.Response.Headers.ETag = etag;
         context.Response.Headers.CacheControl = "no-cache";
@@ -220,14 +256,73 @@ app.Use(async (context, next) =>
                 return;
             }
         }
+
+        // Range requests are left to the static-file middleware, which serves ranges of
+        // the identity representation. Browsers do not range-request these assets.
+        if (!context.Request.Headers.ContainsKey(HeaderNames.Range)
+            && AcceptsBrotli(context.Request)
+            && precompressedAssets.TryGet(path, out var precompressed))
+        {
+            context.Response.Headers.Append(
+                HeaderNames.Vary, HeaderNames.AcceptEncoding);
+            context.Response.Headers.ContentEncoding = "br";
+            context.Response.ContentType = precompressed.ContentType;
+            context.Response.ContentLength = precompressed.Body.Length;
+            // Content-Encoding is already set, so the response-compression middleware
+            // leaves this body alone rather than compressing it a second time.
+            if (method != HttpMethods.Head)
+            {
+                await context.Response.Body.WriteAsync(precompressed.Body);
+            }
+            return;
+        }
     }
     await next(context);
 });
 
-app.UseStaticFiles();
+// Accept-Encoding must list br without rejecting it via a zero quality value.
+static bool AcceptsBrotli(HttpRequest request)
+{
+    if (!StringWithQualityHeaderValue.TryParseList(
+        request.Headers.AcceptEncoding, out var encodings))
+    {
+        return false;
+    }
+
+    foreach (var encoding in encodings)
+    {
+        if (encoding.Value.Equals("br", StringComparison.OrdinalIgnoreCase))
+        {
+            return encoding.Quality.GetValueOrDefault(1) > 0;
+        }
+    }
+    return false;
+}
+
+app.UseStaticFiles(new StaticFileOptions
+{
+    // The static-file middleware stamps its own last-modified/length ETag over the
+    // content-hash ETag set above. Re-apply the content hash so the identity and Brotli
+    // representations advertise the same validator for the same bytes — and so a
+    // redeploy of unchanged files still revalidates as 304 (container image file
+    // timestamps change on every build; content hashes do not).
+    OnPrepareResponse = ctx =>
+    {
+        if (etags.TryGetValue(ctx.Context.Request.Path.Value ?? "", out var contentEtag))
+        {
+            ctx.Context.Response.Headers.ETag = contentEtag;
+        }
+    }
+});
 
 // Map SignalR hub. RequireCors so cross-origin spectator connections from
 // peer regions can negotiate + open the WebSocket.
+//
+// permessage-deflate is negotiated for this path only. The helper installs the
+// WebSocket middleware on a path branch as well, because MapHub's own copy runs
+// inside the endpoint sub-pipeline — too late to decorate. See
+// Hubs/WebSocketCompressionMiddleware.cs.
+app.UseWebSocketCompression("/sessionHub");
 app.MapHub<SessionHub>("/sessionHub").RequireCors("RegionalApi");
 
 // Server monitoring metrics API endpoint

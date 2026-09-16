@@ -53,20 +53,23 @@ test('mobile controls skip unchanged DOM writes', () => {
     let over = false;
     const game = { state: 'playing' };
     const { startMobileUILoop } = loadInlineGameFunctions(['startMobileUILoop'], {
-        game, touchButtons, requestAnimationFrame: callback => callbacks.push(callback),
+        game, touchButtons, addFrameCallback: callback => callbacks.push(callback),
         isGameOver: () => over, isSessionMode: () => false,
         startScreen: { classList: { contains: () => true } },
     });
     startMobileUILoop();
-    for (let i = 0; i < 120; i++) callbacks.shift()();
+    // One registration on the shared game-loop driver, not a self-rescheduling
+    // requestAnimationFrame loop of its own.
+    assert.equal(callbacks.length, 1, 'registered exactly once');
+    for (let i = 0; i < 120; i++) callbacks[0]();
     assert.equal(touchButtons.restart.writes.length, 1);
     assert.equal(touchButtons.pause.writes.length, 1);
     over = true;
     game.state = 'gameover';
-    callbacks.shift()();
+    callbacks[0]();
     assert.equal(touchButtons.restart.writes.length, 2);
     assert.equal(touchButtons.pause.writes.length, 2);
-    assert.equal(callbacks.length, 1, 'only one scheduled successor');
+    assert.equal(callbacks.length, 1, 'no per-frame re-registration');
 });
 
 function analogHarness() {
@@ -83,7 +86,6 @@ function analogHarness() {
             CONFIG, stickInput, analogInputConfigKeys,
             analogInputCache: { config: {}, active: false },
             game: { ship: { angle: 0.5 } },
-            requestAnimationFrame() {},
             getAnalogControlScheme: () => scheme,
             getAnalogAnchorScale: () => { calls.scale++; return scale; },
             ANALOG_CONTROL_SCHEMES: { POLAR: 'polar' },
@@ -134,4 +136,70 @@ test('active analog mapping invalidates on input, scale, mode, config and reused
     h.updateStickAnalog();
     assert.equal(h.stickInput.polarThrust, 0);
     assert.equal(h.stickInput.polarActive, false);
+});
+
+// ── single frame driver ─────────────────────────────────────────────────────
+// Auxiliary per-frame work used to run from its own requestAnimationFrame loops
+// (one for analog input, one for mobile UI visibility), so constrained devices
+// paid three rAF callbacks per frame and the analog loop ran even on desktop.
+// They are now registered on the game loop's frame-callback list.
+
+function frameDriver() {
+    const frameCallbacks = [];
+    const errors = [];
+    return {
+        frameCallbacks,
+        errors,
+        ...loadInlineGameFunctions(['addFrameCallback', 'runFrameCallbacks'], {
+            frameCallbacks,
+            console: { error: (...args) => errors.push(args) },
+        }),
+    };
+}
+
+test('frame callbacks register once, in order, and reject non-functions', () => {
+    const driver = frameDriver();
+    const order = [];
+    const first = () => order.push('first');
+    const second = () => order.push('second');
+    driver.addFrameCallback(first);
+    driver.addFrameCallback(second);
+    driver.addFrameCallback(first);
+    for (const invalid of [null, undefined, 0, 'tick', {}]) driver.addFrameCallback(invalid);
+    assert.equal(driver.frameCallbacks.length, 2);
+    driver.runFrameCallbacks();
+    assert.deepEqual(order, ['first', 'second']);
+});
+
+test('a throwing frame callback cannot take down the rest of the frame', () => {
+    const driver = frameDriver();
+    const reached = [];
+    driver.addFrameCallback(() => { throw new Error('input blew up'); });
+    driver.addFrameCallback(() => reached.push('survivor'));
+    driver.runFrameCallbacks();
+    assert.deepEqual(reached, ['survivor']);
+    assert.equal(driver.errors.length, 1);
+});
+
+test('the game loop runs auxiliary callbacks before the simulation steps', () => {
+    // Control intent sampled this frame must be visible to this frame's steps.
+    const order = [];
+    const elapsed = 1000 / 60;
+    const game = { lastFrameTime: -elapsed };   // one whole fixed step this frame
+    const { gameLoop } = loadInlineGameFunctions(['gameLoop'], {
+        game,
+        fixedStep: { accumulatorMs: 0, alpha: 0 },
+        CONFIG: { TARGET_FPS: 60 },
+        MAX_SIM_STEPS_PER_FRAME: 5,
+        MAX_ACCUMULATED_MS: 250,
+        fpsTracker: { sample() {} },
+        runFrameCallbacks: () => order.push('frameCallbacks'),
+        isSessionMode: () => false,
+        isDeterministicMode: () => true,
+        runSimulationStep: () => order.push('simulation'),
+        renderScene: () => order.push('render'),
+        requestAnimationFrame() {},
+    });
+    gameLoop(game.lastFrameTime + elapsed);
+    assert.deepEqual(order, ['frameCallbacks', 'simulation', 'render']);
 });
