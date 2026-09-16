@@ -20,6 +20,17 @@ const SessionClient = (function() {
     // client first entered the session with, which is what game state uses to
     // count a participant exactly once.
     let participantIdentity = null;
+    const maxReconnectAttempts = 10;
+    const reconnectDelay = 1000;
+    let connectionEpoch = 0;
+    let sessionEpoch = 0;
+    let pendingSessionTransition = null;
+    let sessionTransitionTail = Promise.resolve();
+    // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
+    // Empty string = same-origin single-region behavior. Tracked so reconnect logic
+    // can rebuild the connection against the correct region after a transient drop.
+    let currentHubHostname = '';
+
     // Per-tab storage key, so a page reload rejoins as the same participant.
     const participantStorageKey = 'astervoids.participant';
 
@@ -44,16 +55,6 @@ const SessionClient = (function() {
             // Quota or a blocked store only costs reload stickiness.
         }
     }
-    const maxReconnectAttempts = 10;
-    const reconnectDelay = 1000;
-    let connectionEpoch = 0;
-    let sessionEpoch = 0;
-    let pendingSessionTransition = null;
-    let sessionTransitionTail = Promise.resolve();
-    // Hostname currently bound to `connection` (e.g. https://astervoids-westus2.example.com).
-    // Empty string = same-origin single-region behavior. Tracked so reconnect logic
-    // can rebuild the connection against the correct region after a transient drop.
-    let currentHubHostname = '';
 
     // Event callbacks
     const callbacks = {
