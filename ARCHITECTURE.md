@@ -1074,12 +1074,14 @@ and validated, but elapsed scheduling never invents time for short/zero ticks.
 ### Heartbeat grid alignment
 
 Send-on-change gates fall back to a periodic heartbeat so idle objects still
-refresh. That heartbeat deadline is quantized onto a fixed wall-clock grid
+refresh. That heartbeat deadline is quantized onto a fixed monotonic grid
 (`heartbeatDue` in `replication-send-policy.js`): the next deadline is
 `floor((lastSentMs + HEARTBEAT) / HEARTBEAT) × HEARTBEAT` rather than
 `lastSentMs + HEARTBEAT`. Objects whose sends drifted apart therefore converge
 onto shared deadlines and ride the same flush, instead of each holding an
-independent phase that forces its own packet.
+independent phase that forces its own packet. `HEARTBEAT` is the fixed
+`CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS` (250 ms), shared by the ballistic and ship
+gates. `AstervoidsWeb/heartbeat-grid.test.mjs` holds the claims below.
 
 Three properties make this safe:
 
@@ -1094,13 +1096,17 @@ Three properties make this safe:
   leave, and its cap-no-carry flush accumulator still makes the effective send
   period `ceil(TX / displayFrameInterval) × displayFrameInterval`.
 
-The grid is deliberately a **local** `performance.now()` grid, not the NTP-style
-synchronized server clock. Each document's time origin differs, so members'
-bursts stay decorrelated; aligning to the shared server clock would make every
-member in a session transmit on the same boundary, producing correlated fan-out
-and ingress queueing. The grid period is the fixed heartbeat constant and must
-not become per-device or derived from measured FPS — that would re-couple send
-rate to frame rate.
+The grid is deliberately anchored to the caller's **local monotonic** clock: both
+gates inject `nowMs: () => performance.now()`, whose origin is that document's
+navigation time. Neither shared-time alternative is safe here. The NTP-style
+synchronized server clock and `Date.now()` are both *common* axes, so quantizing
+against either would put every member of a session on the same 250 ms boundary
+and correlate server fan-out and ingress queueing — the opposite of the intent.
+`Date.now()` is additionally slewable, which would drag deadlines around under
+NTP correction. Per-document `performance.now()` origins keep senders naturally
+decorrelated and immune to slewing. The grid period is the fixed heartbeat
+constant and must not become per-device or derived from measured FPS — that
+would re-couple send rate to frame rate.
 
 The effect is largest where packet count, not payload size, is the cost:
 alignment collapses per-object phases into shared flushes, so flush rate and

@@ -10,7 +10,7 @@ const { heartbeatDue, createBallisticGate } =
 const AuthoritativeObject =
     require('./wwwroot/js/authoritative-object.js');
 
-// Heartbeat deadlines are quantized onto a fixed local wall-clock grid
+// Heartbeat deadlines are quantized onto a fixed local monotonic grid
 // (`floor((lastSentMs + HB) / HB) * HB`) so that objects whose last send
 // happened at unrelated instants re-anchor together and coalesce into ONE
 // transport flush, instead of trickling across flush opportunities one or two

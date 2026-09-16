@@ -16,7 +16,7 @@ const { createShipGate } = require('./wwwroot/js/replication-send-policy.js');
 //   2. control-intent change (thrustInput/brakeInput/thrusting flip, or any
 //      turn field: mode, target, target-angle, magnitude, bias)
 //   3. explicit invulnerability transition (respawn / expiry, not countdown)
-//   4. heartbeat (the first wall-clock grid point at or after HEARTBEAT_MS)
+//   4. heartbeat (the first monotonic grid point at or after HEARTBEAT_MS)
 //   plus force=true (the P1 immediate control-edge flush) always sends.
 // Velocity / position are NOT triggers — the receiver derives them from replay.
 
@@ -220,7 +220,7 @@ test('force=true always sends and re-baselines, even with identical intent', () 
     clock.advance(16);
     assert.equal(gate.shouldSend('ship', coastingShip(), true), true, 'force overrides suppression');
     // The forced send re-baselines the heartbeat. Deadlines are quantized onto
-    // the shared wall-clock grid, so the next one is the first grid point after
+    // the shared monotonic grid, so the next one is the first grid point after
     // the forced send: strictly later than it, and never later than
     // HEARTBEAT_MS after it. Walk the clock instead of restating the formula.
     let elapsed = 0;

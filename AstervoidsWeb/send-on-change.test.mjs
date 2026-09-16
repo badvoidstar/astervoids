@@ -16,7 +16,7 @@ const { createBallisticGate } = require('./wwwroot/js/replication-send-policy.js
 //   1. no baseline (creation / ownership adoption)
 //   2. velocity / rotationSpeed change beyond epsilon
 //   3. wrap jump (single-frame position delta > WRAP_JUMP)
-//   4. heartbeat (the first wall-clock grid point at or after HEARTBEAT_MS)
+//   4. heartbeat (the first monotonic grid point at or after HEARTBEAT_MS)
 
 const CONFIG = {
     SEND_ON_CHANGE_ENABLED: true,
