@@ -185,8 +185,31 @@ public class WebSocketCompressionTests
     private sealed class KestrelFactory : AstervoidsWebFactory
     {
         private IHost? _kestrel;
+        private string _origin = "";
 
-        public string Origin { get; private set; } = "";
+        /// <summary>
+        /// Loopback origin of the Kestrel listener, e.g. <c>http://127.0.0.1:41234</c>.
+        /// Reading it builds and starts the hosts on first access.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately not forced via <c>CreateClient()</c>. That hands back a handler
+        /// bound to the <see cref="TestServer"/> host, which is only usable once the
+        /// TestServer itself has completed <c>StartAsync</c>. Because both hosts are spun
+        /// from the same deferred entry point, that had not reliably happened by the time
+        /// <c>Start()</c> returned, and the call failed roughly one run in four under
+        /// parallel load with "The server has not been started or no web application was
+        /// configured". These tests speak raw TCP to Kestrel and never used the client, so
+        /// the dependency was accidental. <c>Services</c> forces the same host creation
+        /// without requiring the unused TestServer to be serviceable.
+        /// </remarks>
+        public string Origin
+        {
+            get
+            {
+                _ = Services;
+                return _origin;
+            }
+        }
 
         protected override IHost CreateHost(IHostBuilder builder)
         {
@@ -201,7 +224,7 @@ public class WebSocketCompressionTests
             // Kestrel must start first, or the two hosts race over shared startup state.
             _kestrel.Start();
 
-            Origin = _kestrel.Services.GetRequiredService<IServer>()
+            _origin = _kestrel.Services.GetRequiredService<IServer>()
                 .Features.Get<IServerAddressesFeature>()!
                 .Addresses.Single();
 
@@ -257,7 +280,6 @@ public class WebSocketCompressionTests
     public async Task HubHandshake_OverRealKestrel_NegotiatesDeflateWithTheTunedWindow()
     {
         using var factory = new KestrelFactory();
-        _ = factory.CreateClient(); // forces host startup, which assigns Origin
 
         var response = await HandshakeAsync(
             factory.Origin, "/sessionHub", "permessage-deflate; client_max_window_bits");
@@ -277,7 +299,6 @@ public class WebSocketCompressionTests
     public async Task HubHandshake_WhenClientOffersNoExtension_StaysUncompressed()
     {
         using var factory = new KestrelFactory();
-        _ = factory.CreateClient(); // forces host startup, which assigns Origin
 
         var response = await HandshakeAsync(factory.Origin, "/sessionHub", null);
 
