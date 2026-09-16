@@ -14,6 +14,12 @@ const SessionClient = (function() {
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
     let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
+    // { sessionId, participantId }. A rejoin (and a plain re-join of the same
+    // session) mints a brand new member id server-side, so member ids cannot
+    // identify "the same human" across a reconnect. This keeps the id this
+    // client first entered the session with, which is what game state uses to
+    // count a participant exactly once.
+    let participantIdentity = null;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
     let connectionEpoch = 0;
@@ -460,6 +466,12 @@ const SessionClient = (function() {
         currentSession = session;
         currentMember = member;
         reconnectIdentity = identity;
+        // Re-entering the same session (auto-rejoin after a drop, or Leave then
+        // Join again) keeps the original participant id; a different session
+        // starts a new participant.
+        participantIdentity = participantIdentity?.sessionId === session.id
+            ? participantIdentity
+            : { sessionId: session.id, participantId: member.id };
         const pendingMemberEvents = applyPendingMemberEvents(context.sessionEpoch);
         lastSessionId = session.id;
         finishSessionTransition(context.sessionEpoch);
@@ -1382,6 +1394,17 @@ const SessionClient = (function() {
     }
 
     /**
+     * Stable identity for this client within the current session. Unlike the
+     * member id, it survives the evict-and-re-register a reconnect performs, so
+     * game state can count each participant once no matter how often they drop.
+     */
+    function getParticipantId() {
+        return currentSession && participantIdentity?.sessionId === currentSession.id
+            ? participantIdentity.participantId
+            : null;
+    }
+
+    /**
      * Clear stale session/member state without disconnecting.
      * Used when reconciliation fails after auto-reconnect: the transport is alive
      * but the server no longer recognizes this connection as a session member.
@@ -1430,6 +1453,7 @@ const SessionClient = (function() {
         isInSession,
         getLastSessionId,
         getReconnectHubHostname,
+        getParticipantId,
         clearSessionState,
         getCurrentHubHostname,
         getSessionEpoch,

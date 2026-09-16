@@ -3630,7 +3630,7 @@
             'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed',
             'thrusting', 'thrustInput', 'brakeInput',
             'turnTarget', 'turnTargetAngle', 'turnMagnitude', 'turnBias',
-            'colorIndex', 'memberId', 'score', 'hitCount'
+            'colorIndex', 'memberId', 'participantId', 'score', 'hitCount'
         ];
 
         constructor(x, y, colorIndex = 0) {
@@ -3662,6 +3662,10 @@
             this.colorIndex = colorIndex;  // Player color index (0-3)
             this.syncObjectId = null;      // ObjectSync ID when in session
             this.memberId = null;          // Session member ID who owns this ship
+            // Session-stable player identity (SessionClient.getParticipantId()).
+            // Survives the reconnect that mints a new memberId, so the shared
+            // extra-life ledger counts each player exactly once.
+            this.participantId = null;
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
             // Vertex cache — avoid re-computing the triangle every frame when pose
@@ -3720,6 +3724,7 @@
                 ...this.captureInvulnerability(),
                 colorIndex: this.colorIndex,
                 memberId: this.memberId,
+                participantId: this.participantId,
                 score: this.score || 0,
                 hitCount: this.hitCount || 0
             };
@@ -5037,6 +5042,7 @@
         // Create ship at center with invulnerability
         game.ship = new Ship(0.5, 0.5, colorIndex);
         game.ship.memberId = memberId;
+        game.ship.participantId = SessionClient.getParticipantId() || memberId;
         game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
         game.multiplayer.myColorIndex = colorIndex;
         
@@ -5959,10 +5965,6 @@
         if (!isSessionMode()) return;
         
         try {
-            // Track peak ship count so reconnecting members don't get extra lives.
-            // Only ships above this high-water mark trigger a life bonus.
-            const shipObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
-            
             const gameStateData = {
                 type: OBJECT_TYPES.GAME_STATE,
                 gameStarted: true,
@@ -5974,7 +5976,12 @@
                 waveDelayTimer: game.waveDelayTimer,
                 processedHits: AstervoidsWireCodec.packCounterMap({}),
                 processedScores: AstervoidsWireCodec.packCounterMap({}),
-                peakShipCount: shipObjects.length,
+                // Participants already granted an entry life, and the count of
+                // them. Both start empty: the first sync counts every ship that
+                // already exists, so nobody is silently swallowed by whichever
+                // client happened to create the GameState object.
+                countedParticipants: AstervoidsWireCodec.packCounterMap({}),
+                peakShipCount: 0,
                 // Authoritative server-time (ms) at which the shared lives reached
                 // 0. Null until game over; stamped once by the GameState owner.
                 // terminalAt is the shared end of the deterministic convergence
@@ -6064,14 +6071,38 @@
             }
         }
         
-        // Award extra lives when the ship count exceeds the previous peak.
-        // Uses a high-water mark so reconnecting members (whose count returns to
-        // a previously seen level) don't receive an extra life.
-        let peakShipCount = persisted?.peakShipCount || 0;
-        const currentShipCount = shipObjects.length;
-        if (currentShipCount > peakShipCount && lives > 0) {
-            lives += currentShipCount - peakShipCount;
-            peakShipCount = currentShipCount;
+        // Award one extra life per additional participant, exactly once each.
+        //
+        // Counting concurrent ships made the award depend on session churn rather
+        // than on the player: whoever entered after somebody else left silently
+        // refilled the vacated slot and got nothing, and whoever was already
+        // aboard when the GameState object was created was never counted at all.
+        // Instead every participant that has ever held a ship is recorded in a
+        // persisted ledger, and the high-water mark counts how many of them have
+        // been paid. Both live on the session-scoped GameState object, so the
+        // award is the same for every player regardless of role or of which
+        // member currently owns that object.
+        //
+        // participantId is stable across the reconnect that mints a new member
+        // id, so a dropped player who returns is not counted twice.
+        const countedParticipants = { ...ledgers.countedParticipants };
+        let countedParticipantCount = Object.keys(countedParticipants).length;
+        // max() also keeps a mark persisted by an older client (which counted
+        // ships) from re-paying seats that client already paid for.
+        let peakShipCount = Math.max(persisted?.peakShipCount || 0, countedParticipantCount);
+        if (lives > 0) {
+            for (const ship of shipObjects) {
+                const participantId = (ship.data?.participantId
+                    || ship.ownerMemberId || ship.data?.memberId || '').toLowerCase();
+                if (!participantId || countedParticipants[participantId]) continue;
+                countedParticipants[participantId] = 1;
+                countedParticipantCount++;
+            }
+            // The first participant plays on the base lives; each later one is
+            // worth exactly one extra life, the first time they are seen.
+            const awarded = Math.max(countedParticipantCount, 1) - Math.max(peakShipCount, 1);
+            if (awarded > 0) lives += awarded;
+            peakShipCount = Math.max(peakShipCount, countedParticipantCount);
         }
         
         return {
@@ -6079,6 +6110,7 @@
             lives,
             processedHits,
             processedScores,
+            countedParticipants,
             peakShipCount,
             scoreLifeAwardCount,
             observedScoreLifeAwardCount,
@@ -6118,10 +6150,11 @@
     }
 
     function serializeGameState(next, terminal, packedLedgers = null) {
-        const { processedHits, processedScores } = next;
+        const { processedHits, processedScores, countedParticipants } = next;
         const ledgers = packedLedgers ?? {
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
-            processedScores: AstervoidsWireCodec.packCounterMap(processedScores)
+            processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
+            countedParticipants: AstervoidsWireCodec.packCounterMap(countedParticipants)
         };
         return {
             type: OBJECT_TYPES.GAME_STATE,
@@ -6134,6 +6167,7 @@
             waveDelayTimer: game.waveDelayTimer,
             processedHits: ledgers.processedHits,
             processedScores: ledgers.processedScores,
+            countedParticipants: ledgers.countedParticipants,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -6199,17 +6233,18 @@
         return { counters, bytes, snapshot: new Uint8Array(bytes) };
     }
 
-    function gameStateCalculationInputs(data, hits, scores, ships) {
+    function gameStateCalculationInputs(data, hits, scores, counted, ships) {
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
-            data?.peakShipCount, data?.state, hits, scores,
+            data?.peakShipCount, data?.state, hits, scores, counted,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
             CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
         ];
         // Score/hit events mutate ship data without changing its wire version.
         // Preserve membership and iteration order (damage clamps per ship).
         for (const ship of ships) {
-            inputs.push(ship.id, ship.ownerMemberId, ship.data?.score, ship.data?.hitCount);
+            inputs.push(ship.id, ship.ownerMemberId, ship.data?.participantId,
+                ship.data?.score, ship.data?.hitCount);
         }
         return inputs;
     }
@@ -6252,6 +6287,8 @@
                 gsObj.data?.processedHits, cache.hits, cache.packedHits);
             cache.scores = readGameStateLedger(
                 gsObj.data?.processedScores, cache.scores, cache.packedScores);
+            cache.counted = readGameStateLedger(
+                gsObj.data?.countedParticipants, cache.counted, cache.packedCounted);
             malformedGameStateLedgerKey = null;
         } catch (error) {
             const ledgerKey = `${game.multiplayer.gameStateObjectId}:${gsObj?.version ?? 0}`;
@@ -6263,12 +6300,17 @@
         }
 
         const ships = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
-        const inputs = gameStateCalculationInputs(gsObj.data, cache.hits, cache.scores, ships);
+        const inputs = gameStateCalculationInputs(
+            gsObj.data, cache.hits, cache.scores, cache.counted, ships);
         const changed = !gameStateInputsEqual(inputs, cache.inputs);
         if (changed) {
             cache.next = calculateGameState(
                 gsObj.data,
-                { processedHits: cache.hits.counters, processedScores: cache.scores.counters },
+                {
+                    processedHits: cache.hits.counters,
+                    processedScores: cache.scores.counters,
+                    countedParticipants: cache.counted.counters
+                },
                 ships,
                 {
                     lives: game.lives,
@@ -6297,12 +6339,17 @@
         game.state = next.state;
         const packedHits = packGameStateLedger(next.processedHits, cache.packedHits);
         const packedScores = packGameStateLedger(next.processedScores, cache.packedScores);
-        const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores;
+        const packedCounted = packGameStateLedger(next.countedParticipants, cache.packedCounted);
+        const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores
+            || packedCounted !== cache.packedCounted;
         cache.packedHits = packedHits;
         cache.packedScores = packedScores;
-        const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores;
+        cache.packedCounted = packedCounted;
+        const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores
+            || cache.counted !== packedCounted;
         const gameStateData = serializeGameState(next, terminal, {
-            processedHits: packedHits.bytes, processedScores: packedScores.bytes
+            processedHits: packedHits.bytes, processedScores: packedScores.bytes,
+            countedParticipants: packedCounted.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
             'peakShipCount', 'state'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
@@ -6315,10 +6362,13 @@
         if (changed || packedChanged || optimisticLedgersChanged || calculationWriteChanged) {
             cache.hits = readGameStateLedger(gsObj.data?.processedHits, cache.hits, packedHits);
             cache.scores = readGameStateLedger(gsObj.data?.processedScores, cache.scores, packedScores);
+            cache.counted = readGameStateLedger(
+                gsObj.data?.countedParticipants, cache.counted, packedCounted);
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
             // the attempted payload (updateObject can fail).
-            cache.inputs = gameStateCalculationInputs(gsObj.data, cache.hits, cache.scores, ships);
+            cache.inputs = gameStateCalculationInputs(
+                gsObj.data, cache.hits, cache.scores, cache.counted, ships);
         }
     }
 
@@ -6389,6 +6439,7 @@
                     _warn('[Game] Ship creation failed, creating local fallback');
                     game.ship = new Ship(0.5, 0.5, colorIndex);
                     game.ship.memberId = member?.id;
+                    game.ship.participantId = SessionClient.getParticipantId() || member?.id;
                     game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
                     game.multiplayer.myColorIndex = colorIndex;
                 }
@@ -10245,7 +10296,7 @@
                         type: 't', x: 'x', y: 'y', angle: 'a',
                         velocityX: 'vx', velocityY: 'vy', rotationSpeed: 'rs',
                         thrusting: 'th', invulnerable: 'iv', colorIndex: 'ci',
-                        memberId: 'mi', score: 'sc', hitCount: 'hc',
+                        memberId: 'mi', participantId: 'pa', score: 'sc', hitCount: 'hc',
                         radius: 'r', seed: 'sd',
                         lifetime: 'lt', ownerMemberId: 'om',
                         pendingHit: 'ph', hitTargetId: 'ht', hitImpactTorque: 'hi',
@@ -10253,6 +10304,7 @@
                         gameStarted: 'gs', wave: 'w', state: 'st', lives: 'lv',
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
+                        countedParticipants: 'cp',
                         groupScore: 'gr', peakShipCount: 'pk',
                         scoreLifeAwardCount: 'sa',
                         gameOverAt: 'go', terminalAt: 'ta',
