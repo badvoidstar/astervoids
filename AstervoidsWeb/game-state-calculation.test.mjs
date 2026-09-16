@@ -10,6 +10,16 @@ const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const codec = require('./wwwroot/js/astervoids-wire-codec.js');
 const firstId = 'aaaaaaaa-0000-0000-0000-000000000001';
 const secondId = 'bbbbbbbb-0000-0000-0000-000000000002';
+const thirdId = 'cccccccc-0000-0000-0000-000000000003';
+// Participants are identified by GUID, like the member ids they are seeded from.
+const participant = letter => `${letter.repeat(8)}-1111-1111-1111-111111111111`;
+const participantA = participant('a');
+const participantB = participant('b');
+const participantC = participant('c');
+const member = letter => `${letter.repeat(8)}-2222-2222-2222-222222222222`;
+const memberA = member('a');
+const memberB = member('b');
+const memberC = member('c');
 const { calculateGameState, calculateGameStateTerminal } = loadInlineGameFunctions(
     ['calculateGameState', 'calculateGameStateTerminal'], { countExtraLivesForScore });
 
@@ -17,12 +27,15 @@ function calculate({
     persisted = {},
     hits = {},
     scores = {},
+    counted = {},
     ships = [],
     local = {},
     threshold = 100,
 } = {}) {
     return calculateGameState(
-        persisted, { processedHits: hits, processedScores: scores }, ships,
+        persisted,
+        { processedHits: hits, processedScores: scores, countedParticipants: counted },
+        ships,
         { lives: 3, state: 'playing', observedScoreLifeAwardCount: null, ...local },
         threshold);
 }
@@ -55,13 +68,14 @@ test('GameState calculation is deterministic and does not mutate its inputs', ()
 test('score lives precede damage and the player-count bonus cannot revive a terminal game', () => {
     const result = calculate({
         persisted: { lives: 1, groupScore: 90, peakShipCount: 0 },
-        ships: [{ id: firstId, data: { score: 10, hitCount: 2 } }],
+        ships: [{ id: firstId, ownerMemberId: 'member-a', data: { score: 10, hitCount: 2 } }],
     });
     assert.equal(result.scoreLifeAwardCount, 1);
     assert.equal(result.announceScoreLifeAward, true);
     assert.equal(result.lives, 0);
     assert.equal(result.beatStopCount, 1);
     assert.equal(result.peakShipCount, 0);
+    assert.deepEqual(result.countedParticipants, {}, 'a terminal game counts no newcomers');
 });
 
 test('damage clamps after each ship and retains each terminal beat-stop effect', () => {
@@ -110,14 +124,122 @@ test('unconfirmed local score awards remain counted without repeated feedback', 
 });
 
 test('player-count bonuses use the peak and terminal games never gain score awards', () => {
-    const ships = [{ id: firstId }, { id: secondId }];
-    assert.equal(calculate({ persisted: { lives: 3, peakShipCount: 1 }, ships }).lives, 4);
+    const ships = [
+        { id: firstId, ownerMemberId: memberA, data: { participantId: participantA } },
+        { id: secondId, ownerMemberId: memberB, data: { participantId: participantB } },
+    ];
+    const bonus = calculate({
+        persisted: { lives: 3, peakShipCount: 1 },
+        counted: { [participantA]: 1 },
+        ships,
+    });
+    assert.equal(bonus.lives, 4);
+    assert.equal(bonus.peakShipCount, 2);
+    assert.deepEqual(bonus.countedParticipants,
+        { [participantA]: 1, [participantB]: 1 });
     const terminal = calculate({
         persisted: { lives: 0, groupScore: 300, peakShipCount: 0 }, ships,
     });
     assert.equal(terminal.lives, 0);
     assert.equal(terminal.scoreLifeAwardCount, 0);
     assert.equal(terminal.announceScoreLifeAward, false);
+});
+
+test('every participant is worth exactly one life, whoever they follow', () => {
+    // The first participant plays on the base lives; each additional one adds a
+    // life the first time they are seen, in any order and from any starting ledger.
+    const ship = (id, participantId) => ({
+        id, ownerMemberId: id, data: { participantId },
+    });
+    const solo = calculate({ persisted: { lives: 3 }, ships: [ship(firstId, participantA)] });
+    assert.equal(solo.lives, 3, 'the first participant is covered by the base lives');
+    assert.equal(solo.peakShipCount, 1);
+
+    // Everyone already aboard when the GameState object is created is counted on
+    // the first sync, instead of being swallowed by a creation-time ship sample.
+    const crowd = calculate({
+        persisted: { lives: 3 },
+        ships: [ship(firstId, participantA), ship(secondId, participantB),
+            ship(thirdId, participantC)],
+    });
+    assert.equal(crowd.lives, 5);
+    assert.equal(crowd.peakShipCount, 3);
+
+    // The bug: a newcomer entering after somebody left used to refill the
+    // vacated slot for free because the concurrent ship count never exceeded the
+    // peak. The ledger makes the award depend on the player, not on churn.
+    const afterDeparture = calculate({
+        persisted: { lives: 4, peakShipCount: 2 },
+        counted: { [participantA]: 1, [participantB]: 1 },
+        ships: [ship(firstId, participantA), ship(thirdId, participantC)],
+    });
+    assert.equal(afterDeparture.lives, 5);
+    assert.equal(afterDeparture.peakShipCount, 3);
+    assert.deepEqual(afterDeparture.countedParticipants,
+        { [participantA]: 1, [participantB]: 1, [participantC]: 1 });
+});
+
+test('a returning participant is never counted twice, however their ship or member changes', () => {
+    const persisted = { lives: 4, peakShipCount: 2 };
+    const counted = { [participantA]: 1, [participantB]: 1 };
+    // Re-entering the game takes a fresh ship object, and a reconnect also mints
+    // a fresh member id; participantId is the only identity that survives both.
+    const rejoined = calculate({
+        persisted, counted,
+        ships: [
+            { id: firstId, ownerMemberId: memberA, data: { participantId: participantA } },
+            { id: thirdId, ownerMemberId: memberC, data: { participantId: participantB } },
+        ],
+    });
+    assert.equal(rejoined.lives, 4);
+    assert.equal(rejoined.peakShipCount, 2);
+    assert.deepEqual(rejoined.countedParticipants, counted);
+
+    // Repeating the calculation (every sync tick, and on the new owner after an
+    // ownership migration) is idempotent, and casing never splits an identity.
+    const migrated = calculate({
+        persisted: { ...persisted, lives: rejoined.lives },
+        counted: rejoined.countedParticipants,
+        ships: [{
+            id: firstId, ownerMemberId: memberA.toUpperCase(),
+            data: { participantId: participantA.toUpperCase() },
+        }],
+    });
+    assert.equal(migrated.lives, 4);
+    assert.deepEqual(migrated.countedParticipants, counted);
+});
+
+test('ships without a reconnect-safe identity are never counted', () => {
+    const result = calculate({
+        persisted: { lives: 3, peakShipCount: 1 },
+        counted: { [participantA]: 1 },
+        ships: [
+            { id: firstId, ownerMemberId: memberA, data: { participantId: participantA } },
+            // The owning member is not a stable identity — it changes on every
+            // reconnect — so a ship that publishes no participantId is skipped
+            // rather than counted (and re-counted) through its owner.
+            { id: secondId, ownerMemberId: memberB, data: { memberId: memberB } },
+            // A malformed id must not reach the GUID-keyed ledger packer.
+            { id: thirdId, ownerMemberId: memberC, data: { participantId: 'not-a-guid' } },
+        ],
+    });
+    assert.equal(result.lives, 3);
+    assert.deepEqual(result.countedParticipants, { [participantA]: 1 });
+});
+
+test('the ledger stops growing at the peak field ceiling instead of overflowing it', () => {
+    const counted = {};
+    for (let i = 0; i < 255; i++) {
+        counted[`${i.toString(16).padStart(8, '0')}-3333-3333-3333-333333333333`] = 1;
+    }
+    const result = calculate({
+        persisted: { lives: 3, peakShipCount: 255 },
+        counted,
+        ships: [{ id: firstId, ownerMemberId: memberA, data: { participantId: participantA } }],
+    });
+    assert.equal(result.peakShipCount, 255);
+    assert.equal(result.lives, 3);
+    assert.equal(Object.keys(result.countedParticipants).length, 255);
 });
 
 test('terminal calculation stamps once and preserves existing terminal anchors', () => {
@@ -254,6 +376,7 @@ test('GameState effects precede terminal clock sampling and packed publication',
         lives: 0, groupScore: 100, speedMultiplier: 1.2, waveDelayTimer: 80,
         processedHits: codec.packCounterMap({ [firstId]: 2 }),
         processedScores: codec.packCounterMap({ [firstId]: 10 }),
+        countedParticipants: codec.packCounterMap({}),
         peakShipCount: 1, gameOverAt: 1000, terminalAt: 1750, scoreLifeAwardCount: 1,
     });
     harness.record.data = payload;
@@ -295,7 +418,7 @@ test('unchanged optimistic ticks reuse calculation and packed ledgers without su
     });
     harness.syncGameState();
     const initial = { ...harness.counts };
-    assert.deepEqual(initial, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(initial, { calculate: 1, pack: 3, unpack: 3 });
     for (let i = 0; i < 20; i++) {
         harness.record.version++;
         harness.ships[0].version++;
@@ -325,11 +448,11 @@ test('score and hit events invalidate only changed ledgers without a version cha
     harness.ships[0].data.score = 35;
     harness.syncGameState();
     assert.equal(harness.game.score, 35);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 3 });
     harness.ships[0].data.hitCount = 1;
     harness.syncGameState();
     assert.equal(harness.game.lives, 2);
-    assert.deepEqual(harness.counts, { calculate: 3, pack: 4, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 3, pack: 5, unpack: 3 });
     assert.equal(harness.record.version, 1);
     assert.equal(harness.ships[0].version, 7);
 
@@ -338,28 +461,35 @@ test('score and hit events invalidate only changed ledgers without a version cha
     harness.syncGameState();
     assert.equal(harness.game.score, 35);
     assert.equal(harness.game.lives, 2);
-    assert.deepEqual(harness.counts, { calculate: 4, pack: 4, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 4, pack: 5, unpack: 3 });
 });
 
 test('ship membership, ownership, and order are calculation inputs', () => {
     const harness = loadSyncHarness({
         data: { lives: 3, peakShipCount: 1 },
-        ships: [{ id: firstId, ownerMemberId: 'member-a', data: { score: 10 } }],
+        ships: [{
+            id: firstId, ownerMemberId: 'member-a',
+            data: { score: 10, participantId: participantA },
+        }],
     });
     harness.syncGameState();
-    harness.ships.push({ id: secondId, data: { score: 15 } });
+    harness.ships.push({
+        id: secondId, ownerMemberId: 'member-b',
+        data: { score: 15, participantId: participantB },
+    });
     harness.syncGameState();
     assert.equal(harness.game.lives, 4);
     assert.equal(harness.game.score, 25);
     harness.ships.reverse();
     harness.syncGameState();
-    harness.ships[0].ownerMemberId = 'member-b';
+    harness.ships[0].ownerMemberId = 'member-c';
     harness.syncGameState();
     harness.ships.pop();
     harness.syncGameState();
-    assert.equal(harness.game.lives, 4);
+    assert.equal(harness.game.lives, 4,
+        'reordering, re-owning, and losing a ship never re-award a counted participant');
     assert.equal(harness.game.score, 25, 'departed score remains in the ledger');
-    assert.deepEqual(harness.counts, { calculate: 5, pack: 3, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 5, pack: 5, unpack: 3 });
 });
 
 test('configuration, local fallback, state, and observed awards invalidate calculation', () => {
@@ -386,7 +516,7 @@ test('configuration, local fallback, state, and observed awards invalidate calcu
     harness.game.lives = 8;
     harness.syncGameState();
     assert.equal(harness.game.lives, 8);
-    assert.deepEqual(harness.counts, { calculate: 6, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 6, pack: 3, unpack: 3 });
     assert.equal(harness.events.filter(event => event === 'award').length, 2);
 });
 
@@ -402,7 +532,7 @@ test('publication-only fields remain fresh without reaggregating or repacking', 
     assert.equal(payload.speedMultiplier, 2);
     assert.equal(payload.waveDelayTimer, 12);
     assert.equal(immediate, true);
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
 });
 
 test('in-place canonical scalar edits and byte mutations cannot hide behind cached references', () => {
@@ -424,14 +554,14 @@ test('in-place canonical scalar edits and byte mutations cannot hide behind cach
         assert.deepEqual(codec.unpackCounterMap(harness.record.data[field]),
             { [firstId]: field === 'processedHits' ? 1 : 10 });
         assert.notEqual(harness.record.data[field], bytes, 'never reuse mutated publication bytes');
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 3 });
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
 
         harness.record.data.lives = 7;
         harness.record.data.groupScore = 90;
         harness.syncGameState();
         assert.equal(harness.game.lives, 7);
         assert.equal(harness.game.score, 90);
-        assert.deepEqual(harness.counts, { calculate: 3, pack: 3, unpack: 3 });
+        assert.deepEqual(harness.counts, { calculate: 3, pack: 4, unpack: 4 });
     }
 });
 
@@ -456,7 +586,7 @@ test('mutable legacy counter maps invalidate on edits, added keys, and removed k
     harness.syncGameState();
     assert.deepEqual(codec.unpackCounterMap(harness.publications.at(-1).payload.processedScores),
         { [firstId]: 10 });
-    assert.deepEqual(harness.counts, { calculate: 4, pack: 4, unpack: 5 });
+    assert.deepEqual(harness.counts, { calculate: 4, pack: 5, unpack: 6 });
 });
 
 test('canonical replacement and ownership/session identity changes discard cached state', () => {
@@ -490,10 +620,10 @@ test('canonical replacement and ownership/session identity changes discard cache
         change(harness);
         harness.syncGameState();
         assert.equal(harness.publications.length, 2, change.toString());
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 },
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 },
             change.toString());
         harness.syncGameState();
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
     }
     const { resetMultiplayerState } = loadInlineGameFunctions(['resetMultiplayerState']);
     assert.match(resetMultiplayerState.toString(), /resetGameStateSyncCache\(\)/);
@@ -514,7 +644,7 @@ test('a same-version recovery snapshot replaces optimistic scores and lives', ()
     assert.equal(harness.game.lives, 8);
     assert.equal(harness.game.score, 45);
     assert.equal(harness.record.version, 1);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
 });
 
 test('failed writes retry cached payloads without replaying effects or moving the terminal edge', () => {
@@ -529,11 +659,11 @@ test('failed writes retry cached payloads without replaying effects or moving th
     harness.syncGameState();
     assert.deepEqual(harness.events, ['award', 'stop', 'clock', 'publish', 'publish', 'publish']);
     assert.equal(harness.record.data.lives, 1, 'failed publication is not an optimistic write');
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
     harness.controls.writeResult = true;
     harness.syncGameState();
     harness.syncGameState();
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
     assert.equal(harness.publications.length, 5);
     assert.equal(harness.record.data.gameOverAt, 1000);
     assert.equal(harness.record.data.terminalAt, 1750);
@@ -553,7 +683,7 @@ test('scalar-only failed writes also rebase the cache when a retry succeeds', ()
     harness.syncGameState();
     assert.equal(harness.game.lives, 5);
     assert.equal(harness.record.data.scoreLifeAwardCount, 2);
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
     assert.deepEqual(harness.events, ['award', 'publish', 'publish', 'publish']);
 });
 
@@ -571,7 +701,7 @@ test('dirty retries consume terminal effects once and refresh delay without rest
     assert.deepEqual(harness.events, ['stop', 'clock', 'publish', 'publish']);
     assert.equal(harness.publications.at(-1).payload.gameOverAt, 1000);
     assert.equal(harness.publications.at(-1).payload.terminalAt, 1900);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 3 });
 
     harness.controls.throwWrite = true;
     assert.throws(() => harness.syncGameState(), /write failed/);
@@ -608,12 +738,12 @@ test('equivalent byte views reuse the cache, but mutations in offset views are d
     storage.set(harness.record.data.processedScores, 7);
     harness.record.data.processedScores = storage.subarray(7, 27);
     harness.syncGameState();
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
     harness.record.data.processedScores = storage.subarray(7, 27);
     storage[7 + 16] = 5;
     harness.syncGameState();
     assert.equal(harness.game.score, 15);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 2, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 4 });
 });
 
 test('recovery snapshots invalidate aggregation without replaying already-consumed effects', () => {
@@ -630,7 +760,7 @@ test('recovery snapshots invalidate aggregation without replaying already-consum
     assert.equal(harness.record.data.groupScore, 100);
     assert.equal(harness.record.data.lives, 0);
     assert.equal(harness.record.data.gameOverAt, 1000);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
 });
 
 test('real ObjectSync retries unconfirmed cached GameState after failed, empty, and rejected responses',
@@ -693,7 +823,7 @@ test('real ObjectSync retries unconfirmed cached GameState after failed, empty, 
             harness.syncGameState();
             await objectSync.flushUpdates();
             assert.equal(batches.length, 3, 'confirmed duplicates remain ObjectSync-suppressed');
-            assert.deepEqual(harness.counts, { calculate: 1, pack: 2, unpack: 2 });
+            assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
             assert.equal(harness.terminalCalls.length, 1);
             assert.deepEqual(harness.events, ['award', 'stop', 'clock']);
         }

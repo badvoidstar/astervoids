@@ -33,6 +33,7 @@ const SHIP_SCHEMA_FIELDS = [
     ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
     ['terminalY', 'f64'], ['terminalAngle', 'f64'],
     ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
+    ['participantId', 'guid'],
 ];
 const ASTEROID_SCHEMA_FIELDS = [
     ['type', 'str'],

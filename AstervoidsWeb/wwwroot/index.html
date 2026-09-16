@@ -6090,11 +6090,23 @@
         // max() also keeps a mark persisted by an older client (which counted
         // ships) from re-paying seats that client already paid for.
         let peakShipCount = Math.max(persisted?.peakShipCount || 0, countedParticipantCount);
+        const guidGroupLengths = [8, 4, 4, 4, 12];
         if (lives > 0) {
             for (const ship of shipObjects) {
-                const participantId = (ship.data?.participantId
-                    || ship.ownerMemberId || ship.data?.memberId || '').toLowerCase();
-                if (!participantId || countedParticipants[participantId]) continue;
+                // Only an explicit participantId is reconnect-safe. Falling back
+                // to the owning member would re-count the same player after every
+                // drop, which is the asymmetry this ledger exists to remove, so a
+                // ship without one is skipped rather than counted unsafely.
+                const participantId = (ship.data?.participantId || '').toLowerCase();
+                // The ledger packs GUID keys and publishes its size through a u8
+                // field: a malformed id or unbounded growth would throw out of
+                // every later publish, so stop counting instead of stalling sync.
+                const groups = participantId.split('-');
+                if (groups.length !== 5
+                    || !guidGroupLengths.every((length, index) => groups[index].length === length)
+                    || !/^[0-9a-f]*$/.test(groups.join(''))
+                    || Object.hasOwn(countedParticipants, participantId)) continue;
+                if (countedParticipantCount >= 255) break;
                 countedParticipants[participantId] = 1;
                 countedParticipantCount++;
             }

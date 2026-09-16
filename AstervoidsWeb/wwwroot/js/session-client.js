@@ -20,6 +20,30 @@ const SessionClient = (function() {
     // client first entered the session with, which is what game state uses to
     // count a participant exactly once.
     let participantIdentity = null;
+    // Per-tab storage key, so a page reload rejoins as the same participant.
+    const participantStorageKey = 'astervoids.participant';
+
+    function loadStoredParticipantIdentity() {
+        try {
+            const stored = JSON.parse(
+                globalThis.sessionStorage?.getItem(participantStorageKey) ?? 'null');
+            return typeof stored?.sessionId === 'string'
+                && typeof stored?.participantId === 'string' ? stored : null;
+        } catch {
+            // Storage can be unavailable (private mode, disabled cookies) or hold
+            // unparsable data. A fresh identity is correct, just less sticky.
+            return null;
+        }
+    }
+
+    function storeParticipantIdentity(identity) {
+        try {
+            globalThis.sessionStorage?.setItem(
+                participantStorageKey, JSON.stringify(identity));
+        } catch {
+            // Quota or a blocked store only costs reload stickiness.
+        }
+    }
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
     let connectionEpoch = 0;
@@ -466,12 +490,16 @@ const SessionClient = (function() {
         currentSession = session;
         currentMember = member;
         reconnectIdentity = identity;
-        // Re-entering the same session (auto-rejoin after a drop, or Leave then
-        // Join again) keeps the original participant id; a different session
-        // starts a new participant.
-        participantIdentity = participantIdentity?.sessionId === session.id
-            ? participantIdentity
-            : { sessionId: session.id, participantId: member.id };
+        // Re-entering the same session (auto-rejoin after a drop, Leave then Join
+        // again, or a page reload) keeps the original participant id; a different
+        // session starts a new participant.
+        if (participantIdentity?.sessionId !== session.id) {
+            participantIdentity = loadStoredParticipantIdentity();
+        }
+        if (participantIdentity?.sessionId !== session.id) {
+            participantIdentity = { sessionId: session.id, participantId: member.id };
+            storeParticipantIdentity(participantIdentity);
+        }
         const pendingMemberEvents = applyPendingMemberEvents(context.sessionEpoch);
         lastSessionId = session.id;
         finishSessionTransition(context.sessionEpoch);
