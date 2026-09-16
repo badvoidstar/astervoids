@@ -24,20 +24,45 @@ namespace AstervoidsWeb.Hubs;
 ///
 /// <para><b>Why it pays.</b> Hot-path hub frames are envelope-dominated — roughly
 /// two-thirds SignalR/hub metadata — and that metadata is near-identical on every
-/// message, which is exactly what a shared compression window exploits. Measured on
-/// captured traffic: about −60% downlink and −54% uplink, for ~1.6 µs of server CPU per
-/// message.</para>
+/// message, which is exactly what a shared compression window exploits. Replaying real
+/// <c>OnObjectsUpdated</c> frames through the production hub protocol, the payload
+/// compresses to 0.28 at a batch of one and 0.38 at a batch of four. Per <i>packet</i>
+/// the saving is nearer −55% than −62%, because the ~46 B of IP/TCP/WebSocket framing
+/// rides uncompressed; size bandwidth arguments off the packet figure, not the payload
+/// ratio.</para>
+///
+/// <para><b>What it costs.</b> ~12 µs of server CPU per message to deflate (p99.9
+/// ~35 µs, bounded) and ~1.4 µs for the client to inflate. Deflate runs once per
+/// connection rather than once per broadcast, so a six-way fan-out costs ~76 µs. At
+/// 20 Hz that is ~0.02% of a core per connection — three to four orders of magnitude
+/// below a 20–80 ms round trip, which is why the trade is worth making even though the
+/// bandwidth saving only converts into latency at a congested bottleneck.</para>
 ///
 /// <para><b>Context takeover must stay enabled.</b> The saving comes almost entirely
-/// from the window persisting across messages; disabling takeover measured a 0.99
-/// ratio, i.e. no compression at all. The cost is one deflate stream per direction per
-/// connection held for the connection's lifetime.</para>
+/// from the window persisting across messages: with takeover disabled the same frames
+/// compress to ~0.89 (−11%) rather than ~0.38 (−62%). The cost is one deflate stream
+/// per direction per connection held for the connection's lifetime.</para>
 ///
-/// <para><b>Window size.</b> <see cref="ServerMaxWindowBits"/> 12 (4 KiB) measured
-/// <i>better</i> than the 15-bit default (0.358 vs 0.366) on this traffic — the frames
-/// are small and their redundancy is local — while using an eighth of the memory per
-/// connection. Bounding it matters because context takeover means the window is
-/// retained per connection.</para>
+/// <para><b>Window size.</b> <see cref="ServerMaxWindowBits"/> 12 (4 KiB) is a
+/// <i>memory</i> choice, not a ratio choice. The 15-bit default compresses strictly
+/// better on this traffic (0.298 vs 0.379 at a batch of four, and at every batch size
+/// measured), as it must — the window is a hard bound on how far back a match may
+/// reach, so a larger one weakly dominates. What 12 buys is ~112 KiB per connection:
+/// zlib's deflate state is <c>(1 &lt;&lt; (windowBits + 2)) + (1 &lt;&lt; (memLevel + 9))</c>,
+/// so 144 KiB at 12 against 256 KiB at 15 — the window term is four times the window,
+/// and the <c>memLevel</c> term is fixed overhead that shrinking the window cannot
+/// touch. That cost is per connection only because context takeover retains the state
+/// for the connection's lifetime. Note this bounds the server's <i>compressor</i>
+/// alone: the client is granted <c>client_max_window_bits=15</c>, so the server's
+/// decompressor stays at 15 (~39 KiB) either way.</para>
+///
+/// <para><b>On these numbers.</b> They are measurements of a point in time, not
+/// budgets, and nothing in CI holds them. An earlier revision of this comment recorded
+/// the window-size comparison backwards and the CPU cost ~7x low, so re-measure before
+/// relying on any of them for a tuning decision. Note also that synthetic frames are a
+/// trap here: a corpus with a realistic envelope but smooth payloads compresses to
+/// ~0.04 and shows no window-size effect at all, because the dominant match is the
+/// previous frame and that sits within even a 4 KiB window.</para>
 ///
 /// <para><b>Security.</b> <c>DangerousEnableCompression</c> is named for the
 /// CRIME/BREACH class of attack: an attacker who can inject chosen plaintext into the
@@ -115,7 +140,8 @@ public static class WebSocketCompressionExtensions
             ArgumentNullException.ThrowIfNull(context);
 
             context.DangerousEnableCompression = true;
-            // The window must persist across messages or the ratio collapses to ~1.0.
+            // The window must persist across messages or the ratio falls from ~0.38
+            // to ~0.89 — most of the saving is cross-message, not within a frame.
             context.DisableServerContextTakeover = false;
             context.ServerMaxWindowBits = ServerMaxWindowBits;
 

@@ -1572,10 +1572,15 @@ flowchart TB
 
 Hub frames are additionally compressed in transit by WebSocket
 `permessage-deflate` (RFC 7692), enabled for the `/sessionHub` path only by
-`UseWebSocketCompression` in `Program.cs`. Server window bits are 12 and context
-takeover is left enabled on both directions — the shared compression window
-across messages is what makes the saving possible, because individual hot-path
-frames are too small to compress on their own. Two consequences matter:
+`UseWebSocketCompression` in `Program.cs`. Context takeover is left enabled on
+both directions — the shared compression window across messages is what makes
+the saving possible, because individual hot-path frames are small enough that
+compressing them in isolation recovers only a fraction of it. Server window bits
+are 12, which is a *memory* choice rather than a ratio choice: the 15-bit default
+compresses better, but 12 holds ~112 KiB less deflate state per connection, and
+context takeover means that state is retained for the connection's lifetime. See
+the `WebSocketCompressionMiddleware` remarks for the measured figures. Two
+consequences matter:
 
 - It is purely a transport-layer concern. No DTO, schema, or client code is
   aware of it, and a peer or proxy that does not offer the extension simply
