@@ -1291,7 +1291,15 @@ member at its latency-dependent displayed pose:
    and, when applicable, `terminalAngle` onto that same object record.
 3. Existing members start from the exact transform rendered on their preceding
    frame and normally preserve position, velocity, and acceleration in a
-   quintic trajectory while reaching the persisted target at rest.
+   quintic trajectory while reaching the persisted target at rest. An explicit
+   teleport re-anchors that displayed transform, because the preceding frame no
+   longer describes where the object is. Losing the last life is exactly this
+   case: the shared lives counter is authoritative, so the owner respawns its
+   ship at the centre on the fatal hit and convergence must begin at the spawn
+   pose rather than sweep from the death pose. A respawn that is ingested after
+   the terminal epoch already opened — the fatal hit-count event can be observed
+   before the respawn pose arrives — likewise adopts the authoritative pose
+   outright and discards any convergence built from the pre-hit transform.
 4. A member joining an already-terminal session creates no ship and seeds
    replicas directly at persisted targets. Target-less snapshot or late-create
    records remain hidden until their target-bearing version arrives.

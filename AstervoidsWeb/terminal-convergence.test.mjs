@@ -647,3 +647,229 @@ test('unified ship schema persists every terminal field written by updates', () 
         { type: 'bullet', terminalEpoch: 1 },
         'create'), 3);
 });
+
+// ── Respawn teleport at the game-over boundary ──────────────────────────────
+// Losing the last life still respawns the ship at the centre: the shared lives
+// counter is authoritative, so the owner cannot know the hit was fatal. The
+// terminal transition is then built on the very next frame from the object's
+// displayed pose, so an unanchored respawn makes the ship glide from where it
+// died to the spawn point instead of appearing there.
+
+const SPAWN = { x: 0.5, y: 0.5, angle: -Math.PI / 2 };
+
+function loadShipRuntime(overrides = {}) {
+    const config = {
+        TARGET_FPS: 60,
+        INVULNERABILITY_TIME: 180,
+        SHIP_SIZE: 0.02,
+        DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+        DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+    };
+    const deterministicTerminalState = {
+        transitions: new Map(),
+        directTargetIds: new Set(),
+        pendingBootstrapIds: new Set(),
+        ownedWrites: new Map()
+    };
+    const game = {
+        ship: null,
+        lives: 1,
+        state: 'playing',
+        multiplayer: { myShipObjectId: 'mine', remoteShips: new Map() }
+    };
+    const writes = [];
+    const events = [];
+    const production = loadInlineGameFunctions([
+        'Ship', 'ShipInvulnerability', 'assignDefined',
+        'rampInputToward', 'handleShipHit', 'anchorPoseAfterTeleport',
+        'rememberRenderedPose', 'lastRenderedPose',
+        'createProvisionalTerminalTransition', 'createCanonicalTerminalTransition',
+        'sampleTerminalTransition'
+    ], {
+        CONFIG: config,
+        game,
+        deterministicTerminalState,
+        TURN_CONTROL_MODE: { KEYBOARD_RATE: 0 },
+        normalizeTurnControlMode: value => value,
+        getShipTurnSpeed: () => 0.1,
+        isSessionMode: () => true,
+        isDeterministicMode: () => true,
+        AudioSystem: {
+            playShipExplosion() {},
+            thrustSound: { stop() {} },
+            beat: { stop() {} }
+        },
+        CollisionEffects: { startShipHit: (...args) => events.push(args) },
+        emitShipStateChanged: pose => events.push(pose),
+        ObjectSync: {
+            updateObject: (id, data, immediate) =>
+                writes.push({ id, data, immediate })
+        },
+        updateHUD() {},
+        publishDebugMetrics() {},
+        velocityToNormalizedDeltaX: value => value,
+        velocityToNormalizedDeltaY: value => value,
+        wrapRadiusFor: () => config.SHIP_SIZE,
+        wrapMarginX: () => 0,
+        wrapMarginY: () => 0,
+        ReplicationPresentation: {
+            createMinimumJerkTransition,
+            createWrappedConvergenceTransition,
+            sampleMinimumJerkTransition
+        },
+        RemoteObjects: { clock: { offsetInitialized: false } },
+        ...overrides
+    });
+    return { ...production, config, game, deterministicTerminalState, writes };
+}
+
+test('a fatal hit respawns the ship and re-anchors both blend anchors', () => {
+    const runtime = loadShipRuntime();
+    const ship = new runtime.Ship(0.85, 0.2);
+    ship.syncObjectId = 'mine';
+    ship.velocityX = 3;
+    ship.velocityY = -2;
+    // The pre-hit pose is what the preceding tick and frame displayed.
+    ship._prevX = 0.84;
+    ship._prevY = 0.21;
+    ship._prevAngle = 1.1;
+    runtime.rememberRenderedPose(ship);
+    runtime.game.ship = ship;
+
+    runtime.handleShipHit(ship);
+
+    assert.equal(ship.x, SPAWN.x);
+    assert.equal(ship.y, SPAWN.y);
+    assert.equal(ship.angle, SPAWN.angle);
+    assert.equal(ship._prevX, SPAWN.x, 'render interpolation must not sweep');
+    assert.equal(ship._prevY, SPAWN.y);
+    assert.equal(ship._prevAngle, SPAWN.angle);
+    const displayed = runtime.lastRenderedPose(ship);
+    assert.equal(displayed.x, SPAWN.x, 'convergence anchor must be the spawn pose');
+    assert.equal(displayed.y, SPAWN.y);
+    assert.equal(displayed.angle, SPAWN.angle);
+    assert.equal(runtime.writes.at(-1).immediate, true);
+});
+
+test('game over after the last life holds the ship at spawn instead of blending', () => {
+    const runtime = loadShipRuntime();
+    const ship = new runtime.Ship(0.85, 0.2);
+    ship.syncObjectId = 'mine';
+    ship.velocityX = 3;
+    ship.velocityY = -2;
+    runtime.rememberRenderedPose(ship);
+    runtime.game.ship = ship;
+
+    runtime.handleShipHit(ship);
+
+    // The shared lives counter reaches zero and this member starts converging
+    // on the very next frame, before any canonical target has been accepted.
+    const terminal = { epoch: 5000, terminalAt: 5750 };
+    const provisional = runtime.createProvisionalTerminalTransition(
+        ship, terminal, 5000);
+    for (const at of [5000, 5100, 5375, 5750]) {
+        const sample = runtime.sampleTerminalTransition(provisional, at);
+        approx(sample.x, SPAWN.x);
+        approx(sample.y, SPAWN.y);
+        approx(sample.angle, SPAWN.angle);
+    }
+
+    // The owner's canonical target is the same spawn pose at rest, so adopting
+    // it must not reintroduce motion either.
+    const record = {
+        id: 'mine',
+        data: {
+            terminalEpoch: terminal.epoch,
+            terminalX: SPAWN.x,
+            terminalY: SPAWN.y,
+            terminalAngle: SPAWN.angle
+        }
+    };
+    const canonical = runtime.createCanonicalTerminalTransition(
+        ship, record, terminal, 5000, provisional);
+    for (const at of [5000, 5375, 5750]) {
+        const sample = runtime.sampleTerminalTransition(canonical, at);
+        approx(sample.x, SPAWN.x);
+        approx(sample.y, SPAWN.y);
+        approx(sample.angle, SPAWN.angle);
+    }
+});
+
+test('without re-anchoring the terminal convergence would sweep from the death pose', () => {
+    // Regression guard: proves the fixture above would fail on the old path.
+    const runtime = loadShipRuntime();
+    const ship = new runtime.Ship(0.85, 0.2);
+    ship.syncObjectId = 'mine';
+    runtime.rememberRenderedPose(ship);
+    // Respawn WITHOUT re-anchoring, exactly as the unfixed code did.
+    ship.reset();
+
+    const provisional = runtime.createProvisionalTerminalTransition(
+        ship, { epoch: 5000, terminalAt: 5750 }, 5000);
+    const start = runtime.sampleTerminalTransition(provisional, 5000);
+    approx(start.x, 0.85);
+    approx(start.y, 0.2);
+    assert.notEqual(start.x, SPAWN.x);
+});
+
+test('a respawn ingested after the terminal epoch snaps the replica', () => {
+    const runtime = loadShipRuntime();
+    let terminalSession = null;
+    const removed = [];
+    const presentationRuntime = loadInlineGameFunctions([
+        'createKinematicPresentation', 'anchorPoseAfterTeleport',
+        'rememberRenderedPose'
+    ], {
+        game: runtime.game,
+        deterministicTerminalState: runtime.deterministicTerminalState,
+        isDeterministicMode: () => true,
+        resolveTerminalSession: () => terminalSession,
+        OBJECT_TYPES: { SHIP: 'ship' },
+        DeadReckon: {
+            states: new Map(),
+            lastVersions: new Map(),
+            updateState() {},
+            remove: id => removed.push(id)
+        },
+        RemoteObjects: {},
+        getDeterministicIngestBaselinePerf: () => 0,
+        calculateShipRateAngularPredictionWindow: () => null,
+        currentKinematicData: (type, id, record) => record.data
+    });
+    const presentation = presentationRuntime.createKinematicPresentation();
+
+    const replica = new runtime.Ship(0.85, 0.2);
+    runtime.game.multiplayer.remoteShips.set('theirs', replica);
+    runtime.rememberRenderedPose(replica);
+    // A pre-hit heartbeat establishes the invulnerability anchor so the next
+    // revision change is recognised as an explicit transition.
+    const facts = { type: 'ship' };
+    presentation.ingest('theirs', {
+        x: 0.85, y: 0.2, angle: 1.1, invulnerable: 0, invulnerabilityRevision: 2
+    }, facts, { id: 'theirs', validAt: 4900, version: 1 }, {});
+
+    // This member observes the fatal hitCount event first, so the terminal
+    // epoch is already open when the owner's respawn pose lands.
+    terminalSession = { epoch: 5000, terminalAt: 5750 };
+    runtime.deterministicTerminalState.transitions.set('theirs', { stale: true });
+    presentation.ingest('theirs', {
+        x: SPAWN.x,
+        y: SPAWN.y,
+        angle: SPAWN.angle,
+        velocityX: 0,
+        velocityY: 0,
+        invulnerable: 180,
+        invulnerabilityRevision: 3
+    }, facts, { id: 'theirs', validAt: 5001, version: 2 }, {});
+
+    assert.equal(replica.x, SPAWN.x, 'replica adopts the authoritative spawn pose');
+    assert.equal(replica.y, SPAWN.y);
+    assert.equal(replica.angle, SPAWN.angle);
+    assert.equal(
+        runtime.lastRenderedPose(replica).x, SPAWN.x,
+        'convergence anchor must follow the teleport');
+    assert.equal(
+        runtime.deterministicTerminalState.transitions.has('theirs'), false,
+        'a stale convergence built from the pre-hit pose must be discarded');
+    assert.deepEqual(removed, ['theirs']);
+});

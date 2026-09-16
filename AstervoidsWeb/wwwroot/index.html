@@ -5261,6 +5261,16 @@
                         // policy consumes the persisted target without allowing
                         // DeadReckon to overwrite the current displayed pose.
                         DeadReckon.remove(id);
+                        // A respawn is the one exception: the owner teleported
+                        // the ship, so its pre-hit transform is not a legal
+                        // convergence anchor. This races the terminal epoch —
+                        // the fatal hitCount event can be observed before the
+                        // respawn pose is ingested — so adopt the authoritative
+                        // pose outright and let convergence restart there.
+                        if (shipTeleport && ship) {
+                            ship.fromSyncData(data);
+                            anchorPoseAfterTeleport(ship, id);
+                        }
                         return;
                     }
                     // Only an explicit transition can teleport timed ships.
@@ -7394,8 +7404,11 @@
             // before the next per-frame batch.
             emitShipStateChanged(hitPose);
 
-            // Reset ship locally
+            // Reset ship locally. The shared lives counter is authoritative, so
+            // this respawn also runs on the fatal hit — the terminal transition
+            // can therefore be built from this pose on the very next frame.
             ship.reset();
+            anchorPoseAfterTeleport(ship);
             if (game.multiplayer.myShipObjectId) {
                 ObjectSync.updateObject(game.multiplayer.myShipObjectId, ship.toUpdateData(), true);
             }
@@ -7415,6 +7428,7 @@
                 AudioSystem.beat.stop();
             } else {
                 ship.reset();
+                anchorPoseAfterTeleport(ship);
             }
         }
     }
@@ -7821,6 +7835,29 @@
                     : obj.angle)
                 : null
         };
+    }
+
+    // An explicit teleport (a ship respawn) ends displayed-pose continuity: the
+    // preceding tick pose and the preceding rendered transform both describe a
+    // place the object no longer occupies. Both are blend anchors — render
+    // interpolation eases _prev*→current within a tick, and game-over terminal
+    // convergence starts at lastRenderedPose() — so a teleport must re-anchor
+    // them or the object sweeps to its new pose instead of appearing there.
+    // That is exactly the last-life case: the ship respawns at the centre and
+    // the terminal transition is built on the very next frame, which would
+    // otherwise glide the ship from where it died to the spawn point. Remote
+    // ship replicas are keyed by object id rather than carrying syncObjectId,
+    // so the caller supplies it for them.
+    function anchorPoseAfterTeleport(obj, syncId = obj?.syncObjectId) {
+        if (!obj) return;
+        obj._prevX = obj.x;
+        obj._prevY = obj.y;
+        if (typeof obj.angle === 'number') obj._prevAngle = obj.angle;
+        rememberRenderedPose(obj);
+        if (syncId) {
+            deterministicTerminalState.transitions.delete(syncId);
+            deterministicTerminalState.directTargetIds.delete(syncId);
+        }
     }
 
     // Borrowed scratch is never shared by nested draws. Pool only four buffers
