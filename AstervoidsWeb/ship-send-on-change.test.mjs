@@ -16,7 +16,7 @@ const { createShipGate } = require('./wwwroot/js/replication-send-policy.js');
 //   2. control-intent change (thrustInput/brakeInput/thrusting flip, or any
 //      turn field: mode, target, target-angle, magnitude, bias)
 //   3. explicit invulnerability transition (respawn / expiry, not countdown)
-//   4. heartbeat (>= HEARTBEAT_MS since last send)
+//   4. heartbeat (the first wall-clock grid point at or after HEARTBEAT_MS)
 //   plus force=true (the P1 immediate control-edge flush) always sends.
 // Velocity / position are NOT triggers — the receiver derives them from replay.
 
@@ -219,9 +219,18 @@ test('force=true always sends and re-baselines, even with identical intent', () 
     assert.equal(gate.shouldSend('ship', coastingShip(), false), false, 'identical => suppressed without force');
     clock.advance(16);
     assert.equal(gate.shouldSend('ship', coastingShip(), true), true, 'force overrides suppression');
-    // baseline clock advanced by the forced send => next heartbeat measured from here
-    clock.advance(CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS - 1);
-    assert.equal(gate.shouldSend('ship', coastingShip(), false), false);
+    // The forced send re-baselines the heartbeat. Deadlines are quantized onto
+    // the shared wall-clock grid, so the next one is the first grid point after
+    // the forced send: strictly later than it, and never later than
+    // HEARTBEAT_MS after it. Walk the clock instead of restating the formula.
+    let elapsed = 0;
+    while (!gate.shouldSend('ship', coastingShip(), false)) {
+        clock.advance(1);
+        elapsed++;
+        assert.ok(elapsed <= CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS,
+            'an aligned heartbeat never fires later than an unaligned one');
+    }
+    assert.ok(elapsed > 0, 'the forced send re-baselined the heartbeat');
 });
 
 // ── disabled / non-deterministic fall-through ───────────────────────────────

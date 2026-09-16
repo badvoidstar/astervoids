@@ -8326,6 +8326,28 @@
         }
     }
 
+    // Auxiliary per-frame work (analog input sampling, mobile UI visibility) is
+    // driven from the single game-loop callback instead of each owning its own
+    // requestAnimationFrame loop. Three concurrent rAF callbacks per frame was pure
+    // scheduling overhead on the most constrained devices — and one of them ran even
+    // on desktop, where it has nothing to do. Registering here also makes the order
+    // relative to the simulation defined rather than incidental.
+    const frameCallbacks = [];
+    function addFrameCallback(callback) {
+        if (typeof callback !== 'function') return;
+        if (!frameCallbacks.includes(callback)) frameCallbacks.push(callback);
+    }
+    // A throwing callback must not take the frame loop down with it.
+    function runFrameCallbacks() {
+        for (let i = 0; i < frameCallbacks.length; i++) {
+            try {
+                frameCallbacks[i]();
+            } catch (error) {
+                console.error('Frame callback failed', error);
+            }
+        }
+    }
+
     function gameLoop(timestamp) {
         // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
         if (!game.lastFrameTime) game.lastFrameTime = timestamp;
@@ -8334,6 +8356,13 @@
 
         // Track FPS from the inter-frame interval (diagnostic only)
         fpsTracker.sample(elapsed);
+
+        // Auxiliary work first, so control intent sampled this frame is visible to
+        // the simulation steps below. The separate rAF loops this replaced happened
+        // to run in that order too, but only because they were registered earlier in
+        // the document than the gameLoop kickoff — reordering the file would have
+        // silently cost a frame of input latency. Here the order is structural.
+        runFrameCallbacks();
         
         // Calculate delta time multiplier (1.0 = one frame at 60fps = 16.67ms)
         const targetFrameTime = 1000 / CONFIG.TARGET_FPS;
@@ -9011,7 +9040,6 @@
         // rectilinear scheme uses computeStickInput to cache a rotation offset;
         // polar uses computePolarStickInput to cache an absolute target angle.
         function updateStickAnalog() {
-            requestAnimationFrame(updateStickAnalog);
             if (stickInput.moveTouchId === null) {
                 if (analogInputCache.active) {
                     stickInput.rectRotationOffset = 0;
@@ -9098,7 +9126,7 @@
                 }
             }
         }
-        requestAnimationFrame(updateStickAnalog);
+        addFrameCallback(updateStickAnalog);
 
         gameContainer.addEventListener('touchstart', (e) => {
             if (!isAnalogControlSchemeEnabled()) return;
@@ -9303,7 +9331,7 @@
     // Mobile UI update loop (only runs after touch controls are enabled)
     function startMobileUILoop() {
         const cache = {};
-        requestAnimationFrame(function mobileLoop() {
+        addFrameCallback(function updateMobileUI() {
             if (touchButtons.restart) {
                 const showRestart = isGameOver();
                 if (cache.restart !== showRestart) {
@@ -9321,7 +9349,6 @@
                     cache.pause = showPause;
                 }
             }
-            requestAnimationFrame(mobileLoop);
         });
     }
     
