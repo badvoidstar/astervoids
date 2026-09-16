@@ -128,7 +128,7 @@ public class WebSocketCompressionTests
         recorder.Observed.Should().NotBeNull();
         recorder.Observed!.DangerousEnableCompression.Should().BeTrue();
         recorder.Observed.DisableServerContextTakeover.Should().BeFalse(
-            "most of the saving is cross-message: without a shared window the ratio falls from ~0.38 to ~0.89");
+            "most of the saving is cross-message: without a shared window the ratio falls from ~0.38 to ~0.86");
         recorder.Observed.ServerMaxWindowBits.Should()
             .Be(WebSocketCompressionExtensions.ServerMaxWindowBits);
     }
@@ -270,7 +270,7 @@ public class WebSocketCompressionTests
         response.Should().Contain(
             $"server_max_window_bits={WebSocketCompressionExtensions.ServerMaxWindowBits}");
         response.Should().NotContain("server_no_context_takeover",
-            "most of the saving is cross-message: without a shared window the ratio falls from ~0.38 to ~0.89");
+            "most of the saving is cross-message: without a shared window the ratio falls from ~0.38 to ~0.86");
     }
 
     [Fact]

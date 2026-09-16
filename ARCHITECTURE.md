@@ -1576,9 +1576,12 @@ Hub frames are additionally compressed in transit by WebSocket
 both directions — the shared compression window across messages is what makes
 the saving possible, because individual hot-path frames are small enough that
 compressing them in isolation recovers only a fraction of it. Server window bits
-are 12, which is a *memory* choice rather than a ratio choice: the 15-bit default
-compresses better, but 12 holds ~112 KiB less deflate state per connection, and
-context takeover means that state is retained for the connection's lifetime. See
+are 12, which costs nothing measurable: a sweep over production-encoded frames is
+flat from 11 through 15 bits, because gameplay state drifts continuously and the
+dominant match is against the previous frame rather than anything far back. The
+~112 KiB less deflate state per connection that 12 holds is therefore free, and it
+is charged per connection because takeover retains that state for the connection's
+lifetime. `AstervoidsWeb/websocket-deflate-window.test.mjs` holds both claims. See
 the `WebSocketCompressionMiddleware` remarks for the measured figures. Two
 consequences matter:
 
