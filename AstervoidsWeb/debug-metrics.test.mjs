@@ -50,7 +50,7 @@ test('debug metrics retain their heartbeat gate, fields, rounding, and per-call 
         ObjectSync: {
             getObjectCount: () => { scans++; return objectCount; },
             getObjectsByOwner: id => { assert.equal(id, 'me'); return [1, 2]; },
-            getSendRate: () => 30,
+            getEffectiveSendIntervalMs: () => 33,
             getReconciliationCount: () => 3,
         },
         fpsTracker: { getFps: () => 60 },

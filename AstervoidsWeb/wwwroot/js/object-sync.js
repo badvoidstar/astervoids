@@ -239,6 +239,23 @@ const ObjectSync = (function() {
     const ADAPTIVE_SEND_MIN = 1 / 20; // fastest send interval (20Hz) in seconds
     const ADAPTIVE_SEND_MAX = 1 / 1;  // slowest send interval (1Hz) in seconds
 
+    // Smoothed spacing of the caller's ticks. Ticks are the only flush
+    // opportunities, so this is what turns the *requested* send interval into
+    // the one this client can actually achieve (see effectiveSendIntervalSec).
+    // Device-scoped rather than session-scoped: a display's refresh rate does
+    // not change when a session ends, so it deliberately survives resetState().
+    let smoothedTickIntervalSec = 0;
+    // EMA weight for new tick samples. Smoothing matters: unsmoothed, a display
+    // hovering either side of a harmonic would flip the advertised interval
+    // between batches, jittering receivers' cadence gates and perturbing a wire
+    // field that is otherwise constant (and therefore nearly free to compress).
+    const TICK_ESTIMATE_SMOOTHING = 0.2;
+    // A stall is not a cadence. Clamping both the sample and the derived result
+    // stops a GC pause or a throttled background timer from advertising a
+    // multi-second interval that would inflate buffering for every receiver.
+    const TICK_SAMPLE_MAX_SEC = 1;
+    const ADVERTISED_INTERVAL_MAX_SEC = 1;
+
     // Callbacks
     const callbacks = {
         onObjectCreated: null,
@@ -301,10 +318,64 @@ const ObjectSync = (function() {
     }
 
     /**
-     * Get the current effective send rate in Hz.
+     * Get the send rate currently in effect in Hz, i.e. the requested cadence
+     * after any adaptive RTT adjustment. This is what the flush accumulator
+     * aims for; see `getEffectiveSendIntervalMs` for what it can achieve.
      */
     function getSendRate() {
         return Math.round(1 / nominalFrameTime);
+    }
+
+    /**
+     * Fold one tick spacing into the smoothed estimate. Zero-length ticks carry
+     * no cadence information, and oversized ones are stalls rather than a rate.
+     * @param {number} frameTimeSec - Elapsed time since the previous tick
+     */
+    function recordTickInterval(frameTimeSec) {
+        if (!(frameTimeSec > 0)) return;
+        const sample = Math.min(TICK_SAMPLE_MAX_SEC, frameTimeSec);
+        smoothedTickIntervalSec = smoothedTickIntervalSec > 0
+            ? smoothedTickIntervalSec
+                + TICK_ESTIMATE_SMOOTHING * (sample - smoothedTickIntervalSec)
+            : sample;
+    }
+
+    /**
+     * The send interval this client can actually achieve, in seconds.
+     *
+     * `nominalFrameTime` is only a request. A batch can be released only on a
+     * tick, and the flush accumulator does not carry surplus time forward, so
+     * the achievable period is the first tick boundary at or after the nominal
+     * interval: ceil(TX / tick) * tick. A 10fps sender asked for 50ms sends
+     * every 100ms; a backgrounded tab, whose timers the browser clamps to ~1s,
+     * sends every ~1s while still nominally asking for 50ms.
+     *
+     * Receivers are told this value rather than the request, because they size
+     * buffering from it and use it to reject implausible packet intervals - and
+     * a sender that claims to be twice as fast as it is gets its own updates
+     * filtered out of every peer's interval statistics. Quantization can only
+     * round the interval up, so this never under-states cadence.
+     *
+     * Derived on read and never written back into `nominalFrameTime`, which
+     * would couple it to `updateSendRate` into a feedback loop.
+     */
+    function effectiveSendIntervalSec() {
+        const tickSec = smoothedTickIntervalSec;
+        if (!(tickSec > 0)) return nominalFrameTime;
+        // The slack mirrors the accumulator's epsilon at the flush test so an
+        // exactly-harmonic ratio does not round a whole tick up.
+        const ticksPerFlush = Math.max(1, Math.ceil(nominalFrameTime / tickSec - 1e-9));
+        return Math.min(
+            Math.max(ADVERTISED_INTERVAL_MAX_SEC, nominalFrameTime),
+            Math.max(nominalFrameTime, ticksPerFlush * tickSec));
+    }
+
+    /**
+     * Achievable send interval in milliseconds, as advertised to receivers.
+     * @returns {number}
+     */
+    function getEffectiveSendIntervalMs() {
+        return Math.round(effectiveSendIntervalSec() * 1000);
     }
 
     /**
@@ -1166,6 +1237,7 @@ const ObjectSync = (function() {
      */
     function tick(frameTimeSec) {
         if (!Number.isFinite(frameTimeSec) || frameTimeSec < 0) return;
+        recordTickInterval(frameTimeSec);
         elapsedSinceFlushSec = Math.min(nominalFrameTime, elapsedSinceFlushSec + frameTimeSec);
         // Once due, an RTT-driven interval increase must not add another wait
         // after an already-saturated in-flight batch.
@@ -1351,7 +1423,7 @@ const ObjectSync = (function() {
             return;
         }
         try {
-            const response = await SessionClient.updateObjects(wireUpdates, currentSenderSequence, Math.round(nominalFrameTime * 1000), clientValidAt);
+            const response = await SessionClient.updateObjects(wireUpdates, currentSenderSequence, getEffectiveSendIntervalMs(), clientValidAt);
             if (!isAsyncContextCurrent(context)) return;
             // Capture response timestamp immediately — before processing
             // versions or sequences — so RTT reflects only the network
@@ -1727,6 +1799,7 @@ const ObjectSync = (function() {
         getReconciliationCount,
         configure,
         getSendRate,
+        getEffectiveSendIntervalMs,
         updateSendRate,
         triggerReconciliation,
         suspendReconciliation,

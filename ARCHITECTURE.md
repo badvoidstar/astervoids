@@ -1071,6 +1071,46 @@ Once elapsed eligibility is reached, it remains latched across adaptive interval
 increases until serviced. Legacy `minFrameTime` configuration remains accepted
 and validated, but elapsed scheduling never invents time for short/zero ticks.
 
+### Advertised send cadence
+
+`senderSendIntervalMs` is the cadence a sender claims on every batch. It is the
+**achievable** interval, not the requested TX above: a batch can only be released
+on a game-owned tick and the accumulator does not carry surplus time forward, so
+the real period is `ceil(TX / tickInterval) × tickInterval`. A 10fps client asked
+for 50 ms sends every 100 ms; a backgrounded tab, whose timers the browser clamps
+to ~1 s, sends every ~1 s while still requesting 50 ms.
+
+Advertising the request instead would be a claim the sender cannot keep, and
+receivers act on it. They seed adaptive delay from it before enough lag samples
+exist, size the dead-reckoning prediction window with it, and — most
+consequentially — reject observed packet intervals wider than twice its value as
+outliers. A sender that overstates its rate by more than 2× has *all* of its
+intervals discarded, so the interval variance that feeds steady-state buffering
+never accumulates for the objects it owns. Because session-scoped objects
+concentrate under one owner, a single degraded member can under-buffer a shared
+object set for every other member in the session, while itself seeing nothing
+wrong.
+
+`ObjectSync` therefore derives the value from a smoothed estimate of tick
+spacing:
+
+- **Smoothed, not instantaneous.** Frame jitter would otherwise move the claim
+  every batch, disturbing receivers' gates and a wire field that is otherwise
+  constant and nearly free to compress.
+- **Clamped at 1 s**, per sample and again on the result, so a GC pause or a
+  suspended machine cannot advertise a stall as a cadence and inflate buffering
+  session-wide. The clamp never reduces the claim below the configured request.
+- **Derived on read**, never written back into `nominalFrameTime`, which would
+  couple it to adaptive RTT updates into a feedback loop.
+
+Quantization only ever rounds up, so the advertised interval is always ≥ TX and
+this can add buffering but never remove it. `getSendRate()` continues to report
+the request; `getEffectiveSendIntervalMs()` reports the claim, and debug
+telemetry uses the latter so `tx:` matches the wire.
+`AstervoidsWeb/send-interval-advertisement.test.mjs` pins the advertised value to
+the spacing actually achieved across a display-cadence × TX matrix, along with
+the clamp, the smoothing, and the unticked-sender fallback.
+
 ### Heartbeat grid alignment
 
 Send-on-change gates fall back to a periodic heartbeat so idle objects still

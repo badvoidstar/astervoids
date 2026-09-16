@@ -7483,7 +7483,7 @@
             }
             debugChannel.postMessage({
                 rtt: Math.round(RemoteObjects.getRtt()),
-                tx: Math.round(1000 / ObjectSync.getSendRate()),
+                tx: ObjectSync.getEffectiveSendIntervalMs(),
                 jitter: Math.round(RemoteObjects.getJitter()),
                 buf: Math.round(RemoteObjects.getDelay()),
                 fps: fpsTracker.getFps(),
