@@ -5244,6 +5244,17 @@
      * DeadReckon can smooth the handoff instead of snapping.
      */
     function createKinematicPresentation() {
+        // A respawn is an explicit teleport: the replica's displayed transform
+        // describes a place the ship no longer occupies, so it is not a legal
+        // continuity anchor. Remote replicas are only repositioned at render
+        // time, and that render may be the first game-over frame — which seeds
+        // terminal convergence from lastRenderedPose(). Adopt the authoritative
+        // destination at ingest so the convergence can never start at the pose
+        // the ship just left and sweep across the arena to the spawn point.
+        const adoptShipTeleport = (ship, id, data) => {
+            ship.fromSyncData(data);
+            anchorPoseAfterTeleport(ship, id);
+        };
         return {
             has(id) {
                 return isDeterministicMode()
@@ -5267,10 +5278,7 @@
                         // the fatal hitCount event can be observed before the
                         // respawn pose is ingested — so adopt the authoritative
                         // pose outright and let convergence restart there.
-                        if (shipTeleport && ship) {
-                            ship.fromSyncData(data);
-                            anchorPoseAfterTeleport(ship, id);
-                        }
+                        if (shipTeleport && ship) adoptShipTeleport(ship, id, data);
                         return;
                     }
                     // Only an explicit transition can teleport timed ships.
@@ -5294,6 +5302,12 @@
                                         record.ownerMemberId)
                                     : null
                         });
+                    // The other half of the same race: the respawn lands while
+                    // play is still observed, but the fatal hitCount turns this
+                    // step terminal before the replica is next rendered. The
+                    // teleport would then be discarded by a convergence anchored
+                    // at the stale rendered pose.
+                    if (isTeleport) adoptShipTeleport(ship, id, data);
                 } else {
                     if (shipTeleport) RemoteObjects.remove(id);
                     RemoteObjects.updateState(

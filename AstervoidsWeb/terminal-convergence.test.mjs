@@ -873,3 +873,72 @@ test('a respawn ingested after the terminal epoch snaps the replica', () => {
         'a stale convergence built from the pre-hit pose must be discarded');
     assert.deepEqual(removed, ['theirs']);
 });
+
+test('a respawn ingested while play is observed survives a same-step game over', () => {
+    // The observed ordering on a watching member: the respawn arrives while
+    // play is still live, so it takes the dead-reckoned path, and the fatal
+    // hitCount turns the very same step terminal. Replicas are only moved at
+    // render time, so without re-anchoring the first game-over frame still
+    // sees the pre-hit pose and sweeps the ship across the arena.
+    const runtime = loadShipRuntime();
+    let terminalSession = null;
+    const updates = [];
+    const presentationRuntime = loadInlineGameFunctions([
+        'createKinematicPresentation', 'anchorPoseAfterTeleport',
+        'rememberRenderedPose'
+    ], {
+        game: runtime.game,
+        deterministicTerminalState: runtime.deterministicTerminalState,
+        isDeterministicMode: () => true,
+        resolveTerminalSession: () => terminalSession,
+        OBJECT_TYPES: { SHIP: 'ship' },
+        DeadReckon: {
+            states: new Map([['theirs', {}]]),
+            lastVersions: new Map(),
+            updateState: (id, data, baseline, isTeleport) =>
+                updates.push({ id, isTeleport }),
+            remove() {}
+        },
+        RemoteObjects: {},
+        getDeterministicIngestBaselinePerf: () => 0,
+        calculateShipRateAngularPredictionWindow: () => null,
+        currentKinematicData: (type, id, record) => record.data
+    });
+    const presentation = presentationRuntime.createKinematicPresentation();
+
+    const replica = new runtime.Ship(0.2, 0.2);
+    runtime.game.multiplayer.remoteShips.set('theirs', replica);
+    runtime.rememberRenderedPose(replica);
+    const facts = { type: 'ship' };
+    presentation.ingest('theirs', {
+        x: 0.2, y: 0.2, angle: 1.1, invulnerable: 0, invulnerabilityRevision: 2
+    }, facts, { id: 'theirs', validAt: 4900, version: 1 }, {});
+
+    presentation.ingest('theirs', {
+        x: SPAWN.x,
+        y: SPAWN.y,
+        angle: SPAWN.angle,
+        velocityX: 0,
+        velocityY: 0,
+        invulnerable: 180,
+        invulnerabilityRevision: 3
+    }, facts, { id: 'theirs', validAt: 5001, version: 2 }, {});
+
+    assert.deepEqual(
+        updates.map(u => u.isTeleport), [false, true],
+        'the respawn must still reach DeadReckon as an explicit teleport');
+    assert.equal(
+        runtime.lastRenderedPose(replica).x, SPAWN.x,
+        'the convergence anchor must follow the teleport, not the render');
+    assert.equal(runtime.lastRenderedPose(replica).y, SPAWN.y);
+
+    // Game over is resolved later in the same step, before the next render.
+    terminalSession = { epoch: 5000, terminalAt: 5750 };
+    const provisional = runtime.createProvisionalTerminalTransition(
+        replica, terminalSession, 5000);
+    for (const at of [5000, 5100, 5375, 5750]) {
+        const sample = runtime.sampleTerminalTransition(provisional, at);
+        approx(sample.x, SPAWN.x);
+        approx(sample.y, SPAWN.y);
+    }
+});
