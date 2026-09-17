@@ -1296,10 +1296,13 @@ member at its latency-dependent displayed pose:
    longer describes where the object is. Losing the last life is exactly this
    case: the shared lives counter is authoritative, so the owner respawns its
    ship at the centre on the fatal hit and convergence must begin at the spawn
-   pose rather than sweep from the death pose. A respawn that is ingested after
-   the terminal epoch already opened — the fatal hit-count event can be observed
-   before the respawn pose arrives — likewise adopts the authoritative pose
-   outright and discards any convergence built from the pre-hit transform.
+   pose rather than sweep from the death pose. Ordering between the fatal
+   hit-count event and the respawn pose is not fixed, so both arrival orders
+   re-anchor: a respawn ingested after the terminal epoch opened adopts the
+   authoritative pose outright and discards any convergence built from the
+   pre-hit transform, and a respawn ingested while play is still observed
+   re-anchors immediately as well, because replicas are only repositioned at
+   render time and that render may already be the first game-over frame.
 4. A member joining an already-terminal session creates no ship and seeds
    replicas directly at persisted targets. Target-less snapshot or late-create
    records remain hidden until their target-bearing version arrives.
