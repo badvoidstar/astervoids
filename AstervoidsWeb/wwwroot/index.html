@@ -5040,22 +5040,31 @@
         if (!memberId) return;
         
         // Create ship at center with invulnerability
-        game.ship = new Ship(0.5, 0.5, colorIndex);
-        game.ship.memberId = memberId;
-        game.ship.participantId = SessionClient.getParticipantId() || memberId;
-        game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
+        const ship = new Ship(0.5, 0.5, colorIndex);
+        ship.memberId = memberId;
+        ship.participantId = SessionClient.getParticipantId();
+        ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
+        // Published before the await because createObject's liveness predicate
+        // reads game.ship to decide whether the caller still wants the object.
+        game.ship = ship;
         game.multiplayer.myColorIndex = colorIndex;
         
         try {
             const objectInfo = await ObjectSync.createObject(
-                game.ship.toSyncData(), 'Member', null,
-                () => game.ship !== null);
-            if (!objectInfo) return;
-            game.ship.syncObjectId = objectInfo.id;
-            game.multiplayer.myShipObjectId = objectInfo.id;
+                ship.toSyncData(), 'Member', null,
+                () => game.ship === ship);
+            if (objectInfo) {
+                ship.syncObjectId = objectInfo.id;
+                game.multiplayer.myShipObjectId = objectInfo.id;
+                return;
+            }
         } catch (err) {
             _error('[Multiplayer] Failed to create ship:', err);
         }
+        // Registration failed or was abandoned. Keeping the ship would leave this
+        // client flying an entity no other member can see or collide with, and
+        // would suppress the caller's fallback, so retract it.
+        if (game.ship === ship) game.ship = null;
     }
 
     /**
@@ -6105,7 +6114,6 @@
         // max() also keeps a mark persisted by an older client (which counted
         // ships) from re-paying seats that client already paid for.
         let peakShipCount = Math.max(persisted?.peakShipCount || 0, countedParticipantCount);
-        const guidGroupLengths = [8, 4, 4, 4, 12];
         if (lives > 0) {
             for (const ship of shipObjects) {
                 // Only an explicit participantId is reconnect-safe. Falling back
@@ -6113,14 +6121,16 @@
                 // drop, which is the asymmetry this ledger exists to remove, so a
                 // ship without one is skipped rather than counted unsafely.
                 const participantId = (ship.data?.participantId || '').toLowerCase();
-                // The ledger packs GUID keys and publishes its size through a u8
-                // field: a malformed id or unbounded growth would throw out of
-                // every later publish, so stop counting instead of stalling sync.
-                const groups = participantId.split('-');
-                if (groups.length !== 5
-                    || !guidGroupLengths.every((length, index) => groups[index].length === length)
-                    || !/^[0-9a-f]*$/.test(groups.join(''))
+                // The ledger packs its keys as GUIDs, and packGameStateLedger runs
+                // outside syncGameState's malformed-ledger guard, so one bad key
+                // would throw out of every later publish.
+                if (!GuidUtils.isGuid(participantId)
                     || Object.hasOwn(countedParticipants, participantId)) continue;
+                // Each entry costs 20 bytes on the wire and the whole ledger is
+                // republished on change and carried in join snapshots, so cap it.
+                // A session with 255 distinct participants has long since stopped
+                // being playable; further arrivals simply play on the lives pool
+                // already earned.
                 if (countedParticipantCount >= 255) break;
                 countedParticipants[participantId] = 1;
                 countedParticipantCount++;
@@ -6466,7 +6476,7 @@
                     _warn('[Game] Ship creation failed, creating local fallback');
                     game.ship = new Ship(0.5, 0.5, colorIndex);
                     game.ship.memberId = member?.id;
-                    game.ship.participantId = SessionClient.getParticipantId() || member?.id;
+                    game.ship.participantId = SessionClient.getParticipantId();
                     game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
                     game.multiplayer.myColorIndex = colorIndex;
                 }
@@ -10878,7 +10888,14 @@
         // with the snapshot apply path inside joinSession and could mis-classify
         // freshly applied objects as ghosts.
         ObjectSync.suspendReconciliation();
-        const wasPlaying = game.state === 'playing' || game.state === 'waveDelay';
+        // Whether *this client* was in the game — not whether the shared game was
+        // running. A lobby spectator also reads game.state 'playing' from the
+        // GameState object (isLobbySpectating deliberately keys off the ship, not
+        // the state), so testing the state alone re-entered the game on their
+        // behalf and turned every spectator into a player on the way back from a
+        // backgrounded tab.
+        const wasPlaying = !!game.ship
+            && (game.state === 'playing' || game.state === 'waveDelay');
         const reconnectHubHostname =
             SessionClient.getReconnectHubHostname?.()
             ?? SessionClient.getCurrentHubHostname?.()
@@ -10963,8 +10980,18 @@
                             game.state = 'lobby';
                             await startGameFromPicker();
                         } else {
-                            // Return to lobby — no ship needed, safe to unfreeze immediately
-                            game.state = 'lobby';
+                            // Return to lobby — no ship needed, safe to unfreeze
+                            // immediately. A spectator keeps spectating, so the
+                            // shared state is read back off the GameState object
+                            // instead of being forced to 'lobby': reconciliation
+                            // re-applies GameState only when a NEW version
+                            // arrives, so a forced reset would freeze the watched
+                            // game until the owner next published a change.
+                            const gameStateData = sessionPicker.gameStarted
+                                ? ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE)?.data
+                                : null;
+                            if (gameStateData) applyGameStateData(gameStateData);
+                            else game.state = 'lobby';
                             updatePickerButtons();
                             startScreen.classList.remove('hidden');
                         }

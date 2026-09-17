@@ -14,12 +14,16 @@ const SessionClient = (function() {
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
     let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
-    // { sessionId, participantId }. A rejoin (and a plain re-join of the same
-    // session) mints a brand new member id server-side, so member ids cannot
+    // sessionId -> participantId. A rejoin, and a plain re-join of the same
+    // session, mint a brand new member id server-side, so a member id cannot
     // identify "the same human" across a reconnect. This keeps the id this
-    // client first entered the session with, which is what game state uses to
-    // count a participant exactly once.
-    let participantIdentity = null;
+    // client first entered each session with, which is what game state uses to
+    // count a participant exactly once. Keyed per session so that visiting
+    // another session and coming back is still the original participant, and
+    // bounded because it is only a cache: a missed entry costs an identity, not
+    // correctness of anything already recorded.
+    const participantIdentities = new Map();
+    const maxParticipantIdentities = 8;
     const maxReconnectAttempts = 10;
     const reconnectDelay = 1000;
     let connectionEpoch = 0;
@@ -32,29 +36,45 @@ const SessionClient = (function() {
     let currentHubHostname = '';
 
     // Per-tab storage key, so a page reload rejoins as the same participant.
-    const participantStorageKey = 'astervoids.participant';
+    const participantStorageKey = 'astervoids.participants';
 
-    function loadStoredParticipantIdentity() {
+    // Storage is attacker-writable in the sense that anything already running in
+    // the page can poison it, and a participant id is published verbatim as a
+    // `guid` wire field. Anything that is not a real GUID is dropped here rather
+    // than allowed to reach the encoder.
+    function loadStoredParticipantIdentities() {
         try {
             const stored = JSON.parse(
                 globalThis.sessionStorage?.getItem(participantStorageKey) ?? 'null');
-            return typeof stored?.sessionId === 'string'
-                && typeof stored?.participantId === 'string' ? stored : null;
+            if (!Array.isArray(stored)) return;
+            for (const entry of stored.slice(-maxParticipantIdentities)) {
+                if (GuidUtils.isGuid(entry?.sessionId)
+                    && GuidUtils.isGuid(entry?.participantId)) {
+                    participantIdentities.set(entry.sessionId, entry.participantId);
+                }
+            }
         } catch {
             // Storage can be unavailable (private mode, disabled cookies) or hold
             // unparsable data. A fresh identity is correct, just less sticky.
-            return null;
         }
     }
 
-    function storeParticipantIdentity(identity) {
+    function rememberParticipantIdentity(sessionId, participantId) {
+        participantIdentities.delete(sessionId);
+        participantIdentities.set(sessionId, participantId);
+        while (participantIdentities.size > maxParticipantIdentities) {
+            participantIdentities.delete(participantIdentities.keys().next().value);
+        }
         try {
-            globalThis.sessionStorage?.setItem(
-                participantStorageKey, JSON.stringify(identity));
+            globalThis.sessionStorage?.setItem(participantStorageKey, JSON.stringify(
+                [...participantIdentities].map(([id, participant]) =>
+                    ({ sessionId: id, participantId: participant }))));
         } catch {
             // Quota or a blocked store only costs reload stickiness.
         }
     }
+
+    loadStoredParticipantIdentities();
 
     // Event callbacks
     const callbacks = {
@@ -491,15 +511,12 @@ const SessionClient = (function() {
         currentSession = session;
         currentMember = member;
         reconnectIdentity = identity;
-        // Re-entering the same session (auto-rejoin after a drop, Leave then Join
-        // again, or a page reload) keeps the original participant id; a different
-        // session starts a new participant.
-        if (participantIdentity?.sessionId !== session.id) {
-            participantIdentity = loadStoredParticipantIdentity();
-        }
-        if (participantIdentity?.sessionId !== session.id) {
-            participantIdentity = { sessionId: session.id, participantId: member.id };
-            storeParticipantIdentity(participantIdentity);
+        // Re-entering a session (auto-rejoin after a drop, Leave then Join again,
+        // a page reload, or a visit to another session and back) keeps the id this
+        // client first entered *that* session with; a session never seen before
+        // adopts this member id as its participant id.
+        if (!participantIdentities.has(session.id)) {
+            rememberParticipantIdentity(session.id, member.id);
         }
         const pendingMemberEvents = applyPendingMemberEvents(context.sessionEpoch);
         lastSessionId = session.id;
@@ -1428,8 +1445,8 @@ const SessionClient = (function() {
      * game state can count each participant once no matter how often they drop.
      */
     function getParticipantId() {
-        return currentSession && participantIdentity?.sessionId === currentSession.id
-            ? participantIdentity.participantId
+        return currentSession
+            ? participantIdentities.get(currentSession.id) ?? null
             : null;
     }
 

@@ -513,6 +513,65 @@ test('voluntary leave bookkeeping blocks rejoin synchronously without clearing p
     assert.equal(logs[0][3], true);
 });
 
+test('a rejoin restores the role this client actually had, not the shared game state', async () => {
+    // Regression: a lobby spectator also reads game.state 'playing' from the
+    // GameState object, so a state-only "was playing" test re-entered the game
+    // on their behalf when a backgrounded tab came back.
+    const run = async ({ ship, gameStarted = true, gameStateData = { state: 'playing', lives: 5 } }) => {
+        const game = { ship, state: 'playing', mode: 'session', connectionLost: true, multiplayer: {} };
+        const sessionPicker = { currentSessionId: 's', gameStarted };
+        const snapshot = gameStarted ? [{ data: { type: 'gameState' } }] : [];
+        const calls = [];
+        const { attemptAutoRejoin } = loadInlineGameFunctions(['attemptAutoRejoin'], {
+            game, sessionPicker, leavingSession: false, rejoinInProgress: false,
+            pendingRejoinSessionId: null,
+            isSessionMode: () => true,
+            document: { hidden: false },
+            setTimeout: fn => fn(),
+            OBJECT_TYPES: { GAME_STATE: 'gameState' },
+            ObjectSync: {
+                suspendReconciliation() {}, resumeReconciliation() {},
+                getObjectByType: type =>
+                    type === 'gameState' && gameStateData ? { data: gameStateData } : null,
+                getAllObjects: () => [],
+            },
+            SessionClient: {
+                isConnected: () => true,
+                joinSession: async () => ({ session: { id: 's', name: 'n', objects: snapshot }, member: { id: 'm' } }),
+            },
+            connectToSessionHub: async () => {},
+            resetMultiplayerState: () => calls.push('reset'),
+            beginSessionSnapshot: () => {},
+            applySessionMembership: () => {},
+            startGameFromPicker: async () => calls.push('enterGame'),
+            applyGameStateData: data => { calls.push('adoptGameState'); game.state = data.state; },
+            updatePickerButtons: () => {}, updateCurrentSessionStatus: () => {},
+            setPickerStatus: () => {}, setPickerConnectionState: () => {},
+            resizeCanvas: () => {}, activateSessionPickerUpdates: async () => {},
+            startScreen: { classList: { remove: () => calls.push('showPicker') } },
+            reconnectingOverlay: { classList: { remove: () => {} } },
+            _log: () => {}, _warn: () => {}, _error: () => {},
+        });
+        await attemptAutoRejoin('s');
+        return { calls, game };
+    };
+
+    const player = await run({ ship: { id: 'ship' } });
+    assert.ok(player.calls.includes('enterGame'), 'a player who had a ship re-enters the game');
+
+    const spectator = await run({ ship: null });
+    assert.ok(!spectator.calls.includes('enterGame'), 'a spectator is never given a ship by a rejoin');
+    assert.ok(spectator.calls.includes('showPicker'), 'a spectator keeps the picker visible');
+    // Reconciliation re-applies GameState only on a NEW version, so the watched
+    // game must be adopted here rather than reset to 'lobby' and left frozen.
+    assert.ok(spectator.calls.includes('adoptGameState'));
+    assert.equal(spectator.game.state, 'playing', 'spectating continues uninterrupted');
+
+    const lobby = await run({ ship: null, gameStarted: false, gameStateData: null });
+    assert.ok(!lobby.calls.includes('enterGame'));
+    assert.equal(lobby.game.state, 'lobby', 'no game to watch still falls back to the lobby');
+});
+
 test('shared solo-mode reset restores local configuration after clearing session identity', () => {
     const game = { mode: 'session', sessionInfo: { id: 's' }, state: 'lobby' };
     let restored = false;

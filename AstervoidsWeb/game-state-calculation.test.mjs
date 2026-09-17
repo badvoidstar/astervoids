@@ -21,7 +21,8 @@ const memberA = member('a');
 const memberB = member('b');
 const memberC = member('c');
 const { calculateGameState, calculateGameStateTerminal } = loadInlineGameFunctions(
-    ['calculateGameState', 'calculateGameStateTerminal'], { countExtraLivesForScore });
+    ['calculateGameState', 'calculateGameStateTerminal'],
+    { countExtraLivesForScore, GuidUtils: require('./wwwroot/js/guid-utils.js') });
 
 function calculate({
     persisted = {},
@@ -311,6 +312,7 @@ function loadSyncHarness({
             return calculateGameStateTerminal(...args);
         },
         malformedGameStateLedgerKey: null, gameStateSyncCache: null,
+        GuidUtils: require('./wwwroot/js/guid-utils.js'),
         CONFIG: config,
         OBJECT_TYPES: { SHIP: 'ship', GAME_STATE: 'gameState' },
         isSessionMode: () => controls.sessionMode,
