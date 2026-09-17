@@ -534,6 +534,41 @@ test('terminal target uses half-ballistic distance tied to terminalAt', () => {
     assert.deepEqual(muchLater, first);
 });
 
+test('a ship frozen at its fatal collision pose converges on that exact pose', () => {
+    // A predicted-fatal death hold stops the ship and zeroes its velocity and
+    // rotation (see handleShipHit / beginShipDeathHold). Every member derives
+    // the same terminal target from that frozen instance, so the wreck is the
+    // final state for the ship's owner, the GameState owner, and spectators
+    // alike — no matter how long the convergence window is.
+    const { buildTerminalTargetPayload: build } = loadInlineGameFunctions(
+        ['buildTerminalTargetPayload'],
+        {
+            CONFIG: { TARGET_FPS: 60, DEADRECKON_MAX_FRAMES: 30 },
+            RemoteObjects: { serverNowMs: () => 1000, getBoundingRadius: () => 0 },
+            wrapRadiusFor: () => 0,
+            wrapMarginX: () => 0,
+            wrapMarginY: () => 0,
+            wrapNormalizedMod: value => ((value % 1) + 1) % 1,
+            velocityToNormalizedDeltaX: value => value,
+            velocityToNormalizedDeltaY: value => value,
+            normalizeTerminalAngle: value =>
+                ((value % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)
+        });
+    const held = {
+        x: 0.25, y: 0.75, angle: 1.25,
+        velocityX: 0, velocityY: 0, rotationSpeed: 0
+    };
+    const record = { validAt: 1000, data: held };
+    for (const terminalAt of [1000, 1250, 100_000]) {
+        const payload = build(held, record, { epoch: 900, terminalAt });
+        approx(payload.terminalX, held.x);
+        approx(payload.terminalY, held.y);
+        approx(payload.terminalAngle, held.angle);
+        assert.equal(payload.x, held.x);
+        assert.equal(payload.y, held.y);
+    }
+});
+
 test('terminal publisher retries owned targets and retires ownership races', () => {
     const records = new Map([
         ['ours', {

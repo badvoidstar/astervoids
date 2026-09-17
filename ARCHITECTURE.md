@@ -206,6 +206,26 @@ The game continues to own orchestration in `wwwroot/index.html`:
   changes invalidate the cache, and cached publication still queues updates
   against `ObjectSync`'s confirmed baseline rather than treating a local write
   as an acknowledgement.
+- A session ship that takes a hit its owner predicts to be fatal holds at that
+  collision pose instead of respawning, so the final frame everyone sees is the
+  collision that ended the game rather than a fresh ship at centre. The owner
+  re-runs the same pure `calculateGameState` locally with its incremented
+  `hitCount` applied, which reproduces the lives the authority is about to
+  publish — including other ships' unprocessed hits and pending extra-life
+  awards — with no extra traffic and regardless of who owns the ship or the
+  GameState object. A held ship stops simulating, accepts no input, cannot
+  collide again, and is zeroed to rest, so `buildTerminalTargetPayload` derives
+  a terminal target equal to its own pose; buffered sessions settle onto the
+  same frozen snapshot. The hold is local state, never replicated: peers need
+  the frozen pose, not the prediction behind it, and the wreck stays drawn.
+  Prediction can be wrong, so a hold is never permanent. It releases into a
+  normal respawn once the authority records that hit in `processedHits` while
+  lives remain — the only proof of survival, since lives are legitimately still
+  positive for the frames before the hit reaches the authority. `hitCount`
+  travels only on the per-object event channel, so a hold whose verdict never
+  arrives expires after `SHIP_DEATH_HOLD_TIMEOUT_MS` into today's respawn
+  rather than leaving that player shipless. Solo play needs none of this: it
+  reads its own lives directly and already leaves the wreck where it died.
 - Entering an in-progress session adopts shared lives from the GameState record
   (`adoptSharedLives`), never from the local starting default. Reconciliation
   re-applies a replica only when its version is new, and a lobby spectator has
@@ -1316,6 +1336,12 @@ member at its latency-dependent displayed pose:
 4. A member joining an already-terminal session creates no ship and seeds
    replicas directly at persisted targets. Target-less snapshot or late-create
    records remain hidden until their target-bearing version arrives.
+
+A ship whose owner predicts its hit was fatal is already stopped at its
+collision pose with zero velocity and rotation, so step 2 derives a target
+equal to that pose and every member converges on the wreck rather than on a
+respawned ship. Nothing about this depends on who owns the ship or the
+GameState object, and it costs no additional replicated state.
 
 Terminal writes retry until `ObjectSync` reports their fields in a
 server-confirmed response; this works whether delta encoding is enabled or not.
