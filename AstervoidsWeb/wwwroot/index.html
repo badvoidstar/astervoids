@@ -5514,6 +5514,21 @@
         presentation: kinematicPresentation
     };
 
+    /**
+     * Shared lives a member adopts when it enters an in-progress session.
+     *
+     * The GameState record is the only correct source: the shared pool grows
+     * with participant and score awards, so the local starting value is just a
+     * default for a session that has no GameState yet. Reconciliation re-applies
+     * GameState only when a NEW version arrives, and a spectator has already
+     * consumed the current one, so an entering member that reset itself to the
+     * default would keep showing the default until the owner next published a
+     * change — dropping the visible lives by however much the pool had grown.
+     */
+    function adoptSharedLives(gameStateData) {
+        return gameStateData?.lives ?? CONFIG.MULTIPLAYER_LIVES;
+    }
+
     function applyGameStateData(data) {
         if (data.wave !== undefined) game.wave = data.wave;
         const oldLives = game.lives;
@@ -6509,7 +6524,7 @@
                 // hardcoded defaults, which would corrupt the synced state for all
                 // clients when syncGameState() broadcasts them.
                 freshGameStart = false;
-                game.lives = existingGsObj?.data?.lives ?? CONFIG.MULTIPLAYER_LIVES;
+                game.lives = adoptSharedLives(existingGsObj?.data);
                 game.wave = existingGsObj?.data?.wave ?? 0;
                 game.score = existingGsObj?.data?.groupScore
                     ?? existingGsObj?.data?.score
@@ -6537,9 +6552,13 @@
                 updateAstervoidsFromSync();
                 updateBulletsFromSync();
             } else {
-                // Non-server non-GS-owner: sync existing state from GameState object
+                // Non-server non-GS-owner: sync existing state from GameState object.
+                // Lives come from the record for the same reason the GS owner
+                // reads them there: updateGameStateFromSync() below re-applies
+                // GameState only on a new version, and spectating already
+                // consumed the current one.
                 freshGameStart = false;
-                game.lives = CONFIG.MULTIPLAYER_LIVES;
+                game.lives = adoptSharedLives(existingGsObj?.data);
                 game.astervoids = [];
                 game.bullets = [];
                 updateAstervoidsFromSync();

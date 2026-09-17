@@ -206,6 +206,12 @@ The game continues to own orchestration in `wwwroot/index.html`:
   changes invalidate the cache, and cached publication still queues updates
   against `ObjectSync`'s confirmed baseline rather than treating a local write
   as an acknowledgement.
+- Entering an in-progress session adopts shared lives from the GameState record
+  (`adoptSharedLives`), never from the local starting default. Reconciliation
+  re-applies a replica only when its version is new, and a lobby spectator has
+  already consumed the current one, so resetting to the default at entry would
+  hold a stale value until the owner next published a change. The GameState
+  owner and a plain client take the same value, so entry is symmetric.
 - Debug snapshot publication is separate from HUD rendering, with the same
   listener gating and update cadence. Entity collections remain ordered arrays.
   Asteroid/bullet reconciliation builds a reference-only ID index once at each
