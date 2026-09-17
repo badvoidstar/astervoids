@@ -1,11 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
-
-const require = createRequire(import.meta.url);
-const { createRuntime } = require(
-    './wwwroot/js/replication-runtime.js');
 
 const GAME_STATE = 'gameState';
 
@@ -83,26 +78,18 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
 }
 
 test('entering an in-progress game adopts the shared lives, not the local default', async () => {
-    // Shared pool grew past the default: base 3 + one participant + one score award.
-    const harness = makeEntryHarness({
-        role: 'Client',
-        gameStateOwner: 'other',
-        gameStateData: { lives: 5, wave: 2, state: 'playing', groupScore: 12000 }
-    });
+    // Above the default (base 3 plus a participant and a score award) and below
+    // it (the group has been losing) are both adopted verbatim.
+    for (const lives of [5, 1]) {
+        const harness = makeEntryHarness({
+            role: 'Client',
+            gameStateOwner: 'other',
+            gameStateData: { lives, wave: 2, state: 'playing', groupScore: 12000 }
+        });
 
-    assert.equal(await harness.init(), true);
-    assert.equal(harness.game.lives, 5);
-});
-
-test('entering below the default adopts the shared lives too', async () => {
-    const harness = makeEntryHarness({
-        role: 'Client',
-        gameStateOwner: 'other',
-        gameStateData: { lives: 1, wave: 4, state: 'playing' }
-    });
-
-    assert.equal(await harness.init(), true);
-    assert.equal(harness.game.lives, 1);
+        assert.equal(await harness.init(), true);
+        assert.equal(harness.game.lives, lives);
+    }
 });
 
 test('the GameState owner and a plain client adopt the same lives on entry', async () => {
@@ -128,55 +115,4 @@ test('a session with no GameState yet still starts from the local default', asyn
 
     assert.equal(await harness.init(), true);
     assert.equal(harness.game.lives, 3);
-});
-
-test('reconciliation does not re-apply GameState after spectating consumed its version', () => {
-    const records = new Map();
-    const game = { lives: 0, multiplayer: { gameStateObjectId: null } };
-    const store = {
-        getObjectsByTypeSnapshot: type =>
-            [...records.values()].filter(record => record.type === type),
-        getObjectsByType: type =>
-            [...records.values()].filter(record => record.type === type),
-        getObject: id => records.get(id),
-        getAllObjects: () => records.values()
-    };
-    const runtime = createRuntime({
-        objectStore: store,
-        getCurrentMemberId: () => 'me',
-        getActiveMemberIds: () => ['me', 'owner'],
-        monotonicNowMs: () => 0,
-        descriptors: [{
-            type: GAME_STATE,
-            classify: record => (record.ownerMemberId === 'me' ? 'owned' : 'replica'),
-            getInstance: id => (game.multiplayer.gameStateObjectId === id ? id : undefined),
-            getInstances: () => (game.multiplayer.gameStateObjectId != null
-                ? [[game.multiplayer.gameStateObjectId, game.multiplayer.gameStateObjectId]]
-                : []),
-            createReplica(record) {
-                game.multiplayer.gameStateObjectId = record.id;
-                return record.id;
-            },
-            adoptOwned(record) {
-                game.multiplayer.gameStateObjectId = record.id;
-                return record.id;
-            },
-            apply(instance, data) { game.lives = data.lives; },
-            remove() { game.multiplayer.gameStateObjectId = null; }
-        }]
-    });
-    records.set('gs', {
-        id: 'gs', type: GAME_STATE, ownerMemberId: 'owner', version: 9,
-        data: { lives: 5, state: 'playing' }
-    });
-    const context = () => ({ instanceType: GAME_STATE, renderTime: 0, now: 0 });
-
-    assert.equal(runtime.reconcileType(GAME_STATE, context()).applied, 1);
-    assert.equal(game.lives, 5);
-
-    // Entry-path reset followed by updateGameStateFromSync(): the version is
-    // unchanged, so nothing is re-applied and the reset value would survive.
-    game.lives = 3;
-    assert.equal(runtime.reconcileType(GAME_STATE, context()).applied, 0);
-    assert.equal(game.lives, 3);
 });

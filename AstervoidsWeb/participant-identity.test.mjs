@@ -6,106 +6,48 @@
 // given session with and reuses it for every later entry into that session.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { loadClassicModule } from './test-support/classic-module.mjs';
-
-const require = createRequire(import.meta.url);
-const GuidUtils = require('./wwwroot/js/guid-utils.js');
-const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
-const SchemaCodec = require('./wwwroot/js/schema-codec.js');
-const WireEnum = require('./wwwroot/js/wire-enum.js');
+import {
+    GuidUtils, loadSessionClient, memoryStorage, withSessionStorage
+} from './test-support/session-client-harness.mjs';
 
 const SESSION_A = '00112233-4455-6677-8899-aabbccddeeff';
 const SESSION_B = '11223344-5566-7788-99aa-bbccddeeff00';
 const RECONNECT_TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function memoryStorage(seed = new Map()) {
-    return {
-        entries: seed,
-        getItem: key => seed.get(key) ?? null,
-        setItem: (key, value) => seed.set(key, String(value))
-    };
-}
-
 // The server mints a new member id for every entry, including rejoins, and
 // never reuses one — not even across a page reload.
 let memberSerial = 0;
 
-async function loadClient(storage) {
-    const window = { ASTERVOIDS_DEBUG: false, SchemaCodec };
-    const SyncPayload = loadClassicModule('sync-payload.js', 'SyncPayload', {
-        window, MsgpackCodec
+async function loadClient(sessionStorage) {
+    const state = { sessionId: SESSION_A, lastMemberId: null };
+    const { client, calls } = await loadSessionClient({
+        sessionStorage,
+        reply(method) {
+            if (method === 'LeaveSession') return true;
+            const memberId =
+                `00000000-0000-0000-0000-${String(++memberSerial).padStart(12, '0')}`;
+            state.lastMemberId = memberId;
+            return {
+                sessionId: GuidUtils.guidToBytes(state.sessionId),
+                sessionName: 'fruit',
+                memberId: GuidUtils.guidToBytes(memberId),
+                role: 1,
+                reconnectToken: RECONNECT_TOKEN,
+                members: [{ id: GuidUtils.guidToBytes(memberId), role: 1 }],
+                objects: [],
+                validAts: [],
+                metadata: {}
+            };
+        }
     });
-    const state = { sessionId: SESSION_A, get memberId() { return this.lastMemberId; } };
-    const response = () => {
-        const memberId = `00000000-0000-0000-0000-${String(++memberSerial).padStart(12, '0')}`;
-        state.lastMemberId = memberId;
-        return {
-            sessionId: GuidUtils.guidToBytes(state.sessionId),
-            sessionName: 'fruit',
-            memberId: GuidUtils.guidToBytes(memberId),
-            role: 1,
-            reconnectToken: RECONNECT_TOKEN,
-            members: [{ id: GuidUtils.guidToBytes(memberId), role: 1 }],
-            objects: [],
-            validAts: [],
-            metadata: {}
-        };
-    };
-    const invocations = [];
-    const connection = {
-        state: 'Disconnected',
-        async start() { this.state = 'Connected'; },
-        async stop() { this.state = 'Disconnected'; },
-        on() {},
-        onreconnecting() {},
-        onreconnected() {},
-        onclose() {},
-        async invoke(method) {
-            invocations.push(method);
-            return method === 'LeaveSession' ? true : response();
-        }
-    };
-    const signalR = {
-        HubConnectionState: { Connected: 'Connected' },
-        LogLevel: { Information: 1 },
-        protocols: { msgpack: { MessagePackHubProtocol: class {} } },
-        HubConnectionBuilder: class {
-            withUrl() { return this; }
-            withHubProtocol() { return this; }
-            withAutomaticReconnect() { return this; }
-            configureLogging() { return this; }
-            build() { return connection; }
-        }
-    };
-    const previousStorage = globalThis.sessionStorage;
-    globalThis.sessionStorage = storage;
-    try {
-        const client = loadClassicModule('session-client.js', 'SessionClient', {
-            window, signalR, GuidUtils, WireEnum, SyncPayload,
-            ObjectSync: { triggerReconciliation() {} }
-        });
-        assert.equal(await client.connect(), true);
-        return { client, state, invocations };
-    } finally {
-        globalThis.sessionStorage = previousStorage;
-    }
+    return { client, state, calls, invoked: method => calls.some(c => c.method === method) };
 }
 
-// The module reads storage lazily, so rebind it for the duration of each call.
-async function withStorage(storage, action) {
-    const previous = globalThis.sessionStorage;
-    globalThis.sessionStorage = storage;
-    try {
-        return await action();
-    } finally {
-        globalThis.sessionStorage = previous;
-    }
-}
+const withStorage = withSessionStorage;
 
 test('the participant id is pinned on entry and reused for every later entry', async () => {
     const storage = memoryStorage();
-    const { client, state, invocations } = await loadClient(storage);
+    const { client, state, calls, invoked } = await loadClient(storage);
 
     await withStorage(storage, () => client.createSession());
     const participantId = client.getParticipantId();
@@ -114,7 +56,7 @@ test('the participant id is pinned on entry and reused for every later entry', a
     // Auto-rejoin after a transient drop: a new member id, the same participant.
     client.clearSessionState();
     await withStorage(storage, () => client.joinSession(SESSION_A));
-    assert.ok(invocations.includes('RejoinSession'));
+    assert.ok(invoked('RejoinSession'));
     assert.notEqual(client.getCurrentMember().id, participantId, 'the member id moved');
     assert.equal(client.getParticipantId(), participantId);
 
@@ -122,9 +64,9 @@ test('the participant id is pinned on entry and reused for every later entry', a
     // person: a clean leave drops the reconnect token, so this is a plain join.
     await withStorage(storage, () => client.leaveSession());
     assert.equal(client.getParticipantId(), null, 'no identity outside a session');
-    invocations.length = 0;
+    calls.length = 0;
     await withStorage(storage, () => client.joinSession(SESSION_A));
-    assert.ok(invocations.includes('JoinSession'));
+    assert.ok(invoked('JoinSession'));
     assert.equal(client.getParticipantId(), participantId);
 
     // A different session is a different game, and a different participant.

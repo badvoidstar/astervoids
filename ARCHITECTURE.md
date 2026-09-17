@@ -212,6 +212,11 @@ The game continues to own orchestration in `wwwroot/index.html`:
   already consumed the current one, so resetting to the default at entry would
   hold a stale value until the owner next published a change. The GameState
   owner and a plain client take the same value, so entry is symmetric.
+- A rejoin restores the role this client actually held, keyed on whether it owned
+  a ship rather than on `game.state`. A lobby spectator also reads `playing` from
+  the GameState record, so a state-only test re-entered the game on their behalf
+  and minted a ship when a backgrounded tab came back. A spectator re-adopts the
+  watched GameState on rejoin for the same version-suppression reason as entry.
 - Debug snapshot publication is separate from HUD rendering, with the same
   listener gating and update cadence. Entity collections remain ordered arrays.
   Asteroid/bullet reconciliation builds a reference-only ID index once at each

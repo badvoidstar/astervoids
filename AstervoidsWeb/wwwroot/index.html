@@ -5526,13 +5526,11 @@
     /**
      * Shared lives a member adopts when it enters an in-progress session.
      *
-     * The GameState record is the only correct source: the shared pool grows
-     * with participant and score awards, so the local starting value is just a
-     * default for a session that has no GameState yet. Reconciliation re-applies
-     * GameState only when a NEW version arrives, and a spectator has already
+     * The GameState record is the only correct source; the local starting value
+     * is just a default for a session that has no GameState yet. Reconciliation
+     * re-applies GameState only on a NEW version and a spectator has already
      * consumed the current one, so an entering member that reset itself to the
-     * default would keep showing the default until the owner next published a
-     * change — dropping the visible lives by however much the pool had grown.
+     * default would keep showing it until the owner next published a change.
      */
     function adoptSharedLives(gameStateData) {
         return gameStateData?.lives ?? CONFIG.MULTIPLAYER_LIVES;
