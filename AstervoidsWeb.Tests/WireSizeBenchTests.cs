@@ -152,6 +152,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
             new PositionalSchemaCodec.FieldSpec("invulnerabilityRevision", "u32"),
             new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
+            new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
         });
 
     private static readonly PositionalSchemaCodec.Schema AsteroidSchema =
@@ -208,6 +209,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("gameOverAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("terminalAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("scoreLifeAwardCount", "u32"),
+            new PositionalSchemaCodec.FieldSpec("countedParticipants", "bytes"),
         });
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────

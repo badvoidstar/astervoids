@@ -190,6 +190,22 @@ test('equal consumed versions suppress re-ingest while presentation still sample
     assert.equal(h.runtime.getConsumedVersion('n'), 3);
 });
 
+test('with no presentation adapter, a suppressed ingest applies nothing at all', () => {
+    // GameState has no presentation, so suppression is a total no-op. Any entry
+    // path that resets local state and leans on a reconcile to restore it keeps
+    // the reset value until the owner happens to publish a new version, which is
+    // why entering members read the record directly instead.
+    const h = makeHarness();
+    h.runtime.beginSession({ epoch: 1, snapshotObjectIds: [] });
+    h.record('gs', 3, 11);
+    assert.equal(h.runtime.reconcileType('counter', { epoch: 1 }).applied, 1);
+    assert.equal(h.instances.get('gs').scalar, 11);
+
+    h.instances.get('gs').scalar = 'reset-on-entry';
+    assert.equal(h.runtime.reconcileType('counter', { epoch: 1 }).applied, 0);
+    assert.equal(h.instances.get('gs').scalar, 'reset-on-entry');
+});
+
 test('reconciliation shares one immutable membership snapshot and refreshes it at the next pivot', () => {
     const p = makePresentation();
     const h = makeHarness({ presentation: p.adapter });

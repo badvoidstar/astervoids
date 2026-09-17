@@ -65,7 +65,8 @@ test('ship transition slots append to the stable schema and preserve timing prec
     registerProductionSchemas();
     const schema = SchemaCodec.get(1);
     assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
-        ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64']
+        ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
+        ['participantId', 'guid']
     ]);
     const data = {
         invulnerable: 180, invulnerabilityRevision: 0xffffffff,

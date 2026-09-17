@@ -1,14 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { loadClassicModule } from './test-support/classic-module.mjs';
+import {
+    GuidUtils, MsgpackCodec, SchemaCodec, loadSessionClient
+} from './test-support/session-client-harness.mjs';
 
 const require = createRequire(import.meta.url);
-const GuidUtils = require('./wwwroot/js/guid-utils.js');
-const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
-const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 const WireSchemas = require('./wwwroot/js/game-wire-schemas.js');
-const WireEnum = require('./wwwroot/js/wire-enum.js');
 
 const SESSION_ID = '00112233-4455-6677-8899-aabbccddeeff';
 const MEMBER_ID = 'fedcba98-7654-3210-fedc-ba9876543210';
@@ -26,15 +24,7 @@ const HANDLES = {
 // Even a GUID-shaped credential is opaque, not a typed Guid parameter.
 const RECONNECT_TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-const loadModule = loadClassicModule;
-
 async function loadClient(guidUtils = GuidUtils) {
-    const window = { ASTERVOIDS_DEBUG: false, SchemaCodec };
-    const SyncPayload = loadModule('sync-payload.js', 'SyncPayload', {
-        window, MsgpackCodec
-    });
-    const calls = [];
-    const handlers = new Map();
     const sessionResponse = () => ({
         sessionId: GuidUtils.guidToBytes(SESSION_ID),
         sessionName: 'fruit',
@@ -59,38 +49,14 @@ async function loadClient(guidUtils = GuidUtils) {
         ['DeleteObject', () => [true, 8]],
         ['BroadcastObjectEvent', () => true]
     ]);
-    const connection = {
-        state: 'Disconnected',
-        async start() { this.state = 'Connected'; },
-        async stop() { this.state = 'Disconnected'; },
-        on(name, handler) { handlers.set(name, handler); },
-        onreconnecting() {},
-        onreconnected() {},
-        onclose() {},
-        async invoke(method, ...args) {
-            calls.push({ method, args });
+    const loaded = await loadSessionClient({
+        guidUtils,
+        reply(method, ...args) {
             assert.ok(replies.has(method), `unexpected hub method ${method}`);
             return replies.get(method)(...args);
         }
-    };
-    const signalR = {
-        HubConnectionState: { Connected: 'Connected' },
-        LogLevel: { Information: 1 },
-        protocols: { msgpack: { MessagePackHubProtocol: class {} } },
-        HubConnectionBuilder: class {
-            withUrl() { return this; }
-            withHubProtocol() { return this; }
-            withAutomaticReconnect() { return this; }
-            configureLogging() { return this; }
-            build() { return connection; }
-        }
-    };
-    const client = loadModule('session-client.js', 'SessionClient', {
-        window, signalR, GuidUtils: guidUtils, WireEnum, SyncPayload,
-        ObjectSync: { triggerReconciliation() {} }
     });
-    assert.equal(await client.connect(), true);
-    return { client, calls, replies, handlers, SyncPayload };
+    return { ...loaded, replies };
 }
 
 /**

@@ -22,14 +22,25 @@ const GuidUtils = (function() {
     for (let i = 0; i < 256; i++) {
         hex[i] = i.toString(16).padStart(2, '0');
     }
+    const canonicalGuid =
+        /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+    /**
+     * Whether a value is a canonical 8-4-4-4-12 hexadecimal GUID string, i.e.
+     * whether `guidToBytes` will accept it. Callers that must not throw — and
+     * anything guarding a value that will later be encoded as a `guid` wire
+     * field — should test with this rather than re-deriving the shape.
+     */
+    function isGuid(value) {
+        return typeof value === 'string' && canonicalGuid.test(value);
+    }
 
     /**
      * Convert a canonical GUID string to the 16-byte .NET mixed-endian layout.
      * Throws when the value is not a canonical 8-4-4-4-12 hexadecimal GUID.
      */
     function guidToBytes(value) {
-        if (typeof value !== 'string'
-            || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value)) {
+        if (!isGuid(value)) {
             throw new TypeError(`Invalid GUID: ${value}`);
         }
         const canonicalHex = value.replace(/-/g, '');
@@ -107,7 +118,7 @@ const GuidUtils = (function() {
         return value;
     }
 
-    return { guidToBytes, bytesToGuid, transformBinaryGuids };
+    return { guidToBytes, bytesToGuid, isGuid, transformBinaryGuids };
 })();
 
 // Export for module systems if available

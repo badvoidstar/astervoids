@@ -36,7 +36,8 @@ public class SchemaCrossWireFixturesTests
         ("turnTargetAngle", "q16_2pi"), ("turnMagnitude", "q8"), ("turnBias", "q16s"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
-        ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"));
+        ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"),
+        ("participantId", "guid"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),

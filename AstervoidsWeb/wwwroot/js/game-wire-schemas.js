@@ -20,6 +20,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['terminalAngle', 'f64'],
             ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
+            ['participantId', 'guid'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],
@@ -63,6 +64,7 @@ const AstervoidsWireSchemas = (function() {
             ['gameOverAt', 'f64'],
             ['terminalAt', 'f64'],
             ['scoreLifeAwardCount', 'u32'],
+            ['countedParticipants', 'bytes'],
         ]},
     ];
 
