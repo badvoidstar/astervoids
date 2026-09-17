@@ -1565,6 +1565,12 @@
         
         // Multiplayer settings
         MULTIPLAYER_LIVES: 3,          // Shared lives pool for multiplayer sessions
+        // Safety bound on a predicted-fatal death hold (see handleShipHit). The
+        // hold normally ends the moment the GameState authority publishes its
+        // verdict, but `hitCount` travels only on the per-object event channel,
+        // so a lost event would otherwise hold a surviving player out of the
+        // game forever. Generous relative to a publish round trip.
+        SHIP_DEATH_HOLD_TIMEOUT_MS: 3000,
         SYNC_NOMINAL_FRAME_TIME: 1/10, // Initial send interval before RTT adaptation (seconds)
         SYNC_MIN_FRAME_TIME: 1/480,    // Min frame time clamp for threshold calc
         ADAPTIVE_SEND_RATE: true,      // Shared transport cadence: RTT-clamped to 1-20Hz
@@ -3668,6 +3674,11 @@
             this.participantId = null;
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
+            // Local-only predicted-fatal hold: { hitCount, startedAtMs } while
+            // this ship waits at its collision pose for the authority's verdict.
+            // Deliberately absent from SYNC_FIELDS and the wire payloads — peers
+            // need the frozen pose, not the prediction that produced it.
+            this.deathHold = null;
             // Vertex cache — avoid re-computing the triangle every frame when pose
             // hasn't changed. Invalidated when x/y/angle/reference dimension shift.
             this._verts = [{x: 0, y: 0}, {x: 0, y: 0}, {x: 0, y: 0}];
@@ -4008,6 +4019,8 @@
             this.velocityX = 0;
             this.velocityY = 0;
             this.invulnerable = CONFIG.INVULNERABILITY_TIME;
+            // Respawning is the opposite of holding at a collision pose.
+            this.deathHold = null;
         }
     }
 
@@ -5696,6 +5709,9 @@
     function resetMultiplayerState() {
         game.multiplayer.myShipObjectId = null;
         game.multiplayer.myColorIndex = 0;
+        // A predicted-fatal hold is scoped to the session that produced it; a
+        // reused ship instance must not stay frozen into the next session.
+        if (game.ship) game.ship.deathHold = null;
         game.multiplayer.remoteShips.clear();
         game.multiplayer.gameStateObjectId = null;
         game.multiplayer.isAuthority = false;
@@ -7065,6 +7081,10 @@
         // Need a ship to control
         if (!game.ship) return;
 
+        // A ship held at its fatal collision pose accepts no further input: it
+        // is the final state every member is converging on.
+        if (game.ship.deathHold) return;
+
         // Resolve control values for this frame. Keyboard input gives discrete
         // values (±1 turn, on/off thrust, configured neutral brake).
         // The analog anchor schemes override movement axes while a move anchor
@@ -7388,8 +7408,11 @@
             }
         }
         
-        // Ship vs Asteroid collisions — only check local player's ship
-        if (game.ship && game.ship.invulnerable <= 0 && game.state === 'playing') {
+        // Ship vs Asteroid collisions — only check local player's ship. A ship
+        // held at its fatal collision pose is already dead and must not collide
+        // again; its wreck stays exactly where the game ended.
+        if (game.ship && !game.ship.deathHold
+            && game.ship.invulnerable <= 0 && game.state === 'playing') {
             if (checkShipAsteroidCollision(game.ship, asteroidCollisionCache)) {
                 handleShipHit(game.ship);
             }
@@ -7484,6 +7507,16 @@
             // before the next per-frame batch.
             emitShipStateChanged(hitPose);
 
+            // A fatal hit is the last thing this ship ever does, so hold it at
+            // the collision pose instead of respawning into a scene everyone is
+            // about to freeze. A ship without a sync object is invisible to the
+            // authority: its hit can never decrement the shared pool, so it must
+            // keep respawning locally rather than hold for a verdict.
+            if (game.multiplayer.myShipObjectId && predictFatalShipHit(ship)) {
+                beginShipDeathHold(ship);
+                return;
+            }
+
             // Reset ship locally
             ship.reset();
             if (game.multiplayer.myShipObjectId) {
@@ -7506,6 +7539,146 @@
             } else {
                 ship.reset();
             }
+        }
+    }
+
+    // ── Predicted-fatal death hold ──────────────────────────────────────────
+    //
+    // Solo play already leaves the wreck where it died: `handleShipHit` simply
+    // skips the respawn once lives run out. A session ship owner cannot do the
+    // same directly, because the shared pool is owned by the GameState
+    // authority and its verdict is a round trip away — so the owner respawns at
+    // center and every member's final frame shows a fresh ship instead of the
+    // collision that ended the game.
+    //
+    // `calculateGameState` is a pure function of the replicated GameState
+    // record and the ship records, so re-running it locally with this hit
+    // applied reproduces the lives the authority is about to publish, with no
+    // extra traffic and regardless of who owns the ship or the GameState.
+    // On a predicted-fatal hit the ship stops simulating and holds its
+    // collision pose at rest; `buildTerminalTargetPayload` then derives a
+    // terminal target from that frozen instance, so deterministic members
+    // converge on the wreck and buffered members settle onto the same final
+    // snapshot.
+    //
+    // The prediction can still be wrong (a concurrent extra life, a lost hit
+    // event), so a hold is never permanent: `resolveShipDeathHold` respawns as
+    // soon as the authority disagrees, and expires a hold whose verdict never
+    // arrives rather than leaving a player shipless.
+
+    /**
+     * Would this hit drive the shared lives pool to zero?
+     * @param {Ship} ship - The local ship, with its new hitCount already applied
+     * @returns {boolean}
+     */
+    function predictFatalShipHit(ship) {
+        const persisted = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE)?.data;
+        // With no GameState record there is no shared pool to reproduce, so the
+        // locally applied count is the only estimate available.
+        if (!persisted) return game.lives <= 1;
+        try {
+            const myShipId = game.multiplayer.myShipObjectId;
+            let sawOwnShip = false;
+            // Substitute rather than mutate: these are live ObjectSync records,
+            // and the authority must still see this hit arrive on its own.
+            const ships = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP).map(record => {
+                if (record.id !== myShipId) return record;
+                sawOwnShip = true;
+                return {
+                    id: record.id,
+                    data: {
+                        ...record.data,
+                        // The hit event patches record.data synchronously, but
+                        // the owner's own instance is authoritative either way.
+                        hitCount: Math.max(record.data?.hitCount || 0, ship.hitCount || 0)
+                    }
+                };
+            });
+            if (!sawOwnShip) return game.lives <= 1;
+            const next = calculateGameState(
+                persisted,
+                {
+                    processedHits:
+                        AstervoidsWireCodec.unpackCounterMap(persisted.processedHits),
+                    processedScores:
+                        AstervoidsWireCodec.unpackCounterMap(persisted.processedScores),
+                    countedParticipants:
+                        AstervoidsWireCodec.unpackCounterMap(persisted.countedParticipants)
+                },
+                ships,
+                {
+                    lives: game.lives,
+                    state: game.state,
+                    observedScoreLifeAwardCount:
+                        game.multiplayer.observedScoreLifeAwardCount
+                },
+                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+            return next.lives <= 0;
+        } catch (error) {
+            // Malformed ledgers are the authority's problem to report (see
+            // syncGameState). Fall back rather than losing the death entirely.
+            _warn('[Multiplayer] Fatal-hit prediction unavailable:', error);
+            return game.lives <= 1;
+        }
+    }
+
+    /**
+     * Freeze the local ship at the pose it died in and publish that final state.
+     * @param {Ship} ship - The local ship
+     */
+    function beginShipDeathHold(ship) {
+        // Zero every quantity a receiver would otherwise integrate forward:
+        // resetControls clears the replayed intent and rotationSpeed, and the
+        // velocity is what dead reckoning extrapolates. Position and angle stay
+        // exactly where the collision happened.
+        ship.resetControls();
+        ship.velocityX = 0;
+        ship.velocityY = 0;
+        ship.deathHold = {
+            hitCount: ship.hitCount || 0,
+            startedAtMs: performance.now()
+        };
+        // Bypasses ShipSendGate exactly like the respawn path: this is the pose
+        // every member will converge on, so it must not wait for a cadence slot.
+        ObjectSync.updateObject(
+            game.multiplayer.myShipObjectId, ship.toUpdateData(), true);
+    }
+
+    /**
+     * Resolve a predicted-fatal hold against the authority's published state.
+     * Keeps holding while the game is over (the prediction was right), respawns
+     * once the authority has processed the hit and the game continues, and
+     * expires rather than stranding a player whose verdict never arrives.
+     */
+    function resolveShipDeathHold() {
+        const ship = game.ship;
+        const hold = ship?.deathHold;
+        if (!hold) return;
+        // Terminal: this ship is the final state. Leave the wreck where it died.
+        if (isGameOver()) return;
+
+        // Lives can legitimately still be positive for the first frames after a
+        // fatal hit — our own damage has not reached the authority yet. Only the
+        // authority recording THIS hit in processedHits proves the survival.
+        const persisted = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE)?.data;
+        const myShipId = game.multiplayer.myShipObjectId;
+        let processed = false;
+        if (persisted && myShipId) {
+            try {
+                const hits = AstervoidsWireCodec.unpackCounterMap(persisted.processedHits);
+                processed = (hits[myShipId.toLowerCase()] || 0) >= hold.hitCount;
+            } catch (error) {
+                processed = false;
+            }
+        }
+        const expired = performance.now() - hold.startedAtMs
+            >= CONFIG.SHIP_DEATH_HOLD_TIMEOUT_MS;
+        if (!processed && !expired) return;
+
+        ship.deathHold = null;
+        ship.reset();
+        if (myShipId) {
+            ObjectSync.updateObject(myShipId, ship.toUpdateData(), true);
         }
     }
 
@@ -8603,8 +8776,12 @@
 
             // --- GAMEPLAY (only when lives > 0) ---
             if (game.lives > 0) {
+                // Release a predicted-fatal hold whose prediction was wrong
+                // before the ship would otherwise be driven this frame.
+                resolveShipDeathHold();
+
                 // Update local ship (spectators have no ship — naturally skipped)
-                if (game.ship) {
+                if (game.ship && !game.ship.deathHold) {
                     game.ship.update(dt);
                     
                     // Sync local ship to ObjectSync in multiplayer
@@ -11261,7 +11438,8 @@
                     }
                     
                     // Update local ship (spectators have no ship — naturally skipped)
-                    if (game.ship) {
+                    resolveShipDeathHold();
+                    if (game.ship && !game.ship.deathHold) {
                         game.ship.update(dt);
                         syncLocalShip();
                     }
