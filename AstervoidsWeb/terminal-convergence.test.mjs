@@ -534,12 +534,13 @@ test('terminal target uses half-ballistic distance tied to terminalAt', () => {
     assert.deepEqual(muchLater, first);
 });
 
-test('a ship frozen at its fatal collision pose converges on that exact pose', () => {
-    // A predicted-fatal death hold stops the ship and zeroes its velocity and
-    // rotation (see handleShipHit / beginShipDeathHold). Every member derives
-    // the same terminal target from that frozen instance, so the wreck is the
-    // final state for the ship's owner, the GameState owner, and spectators
-    // alike — no matter how long the convergence window is.
+test('a coasting wreck converges on the same stopping point for every member', () => {
+    // A predicted-fatal death hold cuts the controls but keeps the ship
+    // coasting (see handleShipHit / beginShipDeathHold), so the wreck is just
+    // another moving object here: its target is the half-ballistic stopping
+    // projection, identical for the ship's owner, the GameState owner, and
+    // spectators. Once friction has bled the coast off, that target collapses
+    // onto the wreck's own pose.
     const { buildTerminalTargetPayload: build } = loadInlineGameFunctions(
         ['buildTerminalTargetPayload'],
         {
@@ -554,18 +555,35 @@ test('a ship frozen at its fatal collision pose converges on that exact pose', (
             normalizeTerminalAngle: value =>
                 ((value % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)
         });
-    const held = {
+
+    // Still coasting: the target leads the wreck by half its ballistic travel
+    // through terminalAt, and rotation is cut so the angle is unchanged.
+    const coasting = {
+        x: 0.25, y: 0.75, angle: 1.25,
+        velocityX: 0.002, velocityY: -0.001, rotationSpeed: 0
+    };
+    const stoppingFrames = ((1250 - 1000) / (1000 / 60)) / 2;
+    const coastingPayload = build(
+        coasting, { validAt: 1000, data: coasting }, { epoch: 900, terminalAt: 1250 });
+    approx(coastingPayload.terminalX, 0.25 + 0.002 * stoppingFrames);
+    approx(coastingPayload.terminalY, 0.75 - 0.001 * stoppingFrames);
+    approx(coastingPayload.terminalAngle, 1.25);
+    assert.equal(coastingPayload.x, 0.25, 'the anchor stays the live pose');
+    assert.equal(coastingPayload.y, 0.75);
+
+    // Fully decayed: no travel left, so every window yields the wreck's pose.
+    const stopped = {
         x: 0.25, y: 0.75, angle: 1.25,
         velocityX: 0, velocityY: 0, rotationSpeed: 0
     };
-    const record = { validAt: 1000, data: held };
+    const record = { validAt: 1000, data: stopped };
     for (const terminalAt of [1000, 1250, 100_000]) {
-        const payload = build(held, record, { epoch: 900, terminalAt });
-        approx(payload.terminalX, held.x);
-        approx(payload.terminalY, held.y);
-        approx(payload.terminalAngle, held.angle);
-        assert.equal(payload.x, held.x);
-        assert.equal(payload.y, held.y);
+        const payload = build(stopped, record, { epoch: 900, terminalAt });
+        approx(payload.terminalX, stopped.x);
+        approx(payload.terminalY, stopped.y);
+        approx(payload.terminalAngle, stopped.angle);
+        assert.equal(payload.x, stopped.x);
+        assert.equal(payload.y, stopped.y);
     }
 });
 

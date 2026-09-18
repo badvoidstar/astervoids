@@ -206,22 +206,35 @@ The game continues to own orchestration in `wwwroot/index.html`:
   changes invalidate the cache, and cached publication still queues updates
   against `ObjectSync`'s confirmed baseline rather than treating a local write
   as an acknowledgement.
-- A session ship that takes a hit its owner predicts to be fatal holds at that
-  collision pose instead of respawning, so the final frame everyone sees is the
+- A session ship that takes a hit its owner predicts to be fatal stops being
+  controlled instead of respawning, so the final frames everyone sees are the
   collision that ended the game rather than a fresh ship at centre. The owner
   re-runs the same pure `calculateGameState` locally with its incremented
   `hitCount` applied, which reproduces the lives the authority is about to
   publish — including other ships' unprocessed hits and pending extra-life
   awards — with no extra traffic and regardless of who owns the ship or the
-  GameState object. A held ship stops simulating, accepts no input, cannot
-  collide again, and is zeroed to rest, so `buildTerminalTargetPayload` derives
-  a terminal target equal to its own pose; buffered sessions settle onto the
-  same frozen snapshot. The hold is local state, never replicated: peers need
-  the frozen pose, not the prediction behind it, and the wreck stays drawn.
-  Prediction can be wrong, so a hold is never permanent. It releases into a
-  normal respawn once the authority records that hit in `processedHits` while
-  lives remain — the only proof of survival, since lives are legitimately still
-  positive for the frames before the hit reaches the authority. `hitCount`
+  GameState object. A held ship accepts no input and cannot collide again, but
+  it keeps simulating and coasts: `beginShipDeathHold` clears the control
+  intent and rotation, leaving `Ship.update` as friction decay, integration,
+  and wrap, so the wreck carries its momentum into the terminal stop rather
+  than halting under the player. Translation velocity is preserved and spin is
+  not, because turn ramping is instantaneous at the shipped
+  `SHIP_TURN_DECEL_TIME` and a replica would damp a spinning wreck the moment
+  it saw the cleared intent. `buildTerminalTargetPayload` then treats the wreck
+  like any other moving object and projects its stopping distance; buffered
+  sessions settle onto the same final snapshot. Keeping the instance simulating
+  is what makes this safe: published velocity is integrated forward by
+  deterministic replay, buffered extrapolation, terminal projection, and
+  late-join seeding, so an instance parked while it still advertised a velocity
+  would leave every replica extrapolating motion the owner never performed,
+  with no heartbeat to correct it. The hold is local state, never replicated:
+  peers replay the published motion, not the prediction behind it, and the
+  wreck stays drawn. Prediction can be wrong, so a hold is never permanent. It
+  releases into a normal respawn once the authority records that hit in
+  `processedHits` while lives remain — the only proof of survival, since lives
+  are legitimately still positive for the frames before the hit reaches the
+  authority. A completed respawn never inherits the coast, because `reset()`
+  returns the ship to centre at zero velocity. `hitCount`
   travels only on the per-object event channel, so a hold whose verdict never
   arrives expires after `SHIP_DEATH_HOLD_TIMEOUT_MS` into today's respawn
   rather than leaving that player shipless. Solo play needs none of this: it
@@ -1337,11 +1350,13 @@ member at its latency-dependent displayed pose:
    replicas directly at persisted targets. Target-less snapshot or late-create
    records remain hidden until their target-bearing version arrives.
 
-A ship whose owner predicts its hit was fatal is already stopped at its
-collision pose with zero velocity and rotation, so step 2 derives a target
-equal to that pose and every member converges on the wreck rather than on a
-respawned ship. Nothing about this depends on who owns the ship or the
-GameState object, and it costs no additional replicated state.
+A ship whose owner predicts its hit was fatal is uncontrolled but still
+coasting, with its rotation cut, so step 2 treats it exactly like an asteroid
+or bullet and projects its remaining stopping distance. Every member converges
+on that wreck rather than on a respawned ship, and the motion into the terminal
+stop is continuous rather than an abrupt halt. Nothing about this depends on
+who owns the ship or the GameState object, and it costs no additional
+replicated state.
 
 Terminal writes retry until `ObjectSync` reports their fields in a
 server-confirmed response; this works whether delta encoding is enabled or not.
