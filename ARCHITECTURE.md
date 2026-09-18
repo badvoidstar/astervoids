@@ -1373,6 +1373,15 @@ at a time that has already passed. Buffered adaptive-delay sessions retain their
 existing authoritative-snapshot settle behavior and do not wait for terminal
 targets.
 
+Terminal convergence covers pose only. Animated ship visuals settle separately
+in the render pass, after both the deterministic and buffered rest passes have
+re-applied authoritative ship data and before anything is drawn: the thrust
+flame is cleared — input handling stops at game over, leaving the flag latched
+at its last value — and invulnerability blinking ends with the ship visible, so
+no wreck freezes on a hidden blink frame. The settle clears the local countdown
+and replica anchor only; the invulnerability revision stays untouched because it
+is the wire transition key, not a presentation value.
+
 ## Ring Buffer Interpolation
 
 ```mermaid

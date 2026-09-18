@@ -3567,6 +3567,15 @@
             this.anchor = null;
         }
 
+        // Game over ends the countdown as presentation, not as a transition:
+        // drop the remaining ticks so the blink stops on its visible half, and
+        // the replica anchor so a later sample cannot revive it. `revision` is
+        // the wire transition key, so a local settle must never move it.
+        settleVisible() {
+            this.remaining = 0;
+            this.anchor = null;
+        }
+
         capture() {
             return {
                 invulnerable: this.remaining,
@@ -3811,6 +3820,20 @@
             this.turnTargetAngle = 0;
             this.turnMagnitude = 0;
             this.turnBias = 0;
+        }
+
+        /**
+         * Settle the animated visuals for a game over, where the scene holds
+         * its final frame. Input handling stops at game over with `thrusting`
+         * latched at its last value, so the flame is dropped explicitly, and
+         * invulnerability blinking ends with the ship VISIBLE rather than
+         * freezing a wreck on a hidden blink frame. Pose and velocity are left
+         * alone — the terminal convergence passes own those.
+         */
+        stopTerminalVisuals() {
+            this.thrusting = false;
+            this.thrustInput = 0;
+            this.invulnerability.settleVisible();
         }
 
         /**
@@ -5351,6 +5374,15 @@
 
     function applyShipReplicaData(instance, data, facts, context) {
         instance.fromSyncData(data);
+        // DeadReckon only carries kinematics, so a deterministic sample drops
+        // the owner's thrust flag. Apply it from the raw record so the flame
+        // renders for every member, not just the controlling one. Buffered
+        // samples already carry the field at the member's render delay and are
+        // left alone.
+        if (data.thrusting === undefined) {
+            const record = ObjectSync.getObject(facts.objectId);
+            if (record) instance.thrusting = !!record.data.thrusting;
+        }
         instance.sampleInvulnerability(
             context?.renderTime,
             isDeterministicMode() || !CONFIG.INTERPOLATION_ENABLED
@@ -8589,6 +8621,24 @@
         }
     }
 
+    /**
+     * Game over holds the final frame, so no ship may keep an animated visual.
+     * Input handling stops with `thrusting` latched at its last value, and the
+     * rest passes above re-apply authoritative ship data every frame — buffered
+     * settling through `fromSyncData`, deterministic terminal sampling through
+     * the replica apply path. Settling after them and before drawing is
+     * therefore the single point that holds for every mode, for the local ship
+     * and for replicas (including ones created after the game ended): the
+     * thrust flame is off and the invulnerability blink ends visible.
+     */
+    function settleShipTerminalVisuals() {
+        if (!isGameOver()) return;
+        if (game.ship) game.ship.stopTerminalVisuals();
+        for (const ship of game.multiplayer.remoteShips.values()) {
+            ship.stopTerminalVisuals();
+        }
+    }
+
     // Auxiliary per-frame work (analog input sampling, mobile UI visibility) is
     // driven from the single game-loop callback instead of each owning its own
     // requestAnimationFrame loop. Three concurrent rAF callbacks per frame was pure
@@ -8928,6 +8978,9 @@
         // snapshot during game over (the gameplay sync pass has stopped). No-op
         // otherwise.
         repositionBufferedRemotesAtRest();
+        // Game over: drop thrust flames and end invulnerability blinking on the
+        // visible half, after the rest passes that re-apply ship data.
+        settleShipTerminalVisuals();
 
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
