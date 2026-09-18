@@ -88,7 +88,7 @@ function harness({ lives = 3, myShipObjectId = MY_SHIP, gameOver = false } = {})
     });
 
     game.ship = new production.Ship(0.5, 0.5);
-    // Put the ship somewhere recognisable and moving, so a frozen wreck is
+    // Put the ship somewhere recognisable and moving, so a coasting wreck is
     // distinguishable from a respawn at centre.
     Object.assign(game.ship, {
         x: 0.25, y: 0.75, angle: 1.25, velocityX: 2, velocityY: -3,
@@ -134,23 +134,63 @@ test('a non-fatal session hit still respawns immediately', () => {
     assert.equal(h.writes.at(-1).immediate, true);
 });
 
-test('a fatal session hit holds the wreck at the collision pose', () => {
+test('a fatal session hit cuts the controls but keeps the wreck coasting', () => {
     const h = harness({ lives: 1 });
     h.production.handleShipHit(h.game.ship);
     assert.deepEqual(h.pose(), {
-        x: 0.25, y: 0.75, angle: 1.25, velocityX: 0, velocityY: 0
-    }, 'position and angle survive; velocity is zeroed so nobody extrapolates');
+        x: 0.25, y: 0.75, angle: 1.25, velocityX: 2, velocityY: -3
+    }, 'pose and translation survive: the wreck carries its momentum');
+    // Spin is the one quantity that must still be cut. Turn ramping is
+    // instantaneous at the shipped SHIP_TURN_DECEL_TIME, so a replica would
+    // damp a spinning wreck the instant it saw the cleared intent while the
+    // owner kept rotating.
     assert.equal(h.game.ship.rotationSpeed, 0);
+    assert.equal(h.game.ship.turnTarget, 0);
     assert.equal(h.game.ship.thrusting, false);
+    assert.equal(h.game.ship.thrustInput, 0);
+    assert.equal(h.game.ship.brakeInput, 0);
     assert.equal(h.game.ship.invulnerable, 0, 'a held wreck never becomes invulnerable');
     assert.equal(h.game.ship.deathHold.hitCount, 1);
     assert.deepEqual(h.events, [{ x: 0.25, y: 0.75, angle: 1.25 }]);
     const write = h.writes.at(-1);
-    assert.equal(write.immediate, true, 'the final pose must not wait for a cadence slot');
+    assert.equal(write.immediate, true, 'the coast baseline must not wait for a cadence slot');
     assert.equal(write.data.x, 0.25);
     assert.equal(write.data.y, 0.75);
-    assert.equal(write.data.velocityX, 0);
-    assert.equal(write.data.velocityY, 0);
+    // The instance and the payload must tell the same story. Publishing a
+    // velocity the owner is not actually integrating is the unsafe variant:
+    // every replica extrapolates motion that never happened.
+    assert.equal(write.data.velocityX, 2);
+    assert.equal(write.data.velocityY, -3);
+});
+
+test('the published packet reproduces the wreck\'s coast exactly', () => {
+    // With all control intent cleared, Ship.update degenerates to friction
+    // decay, integration, and wrap — so a replica replaying that same update
+    // from the owner's published packet tracks the wreck exactly, with no
+    // heartbeat needed to correct it.
+    const h = harness({ lives: 1 });
+    h.production.handleShipHit(h.game.ship);
+    const packet = h.writes.at(-1).data;
+
+    const replica = new h.production.Ship(0, 0);
+    replica.fromSyncData(packet);
+
+    for (let frame = 0; frame < 30; frame++) {
+        h.game.ship.update(1);
+        replica.update(1);
+    }
+
+    assert.deepEqual(h.pose(), {
+        x: replica.x,
+        y: replica.y,
+        angle: replica.angle,
+        velocityX: replica.velocityX,
+        velocityY: replica.velocityY
+    });
+    assert.notEqual(h.game.ship.x, 0.25, 'the wreck actually moved');
+    assert.ok(Math.abs(h.game.ship.velocityX) < 2, 'and friction is bleeding the coast off');
+    assert.equal(h.game.ship.angle, 1.25, 'an uncontrolled wreck never starts turning');
+    assert.equal(h.game.ship.rotationSpeed, 0);
 });
 
 test('the hold is local: it never reaches the wire payloads', () => {
@@ -226,7 +266,7 @@ test('a hold survives until the authority has processed the fatal hit', () => {
     assert.deepEqual(h.pose(), held);
 });
 
-test('a hold persists through game over so the wreck stays put', () => {
+test('a hold persists through game over so the wreck reaches the terminal stop', () => {
     const h = harness({ lives: 1 });
     h.production.handleShipHit(h.game.ship);
     const held = h.pose();
@@ -235,13 +275,17 @@ test('a hold persists through game over so the wreck stays put', () => {
     h.advance(60_000);
     h.production.resolveShipDeathHold();
     assert.ok(h.game.ship.deathHold, 'terminal holds never expire');
-    assert.deepEqual(h.pose(), held);
+    assert.deepEqual(h.pose(), held, 'and resolving never teleports the wreck');
 });
 
-test('a mispredicted hold respawns once the authority reports survivors', () => {
+test('a completed respawn never inherits the coast', () => {
     const h = harness({ lives: 1 });
     h.production.handleShipHit(h.game.ship);
     assert.ok(h.game.ship.deathHold, 'precondition: the ship is holding');
+    // Let the wreck coast a while first, so a respawn that merely kept the
+    // instance's momentum would be caught.
+    for (let frame = 0; frame < 30; frame++) h.game.ship.update(1);
+    assert.ok(Math.abs(h.game.ship.velocityX) > 0, 'precondition: still coasting');
     // The authority processed our hit and still has lives left (an extra life
     // landed in the same window).
     h.setGameState({
@@ -255,8 +299,14 @@ test('a mispredicted hold respawns once the authority reports survivors', () => 
     h.production.resolveShipDeathHold();
     assert.equal(h.game.ship.deathHold, null);
     assert.equal(h.game.ship.x, 0.5);
+    assert.equal(h.game.ship.y, 0.5);
+    assert.equal(h.game.ship.velocityX, 0, 'the respawn starts at rest');
+    assert.equal(h.game.ship.velocityY, 0);
     assert.ok(h.game.ship.invulnerable > 0);
-    assert.equal(h.writes.at(-1).immediate, true);
+    const write = h.writes.at(-1);
+    assert.equal(write.immediate, true);
+    assert.equal(write.data.velocityX, 0, 'and peers are told so immediately');
+    assert.equal(write.data.velocityY, 0);
 });
 
 test('a hold whose verdict never arrives expires rather than stranding the player', () => {
@@ -269,6 +319,8 @@ test('a hold whose verdict never arrives expires rather than stranding the playe
     h.production.resolveShipDeathHold();
     assert.equal(h.game.ship.deathHold, null);
     assert.equal(h.game.ship.x, 0.5, 'worst case is exactly today\'s behaviour');
+    assert.equal(h.game.ship.velocityX, 0, 'an expired hold respawns at rest too');
+    assert.equal(h.game.ship.velocityY, 0);
 });
 
 test('respawning always clears the hold', () => {
