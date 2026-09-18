@@ -125,7 +125,8 @@ function harness({ lives = 3, myShipObjectId = MY_SHIP, gameOver = false } = {})
 
 test('a non-fatal session hit still respawns immediately', () => {
     const h = harness({ lives: 3 });
-    h.production.handleShipHit(h.game.ship);
+    assert.equal(h.production.handleShipHit(h.game.ship), false,
+        'a survivable hit is not terminal, so the crash still counts as a hit on the asteroid');
     assert.equal(h.game.ship.deathHold, null);
     assert.equal(h.game.ship.x, 0.5);
     assert.equal(h.game.ship.y, 0.5);
@@ -136,7 +137,8 @@ test('a non-fatal session hit still respawns immediately', () => {
 
 test('a fatal session hit cuts the controls but keeps the wreck coasting', () => {
     const h = harness({ lives: 1 });
-    h.production.handleShipHit(h.game.ship);
+    assert.equal(h.production.handleShipHit(h.game.ship), true,
+        'a predicted-fatal hit reports itself terminal to the collision pass');
     assert.deepEqual(h.pose(), {
         x: 0.25, y: 0.75, angle: 1.25, velocityX: 2, velocityY: -3
     }, 'pose and translation survive: the wreck carries its momentum');

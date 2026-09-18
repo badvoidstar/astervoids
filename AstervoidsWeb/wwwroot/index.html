@@ -7446,8 +7446,20 @@
         // its wreck coasts through whatever it drifts into.
         if (game.ship && !game.ship.deathHold
             && game.ship.invulnerable <= 0 && game.state === 'playing') {
-            if (checkShipAsteroidCollision(game.ship, asteroidCollisionCache)) {
-                handleShipHit(game.ship);
+            const crash = checkShipAsteroidCollision(game.ship, asteroidCollisionCache);
+            if (crash) {
+                // Built before the hit resets or holds the ship, so the
+                // equivalent shot keeps the crash pose: it leaves the contact
+                // point carrying the ship's velocity, not muzzle speed.
+                const crashBullet = new Bullet(
+                    crash.x, crash.y,
+                    game.ship.velocityX, game.ship.velocityY,
+                    game.ship.colorIndex, game.ship.memberId);
+                // A terminal crash keeps today's behavior exactly: the wreck
+                // holds (or solo ends) and the asteroid is left untouched.
+                if (!handleShipHit(game.ship)) {
+                    fireShipCrashImpact(crashBullet, crash.asteroid, myMemberId);
+                }
             }
         }
         
@@ -7485,9 +7497,10 @@
     }
 
     /**
-     * Check collision for a specific ship against all astervoids
+     * Find the asteroid the given ship is overlapping
      * @param {Ship} ship - The ship to check
-     * @returns {boolean} True if collision detected
+     * @returns {{asteroid: Asteroid, x: number, y: number}|null} The struck
+     *   asteroid with the normalized contact point, or null when clear
      */
     function checkShipAsteroidCollision(ship, asteroidCollisionCache = new Map()) {
         const shipVertices = ship.getVertices();
@@ -7509,24 +7522,52 @@
             // Check if any ship vertex is inside asteroid
             for (const vertex of shipVertices) {
                 if (pointInPolygon(vertex, asteroidVerts)) {
-                    return true;
+                    return shipAsteroidCrash(asteroid, vertex);
                 }
             }
             
             // Check if any asteroid vertex is inside ship triangle
             for (const vertex of asteroidVerts) {
                 if (pointInPolygon(vertex, shipVertices)) {
-                    return true;
+                    return shipAsteroidCrash(asteroid, vertex);
                 }
             }
         }
-        return false;
+        return null;
+    }
+
+    // The struck asteroid plus the contact point in normalized coordinates.
+    // Both vertex sources are pixel-space and borrowed (asteroid world vertices
+    // are rewritten on the next pose refresh), so the point is copied out here.
+    function shipAsteroidCrash(asteroid, contactVertex) {
+        return {
+            asteroid,
+            x: contactVertex.x / getGameWidth(),
+            y: contactVertex.y / getGameHeight()
+        };
+    }
+
+    // A crash also strikes the asteroid: the contact point is treated as a shot
+    // fired there, so scoring, split geometry, cues, ownership and the
+    // cross-owner claim/confirmation flow all reuse the bullet paths unchanged.
+    function fireShipCrashImpact(crashBullet, asteroid, myMemberId) {
+        game.bullets.push(crashBullet);
+        resolveBulletAsteroidHit(
+            crashBullet, game.bullets.length - 1,
+            asteroid, game.astervoids.indexOf(asteroid), myMemberId);
+        // A locally resolved hit already removed it; a cross-owner claim stays
+        // in flight and needs a synced object carrying it to the asteroid owner.
+        if (isSessionMode() && game.bullets.includes(crashBullet)) {
+            createSyncedBullet(crashBullet);
+        }
     }
 
     /**
      * Handle ship being hit by asteroid (local ship only)
      * Ship owner handles reset locally; reports to authority for lives decrement.
      * @param {Ship} ship - The ship that was hit
+     * @returns {boolean} True when the hit ended this ship's run — a predicted
+     *   death hold or solo game over — and no respawn followed
      */
     function handleShipHit(ship) {
         AudioSystem.playShipExplosion();
@@ -7547,7 +7588,7 @@
             // keep respawning locally rather than hold for a verdict.
             if (game.multiplayer.myShipObjectId && predictFatalShipHit(ship)) {
                 beginShipDeathHold(ship);
-                return;
+                return true;
             }
 
             // Reset ship locally
@@ -7569,10 +7610,11 @@
             if (game.lives <= 0) {
                 game.state = 'gameover';
                 AudioSystem.beat.stop();
-            } else {
-                ship.reset();
+                return true;
             }
+            ship.reset();
         }
+        return false;
     }
 
     // ── Predicted-fatal death hold ──────────────────────────────────────────

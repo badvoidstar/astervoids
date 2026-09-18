@@ -24,7 +24,7 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
         ASTEROID_MAX_SPEED: 0.4, ASTEROID_MAX_SPIN: Math.PI / 6,
         ASTEROID_LARGE_THRESHOLD: 0.067, ASTEROID_MEDIUM_THRESHOLD: 0.034,
         POINTS_LARGE: 20, POINTS_MEDIUM: 50, POINTS_SMALL: 100,
-        BULLET_RADIUS: 0.0033, SHIP_SIZE: 0.025,
+        BULLET_RADIUS: 0.0033, BULLET_LIFETIME: 60, SHIP_SIZE: 0.025,
         EXTRA_LIFE_SCORE_THRESHOLD: 10000,
     };
     const game = {
@@ -33,11 +33,12 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
     };
     const objects = new Map();
     const production = loadInlineGameFunctions([
-        'Asteroid', 'assignDefined', 'rescaleAsteroidForAspectChange', 'getReferenceDimension',
+        'Asteroid', 'Bullet', 'assignDefined', 'rescaleAsteroidForAspectChange', 'getReferenceDimension',
         'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapMarginX', 'wrapMarginY', 'wrapNormalized', 'drawAsteroidsBatched',
-        'checkCollisions', 'checkShipAsteroidCollision', 'prepareAsteroidCollision',
+        'checkCollisions', 'checkShipAsteroidCollision', 'shipAsteroidCrash',
+        'prepareAsteroidCollision',
         'computeBulletImpact', 'computeBulletAsteroidImpact', 'awardSoloAsteroidScore',
         'resolveBulletAsteroidHit', 'resolveOwnedAsteroidHit',
         'claimCrossOwnerAsteroidHit', 'resolveSoloAsteroidHit',
@@ -87,7 +88,9 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
         emitOwnedAsteroidImpactCue: (...args) => calls.events.push(['owned-cue', ...args]),
         deleteSyncedBullet: bullet => calls.events.push(['delete', bullet]),
         emitShipStateChanged: () => calls.events.push(['ship-update']),
-        handleShipHit: ship => calls.events.push(['ship-hit', ship]),
+        // Terminal crash: no bullet-hit equivalence follows, keeping this file
+        // focused on geometry preparation (see ship-crash-hit.test.mjs).
+        handleShipHit: ship => { calls.events.push(['ship-hit', ship]); return true; },
         getShipByMemberId: () => null,
         countExtraLivesForScore: (score, threshold) => Math.floor(score / threshold),
         announceExtraLifeAward: () => calls.events.push(['extra-life']),
@@ -253,11 +256,11 @@ test('drawing and bullet/ship collisions consume the same refreshed geometry', (
     asteroid.draw(ctx);
     assert.deepEqual(paths, buffer);
     h.game.astervoids.push(asteroid);
-    assert.equal(h.checkShipAsteroidCollision({
+    assert.deepEqual(h.checkShipAsteroidCollision({
         x: asteroid.x, y: asteroid.y, getVertices: () => [
             { x: 510, y: 490 }, { x: 511, y: 490 }, { x: 510, y: 491 },
         ],
-    }), true);
+    }), { asteroid, x: 0.51, y: 0.49 });
     h.game.bullets.push(bullet(asteroid.x, asteroid.y));
     asteroid._collisionPrevX = asteroid.x;
     asteroid._collisionPrevY = asteroid.y;

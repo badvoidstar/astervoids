@@ -1475,6 +1475,15 @@ existing confirmation baseline; hidden pending bullets no longer publish motion
 or lifetime. The owner still advances local lifetime and deletes on expiry or
 target-removal confirmation.
 
+A ship crashing into an asteroid also strikes it: the survivable crash spawns a
+hidden bullet at the contact point carrying the ship's velocity, and hands it to
+the same resolution paths (owned split, cross-owner claim, or solo removal), so
+scoring, split geometry, cues and replication are unchanged from a shot. A
+cross-owner crash claim rides the bullet's creation payload, because the crash
+bullet has no synced object yet. A crash that ends the run — a predicted-fatal
+hit that begins a death hold, or the last solo life — keeps its existing
+terminal behavior and leaves the asteroid untouched.
+
 Wave spawning uses at most four concurrent create calls in multiplayer, awaiting
 each bounded group before scheduling more. Random generation/invocation order,
 ownership, cancellation checks and stale-create cleanup remain game-owned.
