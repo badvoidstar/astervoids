@@ -210,6 +210,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("terminalAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("scoreLifeAwardCount", "u32"),
             new PositionalSchemaCodec.FieldSpec("countedParticipants", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("terminalShipId", "guid"),
         });
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────

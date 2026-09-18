@@ -1309,6 +1309,8 @@
         // Ship settings: sizes are fractions of the gameplay reference dimension;
         // velocities are reference-dimension units per second.
         SHIP_SIZE: 0.025,           // Ship triangle size (normalized)
+        SHIP_TERMINAL_SEPARATION: 0.18, // Maximum edge displacement, in ship radii
+        SHIP_TERMINAL_ROTATION: 0.12,   // Maximum edge rotation, in radians
         SHIP_THRUST: 0.009,         // Full-input velocity increment per nominal 60 Hz tick (0.54 ref-dim/s^2)
         SHIP_FRICTION: 0.99,        // Velocity decay (1 = no friction)
         SHIP_KEYBOARD_TURN_SPEED: SHARED_CONFIG_DEFAULTS.SHIP_KEYBOARD_TURN_SPEED,
@@ -6127,12 +6129,18 @@
         
         // Process hitCounts from all ships (idempotent via processedHits tracking)
         let beatStopCount = 0;
+        let terminalShipId = persisted?.terminalShipId ?? null;
         for (const ship of shipObjects) {
             const shipId = ship.id.toLowerCase();
             const hitCount = ship.data?.hitCount || 0;
             const lastProcessed = processedHits[shipId] || 0;
             const newHits = hitCount - lastProcessed;
             if (newHits > 0) {
+                // Persist the authority's zero-crossing choice, not a local
+                // prediction or arrival order that could differ across members.
+                if (terminalShipId == null && lives > 0 && newHits >= lives) {
+                    terminalShipId = shipId;
+                }
                 lives -= newHits;
                 processedHits[shipId] = hitCount;
                 if (lives <= 0) {
@@ -6200,6 +6208,7 @@
             observedScoreLifeAwardCount,
             announceScoreLifeAward,
             beatStopCount,
+            terminalShipId,
             // A spectator inheriting ownership must not publish lobby as game state.
             state: local.state === 'lobby' ? (persisted?.state ?? 'playing') : local.state
         };
@@ -6255,6 +6264,7 @@
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
+            ...(next.terminalShipId ? { terminalShipId: next.terminalShipId } : {}),
             scoreLifeAwardCount: next.scoreLifeAwardCount
         };
     }
@@ -6321,6 +6331,7 @@
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
             data?.peakShipCount, data?.state, hits, scores, counted,
+            data?.terminalShipId,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
             CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
         ];
@@ -6436,7 +6447,7 @@
             countedParticipants: packedCounted.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
-            'peakShipCount', 'state'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
+            'peakShipCount', 'state', 'terminalShipId'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
         
         // A cached calculation is not a server acknowledgement. Keep enqueueing:
         // ObjectSync retries unconfirmed fields against its confirmed baseline.

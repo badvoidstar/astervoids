@@ -49,6 +49,8 @@ const AstervoidsConfig = (function() {
         'ASTEROID_DIFFICULTY_FACTOR',
         'SIM_MODE',
         'EXTRA_LIFE_SCORE_THRESHOLD',
+        'SHIP_TERMINAL_SEPARATION',
+        'SHIP_TERMINAL_ROTATION',
     ]);
 
     const DEBUG_CONFIG_STORAGE_KEY = 'astervoids-debug-config';

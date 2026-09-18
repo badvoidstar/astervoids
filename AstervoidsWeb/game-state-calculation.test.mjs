@@ -104,6 +104,7 @@ test('departed ship scores and high-water ledgers survive repeat sync and migrat
         ships: [{ id: firstId, data: { score: 90, hitCount: 1 } }],
         local: { lives: 99, state: 'lobby' },
     });
+
     assert.equal(result.lives, 4);
     assert.equal(result.groupScore, 150);
     assert.equal(result.peakShipCount, 2);
@@ -111,6 +112,31 @@ test('departed ship scores and high-water ledgers survive repeat sync and migrat
     assert.equal(result.announceScoreLifeAward, false);
     assert.deepEqual(result.processedScores, { [firstId]: 100, [secondId]: 50 });
     assert.deepEqual(result.processedHits, { [firstId]: 2, [secondId]: 1 });
+});
+
+test('only the ship crossing zero lives becomes the immutable terminal ship', () => {
+    const ships = [
+        { id: firstId, data: { hitCount: 1 } },
+        { id: secondId.toUpperCase(), data: { hitCount: 1 } },
+        { id: thirdId, data: { hitCount: 1 } },
+    ];
+    const result = calculate({ persisted: { lives: 2 }, ships });
+    assert.equal(result.lives, 0);
+    assert.equal(result.terminalShipId, secondId);
+    const migrated = calculate({
+        persisted: result, hits: result.processedHits,
+        ships: [{ id: thirdId, data: { hitCount: 2 } }],
+    });
+    assert.equal(migrated.terminalShipId, secondId,
+        'later hits and departure of the wreck must not select another ship');
+});
+
+test('survival and older terminal sessions do not invent a terminal ship', () => {
+    const ships = [{ id: firstId, data: { hitCount: 1, score: 100 } }];
+    assert.equal(calculate({ persisted: { lives: 1 }, ships }).terminalShipId, null,
+        'score life is awarded before damage');
+    assert.equal(calculate({ persisted: { lives: 0 }, ships }).terminalShipId, null,
+        'a terminal session without identity cannot be reconstructed from hit totals');
 });
 
 test('unconfirmed local score awards remain counted without repeated feedback', () => {
@@ -380,6 +406,7 @@ test('GameState effects precede terminal clock sampling and packed publication',
         processedScores: codec.packCounterMap({ [firstId]: 10 }),
         countedParticipants: codec.packCounterMap({}),
         peakShipCount: 1, gameOverAt: 1000, terminalAt: 1750, scoreLifeAwardCount: 1,
+        terminalShipId: firstId,
     });
     harness.record.data = payload;
     harness.events.length = 0;
