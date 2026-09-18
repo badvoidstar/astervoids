@@ -1377,11 +1377,18 @@ Optional presence bits keep mode-specific and terminal fields absent from the
 body until needed.
 
 Every canonical position and angle transition selects the nearest topologically
-equivalent target. An axis normally retains its incoming derivatives; if doing
-so would add a complete toroidal winding, only that axis clamps its presentation
-velocity to the monotone shortest-path bound and clears its acceleration. The
-velocity can fall to zero when the target is coincident or lies in the opposite
-direction. If a target arrives too late to use the shared `terminalAt` without a
+equivalent target that the object's own motion can still reach. An axis normally
+retains its incoming derivatives; preserving them can require a complete
+toroidal winding, which is kept only when the incoming speed covers that travel
+within the convergence window — a fast spin or crossing whose target genuinely
+lies more than half a span ahead keeps turning or moving forward into its rest
+pose instead of reversing onto a target that reads as nearer only because the
+persisted value is normalized. A winding beyond that ballistic reach is
+gratuitous (the object has effectively reached its target already), so that axis
+falls back to the nearest target, clamps its presentation velocity to the
+monotone shortest-path bound, and clears its acceleration. The velocity can fall
+to zero when the target is coincident or lies in the opposite direction. If a
+target arrives too late to use the shared `terminalAt` without a
 visible discontinuity, that member also uses a short local settle window. Exact
 eventual pose and continuous position take precedence over pretending it stopped
 at a time that has already passed. Buffered adaptive-delay sessions retain their
