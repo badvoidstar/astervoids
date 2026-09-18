@@ -490,6 +490,27 @@ public class WireSizeBenchTests
     }
 
     [Fact]
+    public void Production_TerminalShipIdentity_MatchesJavaScriptFixtureAndSnapshotReencoding()
+    {
+        const string shipId = "00112233-4455-6677-8899-aabbccddeeff";
+        var data = new Dictionary<string, object?>
+        {
+            ["lives"] = 0,
+            ["gameOverAt"] = 1000d,
+            ["terminalAt"] = 1750d,
+            ["terminalShipId"] = shipId
+        };
+        var encoded = PositionalSchemaCodec.Encode(GameStateSchema, data);
+        Convert.ToHexString(encoded).ToLowerInvariant().Should().Be(
+            "109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff");
+        var decoded = PositionalSchemaCodec.Decode(GameStateSchema, encoded);
+        decoded["terminalShipId"].Should().Be(shipId);
+        PositionalSchemaCodec.Encode(GameStateSchema, decoded).Should().Equal(encoded);
+        PositionalSchemaCodec.Encode(GameStateSchema,
+            new Dictionary<string, object?> { ["lives"] = 3 }).Length.Should().Be(4);
+    }
+
+    [Fact]
     public void Production_InnerPayloadBodies_AreByteStable()
     {
         var shipCreate = PositionalSchemaCodec.Encode(ShipSchema, new Dictionary<string, object?>

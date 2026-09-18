@@ -3690,6 +3690,7 @@
             // Deliberately absent from SYNC_FIELDS and the wire payloads — peers
             // replay the published motion, not the prediction behind it.
             this.deathHold = null;
+            this.terminalDecomposition = null; // Render-only offsets; never affect collision or sync pose
             // Vertex cache — avoid re-computing the triangle every frame when pose
             // hasn't changed. Invalidated when x/y/angle/reference dimension shift.
             this._verts = [{x: 0, y: 0}, {x: 0, y: 0}, {x: 0, y: 0}];
@@ -3972,10 +3973,14 @@
             ctx.strokeStyle = shipColor;
             ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.moveTo(vertices[0].x, vertices[0].y);
-            ctx.lineTo(vertices[1].x, vertices[1].y);
-            ctx.lineTo(vertices[2].x, vertices[2].y);
-            ctx.closePath();
+            if (this.terminalDecomposition?.progress > 0) {
+                this.drawTerminalEdges(ctx, vertices, size);
+            } else {
+                ctx.moveTo(vertices[0].x, vertices[0].y);
+                ctx.lineTo(vertices[1].x, vertices[1].y);
+                ctx.lineTo(vertices[2].x, vertices[2].y);
+                ctx.closePath();
+            }
             ctx.stroke();
             
             // Draw thrust flame when accelerating
@@ -4004,6 +4009,28 @@
                 ctx.lineTo(flameTip.x, flameTip.y);
                 ctx.lineTo(flameBase2.x, flameBase2.y);
                 ctx.stroke();
+            }
+        }
+
+        drawTerminalEdges(ctx, vertices, size) {
+            const { edges, progress } = this.terminalDecomposition;
+            const separation = Math.max(0, CONFIG.SHIP_TERMINAL_SEPARATION) * size * progress;
+            const rotation = Math.max(0, CONFIG.SHIP_TERMINAL_ROTATION) * progress;
+            for (let i = 0; i < 3; i++) {
+                const a = vertices[i], b = vertices[(i + 1) % 3], edge = edges[i];
+                const dx = (b.x - a.x) / 2, dy = (b.y - a.y) / 2;
+                const length = Math.hypot(dx, dy) || 1;
+                // Outward normal with a small seeded directional variation.
+                // All offsets follow the current hull pose, even while it coasts.
+                const nx = dy / length, ny = -dx / length;
+                const c = Math.cos(edge.direction), s = Math.sin(edge.direction);
+                const mx = (a.x + b.x) / 2 + (nx * c - ny * s) * separation * edge.separation;
+                const my = (a.y + b.y) / 2 + (nx * s + ny * c) * separation * edge.separation;
+                const angle = edge.rotation * rotation;
+                const rx = dx * Math.cos(angle) - dy * Math.sin(angle);
+                const ry = dx * Math.sin(angle) + dy * Math.cos(angle);
+                ctx.moveTo(mx - rx, my - ry);
+                ctx.lineTo(mx + rx, my + ry);
             }
         }
 
@@ -4038,6 +4065,7 @@
          * Reset ship to center of gameplay area (normalized: 0.5, 0.5)
          */
         reset() {
+            this.terminalDecomposition = null;
             this.x = 0.5;
             this.y = 0.5;
             this.angle = -Math.PI / 2;
@@ -8691,8 +8719,35 @@
         }
     }
 
+    function createTerminalShipDecomposition(shipId, epoch) {
+        let seed = 2166136261;
+        for (const char of `${shipId.toLowerCase()}:${epoch}`) {
+            seed = Math.imul(seed ^ char.charCodeAt(0), 16777619);
+        }
+        const random = AstervoidsFracture.makeSeededRandom(seed);
+        return {
+            epoch,
+            progress: 0,
+            edges: Array.from({ length: 3 }, () => ({
+                separation: 0.5 + random() * 0.5,
+                direction: (random() - 0.5) * Math.PI / 4,
+                rotation: random() * 2 - 1
+            }))
+        };
+    }
+
+    function terminalShipDecompositionProgress(terminal, nowServer) {
+        const duration = terminal.terminalAt - terminal.epoch;
+        const t = duration > 0
+            ? Math.max(0, Math.min(1, (nowServer - terminal.epoch) / duration))
+            : (nowServer >= terminal.epoch ? 1 : 0);
+        // Integrated decaying impulse: velocity and acceleration reach zero at
+        // terminalAt. Absolute server time makes sampling frame-rate independent.
+        return 2 * t - 2 * t * t * t + t * t * t * t;
+    }
+
     /**
-     * Game over holds the final frame, so no ship may keep an animated visual.
+     * Game over holds the final frame after the terminal visual impulse settles.
      * Input handling stops with `thrusting` latched at its last value, and the
      * rest passes above re-apply authoritative ship data every frame — buffered
      * settling through `fromSyncData`, deterministic terminal sampling through
@@ -8702,10 +8757,28 @@
      * thrust flame is off and the invulnerability blink ends visible.
      */
     function settleShipTerminalVisuals() {
-        if (!isGameOver()) return;
-        if (game.ship) game.ship.stopTerminalVisuals();
-        for (const ship of game.multiplayer.remoteShips.values()) {
-            ship.stopTerminalVisuals();
+        const gameOver = isGameOver();
+        const data = gameOver && isSessionMode()
+            ? ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE)?.data : null;
+        const terminal = data ? resolveTerminalSession(data) : null;
+        const terminalShipId = typeof data?.terminalShipId === 'string'
+            ? data.terminalShipId.toLowerCase() : null;
+        const progress = terminal && terminalShipId
+            ? terminalShipDecompositionProgress(terminal, RemoteObjects.serverNowMs()) : 0;
+        const settle = (ship, id) => {
+            if (gameOver) ship.stopTerminalVisuals();
+            if (!terminal || !terminalShipId || id?.toLowerCase() !== terminalShipId) {
+                ship.terminalDecomposition = null;
+                return;
+            }
+            if (ship.terminalDecomposition?.epoch !== terminal.epoch) {
+                ship.terminalDecomposition = createTerminalShipDecomposition(terminalShipId, terminal.epoch);
+            }
+            ship.terminalDecomposition.progress = progress;
+        };
+        if (game.ship) settle(game.ship, game.multiplayer.myShipObjectId);
+        for (const [id, ship] of game.multiplayer.remoteShips) {
+            settle(ship, id);
         }
     }
 

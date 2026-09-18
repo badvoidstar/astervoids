@@ -1404,6 +1404,33 @@ no wreck freezes on a hidden blink frame. The settle clears the local countdown
 and replica anchor only; the invulnerability revision stays untouched because it
 is the wire transition key, not a presentation value.
 
+In multiplayer, only the ship whose damage exhausts the shared lives pool
+decomposes into three detached triangle edges. The GameState owner records
+`terminalShipId` on the first positive-to-zero lives transition, after score-life
+awards and in the existing hit-processing order. It remains immutable through
+later hits, ship departure, and authority migration. This optional GUID is
+appended to the GameState schema (no additional live payload bytes or ship
+updates); the local predicted death hold is not used to select the wreck.
+
+Edge offsets are render-only, seeded from that ship ID and `gameOverAt`, and
+sampled in server time over `gameOverAt` → `terminalAt` in both multiplayer modes.
+A small initial linear/angular impulse decays to exact rest at the shared end
+time. Each rigid edge rotates about its midpoint and separates outward while
+following the ship's current moving/rotating origin; collision vertices, pose,
+and replication are unchanged. Late joiners sample the same settled shape
+without replaying the effect. Late pose targets may still use the existing local
+grace interval; the edge offsets retain the shared clock. Solo play and older
+terminal records without `terminalShipId` retain the intact triangle.
+
+Tune the effect on the session creator's URL:
+`?cfg.SHIP_TERMINAL_SEPARATION=0.18&cfg.SHIP_TERMINAL_ROTATION=0.12`.
+Separation is the maximum edge-midpoint displacement in ship radii (default
+`0.18`); rotation is the maximum absolute edge rotation in radians (default
+`0.12`, about 7°). Each edge receives a seeded fraction of those limits.
+Zero disables the respective component; negative values are treated as zero.
+Both settings are session metadata, so members and spectators adopt the
+creator's values rather than diverging with their own URL overrides.
+
 ## Ring Buffer Interpolation
 
 ```mermaid
@@ -1874,7 +1901,7 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 | 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id |
 
 Every known gameplay type uses exactly one superset schema for create, update,
 replace, terminal writes, and snapshot re-encoding. Adaptive-delay and

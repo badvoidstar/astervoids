@@ -219,6 +219,9 @@ test('GameState appends a sparse final-life ship identity for updates and join s
         terminalShipId: '00112233-4455-6677-8899-aabbccddeeff',
     };
     const encoded = SchemaCodec.encode(schema, terminal);
+    assert.equal(Buffer.from(encoded).toString('hex'),
+        '109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
+        'shared with the C# production schema fixture');
     const decoded = SchemaCodec.decode(schema, encoded);
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
