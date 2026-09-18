@@ -257,6 +257,65 @@ test('shortest seam crossing preserves derivatives without an extra winding', ()
     approx(start.acceleration, 0.000001);
 });
 
+test('a momentum-justified winding keeps a fast spin turning forward', () => {
+    // A fractured asteroid at the spin cap projects its terminal angle more
+    // than half a turn ahead, so the nearest congruent target lies BEHIND it.
+    // Converging on that target would run the spin backwards into its rest
+    // pose; the winding the incoming speed can cover must survive.
+    const stepMs = 1000 / 60;
+    const duration = 750;
+    const spinPerFrame = 0.2;
+    const angularVelocity = spinPerFrame / stepMs;
+    const forwardTravel = spinPerFrame * (duration / stepMs) / 2;
+    let nearestTarget = forwardTravel % (Math.PI * 2);
+    if (nearestTarget > Math.PI) nearestTarget -= Math.PI * 2;
+    assert.ok(nearestTarget < 0);
+
+    const axis = createWrappedConvergenceTransition({
+        start: 0,
+        target: nearestTarget,
+        span: Math.PI * 2,
+        startVelocity: angularVelocity,
+        startTime: 0,
+        endTime: duration,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, false);
+    approx(axis.target, forwardTravel);
+    let previous = sampleMinimumJerkTransition(axis.transition, 0);
+    approx(previous.velocity, angularVelocity);
+    for (let now = 5; now <= duration; now += 5) {
+        const current = sampleMinimumJerkTransition(axis.transition, now);
+        assert.ok(
+            current.value >= previous.value - 1e-12,
+            `rotation reversed at ${now}ms: ${previous.value} -> ${current.value}`);
+        previous = current;
+    }
+    approx(previous.value, forwardTravel);
+});
+
+test('a winding beyond ballistic reach still relaxes to the nearest target', () => {
+    // A slow spin that has already drifted past its target must not buy a whole
+    // extra turn to keep rotating forward; the short correction wins.
+    const axis = createWrappedConvergenceTransition({
+        start: 1.25,
+        target: 1.2,
+        span: Math.PI * 2,
+        startVelocity: 0.02 / (1000 / 60),
+        startAcceleration: 0.00001,
+        startTime: 0,
+        endTime: 750,
+        relaxExtraWinding: true
+    });
+
+    assert.equal(axis.relaxed, true);
+    approx(axis.target, 1.2);
+    const start = sampleMinimumJerkTransition(axis.transition, 0);
+    assert.equal(start.velocity, 0);
+    assert.equal(start.acceleration, 0);
+});
+
 test('early canonical handoff preserves provisional position and derivatives', () => {
     const target = 0.475;
     const provisional = createMinimumJerkTransition({
@@ -352,6 +411,68 @@ test('production relaxes winding axes regardless of the late threshold', () => {
     approx(
         sampleMinimumJerkTransition(onTime.yTransition, now).velocity,
         current.velocityY);
+});
+
+test('production canonical convergence never reverses a fast spin', () => {
+    // Angles persist normalized, so a spin projected more than half a turn
+    // ahead comes back as a target that reads as "behind" the object. The
+    // canonical transition must keep rotating in the spin's own direction.
+    const angularVelocity = 0.012;
+    const duration = 750;
+    const forwardTravel = angularVelocity * duration / 2;
+    let terminalAngle = forwardTravel % (Math.PI * 2);
+    if (terminalAngle > Math.PI) terminalAngle -= Math.PI * 2;
+    assert.ok(terminalAngle < 0);
+    const current = {
+        x: 0.5,
+        y: 0.5,
+        angle: 0,
+        velocityX: 0,
+        velocityY: 0,
+        angularVelocity,
+        accelerationX: 0,
+        accelerationY: 0,
+        angularAcceleration: 0
+    };
+    const { createCanonicalTerminalTransition: create } = loadInlineGameFunctions(
+        ['createCanonicalTerminalTransition'],
+        {
+            deterministicTerminalState: { directTargetIds: new Set() },
+            sampleTerminalTransition: () => current,
+            lastRenderedPose: () => current,
+            velocityToNormalizedDeltaX: value => value,
+            velocityToNormalizedDeltaY: value => value,
+            CONFIG: {
+                TARGET_FPS: 1000,
+                DEADRECKON_GAMEOVER_MIN_CONVERGENCE_MS: 180,
+                DEADRECKON_GAMEOVER_LATE_SETTLE_MS: 300
+            },
+            wrapRadiusFor: () => 0.05,
+            wrapMarginX: () => 0.05,
+            wrapMarginY: () => 0.05,
+            ReplicationPresentation: { createWrappedConvergenceTransition }
+        });
+    const now = 1000;
+    const entry = create(
+        {},
+        { id: 'asteroid', data: { terminalX: 0.5, terminalY: 0.5, terminalAngle } },
+        { epoch: 1, terminalAt: now + duration },
+        now,
+        {});
+
+    let previous = sampleMinimumJerkTransition(entry.angleTransition, now);
+    approx(previous.velocity, angularVelocity);
+    for (let at = now + 5; at <= now + duration; at += 5) {
+        const sample = sampleMinimumJerkTransition(entry.angleTransition, at);
+        assert.ok(
+            sample.value >= previous.value - 1e-12,
+            `rotation reversed at ${at - now}ms: ${previous.value} -> ${sample.value}`);
+        previous = sample;
+    }
+    approx(previous.value, forwardTravel);
+    approx(
+        (previous.value - terminalAngle) / (Math.PI * 2),
+        Math.round((previous.value - terminalAngle) / (Math.PI * 2)));
 });
 
 test('production provisional convergence uses half-ballistic stopping distance', () => {

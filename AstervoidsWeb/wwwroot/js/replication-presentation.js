@@ -638,8 +638,9 @@ const ReplicationPresentation = (function () {
 
     /**
      * Build a wrapped terminal transition. When preserving the incoming
-     * derivatives would select an additional full winding, clamp velocity to
-     * the monotone shortest-path bound and clear acceleration.
+     * derivatives would select an additional full winding that the incoming
+     * speed cannot cover within the window, clamp velocity to the monotone
+     * shortest-path bound and clear acceleration.
      */
     function createWrappedConvergenceTransition({
         start,
@@ -669,7 +670,22 @@ const ReplicationPresentation = (function () {
                 target,
                 span
             });
-            if (Math.abs(selectedTarget - nearestTarget) > span / 2) {
+            // A winding is added for two very different reasons. Either the
+            // target genuinely lies more than half a span ahead along the
+            // current motion — a fast spin or crossing, where the nearest
+            // congruent target sits BEHIND the object and converging on it
+            // would visibly run the object backwards instead of letting it
+            // continue into its rest pose — or the object has effectively
+            // reached the target already and continuing would buy a whole extra
+            // lap or turn for a negligible correction. Ballistic reach
+            // separates them: a momentum-justified winding stays within the
+            // distance the incoming speed covers over the window (the canonical
+            // target is half that distance), while a gratuitous one demands
+            // more travel than the object could make without speeding up.
+            const windingTravel = Math.abs(selectedTarget - start);
+            const ballisticReach = Math.abs(startVelocity) * duration;
+            if (Math.abs(selectedTarget - nearestTarget) > span / 2
+                && windingTravel > ballisticReach) {
                 selectedTarget = nearestTarget;
                 const nearestDelta = nearestTarget - start;
                 const direction = Math.sign(nearestDelta);
