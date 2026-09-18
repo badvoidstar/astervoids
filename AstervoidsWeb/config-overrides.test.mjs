@@ -113,7 +113,7 @@ test('separation angle variance is configurable with a pi/8 default', () => {
 });
 
 test('terminal ship tuning is URL configurable and shared by the session creator', () => {
-    const cfg = { SHIP_TERMINAL_SEPARATION: 0.18, SHIP_TERMINAL_ROTATION: 0.12 };
+    const cfg = { SHIP_TERMINAL_SEPARATION: 0.35, SHIP_TERMINAL_ROTATION: 2 };
     applyUrlConfigOverrides(cfg, '?cfg.SHIP_TERMINAL_SEPARATION=0.25&cfg.SHIP_TERMINAL_ROTATION=0.2');
     assert.deepEqual(cfg, { SHIP_TERMINAL_SEPARATION: 0.25, SHIP_TERMINAL_ROTATION: 0.2 });
     const joiner = { SHIP_TERMINAL_SEPARATION: 0, SHIP_TERMINAL_ROTATION: 0 };

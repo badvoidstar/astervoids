@@ -1423,10 +1423,10 @@ grace interval; the edge offsets retain the shared clock. Solo play and older
 terminal records without `terminalShipId` retain the intact triangle.
 
 Tune the effect on the session creator's URL:
-`?cfg.SHIP_TERMINAL_SEPARATION=0.18&cfg.SHIP_TERMINAL_ROTATION=0.12`.
+`?cfg.SHIP_TERMINAL_SEPARATION=0.35&cfg.SHIP_TERMINAL_ROTATION=2`.
 Separation is the maximum edge-midpoint displacement in ship radii (default
-`0.18`); rotation is the maximum absolute edge rotation in radians (default
-`0.12`, about 7°). Each edge receives a seeded fraction of those limits.
+`0.35`); rotation is the maximum absolute edge rotation in radians (default
+`2`, about 115°). Each edge receives a seeded fraction of those limits.
 Zero disables the respective component; negative values are treated as zero.
 Both settings are session metadata, so members and spectators adopt the
 creator's values rather than diverging with their own URL overrides.
