@@ -3684,9 +3684,9 @@
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
             // Local-only predicted-fatal hold: { hitCount, startedAtMs } while
-            // this ship waits at its collision pose for the authority's verdict.
+            // this ship coasts, uncontrolled, awaiting the authority's verdict.
             // Deliberately absent from SYNC_FIELDS and the wire payloads — peers
-            // need the frozen pose, not the prediction that produced it.
+            // replay the published motion, not the prediction behind it.
             this.deathHold = null;
             // Vertex cache — avoid re-computing the triangle every frame when pose
             // hasn't changed. Invalidated when x/y/angle/reference dimension shift.
@@ -4042,7 +4042,8 @@
             this.velocityX = 0;
             this.velocityY = 0;
             this.invulnerable = CONFIG.INVULNERABILITY_TIME;
-            // Respawning is the opposite of holding at a collision pose.
+            // A completed respawn is the opposite of a death hold, and the
+            // zeroed velocity above is what stops it inheriting the coast.
             this.deathHold = null;
         }
     }
@@ -7113,8 +7114,8 @@
         // Need a ship to control
         if (!game.ship) return;
 
-        // A ship held at its fatal collision pose accepts no further input: it
-        // is the final state every member is converging on.
+        // A ship held after its fatal hit accepts no further input. It still
+        // coasts, but the player no longer steers it.
         if (game.ship.deathHold) return;
 
         // Resolve control values for this frame. Keyboard input gives discrete
@@ -7441,8 +7442,8 @@
         }
         
         // Ship vs Asteroid collisions — only check local player's ship. A ship
-        // held at its fatal collision pose is already dead and must not collide
-        // again; its wreck stays exactly where the game ended.
+        // held after its fatal hit is already dead and must not collide again;
+        // its wreck coasts through whatever it drifts into.
         if (game.ship && !game.ship.deathHold
             && game.ship.invulnerable <= 0 && game.state === 'playing') {
             if (checkShipAsteroidCollision(game.ship, asteroidCollisionCache)) {
@@ -7587,11 +7588,12 @@
     // record and the ship records, so re-running it locally with this hit
     // applied reproduces the lives the authority is about to publish, with no
     // extra traffic and regardless of who owns the ship or the GameState.
-    // On a predicted-fatal hit the ship stops simulating and holds its
-    // collision pose at rest; `buildTerminalTargetPayload` then derives a
-    // terminal target from that frozen instance, so deterministic members
-    // converge on the wreck and buffered members settle onto the same final
-    // snapshot.
+    // On a predicted-fatal hit the ship cuts its controls but keeps coasting,
+    // so it decelerates under friction from the velocity it died with instead
+    // of stopping dead. `buildTerminalTargetPayload` then derives a terminal
+    // target from that still-moving instance exactly as it does for asteroids
+    // and bullets, so deterministic members converge along a continuous path
+    // and buffered members settle onto the same final snapshot.
     //
     // The prediction can still be wrong (a concurrent extra life, a lost hit
     // event), so a hold is never permanent: `resolveShipDeathHold` respawns as
@@ -7655,23 +7657,35 @@
     }
 
     /**
-     * Freeze the local ship at the pose it died in and publish that final state.
+     * Cut the local ship's controls at the pose it died in and publish that
+     * state. The wreck keeps coasting from the velocity it carried into the
+     * collision; only the controls stop.
      * @param {Ship} ship - The local ship
      */
     function beginShipDeathHold(ship) {
-        // Zero every quantity a receiver would otherwise integrate forward:
-        // resetControls clears the replayed intent and rotationSpeed, and the
-        // velocity is what dead reckoning extrapolates. Position and angle stay
-        // exactly where the collision happened.
+        // resetControls clears every replayed INTENT (thrust, brake, turn) and
+        // rotationSpeed with it, which is what makes the remaining motion
+        // predictable: Ship.update degenerates to friction decay, position
+        // integration, and wrap. Translation velocity is deliberately NOT
+        // zeroed — the wreck carries its momentum into the terminal stop
+        // instead of halting under the player's feet. Rotation is: turn ramping
+        // is instantaneous at the shipped SHIP_TURN_DECEL_TIME, so replicas
+        // would damp a spinning wreck the moment they saw the cleared intent
+        // while the owner kept spinning.
+        //
+        // The hold does not freeze the instance. `ship.update` keeps running
+        // (see the game loop), so the owner's simulation and the velocity it
+        // publishes stay the same story — the only arrangement every consumer
+        // of that velocity agrees on (deterministic replay, buffered
+        // extrapolation, terminal projection, late-join seeding).
         ship.resetControls();
-        ship.velocityX = 0;
-        ship.velocityY = 0;
         ship.deathHold = {
             hitCount: ship.hitCount || 0,
             startedAtMs: performance.now()
         };
-        // Bypasses ShipSendGate exactly like the respawn path: this is the pose
-        // every member will converge on, so it must not wait for a cadence slot.
+        // Bypasses ShipSendGate exactly like the respawn path: this packet is
+        // the baseline every member replays the coast from, so it must not wait
+        // for a cadence slot.
         ObjectSync.updateObject(
             game.multiplayer.myShipObjectId, ship.toUpdateData(), true);
     }
@@ -7686,7 +7700,8 @@
         const ship = game.ship;
         const hold = ship?.deathHold;
         if (!hold) return;
-        // Terminal: this ship is the final state. Leave the wreck where it died.
+        // Terminal: this ship is the final state. Let the wreck coast into the
+        // terminal convergence instead of respawning out from under it.
         if (isGameOver()) return;
 
         // Lives can legitimately still be positive for the first frames after a
@@ -7708,6 +7723,8 @@
         if (!processed && !expired) return;
 
         ship.deathHold = null;
+        // reset() returns the ship to centre at zero velocity, so a completed
+        // respawn never inherits the coast the hold was carrying.
         ship.reset();
         if (myShipId) {
             ObjectSync.updateObject(myShipId, ship.toUpdateData(), true);
@@ -8830,8 +8847,13 @@
                 // before the ship would otherwise be driven this frame.
                 resolveShipDeathHold();
 
-                // Update local ship (spectators have no ship — naturally skipped)
-                if (game.ship && !game.ship.deathHold) {
+                // Update local ship (spectators have no ship — naturally
+                // skipped). A held wreck keeps simulating: its controls are
+                // already cleared, so update() is friction decay, integration,
+                // and wrap. Parking the instance while it still published a
+                // velocity would leave every replica extrapolating motion the
+                // owner never performed, with no heartbeat to correct it.
+                if (game.ship) {
                     game.ship.update(dt);
                     
                     // Sync local ship to ObjectSync in multiplayer
@@ -11490,9 +11512,11 @@
                         return;
                     }
                     
-                    // Update local ship (spectators have no ship — naturally skipped)
+                    // Update local ship (spectators have no ship — naturally
+                    // skipped). A held wreck coasts here too, for the same
+                    // reason as the visible loop.
                     resolveShipDeathHold();
-                    if (game.ship && !game.ship.deathHold) {
+                    if (game.ship) {
                         game.ship.update(dt);
                         syncLocalShip();
                     }
