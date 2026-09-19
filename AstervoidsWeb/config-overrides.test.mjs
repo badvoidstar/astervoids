@@ -112,6 +112,17 @@ test('separation angle variance is configurable with a pi/8 default', () => {
     assert.equal(cfg.SEPARATION_ANGLE_VARIANCE, 0.25);
 });
 
+test('terminal ship tuning is URL configurable and shared by the session creator', () => {
+    const cfg = { SHIP_TERMINAL_SEPARATION: 0.35, SHIP_TERMINAL_ROTATION: 2 };
+    applyUrlConfigOverrides(cfg, '?cfg.SHIP_TERMINAL_SEPARATION=0.25&cfg.SHIP_TERMINAL_ROTATION=0.2');
+    assert.deepEqual(cfg, { SHIP_TERMINAL_SEPARATION: 0.25, SHIP_TERMINAL_ROTATION: 0.2 });
+    const joiner = { SHIP_TERMINAL_SEPARATION: 0, SHIP_TERMINAL_ROTATION: 0 };
+    applySessionConfigMetadata({ config: buildSessionConfigMetadata(cfg) }, joiner);
+    assert.deepEqual(joiner, cfg, 'joiner URL settings cannot diverge from the session');
+    applyUrlConfigOverrides(cfg, '?cfg.SHIP_TERMINAL_ROTATION=Infinity&cfg.SHIP_TERMINAL_SEPARATION=invalid');
+    assert.deepEqual(cfg, joiner, 'non-finite overrides are rejected');
+});
+
 test('score milestones count only enabled whole-score thresholds', () => {
     assert.equal(countExtraLivesForScore(9999, 10000), 0);
     assert.equal(countExtraLivesForScore(10000, 10000), 1);

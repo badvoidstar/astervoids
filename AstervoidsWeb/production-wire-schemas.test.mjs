@@ -209,6 +209,26 @@ test('known terminal updates do not fall back to schema zero', () => {
     }
 });
 
+test('GameState appends a sparse final-life ship identity for updates and join snapshots', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(4);
+    assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]),
+        [['terminalShipId', 'guid']]);
+    const terminal = {
+        lives: 0, gameOverAt: 1000, terminalAt: 1750,
+        terminalShipId: '00112233-4455-6677-8899-aabbccddeeff',
+    };
+    const encoded = SchemaCodec.encode(schema, terminal);
+    assert.equal(Buffer.from(encoded).toString('hex'),
+        '109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
+        'shared with the C# production schema fixture');
+    const decoded = SchemaCodec.decode(schema, encoded);
+    assert.deepEqual(decoded, terminal);
+    assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
+    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 4,
+        'the appended optional field leaves the live two-byte mask unchanged');
+});
+
 test('production serializers keep optional high-cost data sparse', () => {
     assert.match(
         source,
