@@ -75,7 +75,7 @@ jobs:
   build:
     name: Build Application
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -102,6 +102,9 @@ jobs:
       - name: Run JavaScript tests
         run: node --test AstervoidsWeb/*.test.mjs
 
+      - name: Validate Squad setup
+        run: node --test .github/scripts/squad-setup.test.mjs
+
       - name: Validate workflow helpers
         run: bash .github/scripts/workflow-helpers.test.sh
 
@@ -126,7 +129,7 @@ jobs:
     outputs:
       custom_subdomain_suffix: ${{ steps.vars.outputs.custom_subdomain_suffix }}
       custom_url_template: ${{ steps.vars.outputs.custom_url_template }}
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -136,12 +139,12 @@ jobs:
         run: |
           BRANCH_NAME="${GITHUB_REF#refs/heads/}"
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          
+
           # Sanitize branch name using shared script
           chmod +x .github/scripts/sanitize-branch-name.sh
           SANITIZED=$(.github/scripts/sanitize-branch-name.sh "$BRANCH_NAME")
           echo "sanitized_branch=$SANITIZED" >> $GITHUB_OUTPUT
-          
+
           # Determine if this is production (main branch)
           if [ "$BRANCH_NAME" = "main" ]; then
             echo "is_production=true" >> $GITHUB_OUTPUT
@@ -257,18 +260,18 @@ jobs:
             [ -n "$CUSTOM_DOMAIN_NAME" ]; then
             DEPLOYMENT_LOCATION=$(primary_region_location "$REGIONS_JSON")
           fi
-          
+
           # Create or select azd environment
           azd env new "$ENV_NAME" --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }} --location "$DEPLOYMENT_LOCATION" || true
           azd env select "$ENV_NAME"
-          
+
           # Branch previews use the existing primary CAE's location whenever
           # a regional production topology is configured.
           azd env set AZURE_LOCATION "$DEPLOYMENT_LOCATION"
           # Pass through region matrix so non-production shared-infra deploys
           # can resolve the primary shared CAE deterministically.
           azd env set REGIONS_JSON "${REGIONS_JSON:-[]}"
-          
+
           # For branch deployments, set resource group to production's resource group
           # This tells azd deploy where to find the container app
           if [ "${{ steps.vars.outputs.is_production }}" != "true" ]; then
@@ -279,11 +282,11 @@ jobs:
           else
             azd env set USE_SHARED_INFRA "false"
           fi
-          
+
           # Write both values even when empty so restored azd environments
           # cannot retain a removed custom-domain configuration.
           azd env set CUSTOM_DOMAIN_NAME "$CUSTOM_DOMAIN_NAME"
-          
+
           # Set subdomain (with branch suffix for non-production)
           if [ "${{ steps.vars.outputs.is_production }}" = "true" ]; then
             azd env set CUSTOM_SUBDOMAIN "$CUSTOM_SUBDOMAIN"

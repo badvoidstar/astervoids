@@ -7,5 +7,6 @@
         "respawning",
         "Verts",
         "WASD"
-    ]
+    ],
+    "chat.newSession.defaultMode": "Squad"
 }
