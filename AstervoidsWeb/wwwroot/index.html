@@ -4321,14 +4321,13 @@
         }
 
         /**
-         * Draw asteroid as a vector polygon
+         * Draw asteroid as a filled vector polygon
          * @param {CanvasRenderingContext2D} ctx - Canvas context
          */
         draw(ctx) {
             const worldVerts = this.getWorldVertices();
             
-            ctx.strokeStyle = CONFIG.STROKE_COLOR;
-            ctx.lineWidth = 2;
+            ctx.fillStyle = CONFIG.STROKE_COLOR;
             ctx.beginPath();
             ctx.moveTo(worldVerts[0].x, worldVerts[0].y);
             
@@ -4337,7 +4336,7 @@
             }
             
             ctx.closePath();
-            ctx.stroke();
+            ctx.fill();
         }
 
         /**
@@ -7901,17 +7900,15 @@
     // ============================================
 
     /**
-     * Batch-draw a list of asteroids in a single beginPath/stroke pair.
-     * All asteroids share the same stroke style, so merging their paths
-     * eliminates per-asteroid canvas state changes and stroke calls.
-     * Produces identical visuals to looping asteroid.draw(ctx) individually.
+     * Batch-draw a list of asteroids in a single beginPath/fill pair.
+     * All asteroids share the same fill style, so merging their paths
+     * eliminates per-asteroid canvas state changes and fill calls.
      * @param {CanvasRenderingContext2D} ctx - Canvas context
      * @param {Asteroid[]} astervoids - Asteroids to render
      */
     function drawAsteroidsBatched(ctx, astervoids) {
         if (!astervoids || astervoids.length === 0) return;
-        ctx.strokeStyle = CONFIG.STROKE_COLOR;
-        ctx.lineWidth = 2;
+        ctx.fillStyle = CONFIG.STROKE_COLOR;
         ctx.beginPath();
         for (const asteroid of astervoids) {
             const worldVerts = asteroid.getWorldVertices();
@@ -7922,7 +7919,7 @@
             }
             ctx.closePath();
         }
-        ctx.stroke();
+        ctx.fill();
     }
 
     /**

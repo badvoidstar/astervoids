@@ -20,6 +20,7 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
     }
     const config = {
         TARGET_FPS: 60,
+        STROKE_COLOR: '#fff',
         ASTEROID_VERTICES: 10, ASTEROID_JAGGEDNESS: 0.4,
         ASTEROID_MAX_SPEED: 0.4, ASTEROID_MAX_SPIN: Math.PI / 6,
         ASTEROID_LARGE_THRESHOLD: 0.067, ASTEROID_MEDIUM_THRESHOLD: 0.034,
@@ -245,7 +246,7 @@ test('drawing and bullet/ship collisions consume the same refreshed geometry', (
     const buffer = asteroid.getWorldVertices();
     const paths = [];
     const ctx = {
-        beginPath() {}, closePath() {}, stroke() {},
+        beginPath() {}, closePath() {}, stroke() {}, fill() {},
         moveTo(x, y) { paths.push({ x, y }); },
         lineTo(x, y) { paths.push({ x, y }); },
     };
@@ -268,6 +269,67 @@ test('drawing and bullet/ship collisions consume the same refreshed geometry', (
     assert.equal(h.calls.narrow[0], buffer);
     assert.equal(h.game.bullets.length, 0);
 });
+
+for (const batched of [false, true]) {
+    test(`${batched ? 'batched' : 'individual'} asteroid drawing fills seeded and fracture polygons with existing color and alpha`, () => {
+        const h = harness({ width: 1200, height: 600 });
+        const asteroids = [
+            new h.Asteroid(0.97, 0.05, 0.08, 0, 0, 456),
+            rock(h, 1.08, -0.15, 0.003, 0.12),
+        ];
+        asteroids[0].angle = 0.7;
+        asteroids[1].angle = -1.1;
+        asteroids[1].update(0);
+        assert.ok(asteroids[1].x < 0 && asteroids[1].y > 1, 'fracture has wrapped across both edges');
+
+        for (const [width, height, color, alpha] of [
+            [1200, 600, '#fff', 1],
+            [2400, 1200, '#fff', 1],
+            [600, 1200, '#79a', 0.35],
+        ]) {
+            Object.assign(h.viewport, { width, height });
+            const expected = asteroids.map(asteroid =>
+                structuredClone(assertGeometry(asteroid, h.viewport)));
+            h.config.STROKE_COLOR = color;
+            let paths = [];
+            const fills = [];
+            let begins = 0;
+            let closes = 0;
+            let strokes = 0;
+            const ctx = {
+                fillStyle: '#000',
+                globalAlpha: alpha,
+                beginPath() { begins++; paths = []; },
+                moveTo(x, y) { paths.push([{ x, y }]); },
+                lineTo(x, y) { paths.at(-1).push({ x, y }); },
+                closePath() { closes++; },
+                fill() {
+                    fills.push({
+                        paths: structuredClone(paths), color: this.fillStyle, alpha: this.globalAlpha,
+                    });
+                },
+                stroke() { strokes++; },
+            };
+
+            if (batched) {
+                h.drawAsteroidsBatched(ctx, asteroids);
+            } else {
+                for (const asteroid of asteroids) asteroid.draw(ctx);
+            }
+
+            const drawCalls = batched ? 1 : asteroids.length;
+            const expectedFills = batched
+                ? [{ paths: expected, color, alpha }]
+                : expected.map(path => ({ paths: [path], color, alpha }));
+            assert.deepEqual(fills, expectedFills,
+                `fill follows the rotated and wrapped world polygons at ${width}x${height}`);
+            assert.equal(begins, drawCalls);
+            assert.equal(closes, asteroids.length, 'each polygon is closed separately');
+            assert.equal(strokes, 0, 'asteroid bodies are filled rather than outlined');
+            assert.equal(ctx.globalAlpha, alpha, 'drawing preserves inherited alpha');
+        }
+    });
+}
 
 test('collision setup is per bullet and per asteroid with reusable pair scratch', () => {
     const h = harness();
