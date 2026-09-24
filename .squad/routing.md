@@ -6,16 +6,69 @@ How to decide who handles what.
 
 | Work Type | Route To | Examples |
 |-----------|----------|----------|
+| Addressed to Alex | Lead | Alex, review this plan; Alex — Lead |
+| Addressed to Jamie | Frontend | Jamie, implement the agreed Canvas interaction; Jamie — Frontend Dev |
+| Addressed to Sam | Backend | Sam, review the transport contract; Sam — Backend Dev |
+| Addressed to Casey | Tester | Casey, verify these acceptance criteria; Casey — QA Engineer |
+| Addressed to Jordan | Infra | Jordan, review the deployment plan; Jordan — DevOps |
+| Addressed to Maya | Designer | Maya, explore this player flow; Maya — Product/Game UX Designer |
+| Addressed to Morgan | Scribe | Morgan, record the approved learning; Morgan — Scribe |
+| Addressed to Quinn | Fact Checker | Quinn, verify this claim; Quinn — Fact Checker |
 | Architecture, ticket triage, or cross-system review | Lead | Contract changes, scoped work plans, PR reviews |
+| Product/game ideas, new player flows, or non-mechanical UX/input changes before implementation | Designer | Explore options and player impact; pair with Lead for feasibility before Frontend implements |
 | Gameplay, Canvas UI, or game-specific adapters | Frontend | `index.html`, picker UX, entity adapters |
 | Realtime server or generic transport contracts | Backend | SignalR hubs, session/object services, MessagePack DTOs |
 | Regression coverage or playable verification | Tester | C# tests, Node tests, multiplayer scenarios |
 | CI/CD, deployment, previews, or Bicep | Infra | GitHub Actions, Azure Container Apps, infrastructure |
 | Claim verification or pre-mortems | Fact Checker | Evidence checks, design challenges |
 | RAI, privacy, or high-signal safety review | Rai | Secrets, injection, public content |
+| Learning review due, observed agent/tool version or capability change, or explicit learning request | Lead | "Review available practices", "learn from this agent"; use `.github\skills\learning-review\SKILL.md` |
+| Useful technique, correction, or substantive observable work outcome | Lead | Evaluate one bounded candidate through reflect; Scribe retains only approved learnings |
 
 Preset installation adds concrete routes for the configured team. Add or edit rows
 here only when their agent names also exist in the casting registry.
+
+## Friendly-Name Resolution
+
+Before work-type routing, resolve an explicitly addressed friendly name through
+the roster's Aliases column and the addressed-name rows above. Match a whole name
+case-insensitively, not substrings or incidental mentions inside artifacts.
+For example, "Maya, explore this idea" routes to **Designer** (`designer`), not to
+a new agent named `maya`. Canonical names and role-based requests still work.
+If addressing multiple members, follow the existing multi-agent routing rules;
+ask rather than guess if a name is ambiguous.
+
+Use friendly name + explicit role in user-facing conversation, but keep the
+canonical registry ID for dispatch and the canonical charter/history paths,
+issue labels, and ceremony participants. Morgan and Quinn resolve to **Scribe**
+and **Fact Checker**; their special-agent identities and responsibilities do not
+change. Ralph, Rai, and `@copilot` have no replacement aliases. Do not change
+`persistent_name`, add alias-named members, move history, or bypass reviewer gates.
+
+## Pre-Implementation Idea Exploration
+
+Route a new gameplay/product idea or a material change to player flows, interaction,
+input, onboarding, or accessibility to **Designer before implementation**, even
+when Frontend could implement it alone. Designer compares a small set of options
+(including the simplest/no-change option), supplies testable acceptance criteria,
+and hands the brief to Lead for feasibility and architecture checks. Frontend
+implements the agreed direction; Tester uses the criteria. Small mechanical fixes
+with no player-behavior change do not need this exploration. Use Design Review in
+`.squad\ceremonies.md`; do not run duplicate design meetings.
+
+## Active-Session Learning Dispatch
+
+At the first routing opportunity in an active session, check the **Learning Review**
+ceremony's due/changed conditions using runtime key `log/learning-review.md`.
+No completed review means it is due; a deferred attempt follows the skill's
+backoff rather than retrying every turn. Explicit requests route to Lead directly.
+After substantive work, apply the **Learning Capture** ceremony only if there is
+concrete new evidence or a correction; reuse an existing retrospective when it fits.
+Include `.github\skills\learning-review\SKILL.md` in the routed task inputs.
+Lead starts alone; involve Fact Checker only for an uncertain claim that matters,
+and use the existing Scribe handoff rather than adding a research agent or fan-out.
+If time, sources, or tools are unavailable, record deferred/unverified status when
+possible and continue unrelated work. This workflow never grants new permissions.
 
 ## Issue Routing
 
