@@ -517,6 +517,14 @@ The workflow is defined in `.github/workflows/azure-deploy.yml` and includes:
 - Builds the solution
 - Runs tests
 
+The build job runs the dependency-free Squad setup suite with
+`node --test .github/scripts/squad-setup.test.mjs`. It checks setup JSON,
+roster/registry/charter consistency, routing, member labels, and the disabled
+Copilot auto-assign setting. The active workflows' JavaScript runs against
+read-only file fixtures and GitHub API mocks; these tests never create issues,
+change remote labels, assign work, or start a deployment. Run the same command
+locally when editing Squad setup files.
+
 ### Deploy Job (push + manual dispatch)
 - Installs Azure Developer CLI (azd)
 - Authenticates to Azure using OIDC (federated credentials)
