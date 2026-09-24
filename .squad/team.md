@@ -13,7 +13,7 @@
 | Name | Role | Charter | Status | Aliases |
 |------|------|---------|--------|---------|
 | Lead | Lead | .squad/agents/lead/charter.md | 🏗️ Active | Alex |
-| Designer | Product/Game UX Designer | .squad\agents\designer\charter.md | ⚛️ Active | Maya |
+| Designer | Product/Game UX Designer | .squad/agents/designer/charter.md | ⚛️ Active | Maya |
 | Frontend | Frontend Dev | .squad/agents/frontend/charter.md | ⚛️ Active | Jamie |
 | Backend | Backend Dev | .squad/agents/backend/charter.md | 🔧 Active | Sam |
 | Tester | QA Engineer | .squad/agents/tester/charter.md | 🧪 Active | Casey |

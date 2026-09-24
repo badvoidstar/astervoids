@@ -6,14 +6,6 @@ How to decide who handles what.
 
 | Work Type | Route To | Examples |
 |-----------|----------|----------|
-| Addressed to Alex | Lead | Alex, review this plan; Alex — Lead |
-| Addressed to Jamie | Frontend | Jamie, implement the agreed Canvas interaction; Jamie — Frontend Dev |
-| Addressed to Sam | Backend | Sam, review the transport contract; Sam — Backend Dev |
-| Addressed to Casey | Tester | Casey, verify these acceptance criteria; Casey — QA Engineer |
-| Addressed to Jordan | Infra | Jordan, review the deployment plan; Jordan — DevOps |
-| Addressed to Maya | Designer | Maya, explore this player flow; Maya — Product/Game UX Designer |
-| Addressed to Morgan | Scribe | Morgan, record the approved learning; Morgan — Scribe |
-| Addressed to Quinn | Fact Checker | Quinn, verify this claim; Quinn — Fact Checker |
 | Architecture, ticket triage, or cross-system review | Lead | Contract changes, scoped work plans, PR reviews |
 | Product/game ideas, new player flows, or non-mechanical UX/input changes before implementation | Designer | Explore options and player impact; pair with Lead for feasibility before Frontend implements |
 | Gameplay, Canvas UI, or game-specific adapters | Frontend | `index.html`, picker UX, entity adapters |
@@ -30,13 +22,29 @@ here only when their agent names also exist in the casting registry.
 
 ## Friendly-Name Resolution
 
+| Friendly Name | Canonical Member | Examples |
+|---------------|------------------|----------|
+| Alex | Lead | Alex, review this plan |
+| Maya | Designer | Maya, explore this player flow |
+| Jamie | Frontend | Jamie, implement the agreed Canvas interaction |
+| Sam | Backend | Sam, review the transport contract |
+| Casey | Tester | Casey, verify these acceptance criteria |
+| Jordan | Infra | Jordan, review the deployment plan |
+| Morgan | Scribe | Morgan, record the approved learning |
+| Quinn | Fact Checker | Quinn, verify this claim |
+
 Before work-type routing, resolve an explicitly addressed friendly name through
-the roster's Aliases column and the addressed-name rows above. Match a whole name
+the roster's Aliases column and the friendly-name table above. Match a whole name
 case-insensitively, not substrings or incidental mentions inside artifacts.
 For example, "Maya, explore this idea" routes to **Designer** (`designer`), not to
 a new agent named `maya`. Canonical names and role-based requests still work.
 If addressing multiple members, follow the existing multi-agent routing rules;
 ask rather than guess if a name is ambiguous.
+
+Keep conversational aliases outside the Routing Table: Ralph consumes that table
+for issue triage and deliberately excludes Scribe and Ralph from its assignable
+roster. Conversational dispatch to Morgan remains a coordinator responsibility,
+not a new issue-assignment route.
 
 Use friendly name + explicit role in user-facing conversation, but keep the
 canonical registry ID for dispatch and the canonical charter/history paths,
