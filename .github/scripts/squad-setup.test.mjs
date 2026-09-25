@@ -165,6 +165,23 @@ test('Ralph parses every configured Routing Table row', () => {
     routes.map(([workType, name]) => [workType, name]));
 });
 
+test('conversational aliases stay separate from Ralph issue-routing rules', () => {
+  const aliases = tableRows(routing, 'Friendly-Name Resolution')
+    .map(([alias, name]) => [alias, name]);
+  const expected = tableRows(team, 'Members').filter((row) => row[4])
+    .map(([name, , , , alias]) => [alias, name]);
+  assert.deepEqual(aliases, expected);
+  assert.equal(new Set(aliases.map(([alias]) => alias.toLowerCase())).size, aliases.length);
+  assert.equal(aliases.find(([alias]) => alias === 'Morgan')?.[1], 'Scribe');
+
+  const assignableMembers = new Set(parseRoster(team).map(({ name }) => name));
+  assert.equal(assignableMembers.has('Scribe'), false);
+  for (const rule of parseRoutingRules(routing)) {
+    assert.doesNotMatch(rule.workType, /^Addressed to /i);
+    assert.ok(assignableMembers.has(rule.agentName), `Unassignable issue route: ${rule.agentName}`);
+  }
+});
+
 test('configured examples route to their actual members, including Fact Checker', () => {
   for (const [, name, examples] of routes) {
     const title = examples.split(',')[0].replaceAll('`', '');

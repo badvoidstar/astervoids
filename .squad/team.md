@@ -10,17 +10,27 @@
 
 ## Members
 
-| Name | Role | Charter | Status |
-|------|------|---------|--------|
-| Lead | Lead | .squad/agents/lead/charter.md | 🏗️ Active |
-| Frontend | Frontend Dev | .squad/agents/frontend/charter.md | ⚛️ Active |
-| Backend | Backend Dev | .squad/agents/backend/charter.md | 🔧 Active |
-| Tester | QA Engineer | .squad/agents/tester/charter.md | 🧪 Active |
-| Infra | DevOps | .squad/agents/infra/charter.md | ⚙️ Active |
-| Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Always on |
-| Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Always on |
-| Rai | RAI Reviewer | .squad/agents/Rai/charter.md | 🛡️ Always on |
-| Fact Checker | Fact Checker | .squad/agents/fact-checker/charter.md | 🔍 Always on |
+| Name | Role | Charter | Status | Aliases |
+|------|------|---------|--------|---------|
+| Lead | Lead | .squad/agents/lead/charter.md | 🏗️ Active | Alex |
+| Designer | Product/Game UX Designer | .squad/agents/designer/charter.md | ⚛️ Active | Maya |
+| Frontend | Frontend Dev | .squad/agents/frontend/charter.md | ⚛️ Active | Jamie |
+| Backend | Backend Dev | .squad/agents/backend/charter.md | 🔧 Active | Sam |
+| Tester | QA Engineer | .squad/agents/tester/charter.md | 🧪 Active | Casey |
+| Infra | DevOps | .squad/agents/infra/charter.md | ⚙️ Active | Jordan |
+| Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Always on | Morgan |
+| Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Always on | |
+| Rai | RAI Reviewer | .squad/agents/Rai/charter.md | 🛡️ Always on | |
+| Fact Checker | Fact Checker | .squad/agents/fact-checker/charter.md | 🔍 Always on | Quinn |
+
+Use friendly name + role in conversation, for example **Maya — Product/Game UX
+Designer** or **Morgan — Scribe (Session Logger)**. The Name column remains the
+canonical identity; aliases are not additional members or a fictional re-cast.
+`.squad\routing.md` resolves addressed aliases to canonical members. Registry keys,
+charter identities, charter/history paths, ceremony participants, and special-agent
+identities stay unchanged. Ralph, Rai, and `@copilot` retain their existing names.
+These are coordinator conversation aliases, not a promise that every CLI selector
+or native task-panel display accepts aliases.
 
 
 ## Coding Agent
@@ -69,3 +79,9 @@
 - Keep the backend and its frontend-facing interface game-agnostic.
 - Keep the game utility layer reusable and non-game-specific.
 - Preserve the documented layering in `ARCHITECTURE.md` when planning or reviewing changes.
+
+## Design and Learning
+
+- Before non-mechanical player-facing implementation, Designer explores options and acceptance criteria with Lead checking feasibility; Frontend owns implementation.
+- Lead owns bounded active-session learning reviews, Fact Checker verifies uncertain claims when needed, and Scribe retains approved learnings. Routing and ceremonies invoke `.github\skills\learning-review\SKILL.md`.
+- Learning is evidence-based and approval-gated, not background monitoring, model training, or automatic upgrades.
