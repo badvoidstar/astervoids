@@ -218,6 +218,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
         obj = ObjectService.UpdateObject(
             session.Id,
             obj.Id,
+            creator.Id,
             new Dictionary<string, object?> { ["revision"] = 2 })!;
         var snapshot = SyncPayloadCodec.EncodeDict(
             obj.SchemaId, obj.Data, registry, session.Id);
@@ -279,7 +280,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
             var updatePayload = SyncPayloadCodec.EncodeDict(
                 schema.Id, data, registry, session.Id);
             var update = SyncPayloadCodec.DecodeDict(updatePayload, session.Id, registry);
-            obj = ObjectService.UpdateObject(session.Id, obj.Id, update)!;
+            obj = ObjectService.UpdateObject(session.Id, obj.Id, creator.Id, update)!;
             var snapshot = SyncPayloadCodec.EncodeDict(
                 obj.SchemaId, obj.Data, registry, session.Id);
             var decoded = SyncPayloadCodec.DecodeDict(snapshot, session.Id, registry);
@@ -317,7 +318,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
             session.Id);
         var terminalUpdate = SyncPayloadCodec.DecodeDict(
             terminalWirePayload, session.Id, registry);
-        obj = ObjectService.UpdateObject(session.Id, obj.Id, terminalUpdate)!;
+        obj = ObjectService.UpdateObject(session.Id, obj.Id, creator.Id, terminalUpdate)!;
 
         var snapshotPayload = SyncPayloadCodec.EncodeDict(
             obj.SchemaId, obj.Data, registry, session.Id);

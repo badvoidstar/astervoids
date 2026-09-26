@@ -71,8 +71,10 @@ public class SessionObject
     public byte SchemaId { get; set; } = 0;
 
     /// <summary>
-    /// Version number for optimistic concurrency control.
-    /// Incremented on each update.
+    /// Server-assigned ordering number for replication and reconciliation.
+    /// Incremented on each accepted update and ownership migration. Updates do
+    /// not carry an expected version: owner-authorized patches are last-write-wins
+    /// per field in service execution order, not optimistic compare-and-swap.
     /// </summary>
     public long Version { get; set; } = 1;
 

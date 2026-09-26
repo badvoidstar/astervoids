@@ -319,11 +319,27 @@ public class SessionHub : Hub
         }
     }
 
-    private static ObjectScope ParseScope(string scope) =>
-        scope.Equals("Session", StringComparison.OrdinalIgnoreCase) ? ObjectScope.Session : ObjectScope.Member;
+    private static bool TryParseObjectOptions(Session session, string? scope, string? ownerMemberId, out ObjectScope objectScope, out Guid? ownerGuid)
+    {
+        objectScope = ObjectScope.Member;
+        ownerGuid = null;
+        if (string.Equals(scope, "Session", StringComparison.OrdinalIgnoreCase))
+            objectScope = ObjectScope.Session;
+        else if (!string.Equals(scope, "Member", StringComparison.OrdinalIgnoreCase))
+            return false;
 
-    private static Guid? ParseOwnerGuid(string? ownerMemberId) =>
-        ownerMemberId != null && Guid.TryParse(ownerMemberId, out var parsed) ? parsed : null;
+        if (ownerMemberId == null)
+            return true;
+        if (!Guid.TryParse(ownerMemberId, out var parsed) || parsed == Guid.Empty)
+            return false;
+        lock (session.SyncRoot)
+        {
+            if (!session.Members.ContainsKey(parsed))
+                return false;
+        }
+        ownerGuid = parsed;
+        return true;
+    }
 
     /// <summary>
     /// Called when a client connects - add them to the AllClients group for broadcasts.
@@ -641,7 +657,7 @@ public class SessionHub : Hub
             // captured atomically by the service. The leaver has already been removed
             // from session.Members, so session.Members.Keys == result.RemainingMemberIds.
             var departureInfo = ToMemberLeftInfo(result);
-            var session = _sessionService.GetSession(result.SessionId);
+            var session = _sessionService.GetSessionForSynchronization(result.SessionId);
             if (session != null)
             {
                 await BroadcastToAllAsync(session, "OnMemberLeft",
@@ -714,6 +730,11 @@ public class SessionHub : Hub
     /// but SignalR reconnection could cause this), the sender's local state would diverge
     /// until reconciliation recovers it. See trackMemberSequence() in object-sync.js.
     /// </summary>
+    /// <remarks>
+    /// Scope accepts Member or Session, case-insensitively. Omission uses Member.
+    /// A null owner defaults to the caller; an explicit owner must be a nonempty
+    /// GUID identifying a current session member. Invalid options return null.
+    /// </remarks>
     /// <summary>
     /// Creates a new synchronized object in the session.
     /// Broadcast uses OthersInGroup — the sender registers the object from the
@@ -746,6 +767,12 @@ public class SessionHub : Hub
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(data, scope, ownerMemberId, clientValidAt));
 
+        if (!TryParseObjectOptions(session, scope, ownerMemberId, out var objectScope, out var ownerGuid))
+        {
+            _logger.LogWarning("CreateObject rejected invalid scope or owner");
+            return null;
+        }
+
         // Phase 3 envelope: decode the wire payload to the server-internal
         // dict shape that ObjectService consumes. SchemaId=0 → MessagePack
         // dict; SchemaId>=1 → positional codec via the per-session registry.
@@ -758,7 +785,7 @@ public class SessionHub : Hub
             member.SessionId,
             _schemaRegistry);
 
-        var obj = _objectService.CreateObject(member.SessionId, member.Id, ParseScope(scope), dataDict, ParseOwnerGuid(ownerMemberId), clientValidAt, serverTimestamp, inboundSchemaId);
+        var obj = _objectService.CreateObject(member.SessionId, member.Id, objectScope, dataDict, ownerGuid, clientValidAt, serverTimestamp, inboundSchemaId);
         if (obj == null)
         {
             _logger.LogWarning("CreateObject failed - could not create object in session");
@@ -786,6 +813,8 @@ public class SessionHub : Hub
     /// Updates multiple objects atomically.
     /// Ownership is enforced inside the service layer (atomically with the update) so
     /// correctness does not depend on this hub's pre-checks.
+    /// Accepted patches merge in request order, last write wins per field. Each
+    /// occurrence receives its own server-assigned version; no expected version is checked.
     /// </summary>
     /// <param name="clientValidAt">
     /// Owner's NTP-aligned server-time estimate of the simulation tick that
@@ -810,22 +839,16 @@ public class SessionHub : Hub
         var session = operation.Session;
 
         // Phase 3 envelope: decode each request's SyncPayload to the dict
-        // shape the service consumes. We cache the original SyncPayload by
-        // handle so the broadcast can echo the SAME bytes the sender sent
+        // shape the service consumes. Keep the original SyncPayload per request
+        // so the broadcast can echo the SAME bytes the sender sent
         // (avoids a wasteful decode-then-reencode round-trip and preserves
         // any compactness the sender's encoder achieved).
-        //
-        // Single pass: the dictionary write is last-write-wins, matching the
-        // previous GroupBy(...).Last() semantics for duplicate handles in one
-        // batch. Materialized before the metrics estimate so the IEnumerable is
-        // only ever enumerated once.
+        // Materialize before the metrics estimate to enumerate the input once.
         var updatesList = updates as IReadOnlyList<ObjectUpdateRequest> ?? updates.ToList();
-        var requestPayloadByHandle = new Dictionary<int, SyncPayload>(updatesList.Count);
         var serviceUpdates = new List<ObjectUpdate>(updatesList.Count);
         for (int i = 0; i < updatesList.Count; i++)
         {
             var u = updatesList[i];
-            requestPayloadByHandle[u.Handle] = u.Data;
             serviceUpdates.Add(new ObjectUpdate(
                 u.Handle, SyncPayloadCodec.DecodeDict(u.Data, member.SessionId, _schemaRegistry)));
         }
@@ -835,20 +858,27 @@ public class SessionHub : Hub
 
         var updatedObjects = _objectService.UpdateObjects(member.SessionId, member.Id, serviceUpdates, clientValidAt, serverTimestamp);
 
+        // The service returns an order-preserving subsequence. Ownership/handle
+        // eligibility cannot change within its lock, including repeated handles.
+        // Match each accepted occurrence once for both its ack and its original
+        // delta; indexing payloads by handle would lose earlier disjoint patches.
+        var versions = new long[updatesList.Count];
+        var updateInfos = new List<ObjectUpdateInfo>(updatedObjects.Count);
+        int accepted = 0;
+        for (int i = 0; i < updatesList.Count && accepted < updatedObjects.Count; i++)
+        {
+            var obj = updatedObjects[accepted];
+            var request = updatesList[i];
+            if (request.Handle != obj.Handle) continue;
+            versions[i] = obj.Version;
+            updateInfos.Add(new ObjectUpdateInfo(obj.Handle, request.Data, obj.Version));
+            accepted++;
+        }
+
         long memberSequence = 0;
         if (updatedObjects.Count > 0)
         {
             memberSequence = NextMemberSequence(session, member);
-            // Build broadcast payload from the cached request payloads (verbatim
-            // bytes from the sender) — no need to re-encode the dict the service
-            // already merged into obj.Data.
-            var updateInfos = new List<ObjectUpdateInfo>(updatedObjects.Count);
-            foreach (var o in updatedObjects)
-            {
-                if (requestPayloadByHandle.TryGetValue(o.Handle, out var payload))
-                    updateInfos.Add(new ObjectUpdateInfo(o.Handle, payload, o.Version));
-            }
-
             // ValidAt is a single batch-level trailing argument. ObjectService
             // resolves it against the newest prior timestamp in the accepted
             // batch, so the value remains monotonic for every updated object.
@@ -861,23 +891,6 @@ public class SessionHub : Hub
                 updateInfos, member.Id, senderSequence, memberSequence, serverTimestamp, senderSendIntervalMs, batchValidAt);
         }
 
-        // Positional acknowledgement: entry i is the version assigned to request
-        // element i, or 0 when that element was not applied.
-        //
-        // ObjectService.UpdateObjects preserves request order and returns an
-        // order-preserving *subsequence* of the requested updates (it appends one
-        // result per accepted update, in iteration order). That invariant lets the
-        // two lists be aligned with a single forward walk, and it stays correct when
-        // one batch carries the same handle more than once — each occurrence is
-        // applied separately and is matched to its own request index in order.
-        var versions = new long[updatesList.Count];
-        int accepted = 0;
-        for (int i = 0; i < updatesList.Count && accepted < updatedObjects.Count; i++)
-        {
-            if (updatesList[i].Handle != updatedObjects[accepted].Handle) continue;
-            versions[i] = updatedObjects[accepted].Version;
-            accepted++;
-        }
         return new UpdateObjectsResponse(versions, memberSequence, serverTimestamp);
     }
 
@@ -937,6 +950,12 @@ public class SessionHub : Hub
     /// Ownership check, creation of replacements, and deletion of the original all happen
     /// atomically under the session lock inside the service layer.
     /// </summary>
+    /// <remarks>
+    /// Scope accepts Member or Session, case-insensitively. Omission uses Session.
+    /// A null owner defaults to the caller; an explicit owner must identify a
+    /// current session member. Invalid options reject without deleting the parent.
+    /// An empty replacement list remains a valid deletion when options are valid.
+    /// </remarks>
     /// <param name="clientValidAt">
     /// Owner's NTP-aligned server-time estimate of the simulation tick that
     /// produced the replacement (for asteroid splits this is the moment of
@@ -962,8 +981,11 @@ public class SessionHub : Hub
 
         _metrics.OnHubInvocation(member.Id, EstimatePayloadBytes(deleteObjectId, replacements, scope, ownerMemberId, clientValidAt));
 
-        var objectScope = ParseScope(scope);
-        var ownerGuid = ParseOwnerGuid(ownerMemberId);
+        if (!TryParseObjectOptions(session, scope, ownerMemberId, out var objectScope, out var ownerGuid))
+        {
+            _logger.LogWarning("ReplaceObject rejected invalid scope or owner");
+            return null;
+        }
 
         // Build replacement specs; service enforces ownership atomically and stamps
         // the validated collision-time on each child's ValidAt. Phase 3 envelope:
@@ -983,8 +1005,7 @@ public class SessionHub : Hub
         var createdObjects = _objectService.ReplaceObject(member.SessionId, deleteObjectId, member.Id, specs, clientValidAt, serverTimestamp);
         if (createdObjects == null)
         {
-            _logger.LogWarning("ReplaceObject failed - object {ObjectId} not found, not owned by member {MemberId}, or session not active",
-                deleteObjectId, member.Id);
+            _logger.LogWarning("ReplaceObject rejected - invalid target, ownership, replacement options, or session state");
             return null;
         }
 

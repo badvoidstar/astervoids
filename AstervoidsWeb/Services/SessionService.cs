@@ -337,6 +337,10 @@ public class SessionService : ISessionService
     }
 
     public Session? GetSession(Guid sessionId)
+        => GetSessionForSynchronization(sessionId)?.CreateSnapshot();
+
+    /// <inheritdoc/>
+    public Session? GetSessionForSynchronization(Guid sessionId)
         => _sessions.TryGetValue(sessionId, out var session) ? session : null;
 
     public Member? GetMemberByConnectionId(string connectionId)
@@ -348,7 +352,7 @@ public class SessionService : ISessionService
     }
 
     public Session? GetSessionByConnectionId(string connectionId)
-        => ResolveConnectionToSession(connectionId)?.session;
+        => ResolveConnectionToSession(connectionId)?.session.CreateSnapshot();
 
     public (Member Member, Session Session)? GetMemberAndSessionByConnectionId(string connectionId)
     {

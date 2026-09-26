@@ -25,8 +25,10 @@ public sealed class SyncSchemaRegistry
     /// Replace the schema set for a session in one shot. Called from the hub
     /// when processing <c>CreateSession</c>'s metadata.schemas. The replacement
     /// is atomic per call but readers see either the old set or the new set
-    /// (no in-between state).
+    /// (no in-between state). Duplicate IDs reject the entire replacement;
+    /// the previous registration remains intact.
     /// </summary>
+    /// <exception cref="InvalidOperationException">A schema ID occurs more than once.</exception>
     public void SetSessionSchemas(Guid sessionId, IEnumerable<PositionalSchemaCodec.Schema>? schemas)
     {
         if (schemas is null)
@@ -37,7 +39,8 @@ public sealed class SyncSchemaRegistry
         var map = new ConcurrentDictionary<byte, PositionalSchemaCodec.Schema>();
         foreach (var s in schemas)
         {
-            map[s.Id] = s;
+            if (!map.TryAdd(s.Id, s))
+                throw new InvalidOperationException("Schema IDs must be unique within a session");
         }
         _bySession[sessionId] = map;
     }
@@ -95,6 +98,7 @@ public sealed class SyncSchemaRegistry
             return Array.Empty<PositionalSchemaCodec.Schema>();
 
         var schemas = new List<PositionalSchemaCodec.Schema>();
+        var ids = new HashSet<byte>();
         if (raw is not System.Collections.IEnumerable list)
             throw new InvalidOperationException("metadata.schemas must be an array");
 
@@ -120,6 +124,8 @@ public sealed class SyncSchemaRegistry
                 throw new InvalidOperationException("metadata.schemas entry missing 'id' or 'fields'");
 
             byte id = Convert.ToByte(idVal);
+            if (!ids.Add(id))
+                throw new InvalidOperationException("Schema IDs must be unique within a session");
             var fields = new List<PositionalSchemaCodec.FieldSpec>();
             if (fieldsVal is not System.Collections.IEnumerable fieldList)
                 throw new InvalidOperationException($"schema {id}: 'fields' must be an array");

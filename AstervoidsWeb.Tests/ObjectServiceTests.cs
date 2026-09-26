@@ -90,6 +90,138 @@ public class ObjectServiceTests : TestBase
         obj.Should().BeNull();
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(2)]
+    [InlineData(int.MaxValue)]
+    public void CreateObject_UndefinedScope_RejectsWithoutAllocatingAHandle(int scope)
+    {
+        var (session, owner) = CreateTestSession();
+
+        ObjectService.CreateObject(session.Id, owner.Id, (ObjectScope)scope).Should().BeNull();
+
+        ObjectService.GetSessionObjects(session.Id).Should().BeEmpty();
+        ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Member)!.Handle.Should().Be(1);
+    }
+
+    [Theory]
+    [InlineData("scope")]
+    [InlineData("empty-owner")]
+    [InlineData("unknown-owner")]
+    [InlineData("foreign-owner")]
+    [InlineData("departed-owner")]
+    public void ReplaceObject_InvalidLaterChild_RejectsEntireOperation(string invalid)
+    {
+        var (session, owner, other) = CreateTestSessionWithClient();
+        var parent = ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["value"] = 1 })!;
+        var scope = invalid == "scope" ? (ObjectScope)99 : ObjectScope.Session;
+        Guid? ownerOverride = invalid switch
+        {
+            "empty-owner" => Guid.Empty,
+            "unknown-owner" => Guid.NewGuid(),
+            "foreign-owner" => CreateTestSession("another-session").creator.Id,
+            "departed-owner" => other.Id,
+            _ => null
+        };
+        if (invalid == "departed-owner")
+            SessionService.LeaveSession(other.ConnectionId);
+
+        var result = ObjectService.ReplaceObject(session.Id, parent.Id, owner.Id,
+        [
+            new(ObjectScope.Session, new Dictionary<string, object?> { ["child"] = 1 }),
+            new(scope, new Dictionary<string, object?> { ["child"] = 2 }, ownerOverride)
+        ]);
+
+        result.Should().BeNull();
+        ObjectService.GetSessionObjects(session.Id).Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(parent);
+        ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Member)!.Handle
+            .Should().Be(parent.Handle + 1, "rejected children must not even consume handles");
+    }
+
+    [Fact]
+    public void ReplaceObject_DefaultAndExplicitCurrentOwner_ArePreserved()
+    {
+        var (session, owner, other) = CreateTestSessionWithClient();
+        var parent = ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Session)!;
+
+        var children = ObjectService.ReplaceObject(session.Id, parent.Id, owner.Id,
+        [
+            new(ObjectScope.Member, new Dictionary<string, object?>()),
+            new(ObjectScope.Session, new Dictionary<string, object?>(), other.Id)
+        ])!;
+
+        children.Select(child => child.OwnerMemberId).Should().Equal(owner.Id, other.Id);
+        children.Should().OnlyContain(child => child.CreatorMemberId == owner.Id);
+        ObjectService.GetObject(session.Id, parent.Id).Should().BeNull();
+    }
+
+    [Fact]
+    public void UpdateObject_RejectsOtherMembersAndMissingCallersWithoutMutation()
+    {
+        var (session, owner, other) = CreateTestSessionWithClient();
+        var obj = ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["value"] = 1 })!;
+        IObjectService service = ObjectService;
+        foreach (var caller in new[] { other.Id, Guid.Empty, Guid.NewGuid() })
+            service.UpdateObject(session.Id, obj.Id, caller,
+                new Dictionary<string, object?> { ["value"] = 2 }).Should().BeNull();
+
+        service.GetObject(session.Id, obj.Id).Should().BeEquivalentTo(obj);
+    }
+
+    [Fact]
+    public void UpdateObject_AfterMigration_OnlyCurrentOwnerCanUpdate()
+    {
+        var (session, owner, other) = CreateTestSessionWithClient();
+        var obj = ObjectService.CreateObject(session.Id, other.Id, ObjectScope.Session)!;
+        SessionService.LeaveSession(other.ConnectionId);
+        var migrated = ObjectService.GetObject(session.Id, obj.Id)!;
+
+        ObjectService.UpdateObject(session.Id, obj.Id, other.Id,
+            new Dictionary<string, object?> { ["x"] = 1 }).Should().BeNull();
+        ObjectService.GetObject(session.Id, obj.Id).Should().BeEquivalentTo(migrated);
+        ObjectService.UpdateObject(session.Id, obj.Id, owner.Id,
+            new Dictionary<string, object?> { ["x"] = 2 })!.Version.Should().Be(migrated.Version + 1);
+    }
+
+    [Fact]
+    public void UpdateObject_RejectsDepartedOwnerOfRetainedObjectAndDestroyedSession()
+    {
+        var (session, owner) = CreateTestSession();
+        var obj = ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Session)!;
+        SessionService.LeaveSession(owner.ConnectionId);
+
+        ObjectService.UpdateObject(session.Id, obj.Id, owner.Id,
+            new Dictionary<string, object?> { ["x"] = 1 }).Should().BeNull();
+        ObjectService.GetObject(session.Id, obj.Id).Should().BeEquivalentTo(obj);
+
+        SessionService.ForceDestroySession(session.Id);
+        ObjectService.UpdateObject(session.Id, obj.Id, owner.Id,
+            new Dictionary<string, object?> { ["x"] = 1 }).Should().BeNull();
+    }
+
+    [Fact]
+    public void UpdateObjects_RepeatedHandle_MergesInOrderAndReturnsPerOccurrenceSnapshots()
+    {
+        var (session, owner) = CreateTestSession();
+        var obj = ObjectService.CreateObject(session.Id, owner.Id, ObjectScope.Session)!;
+
+        var results = ObjectService.UpdateObjects(session.Id, owner.Id,
+        [
+            new(obj.Handle, new Dictionary<string, object?> { ["x"] = 1 }),
+            new(obj.Handle, new Dictionary<string, object?> { ["y"] = 2 }),
+            new(obj.Handle, new Dictionary<string, object?> { ["x"] = 3 })
+        ]);
+
+        results.Select(result => result.Version).Should().Equal(2, 3, 4);
+        results[0].Data.Should().BeEquivalentTo(new Dictionary<string, object?> { ["x"] = 1 });
+        results[1].Data.Should().BeEquivalentTo(new Dictionary<string, object?> { ["x"] = 1, ["y"] = 2 });
+        results[2].Data.Should().BeEquivalentTo(new Dictionary<string, object?> { ["x"] = 3, ["y"] = 2 });
+        ObjectService.GetObject(session.Id, obj.Id)!.Data.Should().BeEquivalentTo(results[2].Data);
+    }
+
     [Fact]
     public void UpdateObject_ShouldMergeData()
     {
@@ -102,7 +234,7 @@ public class ObjectServiceTests : TestBase
         });
 
         // Act
-        var updated = ObjectService.UpdateObject(session.Id, obj!.Id, new Dictionary<string, object?>
+        var updated = ObjectService.UpdateObject(session.Id, obj!.Id, creator.Id, new Dictionary<string, object?>
         {
             ["x"] = 150.0,
             ["z"] = 50.0
@@ -300,7 +432,7 @@ public class ObjectServiceTests : TestBase
         ObjectService.DeleteObject(session.Id, obj!.Id, creator.Id);
 
         // Act - update on deleted object
-        var updated = ObjectService.UpdateObject(session.Id, obj.Id, new Dictionary<string, object?>
+        var updated = ObjectService.UpdateObject(session.Id, obj.Id, creator.Id, new Dictionary<string, object?>
         {
             ["x"] = 200.0
         });
@@ -432,8 +564,8 @@ public class ObjectServiceTests : TestBase
         });
 
         // Update the object a few times to advance the version
-        ObjectService.UpdateObject(session.Id, asteroid!.Id, new Dictionary<string, object?> { ["x"] = 0.6 });
-        ObjectService.UpdateObject(session.Id, asteroid.Id, new Dictionary<string, object?> { ["x"] = 0.7 });
+        ObjectService.UpdateObject(session.Id, asteroid!.Id, client.Id, new Dictionary<string, object?> { ["x"] = 0.6 });
+        ObjectService.UpdateObject(session.Id, asteroid.Id, client.Id, new Dictionary<string, object?> { ["x"] = 0.7 });
 
         // Act — client leaves; migration version is included in the unified result
         var departure = SessionService.LeaveSession("connection-2");
@@ -477,8 +609,8 @@ public class ObjectServiceTests : TestBase
             ["type"] = "asteroid"
         });
         // Update obj1 twice → version 3
-        ObjectService.UpdateObject(session.Id, obj1!.Id, new Dictionary<string, object?> { ["x"] = 1 });
-        ObjectService.UpdateObject(session.Id, obj1.Id, new Dictionary<string, object?> { ["x"] = 2 });
+        ObjectService.UpdateObject(session.Id, obj1!.Id, client.Id, new Dictionary<string, object?> { ["x"] = 1 });
+        ObjectService.UpdateObject(session.Id, obj1.Id, client.Id, new Dictionary<string, object?> { ["x"] = 2 });
 
         var obj2 = ObjectService.CreateObject(session.Id, client.Id, ObjectScope.Session, new Dictionary<string, object?>
         {
@@ -556,7 +688,7 @@ public class ObjectServiceTests : TestBase
         var receiveUpdate = receiveCreate + 500;
         var staleClientStamp = receiveCreate - 200; // older than obj.ValidAt
         var updated = ObjectService.UpdateObject(
-            session.Id, obj.Id,
+            session.Id, obj.Id, creator.Id,
             new Dictionary<string, object?> { ["x"] = 2.0 },
             clientValidAt: staleClientStamp,
             serverReceiveTimeMs: receiveUpdate);
@@ -617,7 +749,7 @@ public class ObjectServiceTests : TestBase
         // than allowing per-object monotonic clamps to diverge.
         var newestPreviousStamp = receiveCreate + 700;
         ObjectService.UpdateObject(
-            session.Id, obj2.Id,
+            session.Id, obj2.Id, creator.Id,
             new Dictionary<string, object?> { ["x"] = 3.0 },
             clientValidAt: newestPreviousStamp,
             serverReceiveTimeMs: newestPreviousStamp);

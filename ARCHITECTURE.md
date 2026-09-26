@@ -78,6 +78,11 @@ These rules are enforced purely by module structure and must not be violated whe
   update DTOs keep their separate shape.
 - **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
 - **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
+- **Transport reports uncertain state; replication decides how to recover.**
+  `SessionClient` emits `onSessionStateUncertain(reason, epoch)` after a transport
+  reconnect or an ambiguous leave failure. `ObjectSync.init()` subscribes and
+  starts its existing epoch-guarded reconciliation. `SessionClient` has no
+  dependency on a global `ObjectSync` and remains usable without replication.
 - **Send rate is decoupled from frame rate.** The game calls `ObjectSync.tick(frameTimeSec)` at its existing reconciliation pivot; ObjectSync accumulates elapsed time against its RTT-derived interval. Immediate updates retain urgency under backpressure; at most one update invocation is in flight, with no catch-up bursts after stalls.
 - **`ReplicationRuntime` is pull-driven.** It never owns a frame loop, calls
   `ObjectSync.tick`, sends a mutation, or subscribes to SignalR. The game invokes
@@ -185,6 +190,10 @@ The game continues to own orchestration in `wwwroot/index.html`:
   expiration, and wave progression. Their orchestration and remote-ship
   reconciliation points remain separate; hidden-tab timing is not the
   deterministic foreground accumulator.
+- Prefer `test-support/inline-game.mjs` for behavior tests of inline declarations
+  rather than copying their implementation. Source-order guards still protect
+  intentional foreground/hidden pivots; normalize line endings before matching
+  multiline source markers so a Windows checkout exercises the same assertions.
 - `calculateGameState` computes score awards, damage, and historical
   player-count bonuses from explicit inputs without mutating them. The
   player-count bonus is identity-based, not a concurrent-ship count: every
@@ -336,7 +345,7 @@ callback delivery and suppress the result if a listener resets the session.
 |---|---|---|---|
 | `createSession(metadata?)` | `CreateSession` | `metadata?` | `{ session, member }` or `null` |
 | `joinSession(sessionId, evictMemberId?)` | `JoinSession` | `sessionId, evictMemberId?` | `{ session, member }` or `null` |
-| `leaveSession()` | `LeaveSession` | — | `void` (broadcast only) |
+| `leaveSession()` | `LeaveSession` | — | `boolean`; failed/uncertain leaves return `false` and preserve recoverable identity |
 | `getActiveSessions()` | `GetActiveSessions` | — | `{ sessions[], maxSessions, canCreateSession }` |
 | `createObject(data, scope, ownerMemberId?, clientValidAt?)` | `CreateObject` | `data, scope, ownerMemberId?, clientValidAt?` | `{ objectInfo, memberSequence }` |
 | `updateObjects(updates, senderSequence, senderSendIntervalMs, clientValidAt?)` | `UpdateObjects` | `updates[], senderSequence, senderSendIntervalMs, clientValidAt?` | `{ versions{}, memberSequence, serverTimestamp }` |
@@ -369,7 +378,7 @@ These methods have no corresponding hub RPC.
 
 ### SessionClient Event Callbacks
 
-`SessionClient.on(name, fn)` registers callbacks from a fixed set of **16** names. The regular mapping is `OnFooBar` (hub broadcast) → `onFooBar` (JS callback). All handler arguments are walked through `GuidUtils.transformBinaryGuids` by `guard()` before dispatch, so callers never observe raw `Uint8Array` GUIDs.
+`SessionClient.on(name, fn)` registers callbacks from its supported event set. The regular mapping is `OnFooBar` (hub broadcast) → `onFooBar` (JS callback). Typed identifier arguments are normalized before dispatch; opaque event payload bytes are not interpreted as GUIDs.
 
 | JS callback | Hub source | Notes |
 |---|---|---|
@@ -379,6 +388,8 @@ These methods have no corresponding hub RPC.
 | `onSessionCreated` | `createSession()` response | Not a hub broadcast; fired after local state is populated from the RPC response |
 | `onSessionJoined` | `joinSession()` response | Not a hub broadcast |
 | `onSessionLeft` | `leaveSession()` | Not a hub broadcast |
+| `onSessionTransition` | Local session lifecycle | `(kind, epoch)`; invalidates old asynchronous state |
+| `onSessionStateUncertain` | Reconnected transport / failed leave | `(reason, epoch)` with `reconnected` or `leaveFailed`; recovery subscribers run before reconnect's `onConnected` notification |
 | `onMemberJoined` | `OnMemberJoined` | `(memberInfo, senderMemberId, memberSequence)` |
 | `onMemberLeft` | `OnMemberLeft` | `(info, senderMemberId, memberSequence)`; may be immediately followed by `onRoleChanged` if the local member was promoted |
 | `onRoleChanged` | Derived from `OnMemberLeft` | Fired only when `info.promotedMemberId === currentMember.id`; arg: `(newRole)` |
@@ -386,6 +397,7 @@ These methods have no corresponding hub RPC.
 | `onObjectsUpdated` | `OnObjectsUpdated` | Arg reorder: hub sends `serverTimestamp` at position 4; callback puts it at position 1 → `(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs)` |
 | `onObjectDeleted` | `OnObjectDeleted` | `(objectId, senderMemberId, memberSequence)` |
 | `onObjectReplaced` | `OnObjectReplaced` | `(event, senderMemberId, memberSequence)` |
+| `onObjectEvent` | `OnObjectEvent` | `(eventInfo, senderMemberId, memberSequence, validAt)`; opaque transient payload, not replayed to later joiners |
 | `onSessionsChanged` | `OnSessionsChanged` | No args; signal only — caller must call `getActiveSessions()` to get the updated list |
 | `onSessionExpired` | `OnSessionExpired` | `(reason)` — server-driven session destroy via `SessionCleanupService` |
 | `onError` | Internal | `(errorMessage)` — fired on connection or RPC errors |
@@ -395,13 +407,21 @@ older response snapshot. `SessionClient` queues those broadcasts, folds them
 into the installed member list in arrival order, then dispatches their callbacks
 after the session callback has initialized snapshot consumers.
 
+`onConnected` reports transport readiness, not completed state reconciliation.
+The uncertainty notification starts recovery without awaiting its snapshot.
+If that snapshot no longer recognizes the member, ObjectSync's existing
+`onReconciliationFailed` callback drives the game-owned auto-rejoin path.
+An ambiguous leave emits the same recovery signal while retaining the current
+identity. Superseded connections and session epochs cannot request recovery for
+a replacement session.
+
 ### ObjectSync Public API
 
 #### Lifecycle / Config
 
 | Method | Description |
 |---|---|
-| `init()` | Subscribes to the six `SessionClient` events the sync layer consumes (`onObjectCreated`, `onObjectsUpdated`, `onObjectDeleted`, `onObjectReplaced`, `onSessionJoined`, `onSessionLeft`) |
+| `init()` | Subscribes to object CRUD/events, session transitions/join/leave, and `onSessionStateUncertain`; the sync layer owns reconciliation |
 | `configure(config)` | Sets `nominalFrameTime`, `minFrameTime`, `deltaEncoding`, `adaptiveSendRate`, and `fieldMap` |
 | `clear()` | Resets all local state (objects, sequences, pending updates); called on session leave |
 
@@ -586,7 +606,7 @@ graph TB
 
     subgraph "ObjectService"
         direction TB
-        OS_OPS["Operations (all enforce ownership + lifecycle<br/>under session.SyncRoot):<br/>CreateObject → Id, Version=1, Owner<br/>UpdateObject → merge, Version++ (no ownership check)<br/>UpdateObjects → Batch, owner-filtered atomically<br/>DeleteObject → ownership-checked TryRemove<br/>ReplaceObject → atomic delete + create children"]
+        OS_OPS["Operations (all enforce ownership + lifecycle<br/>under session.SyncRoot):<br/>CreateObject → Id, Version=1, validated Owner/Scope<br/>UpdateObject → owner-checked merge, Version++<br/>UpdateObjects → Batch, owner-filtered atomically<br/>DeleteObject → ownership-checked TryRemove<br/>ReplaceObject → validate all children, then atomic delete + create"]
     end
 
     subgraph "FruitNameGenerator (ISessionNameGenerator)"
@@ -707,11 +727,19 @@ All mutations run under `Session.SyncRoot`. Ownership and session lifecycle are
 validated atomically inside `ObjectService` itself (the hub still pre-checks for
 fast early-return / logging, but correctness does not rely on it).
 
+Object updates use **last-write-wins field merging**, not optimistic concurrency.
+The wire request has no expected-version field. Each accepted patch merges into
+the latest state and receives a new server-assigned version; disjoint fields
+accumulate, and later writes to the same field win. Client version checks reject
+stale incoming state and acknowledgements; they are not a server-side
+compare-and-swap precondition. Adding expected-version rejection would be a
+separate wire-contract and behavior change.
+
 ```mermaid
 flowchart TB
-    subgraph "UpdateObject (single, no ownership check)"
-        U1["UpdateObject(sessionId, objectId, data)"]
-        U2{"Session active?<br/>Object exists?"}
+    subgraph "UpdateObject (single, ownership enforced in service)"
+        U1["UpdateObject(sessionId, objectId, ownerMemberId, data)"]
+        U2{"Session active?<br/>Caller is a current member?<br/>Object exists and caller owns it?"}
         U4["Replace obj.Data with merged copy<br/>obj.Version++<br/>obj.UpdatedAt = now"]
         U5["Return updated SessionObject"]
         UF["Return null (failure)"]
@@ -746,7 +774,7 @@ flowchart TB
 
     subgraph "ReplaceObject (atomic delete + create)"
         R1["ReplaceObject(sessionId, deleteObjectId,<br/>ownerMemberId, replacements[])"]
-        R2{"Session active AND<br/>delete target owned<br/>by ownerMemberId?"}
+        R2{"Session active AND<br/>delete target owned by current caller?<br/>All child scopes and explicit owners valid?"}
         R3["Delete target,<br/>create each replacement<br/>(Version=1, owner = caller or override)"]
         R4["Return created list"]
         R5["Return null (no changes applied)"]
@@ -868,7 +896,7 @@ sequenceDiagram
     HUB->>HUB: GetMemberByConnectionId(connectionId)
     HUB->>HUB: Filter updates: only objects where<br/>obj.OwnerMemberId == caller.Id
     HUB->>OS: UpdateObjects(sessionId, authorizedUpdates)
-    OS-->>HUB: List of successfully updated objects<br/>(partial success — failed versions skipped)
+    OS-->>HUB: List of successfully updated objects<br/>(partial success — unknown/unowned objects skipped)
     HUB->>HUB: memberSequence = Interlocked.Increment(member.EventSequence)
     HUB->>HUB: serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
 
@@ -1058,7 +1086,7 @@ sequenceDiagram
     OS->>SC: updateObjects(updates, senderSeq, senderSendIntervalMs)
     SC->>HUB: Invoke UpdateObjects(updates, senderSeq, senderSendIntervalMs, clientValidAt?)
 
-    Note over HUB: Server processes batch atomically<br/>Version check per object<br/>memberSequence = Interlocked.Increment<br/>validAt = clamp(clientValidAt, ServerTimestamp ± 2s) ?? ServerTimestamp
+    Note over HUB: Server processes batch atomically<br/>Ownership/lifecycle checks; patches merge in request order<br/>memberSequence = Interlocked.Increment<br/>validAt = clamp(clientValidAt, ServerTimestamp ± 2s) ?? ServerTimestamp
 
     par Response to sender
         HUB-->>SC: Response {versions{}, memberSequence, serverTimestamp}
@@ -1560,6 +1588,21 @@ flowchart TB
     end
 ```
 
+## Durable State and Object Events
+
+Object records are the recovery contract: joins and reconciliation receive their
+latest authoritative state. Object events are transient notifications, not an
+event log; they are not replayed to a late joiner or recovered as occurrences from
+a snapshot. Sequence-gap recovery can restore records, but cannot reconstruct an
+event that left no durable state.
+
+Gameplay that must survive a reconnect or late join must therefore serialize the
+necessary state through its game adapter. Use events for notifications where a
+missed occurrence is acceptable, or pair them with a durable record that permits
+recovery. New replicated fields require an explicit schema/default strategy and
+JavaScript/C# compatibility coverage; a new event is not a shortcut around that
+review. Generic transport and server layers remain opaque to the game's fields.
+
 ## Delta Encoding & Deferred Confirmation
 
 ```mermaid
@@ -1631,12 +1674,13 @@ sequenceDiagram
 
     alt Reconnection succeeds (transport restored)
         SR->>C: onreconnected(connectionId)
-        C->>C: ObjectSync.triggerReconciliation()
+        C->>C: onSessionStateUncertain("reconnected", epoch)<br/>ObjectSync subscriber starts reconciliation
         C->>HUB: GetSessionState()
+        C->>C: onConnected fires (transport ready;<br/>snapshot still pending)
 
         alt Server still has the member
             HUB-->>C: Full snapshot + memberSequences
-            C->>C: Sync local objects:<br/>• Add missing<br/>• Update stale<br/>• Remove ghosts<br/>• Reset sequences<br/>onConnected fires → unfreeze gameplay
+            C->>C: Sync local objects:<br/>• Add missing<br/>• Update stale<br/>• Remove ghosts<br/>• Reset sequences<br/>onReconciliationComplete fires
         else Server already processed disconnect
             HUB-->>C: null
             C->>C: onReconciliationFailed → re-freeze<br/>and call attemptAutoRejoin (full path below)
@@ -1682,9 +1726,32 @@ Ownership and session lifecycle are validated **inside the service layer** under
 `Session.SyncRoot`, atomically with the mutation. Hub-layer pre-checks remain
 only as fast early-return / logging — they are not relied on for correctness.
 
+`GetSession` and `GetSessionByConnectionId` return detached, lock-consistent
+snapshots, including independent member/object records, handle indexes, metadata,
+and supported mutable payload containers. Locking or modifying such a snapshot
+does not synchronize with or mutate live authority.
+
+Hot infrastructure instead uses the explicit `GetSessionForSynchronization`
+lookup, without cloning an entire session per object update. Its live result
+requires the existing lock ordering and in-lock lifecycle/authorization checks.
+Combined member/session lookups, cleanup enumeration, and lifecycle result
+records likewise remain documented live infrastructure references, not immutable
+public data. This boundary hardening does not replace the session locks or turn
+the whole service model into an immutable API.
+
+Create/replace scope strings accept `Member` or `Session`, case-insensitively;
+omission retains each RPC's existing default. Only a null/omitted owner defaults
+to the caller. Explicit malformed, empty, unknown, or departed owners reject
+normally rather than silently changing ownership. Services revalidate membership
+under the session lock. Replacements validate every child's scope and explicit
+owner before creating children, allocating their handles, or deleting the parent;
+invalid input leaves the original state intact. A valid empty replacement list
+remains an intentional deletion.
+
 ```mermaid
 flowchart TB
     subgraph "ObjectService (authoritative — under SyncRoot)"
+        OS_SINGLE["UpdateObject: requires current caller ID<br/>and checks object ownership"]
         OS_UPD["UpdateObjects: filters batch to objects<br/>where OwnerMemberId == ownerMemberId"]
         OS_DEL["DeleteObject(sessionId, objectId, ownerMemberId):<br/>verifies ownership before TryRemove"]
         OS_REP["ReplaceObject(sessionId, deleteId,<br/>ownerMemberId, replacements[]):<br/>verifies ownership of delete target<br/>before atomic delete + create"]
@@ -1834,6 +1901,12 @@ object applies each occurrence separately, and each occurrence is acknowledged
 at its own request index; `session-client.js` keeps the highest version when
 folding such a batch back to `{objectId: version}`.
 
+The same forward walk pairs each accepted occurrence's assigned version with
+that occurrence's original `SyncPayload` bytes for broadcast. Payloads must not
+be cached only by handle: two disjoint patches to one object need two distinct
+broadcast patches, not the last patch repeated twice. Unknown/unowned requests
+remain zero acknowledgements and do not shift the accepted payloads.
+
 `session-client.js` converts these arrays to named objects immediately at every
 invoke, live-event, snapshot, replacement, and reconciliation boundary.
 
@@ -1851,6 +1924,12 @@ invoke, live-event, snapshot, replacement, and reconciliation boundary.
 
 The C# counterpart `SyncSchemaRegistry` (per-`SessionId` map) parses
 `metadata.schemas` at session create and clears it on the last leave.
+
+Schema IDs must be unique within one registration. Duplicate IDs reject the
+entire set during metadata parsing or direct registration; they do not silently
+replace an earlier descriptor. A failed replacement leaves the previously
+registered set usable. Changing a field layout therefore requires explicit
+compatibility review rather than relying on registration order.
 
 ### Wire shape (SchemaId >= 1)
 
@@ -2344,7 +2423,7 @@ astervoids/
 │   ├── ServerPromotionTests.cs      # Server promotion, eviction, orphan adoption
 │   ├── ConcurrencyTests.cs          # Concurrency / thread-safety tests
 │   ├── BinaryGuidFormatterTests.cs  # MessagePack binary GUID round-trip tests
-│   ├── ReplaceAfterEvictTest.cs     # Regression: replace right after eviction
+│   ├── ReplaceAfterRejoinTest.cs    # Regression: replace right after a rejoin/eviction
 │   └── SessionHubTests.cs           # SessionHub unit tests
 │
 ├── infra/                      # Azure infrastructure (Bicep IaC)

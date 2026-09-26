@@ -92,7 +92,8 @@ LONG_SANITIZED=$(bash "$SCRIPT_DIR/sanitize-branch-name.sh" feature/this-is-a-de
 # The CLI mocks record argument arrays across command-substitution subshells.
 # All artifacts are temporary and removed even on test failure.
 cd "$SCRIPT_DIR/../.."
-TEST_DIR=$(mktemp -d)
+TEST_DIR="$PWD/.workflow-helper-tests-$$-$RANDOM"
+mkdir "$TEST_DIR"
 trap 'rm -rf "$TEST_DIR"' EXIT
 CALL_LOG="$TEST_DIR/calls.jsonl"
 

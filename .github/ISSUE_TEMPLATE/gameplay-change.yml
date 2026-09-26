@@ -1,0 +1,47 @@
+name: Gameplay or multiplayer change
+description: Scope a small change with a clear owner, contract boundary, and playable acceptance scenario.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Player problem and intended behavior
+      description: Describe what changes for a player, including the simplest useful option.
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Primary owning boundary
+      options:
+        - Gameplay / game adapter using the existing wire contract
+        - Reusable client replication or transport
+        - Backend lifecycle, ownership, or wire contract
+        - Regional discovery, deployment, or infrastructure
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Primary implementation owner and reviewer
+      description: Name one owner or team role; list collaborators only where needed.
+    validations:
+      required: true
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Contract impact and constraints
+      description: Identify any new schema, transient event, lifecycle/timing change, or authority assumption. Otherwise state that the existing wire contract is unchanged.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Observable acceptance criteria and playable scenario
+      description: Include relevant solo and two-client create/join/play/leave/rejoin behavior, plus input or accessibility considerations. Use default public Azure hostnames only; never include private deployment URLs.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Regression coverage and remaining manual checks
+      description: Identify the focused tests, applicable full suites, browser smoke, and any device/network/deployment behavior not established by automation.

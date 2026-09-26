@@ -98,9 +98,25 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
+
+      - name: Install browser smoke tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Run JavaScript tests
         run: node --test AstervoidsWeb/*.test.mjs
+
+      - name: Validate browser smoke helpers
+        run: npm run test:browser:helpers
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Real-browser local playability smoke
+        timeout-minutes: 5
+        run: npm run test:browser
+        env:
+          BROWSER_SMOKE_NO_BUILD: '1'
 
       - name: Validate Squad setup
         run: node --test .github/scripts/squad-setup.test.mjs
@@ -114,8 +130,9 @@ jobs:
       - name: Bicep build (template smoke check)
         run: |
           # az is preinstalled on ubuntu-latest runners; bicep CLI auto-installs on first use.
-          az bicep build --file infra/main.bicep --outfile /tmp/main.compiled.json
-          test -s /tmp/main.compiled.json
+          mkdir -p test-results
+          az bicep build --file infra/main.bicep --outfile test-results/main.compiled.json
+          test -s test-results/main.compiled.json
           echo "✅ infra/main.bicep compiles"
 
   deploy:
@@ -466,6 +483,28 @@ jobs:
             echo "The Azure deployment is available at its default Azure hostname, but managed-certificate binding is not ready yet." >> $GITHUB_STEP_SUMMARY
             echo "Review the Configure Custom Domain step and rerun after DNS propagation completes." >> $GITHUB_STEP_SUMMARY
           fi
+
+      # Branch previews are single-region ACA apps even when production uses
+      # a multi-region static apex. Never feed a custom hostname to this gate.
+      - name: Setup Node.js for preview smoke
+        if: steps.vars.outputs.is_production != 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install preview smoke tooling
+        if: steps.vars.outputs.is_production != 'true'
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Real-browser branch-preview playability smoke
+        if: steps.vars.outputs.is_production != 'true'
+        timeout-minutes: 6
+        run: npm run test:browser:remote
+        env:
+          BROWSER_SMOKE_BASE_URL: ${{ steps.deploy.outputs.url }}
 
       - name: Deployment Summary
         run: |

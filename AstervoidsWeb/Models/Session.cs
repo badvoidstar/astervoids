@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+using AstervoidsWeb.Services;
 
 namespace AstervoidsWeb.Models;
 
 /// <summary>
 /// Represents a game session that members can join.
+/// Detached lookup snapshots use the same model with independent state and SyncRoot;
+/// mutating a snapshot does not change the live service state.
 ///
 /// Synchronization model
 /// ─────────────────────
@@ -152,9 +155,46 @@ public class Session
     public DateTime? LastMemberLeftAt { get; set; }
 
     /// <summary>
-    /// Version number for optimistic concurrency control on session-level operations.
+    /// Server-assigned ordering number for session-level changes, not an expected-version precondition.
     /// Incremented on server promotion.  Must only be read or written while holding
     /// <see cref="SyncRoot"/>.
     /// </summary>
     public long Version { get; set; } = 1;
+
+    internal Session CreateSnapshot()
+    {
+        lock (SyncRoot)
+        {
+            var snapshot = new Session
+            {
+                Id = Id,
+                Name = Name,
+                CreatedAt = CreatedAt,
+                Metadata = SyncDataCloner.CloneDictionary(Metadata),
+                LifecycleState = LifecycleState,
+                LastMemberLeftAt = LastMemberLeftAt,
+                Version = Version,
+                _lastObjectHandle = _lastObjectHandle
+            };
+            // The unpublished copy has its own lock and handle index; neither
+            // member/object records nor mutable payload containers are shared.
+            lock (snapshot.SyncRoot)
+            {
+                foreach (var member in Members.Values)
+                    snapshot.Members[member.Id] = new Member
+                    {
+                        Id = member.Id,
+                        ConnectionId = member.ConnectionId,
+                        Role = member.Role,
+                        JoinedAt = member.JoinedAt,
+                        SessionId = member.SessionId,
+                        ReconnectToken = member.ReconnectToken,
+                        EventSequence = Interlocked.Read(ref member.EventSequence)
+                    };
+                foreach (var obj in Objects.Values)
+                    snapshot.AddObject(SyncDataCloner.CloneObject(obj));
+            }
+            return snapshot;
+        }
+    }
 }

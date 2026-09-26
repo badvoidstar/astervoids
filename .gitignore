@@ -50,6 +50,13 @@ infra/*.json
 
 # Local-only deployment secrets (consumed by .github/scripts/branch-url.sh)
 .deploy.local
+
+# Dev-only real-browser smoke tooling
+node_modules/
+test-results/
+playwright-report/
+.workflow-helper-tests-*/
+
 # Squad: ignore runtime state (logs, inbox, sessions)
 # Note: .squad/casting/* is identity and MUST be committed to main, not ignored
 .squad/orchestration-log/

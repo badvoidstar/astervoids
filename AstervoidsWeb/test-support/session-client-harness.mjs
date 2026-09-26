@@ -56,8 +56,7 @@ export async function loadSessionClient({ reply, guidUtils = GuidUtils, sessionS
     };
     const client = await withSessionStorage(sessionStorage, async () =>
         loadClassicModule('session-client.js', 'SessionClient', {
-            window, signalR, GuidUtils: guidUtils, WireEnum, SyncPayload,
-            ObjectSync: { triggerReconciliation() {} }
+            window, signalR, GuidUtils: guidUtils, WireEnum, SyncPayload
         }));
     assert.equal(await client.connect(), true);
     return { client, calls, handlers, connection, SyncPayload };

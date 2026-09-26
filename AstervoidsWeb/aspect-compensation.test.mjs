@@ -23,7 +23,8 @@ const {
 } = require('./wwwroot/js/asteroid-fracture.js');
 
 const EPS = 1e-10;
-const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
+const indexSource = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
+    .replace(/\r\n/g, '\n');
 
 function scaleCacheHarness() {
     const state = { session: false, width: 1600, height: 900, derivations: 0 };

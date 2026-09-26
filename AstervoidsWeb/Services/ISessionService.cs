@@ -78,29 +78,45 @@ public interface ISessionService
     int MaxMembersPerSession { get; }
 
     /// <summary>
-    /// Gets a session by ID.
+    /// Gets a detached, consistent session snapshot by ID. Mutating the returned
+    /// session, its members, objects, or supported payload containers cannot alter
+    /// live state. Prefer GetActiveSessions for lightweight listing.
     /// </summary>
     Session? GetSession(Guid sessionId);
 
     /// <summary>
+    /// Infrastructure-only lookup of live session state, without cloning. Callers
+    /// must hold Session.SyncRoot for compound reads and all mutations, recheck
+    /// lifecycle/authorization there, and never await while holding it.
+    /// Do not acquire the global session lock while holding Session.SyncRoot.
+    /// Use GetSession for a detached read instead.
+    /// </summary>
+    Session? GetSessionForSynchronization(Guid sessionId);
+
+    /// <summary>
     /// Gets a member by their connection ID.
+    /// Returns a live infrastructure reference, not a detached snapshot.
     /// </summary>
     Member? GetMemberByConnectionId(string connectionId);
 
     /// <summary>
-    /// Gets the session a connection belongs to.
+    /// Gets a detached snapshot of the session a connection belongs to.
     /// </summary>
     Session? GetSessionByConnectionId(string connectionId);
 
     /// <summary>
     /// Gets both the member and session for a connection in a single lookup.
     /// More efficient than calling GetMemberByConnectionId + GetSession separately.
+    /// These are live infrastructure references, not snapshots: callers must
+    /// synchronize compound reads/mutations on Session.SyncRoot and revalidate.
     /// </summary>
     (Member Member, Session Session)? GetMemberAndSessionByConnectionId(string connectionId);
 
     /// <summary>
     /// Gets all sessions (including empty ones awaiting cleanup).
     /// Used by the cleanup service to check for expired sessions.
+    /// The membership list is copied, but each Session is live infrastructure
+    /// state. Lock its SyncRoot for compound reads; GetSession returns detached state.
     /// </summary>
     IEnumerable<Session> GetAllSessions();
 
@@ -200,6 +216,7 @@ public record ActiveSessionsResult(
 
 /// <summary>
 /// Result of attempting to create a session.
+/// Session and Creator are live infrastructure references, not read snapshots.
 /// </summary>
 public record CreateSessionResult(
     bool Success,
@@ -210,6 +227,7 @@ public record CreateSessionResult(
 
 /// <summary>
 /// Result of attempting to join a session.
+/// Session and Member are live infrastructure references, not read snapshots.
 /// </summary>
 public record JoinSessionResult(
     bool Success,

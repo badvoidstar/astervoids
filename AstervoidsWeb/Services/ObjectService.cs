@@ -8,7 +8,7 @@ namespace AstervoidsWeb.Services;
 /// Correctness guarantees
 /// ──────────────────────
 /// • All object mutations (create, update, delete, replace) execute under the session's
-///   <c>Session.SyncRoot</c> lock, making version checks, ownership checks, and data
+///   <c>Session.SyncRoot</c> lock, making version increments, ownership checks, and data
 ///   writes atomic.
 /// • <c>SessionObject.Data</c> is replaced with a new dictionary on every mutation
 ///   (copy-on-write) so that snapshot reads outside the lock observe a stable copy.
@@ -30,10 +30,13 @@ public class ObjectService : IObjectService
     /// Validates that a session exists. Returns the session if valid, or null if not found.
     /// </summary>
     private Session? GetValidSession(Guid sessionId)
-        => _sessionService.GetSession(sessionId);
+        => _sessionService.GetSessionForSynchronization(sessionId);
 
     public SessionObject? CreateObject(Guid sessionId, Guid creatorMemberId, ObjectScope scope, Dictionary<string, object?>? data = null, Guid? ownerMemberId = null, long? clientValidAt = null, long? serverReceiveTimeMs = null, byte schemaId = 0)
     {
+        if (!Enum.IsDefined(scope))
+            return null;
+
         var session = GetValidSession(sessionId);
         if (session == null)
             return null;
@@ -59,11 +62,10 @@ public class ObjectService : IObjectService
     }
 
     /// <summary>
-    /// Updates a single object without ownership enforcement.
-    /// Used internally and by tests.  The hub uses <see cref="UpdateObjects"/> which
-    /// enforces ownership inside the lock.
+    /// Updates a single object owned by the caller. Ownership, membership, and
+    /// lifecycle are checked atomically with the last-write-wins data merge.
     /// </summary>
-    public SessionObject? UpdateObject(Guid sessionId, Guid objectId, Dictionary<string, object?> data, long? clientValidAt = null, long? serverReceiveTimeMs = null)
+    public SessionObject? UpdateObject(Guid sessionId, Guid objectId, Guid ownerMemberId, Dictionary<string, object?> data, long? clientValidAt = null, long? serverReceiveTimeMs = null)
     {
         var session = GetValidSession(sessionId);
         if (session == null)
@@ -73,8 +75,12 @@ public class ObjectService : IObjectService
         {
             if (session.LifecycleState != SessionLifecycleState.Active)
                 return null;
+            if (!session.Members.ContainsKey(ownerMemberId))
+                return null;
 
             if (!session.Objects.TryGetValue(objectId, out var obj))
+                return null;
+            if (obj.OwnerMemberId != ownerMemberId)
                 return null;
 
             var receive = serverReceiveTimeMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -90,7 +96,9 @@ public class ObjectService : IObjectService
     /// Updates address their target by session-scoped <c>Handle</c> rather than by GUID —
     /// that is the identity the hot wire path carries. Unknown handles and objects not
     /// owned by the caller are silently skipped.  Successfully updated objects are
-    /// returned. The call-level timestamp goes through the ±2 s server-time sanity check,
+    /// returned in request order, including each repeated handle. Patches merge in
+    /// that order (last write wins per field); no expected version is supplied or checked.
+    /// The call-level timestamp goes through the ±2 s server-time sanity check,
     /// then is clamped against the newest previous timestamp in the accepted batch so
     /// every updated object shares one monotonic <c>ValidAt</c>.
     /// </summary>
@@ -195,6 +203,15 @@ public class ObjectService : IObjectService
             if (objToDelete.OwnerMemberId != ownerMemberId)
                 return null;
 
+            // Validate every child before allocating handles, adding children, or
+            // deleting the parent. Only an omitted owner defaults to the caller.
+            foreach (var spec in replacements)
+            {
+                if (!Enum.IsDefined(spec.Scope)
+                    || (spec.OwnerOverride is { } owner && !session.Members.ContainsKey(owner)))
+                    return null;
+            }
+
             // All replacement children share the SAME validated collision-time stamp so
             // observers see them spawn at exactly the parent's bracket-rendered position
             // at that moment. Monotonic cap is taken against the deleted parent's
@@ -206,10 +223,7 @@ public class ObjectService : IObjectService
             var created = new List<SessionObject>(replacements.Count);
             foreach (var spec in replacements)
             {
-                var effectiveOwner = spec.OwnerOverride.HasValue
-                    && session.Members.ContainsKey(spec.OwnerOverride.Value)
-                    ? spec.OwnerOverride.Value
-                    : ownerMemberId;
+                var effectiveOwner = spec.OwnerOverride ?? ownerMemberId;
 
                 var obj = NewSessionObject(session, ownerMemberId, effectiveOwner, spec.Scope, spec.Data, validAt, spec.SchemaId);
                 session.AddObject(obj);
@@ -305,19 +319,5 @@ public class ObjectService : IObjectService
         };
 
     private static SessionObject Snapshot(SessionObject obj)
-        => new()
-        {
-            Id = obj.Id,
-            Handle = obj.Handle,
-            SessionId = obj.SessionId,
-            CreatorMemberId = obj.CreatorMemberId,
-            OwnerMemberId = obj.OwnerMemberId,
-            Scope = obj.Scope,
-            Data = SyncDataCloner.CloneDictionary(obj.Data),
-            SchemaId = obj.SchemaId,
-            Version = obj.Version,
-            ValidAt = obj.ValidAt,
-            CreatedAt = obj.CreatedAt,
-            UpdatedAt = obj.UpdatedAt
-        };
+        => SyncDataCloner.CloneObject(obj);
 }

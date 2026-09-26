@@ -192,6 +192,33 @@ public class SessionHubTests
     }
 
     [Fact]
+    public async Task CreateSession_DuplicateSchemaIds_ReturnsNormalRejectionWithoutPublishingSession()
+    {
+        var hub = CreateHub("connection-new");
+        var metadata = new Dictionary<string, object?>
+        {
+            ["schemas"] = new object[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["id"] = 1,
+                    ["fields"] = new object[] { new object[] { "x", "f64" } }
+                },
+                new Dictionary<string, object?>
+                {
+                    ["id"] = 1,
+                    ["fields"] = new object[] { new object[] { "y", "f64" } }
+                }
+            }
+        };
+
+        (await hub.CreateSession(metadata)).Should().BeNull();
+
+        _sessionService.GetAllSessions().Should().BeEmpty();
+        _sessionService.GetMemberByConnectionId("connection-new").Should().BeNull();
+    }
+
+    [Fact]
     public async Task CreateSession_RegistersSchemasBeforePublishingSession()
     {
         var registry = new SyncSchemaRegistry();
@@ -1125,6 +1152,55 @@ public class SessionHubTests
             "the second occurrence is applied on top of the first");
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UpdateObjects_RepeatedHandles_BroadcastsEachAcceptedPatchWithItsOwnVersion(bool positional)
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var session = created.Session!;
+        var owner = created.Creator!;
+        var other = _sessionService.JoinSession(session.Id, "connection-2").Member!;
+        var schemaId = positional ? (byte)1 : (byte)0;
+        if (positional)
+            _schemaRegistry.SetSessionSchemas(session.Id,
+                [new PositionalSchemaCodec.Schema(1, [new("x", "u8"), new("y", "u8")])]);
+        var obj = _objectService.CreateObject(session.Id, owner.Id, ObjectScope.Session, schemaId: schemaId)!;
+        var foreign = _objectService.CreateObject(session.Id, other.Id, ObjectScope.Session)!;
+        var x = SyncPayloadCodec.EncodeDict(schemaId, new Dictionary<string, object?> { ["x"] = 1 }, _schemaRegistry, session.Id);
+        var y = SyncPayloadCodec.EncodeDict(schemaId, new Dictionary<string, object?> { ["y"] = 2 }, _schemaRegistry, session.Id);
+        object?[]? broadcast = null;
+        var proxy = new Mock<IClientProxy>();
+        proxy.Setup(p => p.SendCoreAsync("OnObjectsUpdated", It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((_, args, _) => broadcast = args)
+            .Returns(Task.CompletedTask);
+        var hub = CreateHubWithProxy("connection-1", proxy);
+
+        var response = await hub.UpdateObjects(new[]
+        {
+            new ObjectUpdateRequest(0, x),
+            new ObjectUpdateRequest(foreign.Handle, x),
+            new ObjectUpdateRequest(obj.Handle, x),
+            new ObjectUpdateRequest(0, y),
+            new ObjectUpdateRequest(foreign.Handle, y),
+            new ObjectUpdateRequest(obj.Handle, y),
+            new ObjectUpdateRequest(0, x)
+        });
+
+        response!.Versions.Should().Equal(0, 0, 2, 0, 0, 3, 0);
+        var updates = ((IEnumerable<ObjectUpdateInfo>)broadcast![0]!).ToArray();
+        updates.Select(u => u.Version).Should().Equal(2, 3);
+        updates.Select(u => u.Handle).Should().Equal(obj.Handle, obj.Handle);
+        updates[0].Data.Should().BeSameAs(x, "each accepted request must retain its original bytes");
+        updates[1].Data.Should().BeSameAs(y);
+        var replica = new Dictionary<string, object?>();
+        foreach (var update in updates)
+            foreach (var entry in SyncPayloadCodec.DecodeDict(update.Data, session.Id, _schemaRegistry))
+                replica[entry.Key] = entry.Value;
+        replica.Should().BeEquivalentTo(_objectService.GetObject(session.Id, obj.Id)!.Data);
+        _objectService.GetObject(session.Id, foreign.Id)!.Version.Should().Be(1);
+    }
+
     // ── Session-scoped object handles on the wire ──────────────────────────────
 
     [Fact]
@@ -1216,4 +1292,91 @@ public class SessionHubTests
         => CreateHub(
             connectionId,
             clientProxyMock: proxy);
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("unknown")]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("Member, Session")]
+    public async Task ObjectOptions_InvalidExplicitScope_RejectsCreateAndReplaceWithoutMutation(string? scope)
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var session = created.Session!;
+        var parent = _objectService.CreateObject(session.Id, created.Creator!.Id, ObjectScope.Session)!;
+        var proxy = new Mock<IClientProxy>(MockBehavior.Strict);
+        var hub = CreateHubWithProxy("connection-1", proxy);
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>());
+
+        (await hub.CreateObject(payload, scope: scope!)).Should().BeNull();
+        (await hub.ReplaceObject(parent.Id, [payload], scope: scope!)).Should().BeNull();
+
+        _objectService.GetSessionObjects(session.Id).Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(parent);
+        created.Creator.EventSequence.Should().Be(0);
+        proxy.VerifyNoOtherCalls();
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("not-a-guid")]
+    [InlineData("empty-guid")]
+    [InlineData("unknown")]
+    [InlineData("other-session")]
+    [InlineData("departed")]
+    public async Task ObjectOptions_InvalidExplicitOwner_RejectsCreateAndReplaceWithoutMutation(string kind)
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var session = created.Session!;
+        var parent = _objectService.CreateObject(session.Id, created.Creator!.Id, ObjectScope.Session)!;
+        var owner = kind switch
+        {
+            "empty-guid" => Guid.Empty.ToString(),
+            "unknown" => Guid.NewGuid().ToString(),
+            "other-session" => _sessionService.CreateSession("other-session").Creator!.Id.ToString(),
+            "departed" => _sessionService.JoinSession(session.Id, "departed").Member!.Id.ToString(),
+            _ => kind
+        };
+        if (kind == "departed")
+            _sessionService.LeaveSession("departed");
+        var proxy = new Mock<IClientProxy>(MockBehavior.Strict);
+        var hub = CreateHubWithProxy("connection-1", proxy);
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>());
+
+        (await hub.CreateObject(payload, ownerMemberId: owner)).Should().BeNull();
+        (await hub.ReplaceObject(parent.Id, [payload], ownerMemberId: owner)).Should().BeNull();
+        (await hub.ReplaceObject(parent.Id, [], ownerMemberId: owner)).Should().BeNull();
+
+        _objectService.GetSessionObjects(session.Id).Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(parent);
+        created.Creator.EventSequence.Should().Be(0);
+        proxy.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ObjectOptions_OmittedDefaultsAndCaseInsensitiveScopes_RemainValid()
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var session = created.Session!;
+        var other = _sessionService.JoinSession(session.Id, "connection-2").Member!;
+        var hub = CreateHub("connection-1");
+        var payload = SyncPayloadCodec.EncodeDict(new Dictionary<string, object?>());
+
+        var first = (await hub.CreateObject(payload))!.ObjectInfo;
+        first.Scope.Should().Be(ObjectScope.Member);
+        first.OwnerMemberId.Should().Be(created.Creator!.Id);
+        var replaced = (await hub.ReplaceObject(first.Id, [payload]))!.CreatedObjects.Single();
+        replaced.Scope.Should().Be(ObjectScope.Session);
+        replaced.OwnerMemberId.Should().Be(created.Creator.Id);
+        var explicitChild = (await hub.ReplaceObject(replaced.Id, [payload],
+            scope: "mEmBeR", ownerMemberId: other.Id.ToString()))!.CreatedObjects.Single();
+        explicitChild.Scope.Should().Be(ObjectScope.Member);
+        explicitChild.OwnerMemberId.Should().Be(other.Id);
+        var explicitObject = (await hub.CreateObject(payload, scope: "sEsSiOn",
+            ownerMemberId: other.Id.ToString()))!.ObjectInfo;
+        explicitObject.Scope.Should().Be(ObjectScope.Session);
+        explicitObject.OwnerMemberId.Should().Be(other.Id);
+    }
 }

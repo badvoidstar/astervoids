@@ -7,6 +7,8 @@ This document explains how to configure the GitHub Actions workflow for automati
 The CI/CD pipeline automatically:
 - **Builds** the .NET application on every push and pull request
 - **Tests** the application to ensure code quality
+- **Exercises real Chromium gameplay** locally before deployment and against
+  the default Azure hostname after a branch-preview deployment
 - **Deploys** to Azure Container Apps when code is pushed to any branch
 - **Creates preview environments** with custom subdomains when configured
 - **Cleans up** orphaned branch resources on a daily schedule or manual run
@@ -164,6 +166,89 @@ ready. The app remains available through its default Azure hostname; review
 the custom-domain step and rerun after DNS propagation instead of treating the
 app deployment as failed.
 
+### Real-browser smoke gates
+
+`package.json` and `package-lock.json` pin the dev-only Playwright test runner.
+This tooling does not bundle, transpile, or change the shipped game. The build
+job installs Chromium and runs `npm run test:browser` against an owned local
+Release server **after** the .NET build (`BROWSER_SMOKE_NO_BUILD=1`). Browser
+failure blocks deployment just like a C# or JavaScript test failure.
+
+Run the same gate locally from the repository root:
+
+```powershell
+npm ci --ignore-scripts --no-audit --no-fund
+npx playwright install chromium
+npm run test:browser:helpers
+npm run test:browser
+```
+
+Linux runners use `npx playwright install --with-deps chromium`. Local smoke
+builds the app unless `BROWSER_SMOKE_NO_BUILD=1` is set, starts it on
+`http://127.0.0.1:5189`, refuses an occupied port, and tears it down afterwards.
+It requires no separately running development server. Do not set the no-build
+flag unless the current sources have already been built in Release.
+
+After a **branch** deploy, the workflow runs `npm run test:browser:remote` with
+`BROWSER_SMOKE_BASE_URL` from `steps.deploy.outputs.url`, the existing non-secret
+default ACA URL. Branches are single-region even when production is multi-region.
+This is a required post-deploy check: failure prevents the success summary but
+does not roll back the already deployed Azure revision. The gate neither reads
+custom-domain secrets nor starts a deployment.
+
+To check an existing preview privately from PowerShell, use its **default**
+`*.azurecontainerapps.io` URL from the deployment summary, not the custom URL:
+
+```powershell
+$env:BROWSER_SMOKE_BASE_URL = 'https://ca-web-preview.example.azurecontainerapps.io'
+npm run test:browser:remote
+Remove-Item Env:BROWSER_SMOKE_BASE_URL
+```
+
+The remote command requires an explicit root HTTPS ACA URL without credentials,
+a nondefault port, query, or fragment; it cannot silently fall back to local
+mode. Readiness retries connection errors/5xx for at most two minutes to allow a
+new container revision to start. Redirects, bad manifests, and a manifest routing
+outside the selected single origin fail closed. Gameplay scenarios have bounded
+assertion waits and **zero test retries**. An unavailable preview fails rather
+than being skipped. Region readiness alone is not a passing smoke result.
+
+The Chromium guard rejects HTTP 301/302/303/307/308 responses, including
+same-origin redirects, at response headers before any redirect target is
+contacted. HTTP bodies and SignalR WebSockets remain native browser traffic;
+no responses are fabricated or replayed. Each context owns one guarded page;
+unsupported page/worker requests fail closed and service workers are disabled.
+The local suite also runs owned-loopback redirect regressions against this same
+guard; remote mode excludes those local-server tests.
+
+**What this establishes:** the actual page boots without uncaught exceptions or
+console errors; solo keyboard movement/fire works; independently stored clients
+create and join the same newly created session through the picker; both start
+playing; ship pose, thrust, and version changes reach the other client in both
+directions through live SignalR; leaving removes membership and the departed
+ship; rejoining creates a fresh ship that replicates again. The clients leave
+only their own session, then verify it is absent from the active-session list.
+Empty-session retention/expiry is still server-owned. No fake hubs, transport
+responses, or test-only production hooks are used.
+
+**Privacy and evidence:** remote output contains only authored scenario names
+and outcomes. Screenshots, videos, traces, raw console messages, object payloads,
+and session identities are not uploaded. Generated Playwright output and
+`node_modules` are ignored. Helper tests verify URL rejection, unavailable-target
+failure, redirect refusal, reporter privacy, and the workflow's safe URL wiring;
+these helpers supplement, not replace, actual browser execution.
+
+**What still needs manual/device/deployment testing:** mobile/touch and Safari/
+Firefox behavior, accessibility, visual quality, audio quality, performance/load,
+long-running sessions, packet loss/reconnect/authority migration, and
+cross-region routing. This narrow gate intentionally does not visit production's
+multi-region static apex or private regional hostnames. Validate those privately
+with the existing deployment checklist. Browser HTTPS checks are not bypassed,
+but success on the default ACA hostname does **not** certify custom DNS,
+certificate issuance/binding, certificate renewal, or Azure permission
+propagation. Workflow-helper mocks and Bicep compilation remain infrastructure
+checks, not proof of a successful live deployment.
+
 ### Automatic Trigger
 
 The workflow will automatically run when:
@@ -187,6 +272,7 @@ When you push to any branch, the workflow automatically:
 2. Deploys to a branch-specific Container App
 3. Creates DNS records for a branch-specific subdomain
 4. Binds HTTPS using the shared BYO wildcard certificate (when BYO cert variables are configured)
+5. Runs the real-browser playability smoke against the default ACA URL
 
 ### Subdomain Naming
 

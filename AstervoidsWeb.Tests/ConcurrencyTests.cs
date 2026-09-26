@@ -304,7 +304,7 @@ public class ConcurrencyTests : TestBase
         {
             for (int i = 0; i < 100; i++)
             {
-                ObjectService.UpdateObject(session.Id, obj!.Id,
+                ObjectService.UpdateObject(session.Id, obj!.Id, creator.Id,
                     new Dictionary<string, object?> { ["x"] = (double)i });
                 await Task.Yield();
             }
