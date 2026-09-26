@@ -128,6 +128,9 @@ public record ObjectUpdateInfo(
 /// after its target was deleted resolves to nothing rather than to another object.
 /// Unknown handles are skipped exactly like unknown ids were, and are reported as
 /// rejected (version 0) in the positional acknowledgement.
+/// There is no expected-version field. Owner-authorized patches merge sequentially
+/// (last write wins per field); the response supplies each accepted occurrence's
+/// server-assigned version for replica ordering and reconciliation.
 /// </para>
 /// </summary>
 [MessagePackObject]

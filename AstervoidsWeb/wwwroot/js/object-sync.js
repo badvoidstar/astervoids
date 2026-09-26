@@ -469,6 +469,7 @@ const ObjectSync = (function() {
         SessionClient.on('onObjectReplaced', handleRemoteObjectReplaced);
         SessionClient.on('onObjectEvent', dispatchRemoteObjectEvent);
         SessionClient.on('onSessionTransition', handleSessionTransition);
+        SessionClient.on('onSessionStateUncertain', triggerReconciliation);
         SessionClient.on('onSessionJoined', handleSessionJoined);
         SessionClient.on('onSessionLeft', handleSessionLeft);
 

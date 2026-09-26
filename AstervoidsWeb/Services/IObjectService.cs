@@ -22,7 +22,8 @@ public interface IObjectService
     /// <param name="creatorMemberId">The member creating the object.</param>
     /// <param name="scope">The lifetime scope of the object (Member or Session).</param>
     /// <param name="data">Initial object data.</param>
-    /// <param name="ownerMemberId">Optional override for the initial owner. Defaults to the creator.</param>
+    /// <param name="ownerMemberId">Optional override for the initial owner. Null defaults
+    /// to the creator; an explicit ID must identify a current session member.</param>
     /// <param name="clientValidAt">Owner-stamped server-time ms (NTP-aligned). Validated
     /// against <paramref name="serverReceiveTimeMs"/> by ±2 s sanity bound; out-of-bounds
     /// or null falls back to the receive time.</param>
@@ -33,19 +34,26 @@ public interface IObjectService
     /// same positional encoding instead of falling back to legacy MessagePack on every
     /// re-broadcast. 0 = legacy dict (no schema). Defaults to 0 so existing callers
     /// keep their current behavior.</param>
-    /// <returns>The created object, or null if session/member not found or session is not active.</returns>
+    /// <returns>The created object, or null if session/member/owner not found, scope is
+    /// undefined, or session is not active.</returns>
     SessionObject? CreateObject(Guid sessionId, Guid creatorMemberId, ObjectScope scope, Dictionary<string, object?>? data = null, Guid? ownerMemberId = null, long? clientValidAt = null, long? serverReceiveTimeMs = null, byte schemaId = 0);
 
     /// <summary>
-    /// Updates an existing object (no ownership enforcement — use <see cref="UpdateObjects"/> for authoritative updates).
+    /// Updates an existing object owned by <paramref name="ownerMemberId"/>, with
+    /// membership, ownership, and lifecycle checks under the session lock.
+    /// Returns null when any check fails. Patches are last-write-wins per field;
+    /// versions are server-assigned ordering values, not optimistic preconditions.
     /// </summary>
-    SessionObject? UpdateObject(Guid sessionId, Guid objectId, Dictionary<string, object?> data, long? clientValidAt = null, long? serverReceiveTimeMs = null);
+    SessionObject? UpdateObject(Guid sessionId, Guid objectId, Guid ownerMemberId, Dictionary<string, object?> data, long? clientValidAt = null, long? serverReceiveTimeMs = null);
 
     /// <summary>
     /// Batch updates multiple objects owned by the specified member.
     /// Each entry addresses its target by session-scoped handle.
     /// Ownership is validated atomically inside the session lock; hub-layer pre-filtering
     /// is not required for correctness.
+    /// Accepted occurrences (including repeated handles) merge sequentially, last
+    /// write wins per field, and return snapshots in request order. Versions are
+    /// assigned by the server, never compared to an expected version from the caller.
     ///
     /// All updates in the batch share <paramref name="callLevelClientValidAt"/> as the
     /// owner-stamped sample time; it is validated (±2 s vs <paramref name="serverReceiveTimeMs"/>;
@@ -76,7 +84,9 @@ public interface IObjectService
     /// <param name="clientValidAt">Owner-stamped collision time in server-clock ms.</param>
     /// <param name="serverReceiveTimeMs">Server's hub-entry timestamp; defaults to <c>UtcNow</c>.</param>
     /// <returns>The list of created objects, or null if the operation could not be performed
-    /// (session not found/active, object not found, ownership mismatch).</returns>
+    /// (session not found/active, object not found, ownership mismatch, undefined
+    /// scope, or explicit replacement owner not a current member). Invalid children
+    /// reject the entire operation before any mutation.</returns>
     IReadOnlyList<SessionObject>? ReplaceObject(
         Guid sessionId,
         Guid deleteObjectId,
@@ -101,7 +111,8 @@ public interface IObjectService
 /// </summary>
 /// <param name="Scope">Lifetime scope of the replacement.</param>
 /// <param name="Data">Initial data dictionary for the new object.</param>
-/// <param name="OwnerOverride">Optional explicit owner; defaults to the caller.</param>
+/// <param name="OwnerOverride">Null defaults to the caller; any explicit owner must
+/// identify a current member of the session.</param>
 /// <param name="SchemaId">Phase 4E wire-format hint: SchemaId of the inbound positional
 /// payload (or 0 for legacy MessagePack). Stored on the new
 /// <see cref="SessionObject.SchemaId"/> so the broadcast and subsequent snapshots replay

@@ -206,6 +206,109 @@ public class SessionServiceTests
         foundSession!.Id.Should().Be(session.Id);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SessionLookup_ReturnsDetachedStateInsteadOfAnUnauthorizedMutationSurface(bool byConnection)
+    {
+        var created = _sessionService.CreateSession("connection-1", new Dictionary<string, object?>
+        {
+            ["settings"] = new Dictionary<string, object?> { ["bytes"] = new byte[] { 7 } }
+        });
+        var live = created.Session!;
+        var owner = created.Creator!;
+        var objectService = new ObjectService(_sessionService);
+        var obj = objectService.CreateObject(live.Id, owner.Id, ObjectScope.Session,
+            new Dictionary<string, object?>
+            {
+                ["nested"] = new Dictionary<string, object?> { ["values"] = new object?[] { 1, 2 } },
+                ["bytes"] = new byte[] { 3, 4 }
+            })!;
+
+        var snapshot = byConnection
+            ? _sessionService.GetSessionByConnectionId("connection-1")!
+            : _sessionService.GetSession(live.Id)!;
+        snapshot.Should().NotBeSameAs(live);
+        snapshot.SyncRoot.Should().NotBeSameAs(live.SyncRoot);
+        snapshot.Members[owner.Id].Should().NotBeSameAs(owner);
+        var originalObjectSnapshot = snapshot.Objects[obj.Id];
+        originalObjectSnapshot.OwnerMemberId = Guid.NewGuid();
+        originalObjectSnapshot.Version = 99;
+        ((object?[])((Dictionary<string, object?>)originalObjectSnapshot.Data["nested"]!)["values"]!)[0] = -1;
+        ((byte[])originalObjectSnapshot.Data["bytes"]!)[0] = 0;
+        ((byte[])((Dictionary<string, object?>)snapshot.Metadata["settings"]!)["bytes"]!)[0] = 0;
+        snapshot.Members[owner.Id].Role = MemberRole.Client;
+        snapshot.Members[owner.Id].EventSequence = 99;
+        snapshot.Members.Clear();
+        snapshot.LifecycleState = SessionLifecycleState.Destroyed;
+        snapshot.Version = 99;
+        snapshot.LastMemberLeftAt = DateTime.UtcNow;
+        lock (snapshot.SyncRoot)
+        {
+            snapshot.TryGetObjectByHandle(obj.Handle, out var indexed).Should().BeTrue();
+            indexed.Should().BeSameAs(originalObjectSnapshot);
+            snapshot.RemoveObject(obj.Id, out _).Should().BeTrue();
+            snapshot.AllocateObjectHandle().Should().Be(obj.Handle + 1);
+        }
+
+        objectService.GetObject(live.Id, obj.Id).Should().BeEquivalentTo(obj);
+        var fresh = _sessionService.GetSession(live.Id)!;
+        fresh.Members.Should().ContainKey(owner.Id);
+        fresh.Members[owner.Id].Role.Should().Be(MemberRole.Server);
+        fresh.Members[owner.Id].EventSequence.Should().Be(0);
+        fresh.Version.Should().Be(1);
+        fresh.LifecycleState.Should().Be(SessionLifecycleState.Active);
+        fresh.LastMemberLeftAt.Should().BeNull();
+        ((byte[])((Dictionary<string, object?>)fresh.Metadata["settings"]!)["bytes"]!)[0].Should().Be(7);
+        objectService.CreateObject(live.Id, owner.Id, ObjectScope.Session)!.Handle.Should().Be(obj.Handle + 1);
+    }
+
+    [Fact]
+    public void SessionLookup_DoesNotChangeAfterLaterServiceMutations()
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var live = created.Session!;
+        var owner = created.Creator!;
+        var objectService = new ObjectService(_sessionService);
+        var obj = objectService.CreateObject(live.Id, owner.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["value"] = 1 })!;
+        var snapshot = _sessionService.GetSession(live.Id)!;
+
+        objectService.UpdateObject(live.Id, obj.Id, owner.Id,
+            new Dictionary<string, object?> { ["value"] = 2 });
+        _sessionService.JoinSession(live.Id, "connection-2");
+        _sessionService.LeaveSession("connection-1");
+
+        snapshot.Members.Should().ContainSingle().Which.Key.Should().Be(owner.Id);
+        snapshot.Objects[obj.Id].Should().BeEquivalentTo(obj);
+        _sessionService.GetSessionForSynchronization(live.Id).Should().BeSameAs(live,
+            "only the explicitly synchronized infrastructure lookup returns live state");
+    }
+
+    [Fact]
+    public async Task SessionLookup_ConcurrentUpdates_CapturesDataAndVersionUnderTheSameLock()
+    {
+        var created = _sessionService.CreateSession("connection-1");
+        var session = created.Session!;
+        var owner = created.Creator!;
+        var objectService = new ObjectService(_sessionService);
+        var obj = objectService.CreateObject(session.Id, owner.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["value"] = 0 })!;
+        var writer = Task.Run(() =>
+        {
+            for (var value = 1; value <= 100; value++)
+                objectService.UpdateObject(session.Id, obj.Id, owner.Id,
+                    new Dictionary<string, object?> { ["value"] = value });
+        });
+
+        for (var i = 0; i < 100; i++)
+        {
+            var snapshot = _sessionService.GetSession(session.Id)!.Objects[obj.Id];
+            snapshot.Version.Should().Be((int)snapshot.Data["value"]! + 1);
+        }
+        await writer;
+    }
+
     [Fact]
     public void CreateSession_MultipleSessions_ShouldHaveUniqueFruitNames()
     {

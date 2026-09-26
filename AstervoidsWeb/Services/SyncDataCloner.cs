@@ -1,9 +1,27 @@
 using System.Collections;
+using AstervoidsWeb.Models;
 
 namespace AstervoidsWeb.Services;
 
 internal static class SyncDataCloner
 {
+    public static SessionObject CloneObject(SessionObject obj)
+        => new()
+        {
+            Id = obj.Id,
+            Handle = obj.Handle,
+            SessionId = obj.SessionId,
+            CreatorMemberId = obj.CreatorMemberId,
+            OwnerMemberId = obj.OwnerMemberId,
+            Scope = obj.Scope,
+            Data = CloneDictionary(obj.Data),
+            SchemaId = obj.SchemaId,
+            Version = obj.Version,
+            ValidAt = obj.ValidAt,
+            CreatedAt = obj.CreatedAt,
+            UpdatedAt = obj.UpdatedAt
+        };
+
     public static Dictionary<string, object?> CloneDictionary(
         IDictionary<string, object?> source)
         => source.ToDictionary(

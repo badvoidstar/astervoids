@@ -85,6 +85,7 @@ const SessionClient = (function() {
         onSessionJoined: null,
         onSessionLeft: null,
         onSessionTransition: null,
+        onSessionStateUncertain: null,
         onMemberJoined: null,
         onMemberLeft: null,
         onRoleChanged: null,
@@ -865,10 +866,14 @@ const SessionClient = (function() {
         }));
 
         thisConnection.onreconnected(guard(connectionId => {
-            // Reconcile state — invoke responses for Create/Delete/Update may have been
+            // Invoke responses for Create/Delete/Update may have been
             // lost during the reconnection window (OthersInGroup means no broadcast fallback)
-            ObjectSync.triggerReconciliation();
-            if (callbacks.onConnected) {
+            if (callbacks.onSessionStateUncertain) {
+                callbacks.onSessionStateUncertain('reconnected', sessionEpoch);
+            }
+            if (connection === thisConnection
+                && connectionEpoch === thisConnectionEpoch
+                && callbacks.onConnected) {
                 callbacks.onConnected();
             }
         }));
@@ -1114,7 +1119,9 @@ const SessionClient = (function() {
                 return false;
             }
             finishSessionTransition(thisSessionEpoch);
-            ObjectSync.triggerReconciliation();
+            if (callbacks.onSessionStateUncertain) {
+                callbacks.onSessionStateUncertain('leaveFailed', thisSessionEpoch);
+            }
             _error('[SessionClient] Leave session failed:', err);
             return false;
         }

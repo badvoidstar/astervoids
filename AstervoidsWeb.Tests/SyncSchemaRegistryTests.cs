@@ -58,6 +58,60 @@ public class SyncSchemaRegistryTests
         registry.GetSchema(sessionId, 2).Should().NotBeNull();
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SetSessionSchemas_DuplicateIds_RejectsBeforeReplacingPriorRegistry(bool identical)
+    {
+        var registry = new SyncSchemaRegistry();
+        var sessionId = Guid.NewGuid();
+        var original = new PositionalSchemaCodec.Schema(1, [new("value", "u8")]);
+        var replacement = new PositionalSchemaCodec.Schema(2, [new("x", "f64")]);
+        var duplicate = identical ? replacement : new PositionalSchemaCodec.Schema(2, [new("y", "f64")]);
+        registry.SetSessionSchemas(sessionId, [original]);
+
+        var act = () => registry.SetSessionSchemas(sessionId, [replacement, duplicate]);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*unique*");
+        registry.GetAllSchemas(sessionId).Should().ContainSingle().Which.Should().BeSameAs(original);
+        registry.GetSchema(sessionId, 2).Should().BeNull();
+        var encoded = SyncPayloadCodec.EncodeDict(1,
+            new Dictionary<string, object?> { ["value"] = 7 }, registry, sessionId);
+        Convert.ToInt32(SyncPayloadCodec.DecodeDict(encoded, sessionId, registry)["value"]).Should().Be(7);
+
+        registry.SetSessionSchemas(sessionId, [original, replacement]);
+        registry.GetAllSchemas(sessionId).Should().HaveCount(2);
+        registry.GetSchema(sessionId, 2).Should().BeSameAs(replacement);
+    }
+
+    [Fact]
+    public void SetSessionSchemas_DuplicateIds_DoNotPublishNewSessionRegistry()
+    {
+        var registry = new SyncSchemaRegistry();
+        var sessionId = Guid.NewGuid();
+        var schema = new PositionalSchemaCodec.Schema(1, [new("value", "u8")]);
+
+        var act = () => registry.SetSessionSchemas(sessionId, [schema, schema]);
+
+        act.Should().Throw<InvalidOperationException>();
+        registry.HasAnySchemas(sessionId).Should().BeFalse();
+    }
+
+    [Fact]
+    public void ParseFromMetadata_DuplicateIds_RejectsAmbiguousSchemaSet()
+    {
+        var entry = new Dictionary<string, object?>
+        {
+            ["id"] = 1,
+            ["fields"] = new object[] { new object[] { "value", "u8" } }
+        };
+        var metadata = new Dictionary<string, object?> { ["schemas"] = new[] { entry, entry } };
+
+        var act = () => SyncSchemaRegistry.ParseFromMetadata(metadata);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*unique*");
+    }
+
     [Fact]
     public void ClearSession_RemovesAll()
     {

@@ -265,7 +265,7 @@ public class ServerPromotionTests : TestBase
 
         var obj = ObjectService.CreateObject(session.Id, server.Id, ObjectScope.Session,
             new Dictionary<string, object?> { ["type"] = "asteroid" });
-        ObjectService.UpdateObject(session.Id, obj!.Id, new Dictionary<string, object?> { ["x"] = 1.0 });
+        ObjectService.UpdateObject(session.Id, obj!.Id, server.Id, new Dictionary<string, object?> { ["x"] = 1.0 });
         // version is now 2
 
         // Act — departure result (including migration info) is now unified in LeaveSession

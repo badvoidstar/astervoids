@@ -143,7 +143,6 @@ function fixtureGuid(label) {
 
 function loadSessionClient(
     connections,
-    objectSyncBridge = { triggerReconciliation() {} },
     guidUtils = GuidUtils,
     syncPayload = SyncPayload) {
     const window = { ASTERVOIDS_DEBUG: false };
@@ -155,7 +154,6 @@ function loadSessionClient(
         GuidUtils: guidUtils,
         WireEnum,
         SyncPayload: syncPayload,
-        ObjectSync: objectSyncBridge,
         setTimeout: (callback, delay) => {
             const timer = setTimeout(callback, delay);
             timer.unref();
@@ -640,6 +638,126 @@ test('failed leave keeps reconnect identity available for recovery', async () =>
         ]);
 });
 
+test('SessionClient reconnect works without a replication module or listener', async () => {
+    const connection = new FakeConnection();
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    let connected = 0;
+    client.on('onConnected', () => { connected++; });
+
+    assert.doesNotThrow(() => connection.reconnectedHandler('restored'));
+    assert.equal(connected, 1);
+});
+
+test('SessionClient reports state uncertainty before reconnect observers', async () => {
+    const connection = new FakeConnection();
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    const order = [];
+    client.on('onSessionStateUncertain', (reason, epoch) =>
+        order.push([reason, epoch]));
+    client.on('onConnected', () => order.push(['connected']));
+
+    connection.reconnectedHandler('restored');
+    assert.deepEqual(order, [
+        ['reconnected', client.getSessionEpoch()],
+        ['connected']
+    ]);
+});
+
+test('recovery callbacks can disconnect without announcing stale transport readiness', async () => {
+    const connection = new FakeConnection();
+    const { client } = loadSessionClient([connection]);
+    await connectImmediately(client, connection);
+    let disconnecting;
+    let connected = 0;
+    client.on('onSessionStateUncertain', () => { disconnecting = client.disconnect(); });
+    client.on('onConnected', () => { connected++; });
+
+    connection.reconnectedHandler('restored');
+    await disconnecting;
+    assert.equal(connected, 0);
+    assert.equal(client.isConnected(), null);
+});
+
+test('stale connections cannot request recovery for a replacement connection', async () => {
+    const first = new FakeConnection();
+    const second = new FakeConnection();
+    const { client } = loadSessionClient([first, second]);
+    await connectImmediately(client, first);
+    const notifications = [];
+    client.on('onSessionStateUncertain', reason => notifications.push(reason));
+    await client.connect(true);
+
+    first.reconnectedHandler('stale');
+    assert.deepEqual(notifications, []);
+    second.reconnectedHandler('current');
+    assert.deepEqual(notifications, ['reconnected']);
+});
+
+for (const reason of ['reconnected', 'leaveFailed']) {
+    test(`ObjectSync reconciles ${reason} through the transport notification`, async () => {
+        const connection = new FakeConnection();
+        const id = fixtureGuid('uncertain-object');
+        connection.invokers.set('JoinSession', sessionId =>
+            Promise.resolve(joinResponse(sessionId, [
+                objectInfo(id, 1, { type: 'counter', value: 1 })
+            ])));
+        connection.invokers.set('GetSessionState', () => Promise.resolve({
+            objects: [objectInfo(id, 2, { type: 'counter', value: 2 })],
+            validAts: {},
+            memberSequences: {}
+        }));
+        connection.invokers.set('LeaveSession', () =>
+            Promise.reject(new Error('ambiguous leave result')));
+        const { client, window } = loadSessionClient([connection]);
+        const objectSync = loadObjectSync(client, window);
+        objectSync.init();
+        await connectImmediately(client, connection);
+        await client.joinSession(fixtureGuid('uncertain-session'));
+        const complete = deferred();
+        objectSync.on('onReconciliationComplete', complete.resolve);
+
+        if (reason === 'reconnected') {
+            objectSync.suspendReconciliation();
+            connection.reconnectedHandler('suspended');
+            assert.equal(connection.invokeCalls.filter(call => call.method === 'GetSessionState').length, 0);
+            objectSync.resumeReconciliation();
+            connection.reconnectedHandler('restored');
+        } else {
+            assert.equal(await client.leaveSession(), false);
+        }
+        await complete.promise;
+
+        assert.equal(objectSync.getObject(id).data.value, 2);
+        assert.equal(objectSync.getObject(id).version, 2);
+        assert.equal(objectSync.getReconciliationCount(), 1);
+        assert.equal(client.getCurrentSession().id, fixtureGuid('uncertain-session'));
+        assert.equal(connection.invokeCalls.filter(call => call.method === 'GetSessionState').length, 1);
+    });
+}
+
+test('a superseded leave failure does not request recovery in the new connection', async () => {
+    const first = new FakeConnection();
+    const second = new FakeConnection();
+    const leaveGate = deferred();
+    first.invokers.set('JoinSession', sessionId => Promise.resolve(joinResponse(sessionId)));
+    first.invokers.set('LeaveSession', () => leaveGate.promise);
+    const { client } = loadSessionClient([first, second]);
+    await connectImmediately(client, first);
+    await client.joinSession(fixtureGuid('old-session'));
+    const notifications = [];
+    client.on('onSessionStateUncertain', reason => notifications.push(reason));
+    const leaving = client.leaveSession();
+    await drainMicrotasks();
+    await client.connect(true);
+    leaveGate.reject(new Error('stale leave failure'));
+
+    assert.equal(await leaving, false);
+    assert.deepEqual(notifications, []);
+    assert.equal(client.getCurrentSession(), null);
+});
+
 for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
     test(`${method} rejects session responses without reconnect credentials`, async () => {
         const { client, gate, response, eventName, enter } = await sessionEntryHarness(method);
@@ -678,7 +796,6 @@ test('SessionClient installs session schemas before decoding a join snapshot', a
     };
     const { client } = loadSessionClient(
         [connection],
-        { triggerReconciliation() {} },
         GuidUtils,
         syncPayload);
 
@@ -704,7 +821,6 @@ test('SessionClient preserves 16-byte opaque event payloads during GUID normaliz
     };
     const { client } = loadSessionClient(
         [connection],
-        { triggerReconciliation() {} },
         { ...GuidUtils, transformBinaryGuids });
     let received;
     client.on('onObjectEvent', eventInfo => { received = eventInfo; });
@@ -731,14 +847,8 @@ test('join snapshot preserves object events delivered before JoinSession returns
     const joinGate = deferred();
     connection.invokers.set('JoinSession', () => joinGate.promise);
 
-    let objectSync;
-    const bridge = {
-        triggerReconciliation() {
-            return objectSync?.triggerReconciliation();
-        }
-    };
-    const loaded = loadSessionClient([connection], bridge);
-    objectSync = loadObjectSync(loaded.client, loaded.window);
+    const loaded = loadSessionClient([connection]);
+    const objectSync = loadObjectSync(loaded.client, loaded.window);
     objectSync.init();
     await connectImmediately(loaded.client, connection);
 
@@ -1125,11 +1235,8 @@ async function replacementHarness() {
             objectInfo(parentId, 1, { type: 'counter', value: 1 })
         ])));
     connection.invokers.set('ReplaceObject', () => responseGate.promise);
-    let objectSync;
-    const loaded = loadSessionClient([connection], {
-        triggerReconciliation: () => objectSync?.triggerReconciliation()
-    });
-    objectSync = loadObjectSync(loaded.client, loaded.window);
+    const loaded = loadSessionClient([connection]);
+    const objectSync = loadObjectSync(loaded.client, loaded.window);
     objectSync.init();
     await connectImmediately(loaded.client, connection);
     await loaded.client.joinSession(fixtureGuid('replace-session'));

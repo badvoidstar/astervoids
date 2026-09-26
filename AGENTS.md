@@ -71,6 +71,13 @@ dotnet test astervoids.sln --configuration Release --no-build
 # All JavaScript tests
 node --test AstervoidsWeb/*.test.mjs
 
+# Squad roster, routing, and automation contracts
+node --test .github/scripts/squad-setup.test.mjs
+
+# Real-browser playability (one-time tooling setup is in README.md)
+npm run test:browser:helpers
+npm run test:browser
+
 # Infrastructure template smoke check
 az bicep build --file infra/main.bicep
 
@@ -98,6 +105,8 @@ node --test AstervoidsWeb/region-service.test.mjs
 Use targeted tests while iterating, then run the full relevant suite. Run the
 solution build and both C# and JavaScript suites for cross-stack or wire-format
 changes. Run the Bicep build and workflow helper tests for deployment changes.
+On Windows, run shell helper checks in Git Bash rather than the Windows
+System32 WSL `bash.exe` shim.
 
 ## Testing guidance
 
@@ -113,6 +122,11 @@ changes. Run the Bicep build and workflow helper tests for deployment changes.
 - Some tests inspect or extract source text. In particular,
   `picker-freshness.test.mjs` slices the `MultiRegionSessions` block between
   source markers; preserve those markers or update the test deliberately.
+- Normalize CRLF to LF before matching multiline source markers; do not change
+  production formatting or weaken assertions to accommodate a local checkout.
+- Run the Squad setup suite when changing team configuration or its automation.
+  Conversational aliases are separate from issue routing: Scribe and Ralph are
+  intentionally not issue-assignment owners.
 - Preserve cross-wire fixtures and positional field order when changing
   MessagePack schemas. Validate both JavaScript and C# sides.
 - Include regression tests for fixes, especially around lifecycle races,
@@ -134,6 +148,27 @@ changes. Run the Bicep build and workflow helper tests for deployment changes.
   not an exact timestamp for every simulated pose.
 - Keep changes surgical. Do not reformat large inline sections or perform
   unrelated cleanup.
+
+## Small ticket-to-playable-PR workflow
+
+Use the gameplay issue form and PR template for a bounded delivery trial. Name
+one primary owner, the owning layer, observable acceptance criteria, and a
+playable scenario. Gameplay-only tickets should normally stay in one adapter or
+game-owned pivot and use existing wire fields. New schemas, events, lifecycle
+dependencies, or regional-authority assumptions require an explicit contract
+review rather than being hidden inside a gameplay change.
+
+Keep foreground and hidden simulation ordering separate where documented. Put
+state that must survive reconnect or late join in replicated records; object
+events are transient and are not a substitute for durable state. Process-local
+sessions do not become shared across regions or instances through a client change.
+
+Attach focused/full automated results and browser evidence, distinguishing local
+smoke from a genuinely verified branch preview. Public evidence may use only
+default Azure hostnames. Do not claim browser playability from mocked transport,
+unit tests, Bicep compilation, or an unvisited deployment URL. Record remaining
+manual device, network, accessibility, and deployment checks explicitly; use the
+trial's evidence to decide whether the workflow should become permanent policy.
 
 ## Deployment and security
 
