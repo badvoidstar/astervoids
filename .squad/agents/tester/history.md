@@ -14,3 +14,7 @@
 ## Learnings
 
 Initial team setup complete.
+
+### 2026-09-25T13:55:03.515-07:00: Named-team review
+
+- Casey approved client changes unchanged but reproduced a P2 browser-guard redirect escape: one denied-target contact with zero recorded violations. Jordan independently revised the harness under author lockout; Casey re-approved after shared-helper inspection and lifecycle probes. The final regressions verify zero actual target requests, not counters alone.
