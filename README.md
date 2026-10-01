@@ -2,6 +2,22 @@
 
 A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
+## Multiplayer scores
+
+During play, `your score` appears above `team score` in the status row. Game over
+replaces that row with the full team total and historical players, including
+departed and zero-score players, as stable anonymous `Player 1`, `Player 2`, etc. Pure
+spectators do not get a player row. Standings sort by score, then the original
+player number, and show the highest-scoring `floor(session capacity * 1.5)`
+entries; longer results scroll without hiding the exit controls.
+
+Personal totals survive ship recreation, same-tab rejoin, and GameState ownership
+migration within that session. They follow the existing team accounting, including
+accepted late awards after game over. Older sessions or detected inconsistent
+histories show personal results as unavailable; missing advertised capacity defers
+the rows, never the team total. Old game owners in mixed-version sessions
+cannot guarantee personal history. Solo `Score` and `Final Score` are unchanged.
+
 ## Local Development
 
 ```powershell

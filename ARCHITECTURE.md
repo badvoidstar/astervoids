@@ -215,6 +215,60 @@ The game continues to own orchestration in `wwwroot/index.html`:
   changes invalidate the cache, and cached publication still queues updates
   against `ObjectSync`'s confirmed baseline rather than treating a local write
   as an acknowledgement.
+- Personal score history is separate from the entry-life ledger. New sessions
+  persist `participantScores` and `participantNumbers` on GameState, keyed by
+  normalized `participantId` GUIDs. The GameState **owner**, not the Server
+  role, registers every observed ship participant at zero, even on fatal and
+  departure transitions. Unseen IDs in one calculation are GUID-sorted before
+  assigning the next positive ordinal; existing ordinals never change.
+  The same accepted positive `Ship.score - processedScores[shipId]` delta
+  increases both the team total and that participant's lifetime total.
+  Duplicate/lower counters are ignored, retired ship baselines remain, and a
+  recreated ship starts at zero rather than inheriting the lifetime score.
+  `countedParticipants`, its 255-entry limit, score-life-before-damage order,
+  and entry-life-after-damage order retain their existing meanings. Personal
+  histories are not evicted to satisfy a presentation row limit.
+- Rare ship score changes are persisted through the existing Ship `score`
+  slot with `ObjectSync.updateObject`, independently of the motion send gate.
+  Unconfirmed counters retry at the existing visible/hidden and terminal
+  maintenance pivots; confirmed scores add no steady-state motion traffic.
+  Ship-state events still provide prompt counter/hit feedback, but are not the
+  durable score source. Before member cleanup removes ships, the game captures
+  their calculation inputs, applies ownership migration, and invokes the same
+  calculator if this member now owns GameState. Voluntary exits leave ship
+  removal to that atomic member-departure path, rather than pre-deleting the
+  inputs while the previous owner's GameState publication may be unconfirmed.
+  Manual ship-delete callbacks retain the deleted record for that calculation
+  too. A newly owning spectator adopts canonical GameState before publication;
+  it acquires no personal
+  history unless it has published a ship.
+- Multiplayer HUD shows `your score` above `team score`. The personal value
+  projects the persisted lifetime total plus positive, unprocessed counters
+  for that participant; it is not a second accumulator. Long session names
+  ellipsize, and a narrow letterboxed viewport may borrow adjacent window space
+  for the status row. Font floors remain bounded by screen size, not name length.
+  Multiplayer final standings replace the playing HUD so they cannot collide
+  with its status columns; solo retains its existing HUD. Short game-over overlays
+  borrow spare window height to keep rows scrollable without changing gameplay
+  or wave-announcement geometry. Standings use only
+  persisted histories, including departed and zero-score players, and label
+  them `Player N` from the immutable ordinal (never a member ID or rank).
+  Sort is score descending, ordinal ascending, then normalized GUID lexical
+  order, independent of locale and live membership. Only the highest-scoring
+  `floor(maxMembers * 1.5)` entries are displayed. Capacity comes from a
+  matching active-session advertisement and is retained on same-session
+  reentry; if absent, at most one query per entry uses the already joined hub's
+  existing `getActiveSessions` API. Unknown capacity keeps the full team total
+  visible but defers the personal rows. The results region alone enables native
+  keyboard/touch scrolling; normal game controls and exits remain unchanged.
+- The creator's schema registry remains authoritative. Sixteen-slot GameState
+  sessions are not reinterpreted as eighteen-slot sessions. Missing, malformed,
+  or incomplete personal history is visibly unavailable rather than reconstructed
+  from currently live ships or the entry-life ledger. A personal-history sum
+  that does not match the persisted team total is also unavailable, without
+  inventing the missing attribution. A mixed-version old GameState owner is
+  **not** guaranteed to maintain the new histories. Solo `Score` / `Final Score`
+  behavior is unchanged.
 - A session ship that takes a hit its owner predicts to be fatal stops being
   controlled instead of respawning, so the final frames everyone sees are the
   collision that ended the game rather than a fresh ship at centre. The owner
@@ -337,9 +391,10 @@ those seams.
 All wrappers route through `invokeHub()`, which enforces session membership and applies `GuidUtils.transformBinaryGuids` to the result before returning it to the caller.
 
 Create and join/rejoin retain distinct RPCs and snapshot construction, then
-share session-entry completion: install validated identity, merge pending member
-events, finish the transition, and notify listeners. Epoch checks stop pending
-callback delivery and suppress the result if a listener resets the session.
+share session-entry completion: install validated identity, seed snapshot
+objects, replay pending broadcasts in receive order, finish the transition, and
+notify listeners for final snapshot backfill. Epoch checks stop seeds and
+pending callbacks and suppress the result if a listener resets the session.
 
 | Wrapper | Hub method | Wire args | Return (after GUID normalization) |
 |---|---|---|---|
@@ -393,7 +448,7 @@ These methods have no corresponding hub RPC.
 | `onMemberJoined` | `OnMemberJoined` | `(memberInfo, senderMemberId, memberSequence)` |
 | `onMemberLeft` | `OnMemberLeft` | `(info, senderMemberId, memberSequence)`; may be immediately followed by `onRoleChanged` if the local member was promoted |
 | `onRoleChanged` | Derived from `OnMemberLeft` | Fired only when `info.promotedMemberId === currentMember.id`; arg: `(newRole)` |
-| `onObjectCreated` | `OnObjectCreated` | `(objectInfo, senderMemberId, memberSequence)` |
+| `onObjectCreated` | `OnObjectCreated` / entry snapshot seed | `(objectInfo, senderMemberId, memberSequence)`; seeds carry `null` sender, sequence `0`, and the object's snapshot `validAt` |
 | `onObjectsUpdated` | `OnObjectsUpdated` | Arg reorder: hub sends `serverTimestamp` at position 4; callback puts it at position 1 → `(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs)` |
 | `onObjectDeleted` | `OnObjectDeleted` | `(objectId, senderMemberId, memberSequence)` |
 | `onObjectReplaced` | `OnObjectReplaced` | `(event, senderMemberId, memberSequence)` |
@@ -403,9 +458,10 @@ These methods have no corresponding hub RPC.
 | `onError` | Internal | `(errorMessage)` — fired on connection or RPC errors |
 
 While a create or join RPC is pending, membership broadcasts can overtake its
-older response snapshot. `SessionClient` queues those broadcasts, folds them
-into the installed member list in arrival order, then dispatches their callbacks
-after the session callback has initialized snapshot consumers.
+older response snapshot. `SessionClient` queues membership and object broadcasts
+together. Validated identity and snapshot objects are installed before their
+handlers and callbacks replay in receive order, including membership changes
+and ownership migrations. Entry completion callbacks run after that replay.
 
 `onConnected` reports transport readiness, not completed state reconciliation.
 The uncertainty notification starts recovery without awaiting its snapshot.
@@ -1432,6 +1488,11 @@ no wreck freezes on a hidden blink frame. The settle clears the local countdown
 and replica anchor only; the invulnerability revision stays untouched because it
 is the wire transition key, not a presentation value.
 
+Neither the team nor personal score is frozen at the pose terminal anchor.
+Late/in-flight ship awards accepted by the existing team calculator update both
+totals and the persisted standings; `gameOverAt`, `terminalAt`, and the final-life
+ship remain immutable. There is no additional score deadline or terminal authority.
+
 In multiplayer, only the ship whose damage exhausts the shared lives pool
 decomposes into three detached triangle edges. The GameState owner records
 `terminalShipId` on the first positive-to-zero lives transition, after score-life
@@ -1931,6 +1992,27 @@ replace an earlier descriptor. A failed replacement leaves the previously
 registered set usable. Changing a field layout therefore requires explicit
 compatibility review rather than relying on registration order.
 
+While create/join/rejoin is pending, `SessionClient` retains session-scoped
+membership and object broadcasts as raw arguments in the existing transition
+queue. The response's `metadata.schemas` is installed before any queued object
+payload is decoded. A join snapshot is decoded first to learn its handles,
+then seeded through ordinary object registration with no sender sequence.
+Queued hub handlers and callbacks replay together in received order, so an
+ownership migration sees its snapshot record before a newer delta advances
+the version. The final session callback retains `ObjectSync`'s version-aware
+snapshot merge: newer live records and owners survive, missing snapshot fields
+are backfilled, and deletion tombstones prevent resurrection. Expiration and
+session-list signals are not delayed.
+
+The queue belongs only to that connection/session epoch and entry RPC: failed,
+rejected, cancelled, reset, expired, or superseded entry discards it rather than
+decoding it with another session's registry. Replay stops if a callback changes
+the epoch. Missing schema metadata clears the positional registry and preserves
+the schema-zero MessagePack-map path, not the previous/startup layout. Invalid
+queued positional payloads reject entry through the existing logged error and
+`onError` path, invalidating any seeds and replayed state along with the raw
+tail; they are not silently treated as successful joins.
+
 ### Wire shape (SchemaId >= 1)
 
 ```
@@ -1980,7 +2062,13 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 | 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id; packed personal-score and participant-number ledgers |
+
+GameState keeps its original slots 0–15 unchanged, then appends optional `bytes`
+fields `participantScores` at slot 16 and `participantNumbers` at slot 17.
+Its current eighteen-slot layout uses a three-byte presence mask. The session
+creator publishes the layout through `metadata.schemas`; older sixteen-slot
+registries retain their two-byte mask on updates and join snapshots.
 
 Every known gameplay type uses exactly one superset schema for create, update,
 replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
@@ -2008,11 +2096,16 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
   metadata so every client regenerates identical geometry. Explicit fracture
   geometry uses four bytes per vertex: q16 wrapped angle followed by q16
   normalized distance.
-- **GameState ledgers:** processed hit/score maps and the counted-participant
-  map are sorted by GUID and encoded as fixed 20-byte entries (16-byte binary
-  GUID + little-endian uint32 count).
+- **GameState ledgers:** processed hit/score maps, the counted-participant map,
+  personal scores, and participant numbers are sorted by normalized GUID and
+  encoded as fixed 20-byte entries (16-byte binary GUID + little-endian uint32).
+  Personal scores validate as nonnegative integers; participant numbers as
+  positive integers. Both maps must describe the same participants. Duplicate
+  GUIDs, invalid entries, and malformed byte lengths are rejected and reported
+  through the existing validation/recovery path, never reset to an empty history.
   `ObjectSync` compares byte arrays by content so repacking an unchanged map
-  does not defeat delta suppression or confirmation tracking.
+  does not defeat delta suppression or confirmation tracking. Decode/pack caches
+  retain private snapshots to detect same-version and in-place mutations.
 - **Object events:** payload maps are field-aliased, MessagePack-encoded once by
   the sender, and relayed by the hub as opaque `byte[]`. The receiver decodes
   and expands aliases before calling the game handler.
@@ -2024,7 +2117,7 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 | ship create body (including countdown timing) | 64 B |
 | seeded asteroid create body | 40 B |
 | bullet create body | 37 B |
-| GameState create body | 52 B |
+| fresh GameState create body (five empty ledgers) | 65 B |
 | asteroid x/y/angle update DTO | 29–35 B |
 | ballistic bullet update DTO | 29–35 B |
 | pending-hit bullet update DTO | 50–60 B |
@@ -2040,6 +2133,13 @@ fixtures additionally cover SignalR MessagePack invocation/completion framing:
 the sender receives one completion, with 11 B of authoritative metadata, instead
 of a completion plus duplicate child broadcast. Neither budget includes
 WebSocket, TLS or IP overhead.
+
+The eighteen-slot GameState fixture without the three optional participant maps
+is 53 B; adding empty personal-score/number maps makes it 61 B, and the fresh
+production producer also includes the empty counted-participant map for 65 B.
+Each historical participant adds 40 B across the two new packed maps. A score-only
+Ship update body is 8 B (four-byte Ship mask plus the existing uint32 counter);
+it is sent only while that counter is unconfirmed, not on every motion update.
 
 ### Hazards verified by tests
 

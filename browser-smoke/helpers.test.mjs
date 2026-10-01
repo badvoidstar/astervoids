@@ -5,6 +5,53 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
+import { rankedPersonalResults, personalRows, personalHudScores } from './personal-scores.mjs';
+
+test('personal score expectation uses the advertised capacity and highest scorers on overflow', () => {
+    const participants = Array.from({ length: 10 }, (_, index) => ({
+        id: String(index), number: index + 1, score: index === 9 ? 123456 : 0,
+    }));
+    assert.deepEqual(rankedPersonalResults(participants, 4), [
+        { number: 10, score: 123456 }, { number: 1, score: 0 },
+        { number: 2, score: 0 }, { number: 3, score: 0 },
+        { number: 4, score: 0 }, { number: 5, score: 0 },
+    ]);
+    assert.equal(rankedPersonalResults(participants, 3).length, 4);
+    assert.equal(rankedPersonalResults(participants, 5).length, 7);
+    assert.throws(() => rankedPersonalResults(participants, undefined), /advertised/);
+});
+
+test('personal score expectation is independent of peer insertion order', () => {
+    const participants = [
+        { id: 'b', number: 2, score: 100 }, { id: 'a', number: 1, score: 100 },
+        { id: 'c', number: 3, score: 0 },
+    ];
+    assert.deepEqual(rankedPersonalResults(participants, 4), [
+        { number: 1, score: 100 }, { number: 2, score: 100 }, { number: 3, score: 0 },
+    ]);
+    assert.deepEqual(rankedPersonalResults([...participants].reverse(), 4),
+        rankedPersonalResults(participants, 4));
+    assert.deepEqual(participants.map(({ id }) => id), ['b', 'a', 'c'], 'The oracle does not mutate inputs');
+});
+
+test('personal result reader retains zero scores, stable labels and six-digit values', () => {
+    assert.deepEqual(personalRows('team score 246,912\nPlayer 2 (you)\n123,456\nPlayer 1\n123456\nPlayer 3\n0'), [
+        { number: 2, score: 123456 }, { number: 1, score: 123456 }, { number: 3, score: 0 },
+    ]);
+    assert.deepEqual(personalRows('Final Score: 123456'), []);
+    assert.deepEqual(personalRows('Player 1 -20'), []);
+    assert.deepEqual(personalRows('Player 1: 0\nPlayer 2 (You): 1'), [
+        { number: 1, score: 0 }, { number: 2, score: 1 },
+    ]);
+});
+
+test('personal HUD reader distinguishes lowercase individual and shared score labels', () => {
+    assert.deepEqual(personalHudScores('your score\n123456\nteam score\n316,932\nWave: 1\nLives: 5'), {
+        your: 123456, team: 316932,
+    });
+    assert.deepEqual(personalHudScores('Score: 123456'), { your: null, team: null });
+    assert.deepEqual(personalHudScores('Your score 1 Team score 2'), { your: null, team: null });
+});
 
 test('only a default single-region ACA origin is accepted remotely', () => {
     assert.equal(remoteBaseURL('https://preview.cluster.azurecontainerapps.io/'),

@@ -53,10 +53,19 @@ const BULLET_SCHEMA_FIELDS = [
     ['hitOffsetN', 'q16s'], ['terminalEpoch', 'f64'],
     ['terminalX', 'f64'], ['terminalY', 'f64'],
 ];
+const GAME_STATE_SCHEMA_FIELDS = [
+    ['type', 'str'], ['gameStarted', 'bool'], ['wave', 'u16'], ['state', 'str'],
+    ['lives', 'u16'], ['groupScore', 'u32'], ['speedMultiplier', 'f32'],
+    ['waveDelayTimer', 'f32'], ['processedHits', 'bytes'], ['processedScores', 'bytes'],
+    ['peakShipCount', 'u8'], ['gameOverAt', 'f64'], ['terminalAt', 'f64'],
+    ['scoreLifeAwardCount', 'u32'], ['countedParticipants', 'bytes'],
+    ['terminalShipId', 'guid'], ['participantScores', 'bytes'], ['participantNumbers', 'bytes'],
+];
 
 test('cross-wire fixtures match every production positional field', () => {
     for (const [id, fields] of [
-        [1, SHIP_SCHEMA_FIELDS], [2, ASTEROID_SCHEMA_FIELDS], [3, BULLET_SCHEMA_FIELDS]
+        [1, SHIP_SCHEMA_FIELDS], [2, ASTEROID_SCHEMA_FIELDS], [3, BULLET_SCHEMA_FIELDS],
+        [4, GAME_STATE_SCHEMA_FIELDS],
     ]) {
         assert.deepEqual(fields, SCHEMAS.find(schema => schema.id === id).fields);
     }
@@ -245,4 +254,42 @@ test('cross-wire: invulnerability transition and capture time have canonical byt
     const hex = '00010003' + 'b400' + '07000000' + '0000000000408f40';
     assert.deepEqual(SchemaCodec.decode(schema, hexToBytes(hex)), data);
     assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
+});
+
+test('cross-wire: eighteen-slot GameState preserves terminal slots with a three-byte mask', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(4, GAME_STATE_SCHEMA_FIELDS);
+    const data = {
+        lives: 0, gameOverAt: 1000, terminalAt: 1750,
+        terminalShipId: '00112233-4455-6677-8899-aabbccddeeff',
+    };
+    const hex = '109800' + '0000' + '0000000000408f40' + '0000000000589b40'
+        + '33221100554477668899aabbccddeeff';
+    assert.deepEqual(SchemaCodec.decode(schema, hexToBytes(hex)), data);
+    assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
+});
+
+test('cross-wire: personal score and number maps use optional slots sixteen and seventeen', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(4, GAME_STATE_SCHEMA_FIELDS);
+    const score = hexToBytes('33221100554477668899aabbccddeeff' + '00000000');
+    const number = hexToBytes('33221100554477668899aabbccddeeff' + '01000000');
+    const hex = '000003' + '14000000' + Buffer.from(score).toString('hex')
+        + '14000000' + Buffer.from(number).toString('hex');
+    const data = { participantScores: score, participantNumbers: number };
+    assert.deepEqual(SchemaCodec.decode(schema, hexToBytes(hex)), data);
+    assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
+    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5);
+});
+
+test('cross-wire: the creator sixteen-slot registry still decodes its original two-byte mask', () => {
+    freshRegistry();
+    const schema = SchemaCodec.register(4, GAME_STATE_SCHEMA_FIELDS.slice(0, 16));
+    const hex = '1098' + '0000' + '0000000000408f40' + '0000000000589b40'
+        + '33221100554477668899aabbccddeeff';
+    const decoded = SchemaCodec.decode(schema, hexToBytes(hex));
+    assert.equal(decoded.terminalShipId, '00112233-4455-6677-8899-aabbccddeeff');
+    assert.equal(decoded.lives, 0);
+    assert.equal('participantScores' in decoded, false);
+    assert.equal(Buffer.from(SchemaCodec.encode(schema, decoded)).toString('hex'), hex);
 });

@@ -387,10 +387,10 @@ test('SessionClient merges member events that overtake a pending join snapshot',
         ['late-member', joiningMemberId].sort());
     assert.equal(result.member.role, 'Server');
     assert.deepEqual(callbacks, [
-        `session:${['late-member', joiningMemberId].sort().join(',')}`,
         'joined:late-member',
         'left:old-server',
-        'role:Server'
+        'role:Server',
+        `session:${['late-member', joiningMemberId].sort().join(',')}`
     ]);
 });
 
@@ -419,7 +419,7 @@ async function sessionEntryHarness(method) {
 }
 
 for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
-    test(`${method} installs identity and pending members before entry callbacks`, async () => {
+    test(`${method} installs identity and replays pending members before entry completion callbacks`, async () => {
         const { client, connection, gate, response, eventName, enter } = await sessionEntryHarness(method);
         const events = [];
         client.on(eventName, (session, member) => {
@@ -430,7 +430,14 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
             events.push('entry');
             connection.emit('OnMemberJoined', { id: 'during-callback', role: 'Client' }, 'sender', 3, 1003);
         });
-        client.on('onMemberJoined', member => events.push(member.id));
+        client.on('onMemberJoined', member => {
+            assert.equal(client.getCurrentSession().id, response.sessionId);
+            assert.equal(client.getCurrentMember().id, response.memberId);
+            assert.equal(client.getLastSessionId(), response.sessionId);
+            assert.ok(client.getParticipantId());
+            assert.ok(client.getCurrentSession().members.some(m => m.id === member.id));
+            events.push(member.id);
+        });
         const entering = enter();
         await drainMicrotasks();
         for (const id of ['first', 'second']) {
@@ -441,8 +448,8 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         const result = await entering;
         assert.equal(result.session, client.getCurrentSession());
         assert.equal(result.member.role, response.role);
-        assert.deepEqual(events, ['entry', 'during-callback', 'first', 'second'],
-            'transition is finished before entry callback; buffered callbacks retain their order');
+        assert.deepEqual(events, ['first', 'second', 'entry', 'during-callback'],
+            'received callbacks finish before entry completion; reentrant events cannot overtake them');
 
         client.clearSessionState();
         connection.invokers.set('RejoinSession', () => Promise.resolve(response));
@@ -476,7 +483,7 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
             assert.equal(await entering, null);
             assert.equal(client.getCurrentSession(), null);
             assert.equal(client.getCurrentMember(), null);
-            assert.deepEqual(events, resetAt === 'entry' ? ['entry'] : ['entry', 'first']);
+            assert.deepEqual(events, resetAt === 'entry' ? ['first', 'second', 'entry'] : ['first']);
         });
     }
 

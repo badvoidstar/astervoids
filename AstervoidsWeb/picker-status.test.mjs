@@ -473,6 +473,8 @@ test('successful membership helpers keep snapshot epochs and identity separate f
                 SessionClient: { getSessionEpoch: () => 42 },
                 replicationRuntime: { beginSession: context => calls.push(context) },
                 adoptSessionConfig: metadata => calls.push(metadata),
+                captureSessionCapacity: () => {},
+                ensureSessionCapacity: () => {},
             });
         beginSessionSnapshot(result);
         applySessionMembership(result);
@@ -481,6 +483,7 @@ test('successful membership helpers keep snapshot epochs and identity separate f
         ]);
         assert.deepEqual(game.sessionInfo, {
             id: 's', name: 'Test session', memberId: 'm', role, metadata: result.session.metadata,
+            maxMembers: null,
         });
         assert.equal(game.mode, 'session');
         assert.equal(game.state, 'waveDelay', 'rejoin controls its own transition');

@@ -67,6 +67,7 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
         isGameOver: () => false,
         spawnWave: async () => true,
         createSyncedGameState: async () => {},
+        syncGameState: () => calls.push('syncGameState'),
         updateHUD: () => {},
         publishDebugMetrics: () => {},
         _warn: () => {}

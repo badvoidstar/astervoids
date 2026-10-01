@@ -17,12 +17,14 @@ test('gameplay overlays write only when state, score, wave or spectator status c
     const game = { state: 'playing', wave: 1, score: 0 };
     const elements = Object.fromEntries([
         'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverScoreEl', 'gameoverPromptEl',
+        'gameoverResultsEl',
     ].map(name => [name, element()]));
     let over = false;
     let spectator = false;
     const { updateGameplayOverlays } = loadInlineGameFunctions(['updateGameplayOverlays'], {
         ...elements, game, overlayCache: {},
         isGameOver: () => over, isLobbySpectating: () => spectator,
+        isSessionMode: () => false,
     });
     updateGameplayOverlays();
     const countWrites = () => Object.values(elements).reduce((sum, el) => sum + el.writes.length, 0);

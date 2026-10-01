@@ -300,7 +300,7 @@ test('the standalone serializer still packs pure calculation results without a c
 
 function loadSyncHarness({
     data = {}, ships = [], sessionMode = true, owner = true, optimistic = true,
-    objectSync = null,
+    objectSync = null, personalHistory = false,
 } = {}) {
     const events = [];
     const publications = [];
@@ -321,12 +321,14 @@ function loadSyncHarness({
         speedMultiplier: 1.2, waveDelayTimer: 80,
         multiplayer: { gameStateObjectId: 'gs', observedScoreLifeAwardCount: null },
     };
-    const { syncGameState, resetGameStateSyncCache } = loadInlineGameFunctions([
+    const { syncGameState, resetGameStateSyncCache, handleShipStateChangedEvent } = loadInlineGameFunctions([
         'calculateGameState',
         'applyCalculatedGameState', 'serializeGameState', 'syncGameState',
         'resetGameStateSyncCache', 'gameStateCounterMapsEqual', 'gameStateLedgerMatches',
         'readGameStateLedger', 'packGameStateLedger', 'gameStateCalculationInputs',
-        'gameStateInputsEqual',
+        'gameStateInputsEqual', 'hasParticipantScoreSchema', 'normalizeParticipantLedger',
+        'readParticipantScoreHistory', 'reportMalformedGameStateLedgers',
+        'handleShipStateChangedEvent',
     ], {
         game,
         countExtraLivesForScore: (...args) => {
@@ -346,6 +348,9 @@ function loadSyncHarness({
         SessionClient: {
             getSessionEpoch: () => controls.epoch,
             getCurrentMember: () => ({ id: controls.memberId }),
+            getCurrentSession: () => ({
+                metadata: { schemas: personalHistory ? require('./wwwroot/js/game-wire-schemas.js').SCHEMAS : [] },
+            }),
         },
         AstervoidsWireCodec: {
             ...codec,
@@ -363,6 +368,7 @@ function loadSyncHarness({
             events.push('award');
         },
         AudioSystem: { beat: { stop: () => events.push('stop') } },
+        CollisionEffects: { startShipHit() {} },
         RemoteObjects: { serverNowMs: () => {
             assert.equal(game.lives, 0);
             events.push('clock');
@@ -370,8 +376,11 @@ function loadSyncHarness({
         } },
         _error: () => events.push('error'),
         ObjectSync: objectSync ?? {
-            getObject: () => controls.record,
+            getObject: id => id === game.multiplayer.gameStateObjectId
+                ? controls.record : ships.find(ship => ship.id === id),
             getObjectsByType: () => ships,
+            getObjectByType: type => type === 'gameState'
+                ? controls.record : ships.find(ship => ship.data?.type === type),
             updateObject: (id, payload, immediate) => {
                 events.push('publish');
                 publications.push({ id, payload, immediate });
@@ -384,7 +393,7 @@ function loadSyncHarness({
     });
     return {
         syncGameState, resetGameStateSyncCache, game, record, events, publications,
-        counts, config, controls, ships, awardStates, terminalCalls,
+        counts, config, controls, ships, awardStates, terminalCalls, handleShipStateChangedEvent,
     };
 }
 
@@ -792,10 +801,12 @@ test('recovery snapshots invalidate aggregation without replaying already-consum
     assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
 });
 
-test('real ObjectSync retries unconfirmed cached GameState after failed, empty, and rejected responses',
+test('real ObjectSync retries legacy and personal GameState after failed, empty, and rejected responses',
     async () => {
         const authoritativeObject = require('./wwwroot/js/authoritative-object.js');
-        for (const failure of [null, { versions: {} }, new Error('network failure')]) {
+        const scenarios = [null, { versions: {} }, new Error('network failure')]
+            .flatMap(failure => [false, true].map(personalHistory => ({ failure, personalHistory })));
+        for (const { failure, personalHistory } of scenarios) {
             const handlers = {};
             const batches = [];
             let confirm = false;
@@ -826,14 +837,18 @@ test('real ObjectSync retries unconfirmed cached GameState after failed, empty, 
                         state: 'playing', scoreLifeAwardCount: 0,
                         processedHits: codec.packCounterMap({}),
                         processedScores: codec.packCounterMap({}),
+                        ...(personalHistory ? {
+                            participantScores: codec.packCounterMap({}),
+                            participantNumbers: codec.packCounterMap({}),
+                        } : {}),
                     },
                 },
                 {
                     id: firstId, version: 1, ownerMemberId: 'member-a', scope: 'Member',
-                    data: { type: 'ship', score: 10, hitCount: 2 },
+                    data: { type: 'ship', score: 10, hitCount: 2, participantId: participantA },
                 },
             ] });
-            const harness = loadSyncHarness({ objectSync });
+            const harness = loadSyncHarness({ objectSync, personalHistory });
             harness.syncGameState();
             const optimistic = { ...objectSync.getObject('gs').data };
             assert.equal(objectSync.isDataConfirmed('gs', optimistic), false);
@@ -852,8 +867,217 @@ test('real ObjectSync retries unconfirmed cached GameState after failed, empty, 
             harness.syncGameState();
             await objectSync.flushUpdates();
             assert.equal(batches.length, 3, 'confirmed duplicates remain ObjectSync-suppressed');
-            assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+            const ledgerCount = personalHistory ? 5 : 3;
+            assert.deepEqual(harness.counts, { calculate: 1, pack: ledgerCount, unpack: ledgerCount });
             assert.equal(harness.terminalCalls.length, 1);
             assert.deepEqual(harness.events, ['award', 'stop', 'clock']);
         }
     });
+
+function personalGameStateData(extra = {}) {
+    return {
+        lives: 3, groupScore: 0, peakShipCount: 0, state: 'playing',
+        participantScores: codec.packCounterMap({}),
+        participantNumbers: codec.packCounterMap({}),
+        ...extra,
+    };
+}
+
+test('personal ledgers reuse decoded maps and packed bytes across motion-only and unchanged ticks', () => {
+    const harness = loadSyncHarness({
+        personalHistory: true, data: personalGameStateData(),
+        ships: [{
+            id: firstId, version: 7, data: { participantId: participantA, score: 20, hitCount: 0 },
+        }],
+    });
+    harness.syncGameState();
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 5, unpack: 5 });
+    const scores = harness.record.data.participantScores;
+    const numbers = harness.record.data.participantNumbers;
+    for (let frame = 0; frame < 120; frame++) {
+        harness.ships[0].data.x = frame / 1000;
+        harness.ships[0].version++;
+        harness.syncGameState();
+    }
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 5, unpack: 5 });
+    assert.equal(harness.record.data.participantScores, scores);
+    assert.equal(harness.record.data.participantNumbers, numbers);
+    assert.deepEqual(codec.unpackCounterMap(scores), { [participantA]: 20 });
+    assert.deepEqual(codec.unpackCounterMap(numbers), { [participantA]: 1 });
+
+    const version = harness.ships[0].version;
+    harness.handleShipStateChangedEvent(firstId, { score: 35, hitCount: 0 });
+    harness.syncGameState();
+    assert.equal(harness.ships[0].version, version, 'counter events do not advance versions');
+    assert.equal(harness.game.score, 35);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores), { [participantA]: 35 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 7, unpack: 5 });
+    assert.equal(harness.record.data.participantNumbers, numbers);
+
+    harness.handleShipStateChangedEvent(firstId, { score: 35, hitCount: 1 });
+    harness.syncGameState();
+    assert.equal(harness.game.lives, 2);
+    assert.deepEqual(harness.counts, { calculate: 3, pack: 8, unpack: 5 });
+    harness.handleShipStateChangedEvent(firstId, { score: 1, hitCount: 0 });
+    harness.syncGameState();
+    assert.equal(harness.game.score, 35);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores), { [participantA]: 35 });
+    assert.deepEqual(harness.counts, { calculate: 4, pack: 8, unpack: 5 });
+});
+
+test('pre-departure ship inputs register zero players and credit departed scorers through the same calculator', () => {
+    const harness = loadSyncHarness({ personalHistory: true, data: personalGameStateData() });
+    const departing = [
+        { id: secondId, data: { participantId: participantB, score: 0 } },
+        { id: firstId, data: { participantId: participantA, score: 30 } },
+    ];
+    harness.game.multiplayer.gameStateObjectId = null;
+    harness.syncGameState(true, departing);
+    assert.equal(harness.game.multiplayer.gameStateObjectId, 'gs',
+        'a departure before descriptor binding still uses the canonical GameState');
+    harness.syncGameState();
+    assert.equal(harness.game.score, 30);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores),
+        { [participantA]: 30, [participantB]: 0 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantNumbers),
+        { [participantA]: 1, [participantB]: 2 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.processedScores), { [firstId]: 30 });
+
+    harness.ships.push({
+        id: thirdId, data: { participantId: participantA, score: 0 },
+    });
+    harness.syncGameState();
+    harness.handleShipStateChangedEvent(thirdId, { score: 15 });
+    harness.syncGameState();
+    assert.equal(harness.game.score, 45);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores),
+        { [participantA]: 45, [participantB]: 0 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantNumbers),
+        { [participantA]: 1, [participantB]: 2 });
+    assert.equal(harness.game.lives, 4, 'rejoin must not repay the participant entry life');
+});
+
+test('fatal zero-score entrants persist, and accepted late score deltas do not freeze at game over', () => {
+    const harness = loadSyncHarness({
+        personalHistory: true, data: personalGameStateData({ lives: 1 }),
+        ships: [{ id: firstId, data: { participantId: participantA, score: 0, hitCount: 1 } }],
+    });
+    harness.syncGameState();
+    assert.equal(harness.game.lives, 0);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.countedParticipants), {});
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores), { [participantA]: 0 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantNumbers), { [participantA]: 1 });
+    assert.equal(harness.record.data.terminalShipId, firstId);
+    harness.handleShipStateChangedEvent(firstId, { score: 150, hitCount: 1 });
+    harness.syncGameState();
+    assert.equal(harness.game.score, 150);
+    assert.equal(harness.game.lives, 0);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores), { [participantA]: 150 });
+    assert.equal(harness.record.data.gameOverAt, 1000);
+    assert.equal(harness.record.data.terminalAt, 1750);
+    assert.equal(harness.record.data.scoreLifeAwardCount, 0);
+});
+
+test('legacy schema or absent histories keeps the existing team and life behavior without inferring totals', () => {
+    for (const personalHistory of [false, true]) {
+        const data = { lives: 3, groupScore: 90, peakShipCount: 1, state: 'playing' };
+        if (!personalHistory) {
+            data.participantScores = new Uint8Array([1]);
+            data.participantNumbers = new Uint8Array([1]);
+        }
+        const harness = loadSyncHarness({
+            personalHistory, data,
+            ships: [{ id: firstId, data: { participantId: participantA, score: 20 } }],
+        });
+        harness.syncGameState();
+        assert.equal(harness.game.score, 110);
+        assert.equal(harness.game.lives, 4);
+        assert.equal('participantScores' in harness.publications[0].payload, false);
+        assert.equal('participantNumbers' in harness.publications[0].payload, false);
+        assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+        assert.equal(harness.events.includes('error'), false);
+    }
+});
+
+test('malformed personal history refuses publication and recovers after a same-version repair', () => {
+    for (const extra of [
+        { participantScores: new Uint8Array([1]) },
+        { participantNumbers: undefined },
+        { participantScores: { bad: 1 }, participantNumbers: { bad: 1 } },
+        { participantScores: { [participantA]: 0 }, participantNumbers: { [participantA]: 0 } },
+        { participantScores: { [participantA]: -1 }, participantNumbers: { [participantA]: 1 } },
+        { participantScores: { [participantA]: 0 }, participantNumbers: { [participantB]: 1 } },
+    ]) {
+        const harness = loadSyncHarness({
+            personalHistory: true, data: personalGameStateData(extra),
+            ships: [{ id: firstId, data: { participantId: participantA, score: 20 } }],
+        });
+        harness.syncGameState();
+        harness.syncGameState();
+        assert.deepEqual(harness.events, ['error']);
+        assert.equal(harness.publications.length, 0);
+        assert.equal(harness.game.score, 0);
+        harness.record.data.participantScores = codec.packCounterMap({});
+        harness.record.data.participantNumbers = codec.packCounterMap({});
+        harness.syncGameState();
+        assert.equal(harness.record.version, 1);
+        assert.equal(harness.game.score, 20);
+        assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores), { [participantA]: 20 });
+        assert.equal(harness.publications.length, 1);
+    }
+});
+
+test('personal wire-range errors are reported rather than thrown after applying score or life effects', () => {
+    const harness = loadSyncHarness({
+        personalHistory: true,
+        data: personalGameStateData({
+            participantScores: codec.packCounterMap({ [participantA]: 0xffffffff }),
+            participantNumbers: codec.packCounterMap({ [participantA]: 1 }),
+        }),
+        ships: [{ id: firstId, data: { participantId: participantA, score: 10 } }],
+    });
+    harness.syncGameState();
+    harness.syncGameState();
+    assert.deepEqual(harness.events, ['error']);
+    assert.equal(harness.game.score, 0);
+    assert.equal(harness.game.lives, 99);
+    assert.equal(harness.publications.length, 0);
+});
+
+test('history mutations, authoritative recovery, and a new GameState owner invalidate caches without losing players', () => {
+    const harness = loadSyncHarness({
+        personalHistory: true, data: personalGameStateData(),
+        ships: [{ id: firstId, data: { participantId: participantA, score: 25 } }],
+    });
+    harness.syncGameState();
+    harness.record.data = personalGameStateData({
+        groupScore: 40,
+        processedScores: codec.packCounterMap({ [firstId]: 20 }),
+        participantScores: codec.packCounterMap({ [participantA]: 40, [participantB]: 0 }),
+        participantNumbers: codec.packCounterMap({ [participantA]: 4, [participantB]: 2 }),
+    });
+    harness.syncGameState();
+    assert.equal(harness.record.version, 1, 'recovery need not advance the consumed version');
+    assert.equal(harness.game.score, 45);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores),
+        { [participantA]: 45, [participantB]: 0 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantNumbers),
+        { [participantA]: 4, [participantB]: 2 });
+
+    const mutated = harness.record.data.participantScores;
+    mutated[16] = 50;
+    harness.syncGameState();
+    assert.equal(codec.unpackCounterMap(harness.record.data.participantScores)[participantA], 50);
+    harness.ships.length = 0;
+    harness.controls.owner = false;
+    harness.syncGameState();
+    harness.controls.memberId = 'new-owner';
+    harness.record.ownerMemberId = 'new-owner';
+    harness.controls.owner = true;
+    harness.syncGameState();
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantScores),
+        { [participantA]: 50, [participantB]: 0 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.participantNumbers),
+        { [participantA]: 4, [participantB]: 2 });
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.processedScores), { [firstId]: 25 });
+});
