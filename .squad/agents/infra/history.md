@@ -14,3 +14,7 @@
 ## Learnings
 
 Initial team setup complete.
+
+### 2026-09-25T13:55:03.515-07:00: Named-team review
+
+- Jordan independently repaired the rejected browser guard; Casey re-approved. Observed evidence: fetch relaying broke WebSockets, so the final shared Chromium guard retained native streaming/WebSockets and prevented denied-origin contact under a documented one-guarded-page contract. Remote runs exclude local fixtures; revision was limited to smoke tooling/tests and delivery documentation.
