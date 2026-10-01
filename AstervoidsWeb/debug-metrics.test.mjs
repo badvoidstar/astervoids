@@ -23,6 +23,7 @@ test('HUD rendering no longer computes or publishes debug metrics', () => {
     const livesDisplay = {};
     const { updateHUD } = loadInlineGameFunctions(['updateHUD'], {
         game, hudCache, scoreDisplay, waveDisplay, livesDisplay,
+        personalScoreDisplay: { style: {} },
         hudDisplay: null,
         isSessionMode: () => false,
         document: { getElementById: () => null },

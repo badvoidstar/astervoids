@@ -206,6 +206,12 @@ The game continues to own orchestration in `wwwroot/index.html`:
   the evict-and-re-register of a rejoin (`SessionClient.getParticipantId`), so a
   reconnect is never paid twice; a ship without one is skipped rather than
   attributed to its (unstable) owning member.
+  Per-participant totals are maintained separately in `playerScores`; score
+  deltas update the personal and team totals together. Final observed counters
+  from deleted ships remain available until both score ledgers are acknowledged,
+  so a departure or ownership handoff between game steps does not lose a
+  participant or their last observed award. These records contribute no damage
+  or entry-life bonuses.
   `calculateGameStateTerminal` computes immutable terminal anchors from an
   explicit server time. `syncGameState` retains ledger validation, local
   effects, game-specific serialization, and publication through `ObjectSync`.
@@ -220,8 +226,8 @@ The game continues to own orchestration in `wwwroot/index.html`:
   collision that ended the game rather than a fresh ship at centre. The owner
   re-runs the same pure `calculateGameState` locally with its incremented
   `hitCount` applied, which reproduces the lives the authority is about to
-  publish — including other ships' unprocessed hits and pending extra-life
-  awards — with no extra traffic and regardless of who owns the ship or the
+  publish — including other ships' unprocessed hits, final observed departed
+  scores, and pending extra-life awards — with no extra traffic and regardless of who owns the ship or the
   GameState object. A held ship accepts no input and cannot collide again, but
   it keeps simulating and coasts: `beginShipDeathHold` clears the control
   intent and rotation, leaving `Ship.update` as friction decay, integration,
@@ -267,6 +273,35 @@ The game continues to own orchestration in `wwwroot/index.html`:
   ID assignment, replacement, and reset without persistent duplicate state.
   Runtime membership facts are shared for that pass; record and cleanup
   snapshots retain callback-mutation safety.
+
+### Multiplayer Scoring
+
+The session-scoped GameState persists a GUID-keyed `playerScores` ledger,
+including zero-point players and departed participants. Ship scores remain
+per-ship monotonic counters; `processedScores` makes their contributions
+idempotent, including when a returning participant publishes a new ship.
+The existing team total and score-based shared-life rules are unchanged.
+Lobby-only spectators do not enter the personal-score ledger.
+
+During session play, the HUD stacks **your score** above **team score** and
+slightly reduces the session row's text size. Personal totals include local
+awards not yet accounted for in GameState, without counting an acknowledged
+award twice. Solo play keeps its existing score presentation.
+Missing or malformed score ledgers are reported as unavailable rather than
+displayed as zero.
+
+Game over shows the team total and the highest-scoring
+`floor(maxMembers * 1.5)` participants, including departed players. All clients
+use only the persisted personal ledger for this ranking, with descending score
+and ascending participant GUID as the deterministic tie-breaker. `maxMembers`
+comes from the server's create/join/rejoin responses, not the current number of
+members or a hardcoded default. The complete personal ledger is retained even
+when the displayed list is capped.
+
+`Player 1`, `Player 2`, etc. are placeholder labels assigned by ascending
+participant GUID, independently of rank. The underlying participant ID is
+session-stable, not a durable player/account identity; durable identity and
+player-facing naming remain future work.
 
 Stationary and swept collision tests share polygon containment and
 squared-distance primitives in `collision-geometry.js`, including degenerate
@@ -368,7 +403,7 @@ These methods have no corresponding hub RPC.
 | `connect(force?)` | Opens `/sessionHub` with `MessagePackHubProtocol`; `force=true` tears down the existing connection first (awaits `stop()` with a 3 s timeout before creating a new one) |
 | `disconnect()` | Stops the connection and clears all state including `lastSessionId` |
 | `on(eventName, callback)` | Registers a named callback from the fixed `callbacks` set |
-| `getCurrentSession()` | Returns the current session object (`id, name, members[], objects[], metadata`) or `null` |
+| `getCurrentSession()` | Returns the current session object (`id, name, maxMembers, members[], objects[], metadata`) or `null` |
 | `getCurrentMember()` | Returns the current member object (`id, role`) or `null` |
 | `getSessionEpoch()` | Returns the monotonically changing local lifecycle epoch used to reject stale async work |
 | `isConnected()` | `true` when the connection is `HubConnectionState.Connected` |
@@ -1980,7 +2015,7 @@ Registered in `index.html` `WIREOPT_SCHEMAS`:
 | 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id; packed personal-score ledger |
 
 Every known gameplay type uses exactly one superset schema for create, update,
 replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
@@ -2008,9 +2043,9 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
   metadata so every client regenerates identical geometry. Explicit fracture
   geometry uses four bytes per vertex: q16 wrapped angle followed by q16
   normalized distance.
-- **GameState ledgers:** processed hit/score maps and the counted-participant
-  map are sorted by GUID and encoded as fixed 20-byte entries (16-byte binary
-  GUID + little-endian uint32 count).
+- **GameState ledgers:** processed hit/score maps, personal-score totals, and the
+  counted-participant map are sorted by GUID and encoded as fixed 20-byte entries
+  (16-byte binary GUID + little-endian uint32 count).
   `ObjectSync` compares byte arrays by content so repacking an unchanged map
   does not defeat delta suppression or confirmation tracking.
 - **Object events:** payload maps are field-aliased, MessagePack-encoded once by
@@ -2024,7 +2059,7 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
 | ship create body (including countdown timing) | 64 B |
 | seeded asteroid create body | 40 B |
 | bullet create body | 37 B |
-| GameState create body | 52 B |
+| GameState create body (including empty personal-score ledger) | 57 B |
 | asteroid x/y/angle update DTO | 29–35 B |
 | ballistic bullet update DTO | 29–35 B |
 | pending-hit bullet update DTO | 50–60 B |

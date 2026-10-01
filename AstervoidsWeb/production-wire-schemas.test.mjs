@@ -213,20 +213,37 @@ test('GameState appends a sparse final-life ship identity for updates and join s
     registerProductionSchemas();
     const schema = SchemaCodec.get(4);
     assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]),
-        [['terminalShipId', 'guid']]);
+        [['terminalShipId', 'guid'], ['playerScores', 'bytes']]);
     const terminal = {
         lives: 0, gameOverAt: 1000, terminalAt: 1750,
         terminalShipId: '00112233-4455-6677-8899-aabbccddeeff',
     };
     const encoded = SchemaCodec.encode(schema, terminal);
     assert.equal(Buffer.from(encoded).toString('hex'),
-        '109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
+        '10980000000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
         'shared with the C# production schema fixture');
     const decoded = SchemaCodec.decode(schema, encoded);
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
-    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 4,
-        'the appended optional field leaves the live two-byte mask unchanged');
+    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5,
+        'the appended player ledger extends the presence mask to three bytes');
+});
+
+test('GameState player scores append to the schema and survive snapshot re-encoding', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(4);
+    const playerScores = WireCodec.packCounterMap({
+        '00112233-4455-6677-8899-aabbccddeeff': 100
+    });
+    const encoded = SchemaCodec.encode(schema, { playerScores });
+    assert.equal(Buffer.from(encoded).toString('hex'),
+        '0000011400000033221100554477668899aabbccddeeff64000000',
+        'shared with the C# production schema fixture');
+    const decoded = SchemaCodec.decode(schema, encoded);
+    assert.deepEqual(decoded.playerScores, playerScores);
+    assert.deepEqual(SchemaCodec.encode(schema, decoded), encoded);
+    assert.deepEqual(WireCodec.unpackCounterMap(decoded.playerScores),
+        { '00112233-4455-6677-8899-aabbccddeeff': 100 });
 });
 
 test('production serializers keep optional high-cost data sparse', () => {

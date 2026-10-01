@@ -70,6 +70,20 @@
             pointer-events: none;
         }
 
+        #score {
+            display: flex;
+            flex-direction: column;
+            white-space: nowrap;
+        }
+
+        #hud.session-scoreboard {
+            align-items: flex-start;
+        }
+
+        #hud.session-scoreboard > span {
+            font-size: 0.85em;
+        }
+
         #lives.life-award {
             animation: life-award-flash 200ms steps(1, end) 25;
         }
@@ -206,6 +220,18 @@
         #gameover-score {
             font-size: calc(var(--vp-ref, 600) / 600 * 24 * 1px);
             margin-top: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
+        }
+
+        #gameover-players {
+            font-size: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
+            line-height: 1.4;
+            margin-top: calc(var(--vp-ref, 600) / 600 * 10 * 1px);
+            max-height: 45%;
+            max-width: 100%;
+            overflow-y: auto;
+            white-space: pre;
+            pointer-events: auto;
+            touch-action: pan-y;
         }
 
         #gameover-prompt {
@@ -677,7 +703,10 @@
         
         <!-- HUD: displays game stats (hidden on start screen, shown by updateHUD) -->
         <div id="hud" style="display: none;">
-            <span id="score">Score: 0</span>
+            <span id="score">
+                <span id="personal-score" style="display: none;">your score: 0</span>
+                <span id="team-score">Score: 0</span>
+            </span>
             <span id="session-indicator"></span>
             <span id="wave">Wave: 1</span>
             <span id="lives">Lives: 3</span>
@@ -740,6 +769,7 @@
         <div id="gameover-overlay" class="gameplay-overlay">
             <div id="gameover-title">GAME OVER</div>
             <div id="gameover-score">Final Score: 0</div>
+            <div id="gameover-players" style="display: none;"></div>
             <div id="gameover-prompt" class="desktop-only">Press ENTER for menu</div>
         </div>
 
@@ -4512,7 +4542,8 @@
 
     // HUD element references
     const hudDisplay = document.getElementById('hud');
-    const scoreDisplay = document.getElementById('score');
+    const scoreDisplay = document.getElementById('team-score');
+    const personalScoreDisplay = document.getElementById('personal-score');
     const waveDisplay = document.getElementById('wave');
     const livesDisplay = document.getElementById('lives');
 
@@ -4520,6 +4551,9 @@
     // Score/wave/lives change at most on discrete events, so rewriting at 60 Hz is wasted work.
     const hudCache = {
         score: null,
+        personalScore: null,
+        personalScoreVisible: null,
+        sessionMode: null,
         wave: null,
         lives: null,
         display: null,
@@ -4556,6 +4590,7 @@
     const waveTextEl = document.getElementById('wave-text');
     const gameoverOverlay = document.getElementById('gameover-overlay');
     const gameoverScoreEl = document.getElementById('gameover-score');
+    const gameoverPlayersEl = document.getElementById('gameover-players');
     const gameoverPromptEl = document.getElementById('gameover-prompt');
 
     // FPS tracking — rolling EMA of frame intervals (ms). Used only for diagnostic
@@ -4639,6 +4674,7 @@
             collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
             seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
             seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
+            departedScoreShips: new Map(), // Final observed counters awaiting score acknowledgement
             observedScoreLifeAwardCount: null
             // Join-snapshot tracking (which orphans/replicas should skip spawn
             // projection or seed onto the delayed timeline) now lives inside
@@ -5206,6 +5242,8 @@
     async function deleteSyncedShip() {
         if (!game.multiplayer.myShipObjectId) return;
 
+        const record = ObjectSync.getObject(game.multiplayer.myShipObjectId);
+        if (record) rememberDepartedShipScore(record);
         await deleteSyncedObject(game.multiplayer.myShipObjectId, 'ship');
 
         game.multiplayer.myShipObjectId = null;
@@ -5780,6 +5818,8 @@
         game.multiplayer.isAuthority = false;
         game.multiplayer.observedScoreLifeAwardCount = null;
         game.multiplayer.processedPendingBullets.clear();
+        game.multiplayer.departedScoreShips.clear();
+        sessionScoreCache = null;
         resetGameStateSyncCache();
         clearExtraLifeAwardFeedback();
         CollisionEffects.clear();
@@ -6077,6 +6117,7 @@
                 waveDelayTimer: game.waveDelayTimer,
                 processedHits: AstervoidsWireCodec.packCounterMap({}),
                 processedScores: AstervoidsWireCodec.packCounterMap({}),
+                playerScores: AstervoidsWireCodec.packCounterMap({}),
                 // Participants already granted an entry life, and the count of
                 // them. Both start empty: the first sync counts every ship that
                 // already exists, so nobody is silently swallowed by whichever
@@ -6098,14 +6139,17 @@
             if (!objectInfo) return;
             game.multiplayer.gameStateObjectId = objectInfo.id;
             game.multiplayer.observedScoreLifeAwardCount = 0;
+            syncGameState(true);
         } catch (err) {
             _error('[Multiplayer] Failed to create GameState:', err);
         }
     }
 
-    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold) {
+    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold,
+        departedScoreShips = []) {
         const processedHits = { ...ledgers.processedHits };
         const processedScores = { ...ledgers.processedScores };
+        const playerScores = { ...ledgers.playerScores };
         let groupScore = persisted?.groupScore || 0;
         const persistedScoreLifeAwardCount =
             Number(persisted?.scoreLifeAwardCount);
@@ -6130,14 +6174,23 @@
         let lives = (persisted?.lives ?? local.lives) + pendingScoreLifeAwards;
         
         // Accumulate score deltas from all ships (survives member departure)
-        for (const ship of shipObjects) {
-            const shipId = ship.id.toLowerCase();
-            const shipScore = ship.data?.score || 0;
-            const lastProcessed = processedScores[shipId] || 0;
-            const delta = shipScore - lastProcessed;
-            if (delta > 0) {
-                groupScore += delta;
-                processedScores[shipId] = shipScore;
+        // Departed records contribute only scores, never damage or entry lives.
+        for (const ships of [shipObjects, departedScoreShips]) {
+            for (const ship of ships) {
+                const shipId = ship.id.toLowerCase();
+                const shipScore = ship.data?.score || 0;
+                const lastProcessed = processedScores[shipId] || 0;
+                const delta = shipScore - lastProcessed;
+                const participantId = (ship.data?.participantId || '').toLowerCase();
+                const hasParticipant = GuidUtils.isGuid(participantId);
+                if (hasParticipant && !Object.hasOwn(playerScores, participantId)) {
+                    playerScores[participantId] = 0;
+                }
+                if (delta > 0) {
+                    groupScore += delta;
+                    processedScores[shipId] = shipScore;
+                    if (hasParticipant) playerScores[participantId] += delta;
+                }
             }
         }
 
@@ -6230,6 +6283,7 @@
             lives,
             processedHits,
             processedScores,
+            playerScores,
             countedParticipants,
             peakShipCount,
             scoreLifeAwardCount,
@@ -6271,10 +6325,11 @@
     }
 
     function serializeGameState(next, terminal, packedLedgers = null) {
-        const { processedHits, processedScores, countedParticipants } = next;
+        const { processedHits, processedScores, playerScores, countedParticipants } = next;
         const ledgers = packedLedgers ?? {
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
+            playerScores: AstervoidsWireCodec.packCounterMap(playerScores),
             countedParticipants: AstervoidsWireCodec.packCounterMap(countedParticipants)
         };
         return {
@@ -6288,6 +6343,7 @@
             waveDelayTimer: game.waveDelayTimer,
             processedHits: ledgers.processedHits,
             processedScores: ledgers.processedScores,
+            playerScores: ledgers.playerScores,
             countedParticipants: ledgers.countedParticipants,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
@@ -6355,19 +6411,24 @@
         return { counters, bytes, snapshot: new Uint8Array(bytes) };
     }
 
-    function gameStateCalculationInputs(data, hits, scores, counted, ships) {
+    function gameStateCalculationInputs(data, hits, scores, players, counted, ships,
+        departedScoreShips) {
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
-            data?.peakShipCount, data?.state, hits, scores, counted,
+            data?.peakShipCount, data?.state, hits, scores, players, counted,
             data?.terminalShipId,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
-            CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
+            CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, ships.length
         ];
         // Score/hit events mutate ship data without changing its wire version.
         // Preserve membership and iteration order (damage clamps per ship).
         for (const ship of ships) {
             inputs.push(ship.id, ship.ownerMemberId, ship.data?.participantId,
                 ship.data?.score, ship.data?.hitCount);
+        }
+        inputs.push(departedScoreShips.length);
+        for (const ship of departedScoreShips) {
+            inputs.push(ship.id, ship.data?.participantId, ship.data?.score);
         }
         return inputs;
     }
@@ -6410,6 +6471,8 @@
                 gsObj.data?.processedHits, cache.hits, cache.packedHits);
             cache.scores = readGameStateLedger(
                 gsObj.data?.processedScores, cache.scores, cache.packedScores);
+            cache.players = readGameStateLedger(
+                gsObj.data?.playerScores, cache.players, cache.packedPlayers);
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, cache.packedCounted);
             malformedGameStateLedgerKey = null;
@@ -6422,9 +6485,24 @@
             return;
         }
 
+        // Local optimistic writes are not proof that a departure was accounted for.
+        if (ObjectSync.isDataConfirmed(gsObj.id, {
+            processedScores: gsObj.data.processedScores, playerScores: gsObj.data.playerScores
+        })) {
+            for (const [id, ship] of game.multiplayer.departedScoreShips) {
+                const participantId = (ship.data.participantId || '').toLowerCase();
+                if ((cache.scores.counters[id] || 0) >= ship.data.score
+                    && (!GuidUtils.isGuid(participantId)
+                        || Object.hasOwn(cache.players.counters, participantId))) {
+                    game.multiplayer.departedScoreShips.delete(id);
+                }
+            }
+        }
         const ships = ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
+        const departedScoreShips = [...game.multiplayer.departedScoreShips.values()];
         const inputs = gameStateCalculationInputs(
-            gsObj.data, cache.hits, cache.scores, cache.counted, ships);
+            gsObj.data, cache.hits, cache.scores, cache.players, cache.counted, ships,
+            departedScoreShips);
         const changed = !gameStateInputsEqual(inputs, cache.inputs);
         if (changed) {
             cache.next = calculateGameState(
@@ -6432,6 +6510,7 @@
                 {
                     processedHits: cache.hits.counters,
                     processedScores: cache.scores.counters,
+                    playerScores: cache.players.counters,
                     countedParticipants: cache.counted.counters
                 },
                 ships,
@@ -6440,7 +6519,7 @@
                     state: game.state,
                     observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
                 },
-                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, departedScoreShips);
         }
         const next = cache.next;
         const effects = changed && next.beatStopCount
@@ -6462,16 +6541,19 @@
         game.state = next.state;
         const packedHits = packGameStateLedger(next.processedHits, cache.packedHits);
         const packedScores = packGameStateLedger(next.processedScores, cache.packedScores);
+        const packedPlayers = packGameStateLedger(next.playerScores, cache.packedPlayers);
         const packedCounted = packGameStateLedger(next.countedParticipants, cache.packedCounted);
         const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores
-            || packedCounted !== cache.packedCounted;
+            || packedPlayers !== cache.packedPlayers || packedCounted !== cache.packedCounted;
         cache.packedHits = packedHits;
         cache.packedScores = packedScores;
+        cache.packedPlayers = packedPlayers;
         cache.packedCounted = packedCounted;
         const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores
-            || cache.counted !== packedCounted;
+            || cache.players !== packedPlayers || cache.counted !== packedCounted;
         const gameStateData = serializeGameState(next, terminal, {
             processedHits: packedHits.bytes, processedScores: packedScores.bytes,
+            playerScores: packedPlayers.bytes,
             countedParticipants: packedCounted.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
@@ -6485,13 +6567,15 @@
         if (changed || packedChanged || optimisticLedgersChanged || calculationWriteChanged) {
             cache.hits = readGameStateLedger(gsObj.data?.processedHits, cache.hits, packedHits);
             cache.scores = readGameStateLedger(gsObj.data?.processedScores, cache.scores, packedScores);
+            cache.players = readGameStateLedger(gsObj.data?.playerScores, cache.players, packedPlayers);
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, packedCounted);
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
             // the attempted payload (updateObject can fail).
             cache.inputs = gameStateCalculationInputs(
-                gsObj.data, cache.hits, cache.scores, cache.counted, ships);
+                gsObj.data, cache.hits, cache.scores, cache.players, cache.counted, ships,
+                departedScoreShips);
         }
     }
 
@@ -7717,6 +7801,8 @@
                         AstervoidsWireCodec.unpackCounterMap(persisted.processedHits),
                     processedScores:
                         AstervoidsWireCodec.unpackCounterMap(persisted.processedScores),
+                    playerScores:
+                        AstervoidsWireCodec.unpackCounterMap(persisted.playerScores),
                     countedParticipants:
                         AstervoidsWireCodec.unpackCounterMap(persisted.countedParticipants)
                 },
@@ -7727,7 +7813,8 @@
                     observedScoreLifeAwardCount:
                         game.multiplayer.observedScoreLifeAwardCount
                 },
-                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+                CONFIG.EXTRA_LIFE_SCORE_THRESHOLD,
+                [...game.multiplayer.departedScoreShips.values()]);
             return next.lives <= 0;
         } catch (error) {
             // Malformed ledgers are the authority's problem to report (see
@@ -7812,6 +7899,63 @@
         }
     }
 
+    let sessionScoreCache = null;
+
+    function readSessionScoreSnapshot() {
+        const session = SessionClient.getCurrentSession();
+        const record = session && ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        if (!record) {
+            sessionScoreCache = null;
+            return null;
+        }
+        const epoch = SessionClient.getSessionEpoch();
+        if (sessionScoreCache?.record !== record || sessionScoreCache.epoch !== epoch) {
+            sessionScoreCache = { record, epoch };
+        }
+        const cache = sessionScoreCache;
+        try {
+            const maxMembers = session.maxMembers;
+            if (!Number.isInteger(maxMembers) || maxMembers < 1) {
+                throw new Error('Session member limit is unavailable');
+            }
+            if (record.data?.playerScores == null) {
+                throw new Error('Player score ledger is unavailable');
+            }
+            cache.players = readGameStateLedger(record.data?.playerScores, cache.players);
+            cache.processed = readGameStateLedger(record.data?.processedScores, cache.processed);
+            cache.maxMembers = maxMembers;
+            cache.errorVersion = null;
+            return cache;
+        } catch (error) {
+            if (cache.errorVersion !== record.version) {
+                cache.errorVersion = record.version;
+                _error('[Multiplayer] Player scores unavailable:', error);
+            }
+            return null;
+        }
+    }
+
+    function getPersonalScore(snapshot) {
+        if (!snapshot) return null;
+        const participantId = (game.ship?.participantId || '').toLowerCase();
+        const recorded = snapshot.players.counters[participantId] || 0;
+        const shipId = game.multiplayer.myShipObjectId?.toLowerCase();
+        const processed = snapshot.processed.counters[shipId] || 0;
+        // Show local awards immediately, without adding an acknowledged award twice.
+        return recorded + Math.max(0, (game.ship?.score || 0) - processed);
+    }
+
+    function rankPlayerScores(playerScores, maxMembers) {
+        return Object.keys(playerScores).sort().map((participantId, index) => ({
+            participantId,
+            label: `Player ${index + 1}`,
+            score: playerScores[participantId]
+        })).sort((left, right) => right.score - left.score
+            || (left.participantId < right.participantId ? -1
+                : left.participantId > right.participantId ? 1 : 0))
+            .slice(0, Math.floor(maxMembers * 1.5));
+    }
+
     /**
      * Update HUD display elements
      */
@@ -7829,10 +7973,28 @@
             }
         }
 
-        if (hudCache.score !== game.score) {
-            scoreDisplay.textContent = `Score: ${game.score}`;
+        const sessionMode = isSessionMode();
+        const modeChanged = hudCache.sessionMode !== sessionMode;
+        if (modeChanged) {
+            hudDisplay?.classList.toggle('session-scoreboard', sessionMode);
+        }
+        if (modeChanged || hudCache.score !== game.score) {
+            scoreDisplay.textContent = sessionMode ? `team score: ${game.score}` : `Score: ${game.score}`;
             hudCache.score = game.score;
         }
+        const personalScoreVisible = sessionMode && !!game.ship;
+        if (hudCache.personalScoreVisible !== personalScoreVisible) {
+            personalScoreDisplay.style.display = personalScoreVisible ? '' : 'none';
+            hudCache.personalScoreVisible = personalScoreVisible;
+        }
+        if (personalScoreVisible) {
+            const personalScore = getPersonalScore(readSessionScoreSnapshot());
+            if (modeChanged || hudCache.personalScore !== personalScore) {
+                personalScoreDisplay.textContent = `your score: ${personalScore ?? 'unavailable'}`;
+                hudCache.personalScore = personalScore;
+            }
+        }
+        hudCache.sessionMode = sessionMode;
         if (hudCache.wave !== game.wave) {
             waveDisplay.textContent = `Wave: ${game.wave}`;
             hudCache.wave = game.wave;
@@ -9211,10 +9373,29 @@
             overlayCache.gameoverVisible = gameoverVisible;
         }
         if (gameoverVisible) {
-            if (overlayCache.score !== game.score) {
-                gameoverScoreEl.textContent = `Final Score: ${game.score}`;
+            const sessionMode = isSessionMode();
+            const modeChanged = overlayCache.sessionMode !== sessionMode;
+            if (modeChanged || overlayCache.score !== game.score) {
+                gameoverScoreEl.textContent = sessionMode
+                    ? `team score: ${game.score}` : `Final Score: ${game.score}`;
                 overlayCache.score = game.score;
             }
+            if (modeChanged) {
+                gameoverPlayersEl.style.display = sessionMode ? '' : 'none';
+            }
+            if (sessionMode) {
+                const snapshot = readSessionScoreSnapshot();
+                if (modeChanged || overlayCache.players !== snapshot?.players
+                    || overlayCache.maxMembers !== snapshot?.maxMembers) {
+                    gameoverPlayersEl.textContent = snapshot
+                        ? rankPlayerScores(snapshot.players.counters, snapshot.maxMembers)
+                            .map((entry, index) => `${index + 1}. ${entry.label}: ${entry.score}`).join('\n')
+                        : 'Player scores unavailable';
+                    overlayCache.players = snapshot?.players;
+                    overlayCache.maxMembers = snapshot?.maxMembers;
+                }
+            }
+            overlayCache.sessionMode = sessionMode;
             const promptDisplay = isLobbySpectating() ? 'none' : '';
             if (overlayCache.promptDisplay !== promptDisplay) {
                 gameoverPromptEl.style.display = promptDisplay;
@@ -10391,6 +10572,16 @@
         CollisionEffects.startShipHit(objectId, payload, obj.data.colorIndex || 0);
     }
 
+    function rememberDepartedShipScore(obj) {
+        if (!isSessionMode() || obj.data?.type !== OBJECT_TYPES.SHIP) return;
+        // Deletion can overtake the next game step, including an ownership handoff.
+        // Keep the last observed counters so that step can still account for them.
+        game.multiplayer.departedScoreShips.set(obj.id.toLowerCase(), {
+            id: obj.id,
+            data: { participantId: obj.data.participantId, score: obj.data.score || 0 }
+        });
+    }
+
     // The event identifies an asteroid the sender owns. Rebuild the cue from
     // relative impact geometry and this receiver's displayed target pose, so
     // deterministic arrival lag or a buffered interpolation delay does not
@@ -10684,6 +10875,7 @@
                 ObjectSync.on(`objectEvent:${EVENT_KIND.ASTEROID_IMPACT_CUE}`, handleAsteroidImpactCue);
                 ObjectSync.on('onBatchReceived', (serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp) => RemoteObjects.recordPacketArrival(serverTimestamp, clientTimestamp, senderSendIntervalMs, senderMemberId, responseTimestamp));
                 ObjectSync.on('onObjectCreated', handleGameStateObjectCreated);
+                ObjectSync.on('onObjectDeleted', rememberDepartedShipScore);
                 ObjectSync.on('onObjectReplaced', handleObjectReplaced);
                 ObjectSync.on('onReconciliationFailed', handleReconciliationFailed);
                 ObjectSync.on('onReconciliationComplete', handleReconciliationComplete);
@@ -10721,6 +10913,7 @@
                         gameStarted: 'gs', wave: 'w', state: 'st', lives: 'lv',
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
+                        playerScores: 'pl',
                         countedParticipants: 'cp',
                         groupScore: 'gr', peakShipCount: 'pk',
                         scoreLifeAwardCount: 'sa',

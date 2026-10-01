@@ -105,7 +105,7 @@ public class BinaryGuidFormatterTests
         var dto = new CreateSessionResponse(
             Guid.NewGuid(), "TestSession", Guid.NewGuid(), MemberRole.Server,
             "reconnect-token",
-            new Dictionary<string, object?> { ["aspectRatio"] = 1.5 });
+            new Dictionary<string, object?> { ["aspectRatio"] = 1.5 }, 3);
 
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<CreateSessionResponse>(bytes, Options);
@@ -115,6 +115,7 @@ public class BinaryGuidFormatterTests
         result.MemberId.Should().Be(dto.MemberId);
         result.Role.Should().Be(dto.Role);
         result.ReconnectToken.Should().Be(dto.ReconnectToken);
+        result.MaxMembers.Should().Be(3);
         result.Metadata.Should().ContainKey("aspectRatio");
     }
 
@@ -264,7 +265,7 @@ public class BinaryGuidFormatterTests
             "reconnect-token",
             new[] { member }, new[] { obj },
             new[] { new GuidLongPair(obj.Id, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) },
-            new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
+            new Dictionary<string, object?> { ["aspectRatio"] = 1.78 }, 3);
 
         var bytes = MessagePackSerializer.Serialize(dto, Options);
         var result = MessagePackSerializer.Deserialize<JoinSessionResponse>(bytes, Options);
@@ -274,6 +275,7 @@ public class BinaryGuidFormatterTests
         result.ReconnectToken.Should().Be(dto.ReconnectToken);
         result.Members.Should().HaveCount(1);
         result.Objects.Should().HaveCount(1);
+        result.MaxMembers.Should().Be(3);
     }
 
     // ── Wire size comparison ─────────────────────────────────────────

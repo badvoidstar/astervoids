@@ -28,17 +28,19 @@ function calculate({
     persisted = {},
     hits = {},
     scores = {},
+    players = {},
     counted = {},
     ships = [],
+    departed = [],
     local = {},
     threshold = 100,
 } = {}) {
     return calculateGameState(
         persisted,
-        { processedHits: hits, processedScores: scores, countedParticipants: counted },
+        { processedHits: hits, processedScores: scores, playerScores: players, countedParticipants: counted },
         ships,
         { lives: 3, state: 'playing', observedScoreLifeAwardCount: null, ...local },
-        threshold);
+        threshold, departed);
 }
 
 test('GameState calculation is deterministic and does not mutate its inputs', () => {
@@ -310,7 +312,7 @@ function loadSyncHarness({
     const record = { id: 'gs', data, version: 1, ownerMemberId: 'member-a' };
     const controls = {
         sessionMode, owner, epoch: 1, memberId: 'member-a', record,
-        optimistic, writeResult: true, throwWrite: false, clock: 1000.4,
+        optimistic, writeResult: true, throwWrite: false, clock: 1000.4, scoreConfirmed: false,
     };
     const config = {
         EXTRA_LIFE_SCORE_THRESHOLD: 100,
@@ -319,7 +321,10 @@ function loadSyncHarness({
     const game = {
         score: 0, lives: 99, wave: 4, state: 'lobby',
         speedMultiplier: 1.2, waveDelayTimer: 80,
-        multiplayer: { gameStateObjectId: 'gs', observedScoreLifeAwardCount: null },
+        multiplayer: {
+            gameStateObjectId: 'gs', observedScoreLifeAwardCount: null,
+            departedScoreShips: new Map()
+        },
     };
     const { syncGameState, resetGameStateSyncCache } = loadInlineGameFunctions([
         'calculateGameState',
@@ -372,6 +377,7 @@ function loadSyncHarness({
         ObjectSync: objectSync ?? {
             getObject: () => controls.record,
             getObjectsByType: () => ships,
+            isDataConfirmed: () => controls.scoreConfirmed,
             updateObject: (id, payload, immediate) => {
                 events.push('publish');
                 publications.push({ id, payload, immediate });
@@ -404,6 +410,7 @@ test('GameState effects precede terminal clock sampling and packed publication',
         lives: 0, groupScore: 100, speedMultiplier: 1.2, waveDelayTimer: 80,
         processedHits: codec.packCounterMap({ [firstId]: 2 }),
         processedScores: codec.packCounterMap({ [firstId]: 10 }),
+        playerScores: codec.packCounterMap({}),
         countedParticipants: codec.packCounterMap({}),
         peakShipCount: 1, gameOverAt: 1000, terminalAt: 1750, scoreLifeAwardCount: 1,
         terminalShipId: firstId,
@@ -415,7 +422,7 @@ test('GameState effects precede terminal clock sampling and packed publication',
 });
 
 test('malformed ledgers refuse all effects and publication, logging once per object version', () => {
-    for (const field of ['processedHits', 'processedScores']) {
+    for (const field of ['processedHits', 'processedScores', 'playerScores', 'countedParticipants']) {
         const harness = loadSyncHarness({ data: { [field]: new Uint8Array([1]) } });
         const initialGame = structuredClone(harness.game);
         harness.syncGameState();
@@ -447,7 +454,7 @@ test('unchanged optimistic ticks reuse calculation and packed ledgers without su
     });
     harness.syncGameState();
     const initial = { ...harness.counts };
-    assert.deepEqual(initial, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(initial, { calculate: 1, pack: 4, unpack: 4 });
     for (let i = 0; i < 20; i++) {
         harness.record.version++;
         harness.ships[0].version++;
@@ -477,11 +484,11 @@ test('score and hit events invalidate only changed ledgers without a version cha
     harness.ships[0].data.score = 35;
     harness.syncGameState();
     assert.equal(harness.game.score, 35);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 5, unpack: 4 });
     harness.ships[0].data.hitCount = 1;
     harness.syncGameState();
     assert.equal(harness.game.lives, 2);
-    assert.deepEqual(harness.counts, { calculate: 3, pack: 5, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 3, pack: 6, unpack: 4 });
     assert.equal(harness.record.version, 1);
     assert.equal(harness.ships[0].version, 7);
 
@@ -490,7 +497,7 @@ test('score and hit events invalidate only changed ledgers without a version cha
     harness.syncGameState();
     assert.equal(harness.game.score, 35);
     assert.equal(harness.game.lives, 2);
-    assert.deepEqual(harness.counts, { calculate: 4, pack: 5, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 4, pack: 6, unpack: 4 });
 });
 
 test('ship membership, ownership, and order are calculation inputs', () => {
@@ -518,7 +525,28 @@ test('ship membership, ownership, and order are calculation inputs', () => {
     assert.equal(harness.game.lives, 4,
         'reordering, re-owning, and losing a ship never re-award a counted participant');
     assert.equal(harness.game.score, 25, 'departed score remains in the ledger');
-    assert.deepEqual(harness.counts, { calculate: 5, pack: 5, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 5, pack: 7, unpack: 4 });
+});
+
+test('departure snapshots survive optimistic writes and are retired only after score acknowledgement', () => {
+    const harness = loadSyncHarness({
+        data: { lives: 3, peakShipCount: 1 },
+        ships: [{ id: firstId, data: { score: 20, participantId: participantA } }],
+    });
+    harness.game.multiplayer.departedScoreShips.set(secondId, {
+        id: secondId, data: { participantId: participantB, score: 65 }
+    });
+    harness.syncGameState();
+    assert.equal(harness.game.score, 85);
+    assert.deepEqual(codec.unpackCounterMap(harness.record.data.playerScores),
+        { [participantA]: 20, [participantB]: 65 });
+    harness.syncGameState();
+    assert.equal(harness.game.multiplayer.departedScoreShips.size, 1);
+    assert.equal(harness.game.score, 85, 'retrying a departure never doubles its contribution');
+    harness.controls.scoreConfirmed = true;
+    harness.syncGameState();
+    assert.equal(harness.game.multiplayer.departedScoreShips.size, 0);
+    assert.equal(harness.game.score, 85);
 });
 
 test('configuration, local fallback, state, and observed awards invalidate calculation', () => {
@@ -545,7 +573,7 @@ test('configuration, local fallback, state, and observed awards invalidate calcu
     harness.game.lives = 8;
     harness.syncGameState();
     assert.equal(harness.game.lives, 8);
-    assert.deepEqual(harness.counts, { calculate: 6, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 6, pack: 4, unpack: 4 });
     assert.equal(harness.events.filter(event => event === 'award').length, 2);
 });
 
@@ -561,7 +589,7 @@ test('publication-only fields remain fresh without reaggregating or repacking', 
     assert.equal(payload.speedMultiplier, 2);
     assert.equal(payload.waveDelayTimer, 12);
     assert.equal(immediate, true);
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
 });
 
 test('in-place canonical scalar edits and byte mutations cannot hide behind cached references', () => {
@@ -583,14 +611,14 @@ test('in-place canonical scalar edits and byte mutations cannot hide behind cach
         assert.deepEqual(codec.unpackCounterMap(harness.record.data[field]),
             { [firstId]: field === 'processedHits' ? 1 : 10 });
         assert.notEqual(harness.record.data[field], bytes, 'never reuse mutated publication bytes');
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 5, unpack: 5 });
 
         harness.record.data.lives = 7;
         harness.record.data.groupScore = 90;
         harness.syncGameState();
         assert.equal(harness.game.lives, 7);
         assert.equal(harness.game.score, 90);
-        assert.deepEqual(harness.counts, { calculate: 3, pack: 4, unpack: 4 });
+        assert.deepEqual(harness.counts, { calculate: 3, pack: 5, unpack: 5 });
     }
 });
 
@@ -615,7 +643,7 @@ test('mutable legacy counter maps invalidate on edits, added keys, and removed k
     harness.syncGameState();
     assert.deepEqual(codec.unpackCounterMap(harness.publications.at(-1).payload.processedScores),
         { [firstId]: 10 });
-    assert.deepEqual(harness.counts, { calculate: 4, pack: 5, unpack: 6 });
+    assert.deepEqual(harness.counts, { calculate: 4, pack: 6, unpack: 7 });
 });
 
 test('canonical replacement and ownership/session identity changes discard cached state', () => {
@@ -649,10 +677,10 @@ test('canonical replacement and ownership/session identity changes discard cache
         change(harness);
         harness.syncGameState();
         assert.equal(harness.publications.length, 2, change.toString());
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 },
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 8, unpack: 8 },
             change.toString());
         harness.syncGameState();
-        assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
+        assert.deepEqual(harness.counts, { calculate: 2, pack: 8, unpack: 8 });
     }
     const { resetMultiplayerState } = loadInlineGameFunctions(['resetMultiplayerState']);
     assert.match(resetMultiplayerState.toString(), /resetGameStateSyncCache\(\)/);
@@ -673,7 +701,7 @@ test('a same-version recovery snapshot replaces optimistic scores and lives', ()
     assert.equal(harness.game.lives, 8);
     assert.equal(harness.game.score, 45);
     assert.equal(harness.record.version, 1);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 8, unpack: 8 });
 });
 
 test('failed writes retry cached payloads without replaying effects or moving the terminal edge', () => {
@@ -688,11 +716,11 @@ test('failed writes retry cached payloads without replaying effects or moving th
     harness.syncGameState();
     assert.deepEqual(harness.events, ['award', 'stop', 'clock', 'publish', 'publish', 'publish']);
     assert.equal(harness.record.data.lives, 1, 'failed publication is not an optimistic write');
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
     harness.controls.writeResult = true;
     harness.syncGameState();
     harness.syncGameState();
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
     assert.equal(harness.publications.length, 5);
     assert.equal(harness.record.data.gameOverAt, 1000);
     assert.equal(harness.record.data.terminalAt, 1750);
@@ -712,7 +740,7 @@ test('scalar-only failed writes also rebase the cache when a retry succeeds', ()
     harness.syncGameState();
     assert.equal(harness.game.lives, 5);
     assert.equal(harness.record.data.scoreLifeAwardCount, 2);
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
     assert.deepEqual(harness.events, ['award', 'publish', 'publish', 'publish']);
 });
 
@@ -730,7 +758,7 @@ test('dirty retries consume terminal effects once and refresh delay without rest
     assert.deepEqual(harness.events, ['stop', 'clock', 'publish', 'publish']);
     assert.equal(harness.publications.at(-1).payload.gameOverAt, 1000);
     assert.equal(harness.publications.at(-1).payload.terminalAt, 1900);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 4 });
 
     harness.controls.throwWrite = true;
     assert.throws(() => harness.syncGameState(), /write failed/);
@@ -767,12 +795,12 @@ test('equivalent byte views reuse the cache, but mutations in offset views are d
     storage.set(harness.record.data.processedScores, 7);
     harness.record.data.processedScores = storage.subarray(7, 27);
     harness.syncGameState();
-    assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+    assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
     harness.record.data.processedScores = storage.subarray(7, 27);
     storage[7 + 16] = 5;
     harness.syncGameState();
     assert.equal(harness.game.score, 15);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 3, unpack: 4 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 4, unpack: 5 });
 });
 
 test('recovery snapshots invalidate aggregation without replaying already-consumed effects', () => {
@@ -789,7 +817,7 @@ test('recovery snapshots invalidate aggregation without replaying already-consum
     assert.equal(harness.record.data.groupScore, 100);
     assert.equal(harness.record.data.lives, 0);
     assert.equal(harness.record.data.gameOverAt, 1000);
-    assert.deepEqual(harness.counts, { calculate: 2, pack: 6, unpack: 6 });
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 8, unpack: 8 });
 });
 
 test('real ObjectSync retries unconfirmed cached GameState after failed, empty, and rejected responses',
@@ -852,7 +880,7 @@ test('real ObjectSync retries unconfirmed cached GameState after failed, empty, 
             harness.syncGameState();
             await objectSync.flushUpdates();
             assert.equal(batches.length, 3, 'confirmed duplicates remain ObjectSync-suppressed');
-            assert.deepEqual(harness.counts, { calculate: 1, pack: 3, unpack: 3 });
+            assert.deepEqual(harness.counts, { calculate: 1, pack: 4, unpack: 4 });
             assert.equal(harness.terminalCalls.length, 1);
             assert.deepEqual(harness.events, ['award', 'stop', 'clock']);
         }

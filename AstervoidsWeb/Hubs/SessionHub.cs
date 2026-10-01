@@ -433,7 +433,8 @@ public class SessionHub : Hub
             creator.Id,
             creator.Role,
             creator.ReconnectToken,
-            session.Metadata
+            session.Metadata,
+            _sessionService.MaxMembersPerSession
         );
     }
 
@@ -605,7 +606,8 @@ public class SessionHub : Hub
             members,
             objects,
             validAts,
-            session.Metadata
+            session.Metadata,
+            _sessionService.MaxMembersPerSession
         );
     }
 

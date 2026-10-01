@@ -978,6 +978,7 @@ const SessionClient = (function() {
             const createdSession = {
                 id: response.sessionId,
                 name: response.sessionName,
+                maxMembers: response.maxMembers,
                 members: [createdMember],
                 objects: [],
                 metadata: response.metadata || {}
@@ -1053,6 +1054,7 @@ const SessionClient = (function() {
             const joinedSession = {
                 id: response.sessionId,
                 name: response.sessionName,
+                maxMembers: response.maxMembers,
                 members: response.members,
                 objects: response.objects,
                 validAts: WireEnum.pairsToObject(response.validAts),

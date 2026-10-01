@@ -205,3 +205,118 @@ test('independent players create, join, play, leave and rejoin', async ({ player
         await replicatedThrust(guest.page, host.page, rejoinedShip);
     });
 });
+
+test('personal scores survive rejoin and ownership handoff with identical game-over rankings', async ({ players }) => {
+    const host = await players.open();
+    const guest = await players.open();
+    const departed = await players.open();
+    const spectator = await players.open();
+    await host.page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(() => host.page.evaluate(() =>
+        canvas.width === window.innerWidth && canvas.height === window.innerHeight)).toBe(true);
+    await host.page.locator('#btn-leave-create').click();
+    await expect(host.page.locator('#btn-start-enter')).toBeVisible();
+    await expect(host.page.locator('#btn-start-enter')).toHaveText('Start');
+    const sessionId = await host.page.evaluate(() => SessionClient.getCurrentSession().id);
+    players.ownSession(sessionId);
+    await host.page.locator('#btn-start-enter').click();
+    await playing(host.page);
+    await host.page.evaluate(() => { game.ship.invulnerable = 60_000; });
+    for (const player of [guest, departed]) {
+        await join(player.page, sessionId);
+        await player.page.locator('#btn-start-enter').click();
+        await playing(player.page);
+        await player.page.evaluate(() => { game.ship.invulnerable = 60_000; });
+    }
+    await join(spectator.page, sessionId);
+    const participantIds = await Promise.all([host, guest, departed].map(player =>
+        player.page.evaluate(() => SessionClient.getParticipantId())));
+
+    // Controlled awards exercise the production event and real hub paths;
+    // collision accuracy is covered separately by the gameplay suites.
+    await host.page.evaluate(() => { game.ship.score += 100; emitShipStateChanged(); });
+    await guest.page.evaluate(() => { game.ship.score += 50; emitShipStateChanged(); });
+    await expect(host.page.locator('#personal-score')).toHaveText('your score: 100');
+    await expect(guest.page.locator('#personal-score')).toHaveText('your score: 50');
+    for (const player of [host, guest]) {
+        await expect(player.page.locator('#team-score')).toHaveText('team score: 150');
+    }
+    await expect(departed.page.locator('#personal-score')).toHaveText('your score: 0');
+    await leave(departed.page);
+    await leave(guest.page);
+    await join(guest.page, sessionId);
+    await guest.page.locator('#btn-start-enter').click();
+    await playing(guest.page);
+    await guest.page.evaluate(() => { game.ship.invulnerable = 60_000; });
+    await expect(guest.page.locator('#personal-score')).toHaveText('your score: 50');
+    expect(await guest.page.evaluate(() => game.ship.score)).toBe(0);
+    await guest.page.evaluate(() => { game.ship.score += 50; emitShipStateChanged(); });
+    await expect(guest.page.locator('#personal-score')).toHaveText('your score: 100');
+    await expect(host.page.locator('#team-score')).toHaveText('team score: 200');
+
+    for (const viewport of [
+        { width: 390, height: 844 }, { width: 320, height: 568 }, { width: 844, height: 390 }
+    ]) {
+        await host.page.setViewportSize(viewport);
+        await expect.poll(() => host.page.evaluate(() =>
+            canvas.width === window.innerWidth && canvas.height === window.innerHeight)).toBe(true);
+        const layout = await host.page.evaluate(() => {
+            const savedScore = game.score;
+            const savedShipScore = game.ship.score;
+            const savedName = game.sessionInfo.name;
+            try {
+                game.score = 0xffffffff;
+                game.ship.score = 0xffffffff;
+                game.sessionInfo.name = 'Pomegranate';
+                updateHUD();
+                const box = id => {
+                    const rect = document.getElementById(id).getBoundingClientRect();
+                    return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+                };
+                const cells = ['score', 'session-indicator', 'wave', 'lives'].map(box);
+                const hud = box('hud');
+                return {
+                    checks: {
+                        contained: cells.every(cell => cell.left >= hud.left - 1 && cell.right <= hud.right + 1),
+                        separated: cells.slice(1).every((cell, index) => cells[index].right <= cell.left + 1),
+                        stacked: box('personal-score').bottom <= box('team-score').top + 1
+                    },
+                    cells, hud
+                };
+            } finally {
+                game.score = savedScore;
+                game.ship.score = savedShipScore;
+                game.sessionInfo.name = savedName;
+                updateHUD();
+            }
+        });
+        expect(layout.checks, `Scores and status fit ${viewport.width}x${viewport.height}: ${JSON.stringify(layout)}`)
+            .toEqual({ contained: true, separated: true, stacked: true });
+    }
+
+    await leave(spectator.page);
+    await leave(host.page);
+    await expect.poll(() => guest.page.evaluate(() => isGameStateOwner()),
+        { message: 'The remaining player inherits GameState ownership' }).toBe(true);
+    await join(host.page, sessionId);
+    await host.page.locator('#btn-start-enter').click();
+    await playing(host.page);
+    await host.page.evaluate(() => { game.ship.invulnerable = 60_000; });
+    await expect(host.page.locator('#personal-score')).toHaveText('your score: 100');
+    await join(spectator.page, sessionId);
+    await guest.page.evaluate(() => {
+        const record = ObjectSync.getObjectByType('gameState');
+        ObjectSync.updateObject(record.id, { lives: 0 }, true);
+    });
+    const expected = [...participantIds].sort().map((participantId, index) => ({
+        participantId, label: `Player ${index + 1}`,
+        score: participantId === participantIds[2] ? 0 : 100
+    })).sort((left, right) => right.score - left.score
+        || (left.participantId < right.participantId ? -1 : 1))
+        .map((entry, index) => `${index + 1}. ${entry.label}: ${entry.score}`).join('\n');
+    for (const player of [host, guest, spectator]) {
+        await expect(player.page.locator('#gameover-score')).toHaveText('team score: 200');
+        await expect(player.page.locator('#gameover-players')).toHaveText(expected);
+    }
+    expect(await spectator.page.evaluate(() => game.ship)).toBeNull();
+});

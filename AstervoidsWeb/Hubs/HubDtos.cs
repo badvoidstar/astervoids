@@ -12,7 +12,8 @@ public record CreateSessionResponse(
     [property: Key("memberId")] Guid MemberId,
     [property: Key("role")] MemberRole Role,
     [property: Key("reconnectToken")] string ReconnectToken,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata);
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("maxMembers")] int MaxMembers);
 
 [MessagePackObject]
 public record JoinSessionResponse(
@@ -24,7 +25,8 @@ public record JoinSessionResponse(
     [property: Key("members")] IEnumerable<MemberInfo> Members,
     [property: Key("objects")] IEnumerable<ObjectInfo> Objects,
     [property: Key("validAts")] GuidLongPair[] ValidAts,
-    [property: Key("metadata")] Dictionary<string, object?> Metadata
+    [property: Key("metadata")] Dictionary<string, object?> Metadata,
+    [property: Key("maxMembers")] int MaxMembers
 );
 
 [MessagePackObject]

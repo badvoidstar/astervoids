@@ -1,3 +1,4 @@
+using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Models;
 using AstervoidsWeb.Services;
@@ -32,6 +33,27 @@ public class SessionHubTests
             .WithParameterName("operationCoordinator");
     }
 
+    [Theory]
+    [InlineData(3)]
+    [InlineData(8)]
+    public async Task SessionEntries_ShouldReturnConfiguredMemberLimit(int maxMembers)
+    {
+        var service = TestServiceFactory.CreateSessionService(
+            new SessionSettings { MaxMembersPerSession = maxMembers });
+        var created = await CreateHub("host", sessionService: service).CreateSession();
+        created.Should().NotBeNull();
+        created!.MaxMembers.Should().Be(maxMembers);
+
+        var joined = await CreateHub("guest", sessionService: service).JoinSession(created.SessionId);
+        joined.Should().NotBeNull();
+        joined!.MaxMembers.Should().Be(maxMembers);
+
+        var rejoined = await CreateHub("rejoined", sessionService: service)
+            .RejoinSession(created.SessionId, joined.MemberId, joined.ReconnectToken);
+        rejoined.Should().NotBeNull();
+        rejoined!.MaxMembers.Should().Be(maxMembers);
+    }
+
     [Fact]
     public async Task JoinSession_ShouldReturnMaterializedSessionSnapshot()
     {
@@ -58,6 +80,7 @@ public class SessionHubTests
         response.Objects.Should().ContainSingle(o => o.Id == createdObject!.Id);
         response.ReconnectToken.Should().Be(
             _sessionService.GetMemberByConnectionId("connection-2")!.ReconnectToken);
+        response.MaxMembers.Should().Be(_sessionService.MaxMembersPerSession);
     }
 
     [Fact]
@@ -385,11 +408,12 @@ public class SessionHubTests
     private SessionHub CreateHub(
         string connectionId,
         Mock<IGroupManager>? groupsMock = null,
-        Mock<IClientProxy>? clientProxyMock = null)
+        Mock<IClientProxy>? clientProxyMock = null,
+        SessionService? sessionService = null)
     {
         var hub = new SessionHub(
-            _sessionService,
-            _objectService,
+            sessionService ?? _sessionService,
+            sessionService == null ? _objectService : new ObjectService(sessionService),
             Mock.Of<ILogger<SessionHub>>(),
             new ServerMetricsService(),
             _schemaRegistry,

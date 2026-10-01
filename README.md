@@ -2,6 +2,19 @@
 
 A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
+## Multiplayer Scores
+
+During multiplayer play, **your score** appears above **team score** in the
+status row. Personal totals survive leaving and rejoining the same session.
+Game over shows the team total and a shared high-to-low player ranking, including
+players who left and players who scored zero. The list keeps the highest scores
+up to `floor(maximum session members * 1.5)` entries (six with the default
+four-player limit); the team total still includes everyone.
+
+Player labels are placeholders (`Player 1`, `Player 2`, etc.). Ties and labels
+are ordered consistently for every client; durable player identity and names
+are not part of this change. Solo score displays are unchanged.
+
 ## Local Development
 
 ```powershell
@@ -32,7 +45,10 @@ system dependencies as well.
 The smoke uses the actual UI and real SignalR connections in separate Chromium
 contexts: clean page boot, solo movement/fire, multiplayer create/join/start,
 bidirectional keyboard-input replication, and leave/rejoin. It checks live ship
-pose/version changes, not just HTTP success or a stale session label. It leaves
+pose/version changes, not just HTTP success or a stale session label. Controlled
+score events additionally cover personal/team totals, narrow-screen HUD layout,
+departed-player retention, rejoin/ownership handoff, and identical game-over
+rankings across players and spectators through the real hub. It leaves
 its own session and verifies it disappears from the active list; the server
 expires the now-empty session normally.
 

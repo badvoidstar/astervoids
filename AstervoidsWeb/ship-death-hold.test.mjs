@@ -36,6 +36,7 @@ function harness({ lives = 3, myShipObjectId = MY_SHIP, gameOver = false } = {})
         multiplayer: {
             myShipObjectId,
             remoteShips: new Map(),
+            departedScoreShips: new Map(),
             observedScoreLifeAwardCount: null
         }
     };
@@ -231,6 +232,25 @@ test('fatality prediction credits a pending score extra life', () => {
     h.production.handleShipHit(h.game.ship);
     assert.equal(h.game.ship.deathHold, null, 'the awarded life absorbs this hit');
     assert.equal(h.game.ship.x, 0.5, 'and the ship respawns as usual');
+});
+
+test('fatality prediction credits an unprocessed departing player score without counting their damage', () => {
+    const h = harness({ lives: 1 });
+    h.setGameState({
+        lives: 1, groupScore: 90, peakShipCount: 1, scoreLifeAwardCount: 0,
+        state: 'playing',
+        processedHits: codec.packCounterMap({}),
+        processedScores: codec.packCounterMap({}),
+        countedParticipants: codec.packCounterMap({ [participant('a')]: 1 })
+    });
+    h.game.multiplayer.departedScoreShips.set(OTHER_SHIP, {
+        id: OTHER_SHIP,
+        data: { participantId: participant('b'), score: 10, hitCount: 999 }
+    });
+    h.production.handleShipHit(h.game.ship);
+    assert.equal(h.game.ship.deathHold, null, 'the final departing award earns the shared life');
+    assert.equal(h.game.ship.x, 0.5);
+    assert.deepEqual(h.warnings, []);
 });
 
 test('a ship with no sync object keeps respawning rather than holding', () => {

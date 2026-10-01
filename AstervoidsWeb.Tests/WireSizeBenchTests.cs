@@ -211,6 +211,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("scoreLifeAwardCount", "u32"),
             new PositionalSchemaCodec.FieldSpec("countedParticipants", "bytes"),
             new PositionalSchemaCodec.FieldSpec("terminalShipId", "guid"),
+            new PositionalSchemaCodec.FieldSpec("playerScores", "bytes"),
         });
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────
@@ -320,11 +321,12 @@ public class WireSizeBenchTests
             Members: members,
             Objects: objects,
             ValidAts: validAtsList.ToArray(),
-            Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 });
+            Metadata: new Dictionary<string, object?> { ["aspectRatio"] = 1.78 },
+            MaxMembers: 4);
 
         var size = Size(dto);
-        size.Should().BeInRange(1830, 1870,
-            "schema-0 comparison snapshot with compact ObjectInfo arrays");
+        size.Should().BeInRange(1842, 1882,
+            "schema-0 comparison snapshot with compact ObjectInfo arrays and the 12-byte member-limit field");
     }
 
     [Fact]
@@ -502,12 +504,27 @@ public class WireSizeBenchTests
         };
         var encoded = PositionalSchemaCodec.Encode(GameStateSchema, data);
         Convert.ToHexString(encoded).ToLowerInvariant().Should().Be(
-            "109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff");
+            "10980000000000000000408f400000000000589b4033221100554477668899aabbccddeeff");
         var decoded = PositionalSchemaCodec.Decode(GameStateSchema, encoded);
         decoded["terminalShipId"].Should().Be(shipId);
         PositionalSchemaCodec.Encode(GameStateSchema, decoded).Should().Equal(encoded);
         PositionalSchemaCodec.Encode(GameStateSchema,
-            new Dictionary<string, object?> { ["lives"] = 3 }).Length.Should().Be(4);
+            new Dictionary<string, object?> { ["lives"] = 3 }).Length.Should().Be(5);
+    }
+
+    [Fact]
+    public void Production_PlayerScores_MatchesJavaScriptFixtureAndSnapshotReencoding()
+    {
+        var scores = Convert.FromHexString(
+            "33221100554477668899aabbccddeeff64000000");
+        var data = new Dictionary<string, object?> { ["playerScores"] = scores };
+        var encoded = PositionalSchemaCodec.Encode(GameStateSchema, data);
+
+        Convert.ToHexString(encoded).ToLowerInvariant().Should().Be(
+            "0000011400000033221100554477668899aabbccddeeff64000000");
+        var decoded = PositionalSchemaCodec.Decode(GameStateSchema, encoded);
+        decoded["playerScores"].Should().BeOfType<byte[]>().Which.Should().Equal(scores);
+        PositionalSchemaCodec.Encode(GameStateSchema, decoded).Should().Equal(encoded);
     }
 
     [Fact]
@@ -554,6 +571,7 @@ public class WireSizeBenchTests
             ["waveDelayTimer"] = 0d,
             ["processedHits"] = Array.Empty<byte>(),
             ["processedScores"] = Array.Empty<byte>(),
+            ["playerScores"] = Array.Empty<byte>(),
             ["peakShipCount"] = 2,
             ["scoreLifeAwardCount"] = 0
         });
@@ -561,6 +579,6 @@ public class WireSizeBenchTests
         shipCreate.Length.Should().Be(64);
         asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
-        gameStateCreate.Length.Should().Be(52);
+        gameStateCreate.Length.Should().Be(57);
     }
 }
