@@ -720,7 +720,7 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false } = {
         'gameoverResultsEl', 'gameoverPromptEl', 'sessionIndicator',
     ].map(name => [name, element()]));
     const errors = [];
-    const counts = { unpack: 0 };
+    const counts = { unpack: 0, layout: 0 };
     const functions = loadInlineGameFunctions([
         'updateHUD', 'updateGameplayOverlays', 'renderParticipantScoreRows', 'isPersonalScoreScrollTarget',
         'getSessionScoreView', 'hasParticipantScoreSchema', 'normalizeParticipantLedger',
@@ -734,6 +734,7 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false } = {
         },
         OBJECT_TYPES: { GAME_STATE: 'gameState', SHIP: 'ship' },
         isSessionMode: () => game.mode === 'session',
+        fitSessionHud: () => counts.layout++,
         isGameOver: () => game.lives === 0,
         isLobbySpectating: () => false,
         SessionClient: {
@@ -768,6 +769,7 @@ test('canonical scalar replacements reuse personal history decodes and standings
     h.updateGameplayOverlays();
     const history = h.getSessionScoreView().history;
     const decoded = h.counts.unpack;
+    const measured = h.counts.layout;
     const writes = h.writes.length;
     for (let frame = 0; frame < 120; frame++) {
         h.record.data = {
@@ -781,6 +783,7 @@ test('canonical scalar replacements reuse personal history decodes and standings
         assert.equal(h.getSessionScoreView().history, history);
     }
     assert.equal(h.counts.unpack, decoded);
+    assert.equal(h.counts.layout, measured, 'unchanged scalar replacements never remeasure HUD layout');
     assert.equal(h.writes.length, writes);
 });
 
@@ -815,6 +818,7 @@ test('multiplayer HUD projects your lifetime score above team score, and solo ke
     for (let frame = 0; frame < 120; frame++) h.updateHUD();
     assert.equal(h.writes.length, writes);
     assert.equal(h.counts.unpack, decoded, 'HUD never decodes unchanged maps every frame');
+    assert.equal(h.counts.layout, 1, 'unchanged HUD contents do not trigger per-frame layout reads');
     h.ships[0].data.score = 30;
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '130', 'same-version score events remain visible');
@@ -957,7 +961,7 @@ test('HUD layout and scroll exceptions stay localized to the score column and vi
     assert.match(source, /class="score-label">your score<\/span>[\s\S]*class="score-label">team score<\/span>/);
     assert.match(source, /#session-indicator \{[^}]*min-width: 0;[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;/);
     assert.match(source, /#hud\.multiplayer #wave,[\s\S]*#hud\.multiplayer #lives \{[^}]*flex-shrink: 0;/);
-    assert.match(source, /Math\.max\(newWidth < 300 \? 8 : 10, Math\.round\(baseSize \* 0\.9\)\)/);
+    assert.match(source, /#gameover-results \{[^}]*width: min\(420px, 90%\);/);
     assert.match(source, /#gameover-results \{[^}]*overflow-y: auto;[^}]*touch-action: pan-y;/);
     assert.match(source, /isPersonalScoreScrollTarget\(e\.target\)[\s\S]*'PageUp', 'PageDown', 'Home', 'End'/);
     const h = scoreUiHarness();
@@ -970,57 +974,94 @@ test('HUD layout and scroll exceptions stay localized to the score column and vi
     assert.equal(h.isPersonalScoreScrollTarget(row), false);
 });
 
-test('production resize borrows letterboxing for a narrow session HUD while retaining solo geometry', () => {
-    for (const [width, height, aspectRatio, sessionMode, expectedLeft, expectedRight, expectedFont] of [
-        [640, 360, 0.5, true, 165, 165, '10px'],
-        [320, 568, 16 / 9, true, 3, 3, '10px'],
-        [240, 426, 16 / 9, true, 2, 2, '8px'],
-        [320, 2000, 0.16, true, 5, 5, '10px'],
-        [1280, 720, 16 / 9, true, 11, 11, '23px'],
-        [640, 360, null, false, 5, 5, '13px'],
+function scoreLayoutHarness(width, height, aspectRatio, sessionMode = true) {
+    const container = { clientWidth: width, clientHeight: height, style: { setProperty() {} } };
+    const view = { style: {} };
+    const hud = { style: {} };
+    const wave = { id: 'wave-overlay', style: {} };
+    const over = { id: 'gameover-overlay', style: {} };
+    const canvas = { width: 0, height: 0 };
+    const metadata = Object.freeze({ aspectRatio });
+    const game = { sessionInfo: { metadata }, viewport: {} };
+    const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas'], {
+        game, canvas, isSessionMode: () => sessionMode, fitSessionHud() {},
+        getEffectiveAsteroidAspectScales: () => null,
+        document: {
+            getElementById: name => ({
+                'game-container': container, 'game-view': view, hud,
+            })[name],
+            querySelectorAll: () => [wave, over],
+        },
+    });
+    function box(element) {
+        const x = parseFloat(view.style.left || 0);
+        const y = parseFloat(view.style.top || 0);
+        const left = x + parseFloat(element.style.left);
+        const top = y + parseFloat(element.style.top);
+        return {
+            left, top,
+            right: element === hud
+                ? x + parseFloat(view.style.width || width) - parseFloat(hud.style.right)
+                : left + parseFloat(element.style.width),
+            bottom: top + parseFloat(element.style.height || 0),
+        };
+    }
+    return { container, view, hud, wave, over, canvas, game, resizeCanvas, box };
+}
+
+test('production resize contains the complete HUD in the creator view without altering shared or solo geometry', () => {
+    for (const [width, height, aspectRatio, sessionMode] of [
+        [640, 360, 0.5, true], [960, 540, 0.45, true],
+        [320, 568, 16 / 9, true], [240, 426, 16 / 9, true],
+        [320, 2000, 0.16, true], [1280, 720, 16 / 9, true],
+        [640, 360, null, false],
     ]) {
-        const hud = { style: {} };
-        const container = { clientWidth: width, clientHeight: height, style: { setProperty() {} } };
-        const game = { sessionInfo: { metadata: { aspectRatio } }, viewport: {} };
-        const canvas = { width: 0, height: 0 };
-        const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas'], {
-            game, canvas, isSessionMode: () => sessionMode,
-            getEffectiveAsteroidAspectScales: () => null,
-            document: {
-                getElementById: name => name === 'hud' ? hud : container,
-                querySelectorAll: () => [],
-            },
-        });
-        resizeCanvas(true);
-        assert.equal(hud.style.left, `${expectedLeft}px`);
-        assert.equal(hud.style.right, `${expectedRight}px`);
-        assert.equal(hud.style.top, `${game.viewport.y + Math.round(game.viewport.height * 0.015)}px`);
-        assert.equal(hud.style.fontSize, expectedFont,
-            sessionMode ? 'bounded responsive multiplayer typography' : 'solo typography remains unchanged');
+        const h = scoreLayoutHarness(width, height, aspectRatio, sessionMode);
+        h.resizeCanvas(true);
+        const vp = h.game.viewport;
+        const expectedWidth = sessionMode ? Math.min(width, height * aspectRatio) : width;
+        const expectedHeight = sessionMode ? Math.min(height, width / aspectRatio) : height;
+        assert.deepEqual(vp, {
+            x: (width - expectedWidth) / 2, y: (height - expectedHeight) / 2,
+            width: expectedWidth, height: expectedHeight,
+        }, 'layout must not rewrite the creator-established gameplay rectangle');
+        assert.equal(h.canvas.width, width);
+        assert.equal(h.canvas.height, height);
+        assert.equal(h.game.sessionInfo.metadata.aspectRatio, aspectRatio);
+        const hud = h.box(h.hud);
+        assert.ok(hud.left >= vp.x, `HUD left ${hud.left} escapes creator view left ${vp.x}`);
+        assert.ok(hud.right <= vp.x + vp.width,
+            `HUD right ${hud.right} escapes creator view right ${vp.x + vp.width}`);
+        assert.equal(hud.top, vp.y + Math.round(vp.height * 0.015));
+        assert.ok(parseFloat(h.hud.style.fontSize) > 0);
+        if (!sessionMode) {
+            assert.equal(h.hud.style.left, '5px');
+            assert.equal(h.hud.style.right, '5px');
+            assert.equal(h.hud.style.fontSize, '13px', 'solo typography remains unchanged');
+        }
     }
 });
 
-test('short session game-over overlays borrow spare window height without changing gameplay or wave geometry', () => {
-    for (const sessionMode of [true, false]) {
-        const container = { clientWidth: 320, clientHeight: 568, style: { setProperty() {} } };
-        const hud = { style: {} };
-        const wave = { id: 'wave-overlay', style: {} };
-        const over = { id: 'gameover-overlay', style: {} };
-        const canvas = { width: 0, height: 0 };
-        const game = { sessionInfo: { metadata: { aspectRatio: 8 } }, viewport: {} };
-        const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas'], {
-            game, canvas, isSessionMode: () => sessionMode,
-            getEffectiveAsteroidAspectScales: () => null,
-            document: {
-                getElementById: name => name === 'hud' ? hud : container,
-                querySelectorAll: () => [wave, over],
-            },
-        });
-        resizeCanvas(true);
-        assert.equal(game.viewport.height, sessionMode ? 40 : 568);
-        assert.equal(wave.style.height, `${game.viewport.height}px`);
-        assert.equal(wave.style.top, `${game.viewport.y}px`);
-        assert.equal(over.style.height, sessionMode ? '200px' : '568px');
-        assert.equal(over.style.top, sessionMode ? '184px' : '0px');
+test('short and narrow final overlays use exactly the creator view, including after a peer resize', () => {
+    for (const [width, height, aspectRatio, sessionMode] of [
+        [320, 568, 8, true], [320, 800, 16 / 9, true],
+        [960, 540, 0.45, true], [320, 568, null, false],
+    ]) {
+        const h = scoreLayoutHarness(width, height, aspectRatio, sessionMode);
+        for (const [nextWidth, nextHeight] of [[width, height], [height, width]]) {
+            h.container.clientWidth = nextWidth;
+            h.container.clientHeight = nextHeight;
+            h.resizeCanvas(true);
+            const vp = h.game.viewport;
+            const expected = {
+                left: vp.x, top: vp.y, right: vp.x + vp.width, bottom: vp.y + vp.height,
+            };
+            assert.deepEqual(h.box(h.wave), expected, 'wave geometry remains the gameplay rectangle');
+            assert.deepEqual(h.box(h.over), expected,
+                'final standings cannot borrow browser height or horizontal letterboxing');
+            assert.equal(h.game.sessionInfo.metadata.aspectRatio, aspectRatio);
+            assert.equal(h.canvas.width, nextWidth);
+            assert.equal(h.canvas.height, nextHeight);
+        }
     }
 });

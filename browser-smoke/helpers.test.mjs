@@ -5,7 +5,9 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
-import { rankedPersonalResults, personalRows, personalHudScores } from './personal-scores.mjs';
+import {
+    rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry,
+} from './personal-scores.mjs';
 
 test('personal score expectation uses the advertised capacity and highest scorers on overflow', () => {
     const participants = Array.from({ length: 10 }, (_, index) => ({
@@ -51,6 +53,44 @@ test('personal HUD reader distinguishes lowercase individual and shared score la
     });
     assert.deepEqual(personalHudScores('Score: 123456'), { your: null, team: null });
     assert.deepEqual(personalHudScores('Your score 1 Team score 2'), { your: null, team: null });
+});
+
+test('score geometry measures the offset creator view, not the fullscreen canvas or browser window', () => {
+    const keys = ['document', 'game', 'innerWidth', 'innerHeight'];
+    const previous = keys.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
+    try {
+        globalThis.innerWidth = 960;
+        globalThis.innerHeight = 800;
+        for (const viewport of [
+            { x: 358.5, y: 0, width: 243, height: 540 },
+            { x: 0, y: 298.75, width: 360, height: 202.5 },
+        ]) {
+            globalThis.game = { viewport };
+            globalThis.document = {
+                getElementById: id => id === 'game' ? {
+                    width: 960, height: 800,
+                    getBoundingClientRect: () => ({
+                        left: 12, top: 18, right: 492, bottom: 418, width: 480, height: 400,
+                    }),
+                } : null,
+                documentElement: { scrollWidth: 960 },
+            };
+            const measured = personalScoreGeometry();
+            assert.deepEqual(measured.gameView, {
+                left: 12 + viewport.x / 2, top: 18 + viewport.y / 2,
+                right: 12 + (viewport.x + viewport.width) / 2,
+                bottom: 18 + (viewport.y + viewport.height) / 2,
+                width: viewport.width / 2, height: viewport.height / 2,
+            });
+            assert.notEqual(measured.gameView.width, measured.viewport.width);
+            assert.notEqual(measured.gameView.height, measured.viewport.height);
+        }
+    } finally {
+        keys.forEach((key, index) => {
+            if (previous[index]) Object.defineProperty(globalThis, key, previous[index]);
+            else delete globalThis[key];
+        });
+    }
 });
 
 test('only a default single-region ACA origin is accepted remotely', () => {

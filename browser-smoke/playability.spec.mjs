@@ -317,14 +317,39 @@ async function personalResults(page, expected, teamScore) {
 }
 
 function boxInViewport(box, viewport, message) {
-    expect(box, message).not.toBeNull();
-    expect(box.left, message).toBeGreaterThanOrEqual(-1);
-    expect(box.right, message).toBeLessThanOrEqual(viewport.width + 1);
-    expect(box.top, message).toBeGreaterThanOrEqual(-1);
-    expect(box.bottom, message).toBeLessThanOrEqual(viewport.height + 1);
+    boxInRegion(box, {
+        left: 0, top: 0, right: viewport.width, bottom: viewport.height,
+    }, message);
 }
 
-async function horizontalPersonalHud(page, yourScore, teamScore) {
+function boxInRegion(box, region, message) {
+    expect(box, message).not.toBeNull();
+    expect(region, 'The actual containing rectangle is measured').not.toBeNull();
+    const evidence = `${message}: ${JSON.stringify({ box, region })}`;
+    expect(box.left, evidence).toBeGreaterThanOrEqual(region.left - 1);
+    expect(box.right, evidence).toBeLessThanOrEqual(region.right + 1);
+    expect(box.top, evidence).toBeGreaterThanOrEqual(region.top - 1);
+    expect(box.bottom, evidence).toBeLessThanOrEqual(region.bottom + 1);
+}
+
+function personalLayoutEvidence(stage, geometry) {
+    const bounds = box => box && [box.left, box.top, box.right, box.bottom]
+        .map(value => Math.round(value * 100) / 100);
+    console.info(`Creator-view ${stage}: ${JSON.stringify({
+        view: bounds(geometry.gameView),
+        hud: bounds(geometry.hud), compact: geometry.compactHud,
+        score: bounds(geometry.score), session: bounds(geometry.session),
+        wave: bounds(geometry.wave), lives: bounds(geometry.lives),
+        overlay: bounds(geometry.overlay), title: bounds(geometry.title),
+        total: bounds(geometry.total), prompt: bounds(geometry.prompt),
+        results: bounds(geometry.results),
+        scroll: geometry.results && [
+            geometry.results.clientHeight, geometry.results.scrollHeight, geometry.results.scrollTop,
+        ],
+    })}`);
+}
+
+async function containedPersonalHud(page, yourScore, teamScore) {
     const longName = 'A remarkably long multiplayer session name';
     await page.evaluate(name => {
         game.sessionInfo.name = name;
@@ -337,21 +362,33 @@ async function horizontalPersonalHud(page, yourScore, teamScore) {
     await expect(page.locator('#wave')).toHaveText(/^Wave: [1-9]\d*$/);
     await expect(page.locator('#lives')).toHaveText(/^Lives: [1-9]\d*$/);
     const geometry = await page.evaluate(personalScoreGeometry);
+    personalLayoutEvidence('HUD', geometry);
     expect(geometry.your, 'The individual counter has real rendered geometry').not.toBeNull();
     expect(geometry.team, 'The team counter has real rendered geometry').not.toBeNull();
     expect(geometry.your.bottom, 'your score stays above team score')
         .toBeLessThanOrEqual(geometry.team.top + 1);
     const boxes = [geometry.score, geometry.session, geometry.wave, geometry.lives];
+    boxInRegion(geometry.hud, geometry.gameView, 'The whole HUD stays inside the creator game-view');
     for (const box of boxes) {
-        boxInViewport(box, geometry.viewport, 'Every horizontal HUD item fits the narrow mobile viewport');
+        boxInRegion(box, geometry.gameView, 'Every HUD item fits the creator game-view, not its letterbox');
         expect(box.right - box.left, 'No HUD item collapses to zero width').toBeGreaterThan(0);
     }
-    for (let index = 1; index < boxes.length; index++) {
-        expect(boxes[index - 1].right, 'Scores, session, Wave and Lives remain ordered without overlap')
-            .toBeLessThanOrEqual(boxes[index].left + 1);
+    for (let index = 0; index < boxes.length; index++) {
+        for (const other of boxes.slice(index + 1)) {
+            const box = boxes[index];
+            expect(box.right <= other.left + 1 || other.right <= box.left + 1
+                || box.bottom <= other.top + 1 || other.bottom <= box.top + 1,
+            'Scores, session, Wave and Lives never overlap even in a compact creator view').toBe(true);
+        }
     }
-    expect(Math.max(...boxes.map(box => box.top)), 'HUD items still occupy one horizontal row')
-        .toBeLessThan(Math.min(...boxes.map(box => box.bottom)) + 1);
+    if (!geometry.compactHud) {
+        for (let index = 1; index < boxes.length; index++) {
+            expect(boxes[index - 1].right, 'The normal horizontal HUD retains its original order')
+                .toBeLessThanOrEqual(boxes[index].left + 1);
+        }
+        expect(Math.max(...boxes.map(box => box.top)), 'The normal HUD still occupies one horizontal row')
+            .toBeLessThan(Math.min(...boxes.map(box => box.bottom)) + 1);
+    }
     expect(geometry.session.height, 'Long session names do not stack the shared HUD composition')
         .toBeLessThanOrEqual(Math.max(geometry.wave.height, geometry.lives.height) * 1.5);
     if (geometry.sessionClips) {
@@ -363,14 +400,34 @@ async function horizontalPersonalHud(page, yourScore, teamScore) {
         .toBeLessThanOrEqual(geometry.viewport.width + 1);
 }
 
-async function readablePersonalResults(page, expected) {
-    const geometry = await page.evaluate(personalScoreGeometry);
+async function readablePersonalResults(page, expected, requireScroll = false) {
+    const results = page.locator('#gameover-results');
+    // Check the desktop prompt as well as touch controls in this same real session.
+    await page.locator('#game-container').evaluate(element => element.classList.remove('touch-enabled'));
+    await expect(page.locator('#gameover-prompt')).toBeVisible();
+    await results.evaluate(element => { element.scrollTop = 0; });
+    let geometry = await page.evaluate(personalScoreGeometry);
+    personalLayoutEvidence('results at first row', geometry);
     expect(geometry.rows.map(({ number, score }) => ({ number, score }))).toEqual(expected);
+    for (const box of [geometry.overlay, geometry.title, geometry.total, geometry.prompt, geometry.results]) {
+        boxInRegion(box, geometry.gameView, 'Final title, team total, prompt and results stay in the creator view');
+    }
+    expect(geometry.title.fontSize, 'The game-over heading remains readable').toBeGreaterThanOrEqual(20);
+    expect(geometry.total.fontSize, 'The complete six-digit team total remains readable').toBeGreaterThanOrEqual(12);
+    expect(geometry.prompt.fontSize, 'The desktop menu instruction remains readable').toBeGreaterThanOrEqual(10);
+    expect(['auto', 'scroll'], 'Only the bounded results region scrolls').toContain(geometry.results.overflowY);
+    expect(geometry.results.scrollWidth, 'Results require no horizontal scrolling')
+        .toBeLessThanOrEqual(geometry.results.clientWidth + 1);
+    const scrolls = geometry.results.scrollHeight > geometry.results.clientHeight;
+    if (requireScroll) {
+        expect(scrolls, 'Historical rows exercise vertical scrolling in the small creator view').toBe(true);
+    }
+    for (const header of geometry.headers) {
+        boxInRegion(header, geometry.results.clip, 'The initial caption and column headers are revealed inside results');
+        expect(header.fontSize, 'Results headers stay readable').toBeGreaterThanOrEqual(12);
+    }
     for (let index = 0; index < geometry.rows.length; index++) {
         const row = geometry.rows[index];
-        boxInViewport(row.box, geometry.viewport, 'Every final result row fits without clipping or scrolling');
-        boxInViewport(row.label, geometry.viewport, 'The player label is actually rendered on screen');
-        boxInViewport(row.value, geometry.viewport, 'The personal score is actually rendered on screen');
         expect(row.label.fontSize, 'Stable player labels remain readable on mobile').toBeGreaterThanOrEqual(12);
         expect(row.value.fontSize, 'Six-digit and zero scores remain readable on mobile').toBeGreaterThanOrEqual(12);
         expect(row.label.right <= row.value.left + 1 || row.value.right <= row.label.left + 1
@@ -381,6 +438,23 @@ async function readablePersonalResults(page, expected) {
                 .toBeLessThanOrEqual(row.box.top + 1);
         }
     }
+    for (const box of [geometry.rows[0].box, geometry.rows[0].label, geometry.rows[0].value]) {
+        boxInRegion(box, geometry.results.clip, 'The first historical row is fully revealed inside the scroll region');
+    }
+    await results.focus();
+    await page.keyboard.press('End');
+    await expect.poll(async () => {
+        const measured = await page.evaluate(personalScoreGeometry);
+        return (!scrolls || measured.results.scrollTop > 0)
+            && measured.rows.at(-1).box.bottom <= measured.results.clip.bottom + 1;
+    }, { message: 'Native End scrolling reaches the last ranked player, not only the first screenful' }).toBe(true);
+    geometry = await page.evaluate(personalScoreGeometry);
+    personalLayoutEvidence('results at last row', geometry);
+    for (const box of [geometry.rows.at(-1).box, geometry.rows.at(-1).label, geometry.rows.at(-1).value]) {
+        boxInRegion(box, geometry.results.clip, 'The last historical row is fully revealed inside the scroll region');
+    }
+    await page.locator('#game-container').evaluate(element => element.classList.add('touch-enabled'));
+    geometry = await page.evaluate(personalScoreGeometry);
     await expect(page.locator('#touch-restart')).toBeVisible();
     boxInViewport(geometry.restart, geometry.viewport, 'The mobile return control remains on screen');
     expect(geometry.restart.width, 'The return control retains a usable touch target').toBeGreaterThanOrEqual(44);
@@ -388,15 +462,31 @@ async function readablePersonalResults(page, expected) {
     expect(geometry.restartReachable, 'The result overlay does not intercept the return control').toBe(true);
 }
 
-for (const mode of ['deterministic', 'buffered']) {
-    test(`personal scores survive departure, authority migration and late spectators (${mode})`, async ({ players }) => {
+const personalLayouts = [
+    {
+        name: 'portrait creator, wide guest',
+        creator: { width: 360, height: 800 },
+        guest: { width: 960, height: 540 },
+        resized: { width: 640, height: 360 },
+    },
+    {
+        name: 'wide creator, portrait guest',
+        creator: { width: 1280, height: 720 },
+        guest: { width: 360, height: 800 },
+        resized: { width: 320, height: 568 },
+    },
+];
+for (const { mode, layout } of ['deterministic', 'buffered']
+    .flatMap(mode => personalLayouts.map(layout => ({ mode, layout })))) {
+    test(`personal scores survive departure, authority migration and late spectators (${mode}; ${layout.name})`, async ({ players }) => {
         test.setTimeout(180_000);
         const path = `/?cfg.SIM_MODE=${mode}&cfg.INVULNERABILITY_TIME=60000`;
         const mobile = {
-            path, viewport: { width: 360, height: 800 }, hasTouch: true, isMobile: true,
+            path, hasTouch: true, isMobile: true,
         };
-        const host = await players.open(mobile);
-        const guest = await players.open(mobile);
+        const host = await players.open({ ...mobile, viewport: layout.creator });
+        const guest = await players.open({ ...mobile, viewport: layout.guest });
+        const creatorAspect = layout.creator.width / layout.creator.height;
         const participants = [];
         let sessionId;
         let maxMembers;
@@ -421,6 +511,17 @@ for (const mode of ['deterministic', 'buffered']) {
             expect(maxMembers, 'This multi-peer scenario needs room for two players and a watcher')
                 .toBeGreaterThanOrEqual(3);
             await join(guest.page, sessionId);
+            for (const page of [host.page, guest.page]) {
+                expect(await page.evaluate(() => ({
+                    session: SessionClient.getCurrentSession().metadata.aspectRatio,
+                    game: game.sessionInfo.metadata.aspectRatio,
+                })), 'Both independent peers use the creator metadata, never the guest window aspect')
+                    .toEqual({ session: creatorAspect, game: creatorAspect });
+            }
+            const view = (await guest.page.evaluate(personalScoreGeometry)).gameView;
+            expect(view.left > 0 || view.top > 0,
+                'This real guest has a nonzero creator-view offset within its fullscreen canvas').toBe(true);
+            expect(view.width / view.height, 'Rendered guest geometry adopts the creator aspect').toBeCloseTo(creatorAspect);
             await host.page.locator('#btn-start-enter').click();
             await playing(host.page);
             hostShip = await shipId(host.page);
@@ -513,7 +614,7 @@ for (const mode of ['deterministic', 'buffered']) {
                 'Session participant identity survives voluntary rejoin').toBe(participants[1].id);
             guestShip = rejoinedShip;
             await personalConvergence([host.page, guest.page], participants);
-            await horizontalPersonalHud(guest.page, participants[1].score,
+            await containedPersonalHud(guest.page, participants[1].score,
                 participants.reduce((sum, participant) => sum + participant.score, 0));
         });
 
@@ -544,7 +645,19 @@ for (const mode of ['deterministic', 'buffered']) {
             await personalPoints(guest.page, 20);
             participants[1].score += 20;
             await personalConvergence([guest.page, watcher.page], participants);
-            await horizontalPersonalHud(guest.page, participants[1].score,
+            await guest.page.setViewportSize(layout.resized);
+            await expect.poll(async () => {
+                const geometry = await guest.page.evaluate(personalScoreGeometry);
+                return {
+                    width: geometry.gameView.width, height: geometry.gameView.height,
+                };
+            }, { message: 'Guest resize recomputes only the local creator-aspect presentation rectangle' }).toEqual({
+                width: Math.min(layout.resized.width, layout.resized.height * creatorAspect),
+                height: Math.min(layout.resized.height, layout.resized.width / creatorAspect),
+            });
+            expect(await guest.page.evaluate(() => game.sessionInfo.metadata.aspectRatio),
+                'Resizing a guest never rewrites creator viewport metadata').toBe(creatorAspect);
+            await containedPersonalHud(guest.page, participants[1].score,
                 participants.reduce((sum, participant) => sum + participant.score, 0));
         });
 
@@ -588,7 +701,13 @@ for (const mode of ['deterministic', 'buffered']) {
                 'The last historical arrival is included because top-K keeps the highest scorers').toBe(true);
             await personalResults(guest.page, expected, teamScore);
             await personalResults(watcher.page, expected, teamScore);
+            await readablePersonalResults(guest.page, expected, creatorAspect > 1);
+            await guest.page.setViewportSize(layout.guest);
+            await personalResults(guest.page, expected, teamScore);
             await readablePersonalResults(guest.page, expected);
+            await guest.page.setViewportSize(layout.resized);
+            await personalResults(guest.page, expected, teamScore);
+            await readablePersonalResults(guest.page, expected, creatorAspect > 1);
             late = await players.open({ path });
             await join(late.page, sessionId);
             await membership(guest.page, sessionId, 3);
@@ -603,10 +722,19 @@ for (const mode of ['deterministic', 'buffered']) {
                 expect(peer.health.hubFrames, 'Every independent browser receives actual hub WebSocket frames')
                     .toBeGreaterThan(0);
             }
-            await guest.page.locator('#touch-restart').tap();
-            await expect(guest.page.locator('#start-screen')).toBeVisible();
+            if (creatorAspect < 1) {
+                await guest.page.locator('#touch-restart').tap();
+                await expect(guest.page.locator('#start-screen')).toBeVisible();
+            } else {
+                await guest.page.keyboard.down('Enter');
+                try {
+                    await expect(guest.page.locator('#start-screen')).toBeVisible();
+                } finally {
+                    await guest.page.keyboard.up('Enter');
+                }
+            }
             await expect.poll(() => guest.page.evaluate(() => SessionClient.isInSession()),
-                { message: 'The reachable mobile return control really leaves the session' }).toBe(false);
+                { message: 'The reachable touch or keyboard return control really leaves the session' }).toBe(false);
             await personalConvergence([watcher.page, late.page], participants);
             await personalResults(watcher.page, expected, teamScore);
             await personalResults(late.page, expected, teamScore);

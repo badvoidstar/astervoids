@@ -245,12 +245,18 @@ The game continues to own orchestration in `wwwroot/index.html`:
 - Multiplayer HUD shows `your score` above `team score`. The personal value
   projects the persisted lifetime total plus positive, unprocessed counters
   for that participant; it is not a second accumulator. Long session names
-  ellipsize, and a narrow letterboxed viewport may borrow adjacent window space
-  for the status row. Font floors remain bounded by screen size, not name length.
+  ellipsize. The creator-aspect gameplay viewport is the hard boundary for all
+  HUD items, including on letterboxed peers and after resizing. Typography fits
+  that rectangle, not the surrounding browser window; narrow views place Wave
+  and Lives on a second row instead of expanding into the black margins.
+  Layout measurements run only on changed HUD content or viewport dimensions.
   Multiplayer final standings replace the playing HUD so they cannot collide
-  with its status columns; solo retains its existing HUD. Short game-over overlays
-  borrow spare window height to keep rows scrollable without changing gameplay
-  or wave-announcement geometry. Standings use only
+  with its status columns; solo retains its existing HUD. The game-over title,
+  team total, results region and menu prompt use the same creator viewport.
+  Results size against the overlay, wrap player labels when narrow, and scroll
+  within their bounded region rather than borrowing window width or height.
+  Canvas/world coordinates, creator metadata and wave-announcement geometry
+  remain unchanged. Standings use only
   persisted histories, including departed and zero-score players, and label
   them `Player N` from the immutable ordinal (never a member ID or rank).
   Sort is score descending, ordinal ascending, then normalized GUID lexical

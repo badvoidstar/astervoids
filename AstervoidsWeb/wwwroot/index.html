@@ -114,11 +114,25 @@
 
         #hud.multiplayer #session-indicator {
             flex: 1;
+            min-width: 2em;
         }
 
         #hud.multiplayer #wave,
         #hud.multiplayer #lives {
             flex-shrink: 0;
+        }
+
+        #hud.multiplayer.compact {
+            flex-wrap: wrap;
+        }
+
+        #hud.multiplayer.compact #wave,
+        #hud.multiplayer.compact #lives {
+            flex-basis: calc(50% - 0.25em);
+        }
+
+        #hud.multiplayer.compact #lives {
+            text-align: right;
         }
 
         #lives.life-award {
@@ -259,12 +273,27 @@
             margin-top: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
         }
 
+        #gameover-overlay.multiplayer {
+            overflow: hidden;
+        }
+
+        #gameover-overlay.multiplayer #gameover-title,
+        #gameover-overlay.multiplayer #gameover-score,
+        #gameover-overlay.multiplayer #gameover-prompt {
+            max-width: 90%;
+            flex-shrink: 0;
+            text-align: center;
+            overflow-wrap: anywhere;
+        }
+
         #gameover-overlay.multiplayer #gameover-title {
-            font-size: max(20px, calc(var(--vp-ref, 600) / 600 * 48 * 1px));
+            font-size: min(max(20px, calc(var(--vp-ref, 600) / 600 * 48 * 1px)),
+                calc(var(--vp-width, 800) * 0.15 * 1px), calc(var(--vp-height, 600) * 0.16 * 1px));
         }
 
         #gameover-overlay.multiplayer #gameover-score {
-            font-size: max(12px, calc(var(--vp-ref, 600) / 600 * 24 * 1px));
+            font-size: min(max(12px, calc(var(--vp-ref, 600) / 600 * 24 * 1px)),
+                calc(var(--vp-height, 600) * 0.12 * 1px));
         }
 
         #gameover-prompt {
@@ -273,11 +302,12 @@
         }
 
         #gameover-overlay.multiplayer #gameover-prompt {
-            font-size: max(10px, calc(var(--vp-ref, 600) / 600 * 20 * 1px));
+            font-size: min(max(10px, calc(var(--vp-ref, 600) / 600 * 20 * 1px)),
+                calc(var(--vp-height, 600) * 0.1 * 1px));
         }
 
         #gameover-results {
-            width: min(420px, 90vw);
+            width: min(420px, 90%);
             max-height: 40%;
             flex-shrink: 1;
             min-height: 0;
@@ -285,7 +315,8 @@
             overscroll-behavior: contain;
             touch-action: pan-y;
             pointer-events: auto;
-            font-size: clamp(12px, calc(var(--vp-ref, 600) / 600 * 20 * 1px), 22px);
+            font-size: min(clamp(12px, calc(var(--vp-ref, 600) / 600 * 20 * 1px), 22px),
+                calc(var(--vp-width, 800) * 0.075 * 1px));
             margin-top: calc(var(--vp-ref, 600) / 600 * 12 * 1px);
         }
 
@@ -300,8 +331,14 @@
 
         #gameover-results th,
         #gameover-results td {
-            padding: 0.15em 0.4em;
+            padding: 0.15em;
             text-align: left;
+        }
+
+        #gameover-results th:first-child,
+        #gameover-results td:first-child,
+        #gameover-results th:last-child,
+        #gameover-results td:last-child {
             white-space: nowrap;
         }
 
@@ -3090,34 +3127,53 @@
         if (hud) {
             const vp = game.viewport;
             const padding = Math.round(vp.height * 0.015);
-            // A portrait session can leave a very narrow viewport on a landscape
-            // screen. Borrow its letterboxing before shrinking readable digits.
-            const hudWidth = isSessionMode() ? Math.min(newWidth, Math.max(vp.width, 320)) : vp.width;
-            const hudX = vp.x + (vp.width - hudWidth) / 2;
             const horizontalPadding = isSessionMode()
-                ? Math.min(padding, Math.round(hudWidth * 0.015)) : padding;
+                ? Math.min(padding, Math.round(vp.width * 0.015)) : padding;
             hud.style.top = `${vp.y + padding}px`;
-            hud.style.left = `${hudX + horizontalPadding}px`;
-            hud.style.right = `${(newWidth - hudX - hudWidth) + horizontalPadding}px`;
+            hud.style.left = `${vp.x + horizontalPadding}px`;
+            hud.style.right = `${(newWidth - vp.x - vp.width) + horizontalPadding}px`;
             const baseSize = Math.min(vp.width, vp.height) * 0.035;
             hud.style.fontSize = `${isSessionMode()
-                ? Math.max(newWidth < 300 ? 8 : 10, Math.round(baseSize * 0.9)) : Math.round(baseSize)}px`;
+                ? Math.max(10, Math.round(baseSize * 0.9)) : Math.round(baseSize)}px`;
+            fitSessionHud();
         }
         
-        // Keep gameplay scaling; short terminal overlays can borrow letterboxing.
         const vpRef = Math.min(game.viewport.width, game.viewport.height);
         container.style.setProperty('--vp-ref', vpRef);
+        container.style.setProperty('--vp-width', game.viewport.width);
+        container.style.setProperty('--vp-height', game.viewport.height);
         document.querySelectorAll('.gameplay-overlay').forEach(el => {
-            const overlayHeight = isSessionMode() && el.id === 'gameover-overlay'
-                ? Math.min(newHeight, Math.max(game.viewport.height, 200)) : game.viewport.height;
-            el.style.top = `${game.viewport.y + (game.viewport.height - overlayHeight) / 2}px`;
+            el.style.top = `${game.viewport.y}px`;
             el.style.left = `${game.viewport.x}px`;
             el.style.width = `${game.viewport.width}px`;
-            el.style.height = `${overlayHeight}px`;
+            el.style.height = `${game.viewport.height}px`;
         });
 
         // No need to scale entity positions - they use normalized coordinates (0-1)
         // The conversion functions (fromNormalizedX, etc.) handle the mapping to pixels
+    }
+
+    function fitSessionHud() {
+        const hud = document.getElementById('hud');
+        if (!isSessionMode() || !hud || hud.style.display === 'none') return;
+        const scores = document.getElementById('multiplayer-scores');
+        const wave = document.getElementById('wave');
+        const lives = document.getElementById('lives');
+        const vp = game.viewport;
+        const fontSize = Math.max(10, Math.round(Math.min(vp.width, vp.height) * 0.035 * 0.9));
+        hud.style.fontSize = `${fontSize}px`;
+        hud.classList.remove('compact');
+        const scoreWidth = scores.getBoundingClientRect().width;
+        const waveWidth = wave.getBoundingClientRect().width;
+        const livesWidth = lives.getBoundingClientRect().width;
+        const gap = fontSize * 0.5;
+        const compact = scoreWidth + waveWidth + livesWidth + gap * 3 + fontSize * 2 > hud.clientWidth;
+        hud.classList.toggle('compact', compact);
+        const availableHeight = vp.y + vp.height - parseFloat(hud.style.top);
+        const scale = Math.min(1, hud.clientWidth / (scoreWidth + (compact ? gap + fontSize * 2 : 0)),
+            compact ? (hud.clientWidth - gap) / (2 * Math.max(waveWidth, livesWidth)) : 1,
+            availableHeight / hud.getBoundingClientRect().height);
+        if (scale < 1) hud.style.fontSize = `${Math.max(1, Math.floor(fontSize * scale * 10) / 10)}px`;
     }
 
     /**
@@ -8152,6 +8208,7 @@
      */
     function updateHUD() {
         const sessionMode = isSessionMode();
+        let layoutChanged = hudCache.sessionMode !== sessionMode;
         // Show HUD row only when content is relevant:
         // - Not on start screen
         // - In session mode: requires GameState; final standings replace this row
@@ -8162,6 +8219,7 @@
             if (hudCache.display !== desired) {
                 hudDisplay.style.display = desired;
                 hudCache.display = desired;
+                layoutChanged = true;
             }
             if (hudCache.sessionMode !== sessionMode) {
                 hudDisplay.classList.toggle('multiplayer', sessionMode);
@@ -8182,10 +8240,12 @@
                     ? view?.history ? 'No personal score: spectating' : 'Personal score unavailable'
                     : `your score ${personal}`);
                 hudCache.personalScore = personalText;
+                layoutChanged = true;
             }
             if (hudCache.score !== teamScore || hudCache.sessionMode !== sessionMode) {
                 teamScoreDisplay.textContent = teamScore;
                 hudCache.score = teamScore;
+                layoutChanged = true;
             }
         } else if (hudCache.score !== game.score || hudCache.sessionMode !== sessionMode) {
             scoreDisplay.textContent = `Score: ${game.score}`;
@@ -8195,10 +8255,12 @@
         if (hudCache.wave !== game.wave) {
             waveDisplay.textContent = `Wave: ${game.wave}`;
             hudCache.wave = game.wave;
+            layoutChanged = true;
         }
         if (hudCache.lives !== game.lives) {
             livesDisplay.textContent = `Lives: ${game.lives}`;
             hudCache.lives = game.lives;
+            layoutChanged = true;
         }
 
         // Update session indicator (only when visibility or text changes)
@@ -8210,13 +8272,15 @@
             if (hudCache.sessionIndicatorText !== desiredText) {
                 sessionIndicator.textContent = desiredText;
                 hudCache.sessionIndicatorText = desiredText;
+                layoutChanged = true;
             }
             if (hudCache.sessionIndicatorVisible !== desiredVisible) {
                 sessionIndicator.style.display = desiredVisible;
                 hudCache.sessionIndicatorVisible = desiredVisible;
+                layoutChanged = true;
             }
         }
-        
+        if (layoutChanged && sessionMode) fitSessionHud();
     }
 
     function publishDebugMetrics() {

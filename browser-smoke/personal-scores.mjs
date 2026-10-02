@@ -36,8 +36,24 @@ export function personalScoreGeometry() {
     });
     const elementBox = id => {
         const element = document.getElementById(id);
-        return element ? rectangle(element.getBoundingClientRect()) : null;
+        return element ? {
+            ...rectangle(element.getBoundingClientRect()),
+            fontSize: parseFloat(getComputedStyle(element).fontSize),
+        } : null;
     };
+    const canvas = document.getElementById('game');
+    const canvasBox = canvas?.getBoundingClientRect();
+    const vp = typeof game === 'undefined' ? null : game.viewport;
+    const gameView = vp && canvasBox && canvas.width && canvas.height ? {
+        left: canvasBox.left + vp.x * canvasBox.width / canvas.width,
+        top: canvasBox.top + vp.y * canvasBox.height / canvas.height,
+        width: vp.width * canvasBox.width / canvas.width,
+        height: vp.height * canvasBox.height / canvas.height,
+    } : null;
+    if (gameView) {
+        gameView.right = gameView.left + gameView.width;
+        gameView.bottom = gameView.top + gameView.height;
+    }
     function visibleText(id) {
         const root = document.getElementById(id);
         const nodes = [];
@@ -108,11 +124,17 @@ export function personalScoreGeometry() {
             restartBox.left + restartBox.width / 2,
             restartBox.top + restartBox.height / 2)
         : null;
+    const results = document.getElementById('gameover-results');
+    const resultsBox = results?.getBoundingClientRect();
+    const resultsStyle = results ? getComputedStyle(results) : null;
+    const prompt = document.getElementById('gameover-prompt');
     return {
         viewport: { width: innerWidth, height: innerHeight },
+        gameView,
         documentWidth: document.documentElement.scrollWidth,
         your, team, score,
         hud: elementBox('hud'),
+        compactHud: document.getElementById('hud')?.classList.contains('compact') ?? false,
         session: elementBox('session-indicator'),
         wave: elementBox('wave'),
         lives: elementBox('lives'),
@@ -120,6 +142,28 @@ export function personalScoreGeometry() {
         sessionOverflow: sessionStyle?.overflowX,
         sessionEllipsis: sessionStyle?.textOverflow,
         rows,
+        overlay: elementBox('gameover-overlay'),
+        title: elementBox('gameover-title'),
+        total: elementBox('gameover-score'),
+        prompt: prompt && getComputedStyle(prompt).display !== 'none'
+            ? elementBox('gameover-prompt') : null,
+        results: results ? {
+            ...elementBox('gameover-results'),
+            clientWidth: results.clientWidth, scrollWidth: results.scrollWidth,
+            clientHeight: results.clientHeight, scrollHeight: results.scrollHeight,
+            scrollTop: results.scrollTop,
+            overflowY: resultsStyle.overflowY,
+            clip: {
+                left: resultsBox.left + results.clientLeft,
+                top: resultsBox.top + results.clientTop,
+                right: resultsBox.left + results.clientLeft + results.clientWidth,
+                bottom: resultsBox.top + results.clientTop + results.clientHeight,
+            },
+        } : null,
+        headers: results ? [...results.querySelectorAll('caption, th')].map(element => ({
+            ...rectangle(element.getBoundingClientRect()),
+            fontSize: parseFloat(getComputedStyle(element).fontSize),
+        })) : [],
         restart: restartBox ? rectangle(restartBox) : null,
         restartReachable: !!restartTarget?.closest('#touch-restart'),
     };
