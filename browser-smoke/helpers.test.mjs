@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
 import {
-    rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry,
+    rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
 
 test('personal score expectation uses the advertised capacity and highest scorers on overflow', () => {
@@ -85,6 +85,46 @@ test('score geometry measures the offset creator view, not the fullscreen canvas
             assert.notEqual(measured.gameView.width, measured.viewport.width);
             assert.notEqual(measured.gameView.height, measured.viewport.height);
         }
+    } finally {
+        keys.forEach((key, index) => {
+            if (previous[index]) Object.defineProperty(globalThis, key, previous[index]);
+            else delete globalThis[key];
+        });
+    }
+});
+
+test('resize readiness requires the canvas backing size and game viewport, not CSS-scaled bounds', () => {
+    const keys = ['document', 'game', 'innerWidth', 'innerHeight'];
+    const previous = keys.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
+    try {
+        globalThis.innerWidth = 640;
+        globalThis.innerHeight = 360;
+        const canvas = {
+            width: 960, height: 540,
+            getBoundingClientRect: () => ({
+                left: 0, top: 0, right: 640, bottom: 360, width: 640, height: 360,
+            }),
+        };
+        globalThis.document = {
+            getElementById: id => id === 'game' ? canvas : null,
+            documentElement: { scrollWidth: 640 },
+        };
+        globalThis.game = { viewport: { x: 358.5, y: 0, width: 243, height: 540 } };
+        const expected = {
+            canvas: { width: 640, height: 360 },
+            gameViewport: { width: 162, height: 360 },
+        };
+        const scaled = personalScoreGeometry().gameView;
+        assert.deepEqual({ width: scaled.width, height: scaled.height }, expected.gameViewport,
+            'The previous CSS-based wait passes before the application handles the resize');
+        assert.notDeepEqual(personalViewResizeState(), expected,
+            'CSS scaling alone cannot release the layout assertions');
+        Object.assign(canvas, expected.canvas);
+        assert.notDeepEqual(personalViewResizeState(), expected,
+            'Updating the canvas alone cannot release checks against a stale game viewport');
+        Object.assign(game.viewport, { x: 239, y: 0, ...expected.gameViewport });
+        assert.deepEqual(personalViewResizeState(), expected,
+            'The wait releases after the synchronous production resize finishes');
     } finally {
         keys.forEach((key, index) => {
             if (previous[index]) Object.defineProperty(globalThis, key, previous[index]);

@@ -1,7 +1,7 @@
 import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
 import {
-    rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry,
+    rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
 
 const test = base.extend({
@@ -332,6 +332,20 @@ function boxInRegion(box, region, message) {
     expect(box.bottom, evidence).toBeLessThanOrEqual(region.bottom + 1);
 }
 
+async function resizePersonalView(page, viewport, creatorAspect) {
+    await page.setViewportSize(viewport);
+    // CSS can scale the old canvas before resizeCanvas synchronously updates the HUD and overlays.
+    await expect.poll(() => page.evaluate(personalViewResizeState), {
+        message: 'Canvas backing size and creator viewport finish resizing before layout is measured',
+    }).toEqual({
+        canvas: { width: viewport.width, height: viewport.height },
+        gameViewport: {
+            width: Math.min(viewport.width, viewport.height * creatorAspect),
+            height: Math.min(viewport.height, viewport.width / creatorAspect),
+        },
+    });
+}
+
 function personalLayoutEvidence(stage, geometry) {
     const bounds = box => box && [box.left, box.top, box.right, box.bottom]
         .map(value => Math.round(value * 100) / 100);
@@ -645,16 +659,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             await personalPoints(guest.page, 20);
             participants[1].score += 20;
             await personalConvergence([guest.page, watcher.page], participants);
-            await guest.page.setViewportSize(layout.resized);
-            await expect.poll(async () => {
-                const geometry = await guest.page.evaluate(personalScoreGeometry);
-                return {
-                    width: geometry.gameView.width, height: geometry.gameView.height,
-                };
-            }, { message: 'Guest resize recomputes only the local creator-aspect presentation rectangle' }).toEqual({
-                width: Math.min(layout.resized.width, layout.resized.height * creatorAspect),
-                height: Math.min(layout.resized.height, layout.resized.width / creatorAspect),
-            });
+            await resizePersonalView(guest.page, layout.resized, creatorAspect);
             expect(await guest.page.evaluate(() => game.sessionInfo.metadata.aspectRatio),
                 'Resizing a guest never rewrites creator viewport metadata').toBe(creatorAspect);
             await containedPersonalHud(guest.page, participants[1].score,
@@ -702,10 +707,10 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             await personalResults(guest.page, expected, teamScore);
             await personalResults(watcher.page, expected, teamScore);
             await readablePersonalResults(guest.page, expected, creatorAspect > 1);
-            await guest.page.setViewportSize(layout.guest);
+            await resizePersonalView(guest.page, layout.guest, creatorAspect);
             await personalResults(guest.page, expected, teamScore);
             await readablePersonalResults(guest.page, expected);
-            await guest.page.setViewportSize(layout.resized);
+            await resizePersonalView(guest.page, layout.resized, creatorAspect);
             await personalResults(guest.page, expected, teamScore);
             await readablePersonalResults(guest.page, expected, creatorAspect > 1);
             late = await players.open({ path });

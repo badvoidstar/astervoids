@@ -28,7 +28,15 @@ export function personalHudScores(text) {
     };
 }
 
-// Self-contained because Playwright serializes this function into the page.
+// Self-contained because Playwright serializes these functions into the page.
+export function personalViewResizeState() {
+    const canvas = document.getElementById('game');
+    return {
+        canvas: { width: canvas.width, height: canvas.height },
+        gameViewport: { width: game.viewport.width, height: game.viewport.height },
+    };
+}
+
 export function personalScoreGeometry() {
     const rectangle = rect => ({
         left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
