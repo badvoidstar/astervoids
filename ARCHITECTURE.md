@@ -242,7 +242,7 @@ The game continues to own orchestration in `wwwroot/index.html`:
   too. A newly owning spectator adopts canonical GameState before publication;
   it acquires no personal
   history unless it has published a ship.
-- Multiplayer HUD shows `your score` above `team score`. The personal value
+- Multiplayer HUD shows `Your Score` above `Team Score`. The personal value
   projects the persisted lifetime total plus positive, unprocessed counters
   for that participant; it is not a second accumulator. Long session names
   ellipsize. The creator-aspect gameplay viewport is the hard boundary for all
@@ -251,8 +251,12 @@ The game continues to own orchestration in `wwwroot/index.html`:
   and Lives on a second row instead of expanding into the black margins.
   Layout measurements run only on changed HUD content or viewport dimensions.
   Multiplayer final standings replace the playing HUD so they cannot collide
-  with its status columns; solo retains its existing HUD. The game-over title,
-  team total, results region and menu prompt use the same creator viewport.
+  with its status columns; solo retains its existing HUD. Game over shows the
+  viewer's persisted `Your Score` above `Team Score`, even when their personal
+  row is outside the ranked limit or capacity is unknown. Pure spectators show
+  `Your Score: --`; unavailable histories do not fabricate a total. The game-over
+  title, personal and team totals, results region and menu prompt use the same
+  creator viewport and native HTML/CSS text rendering.
   Results size against the overlay, wrap player labels when narrow, and scroll
   within their bounded region rather than borrowing window width or height.
   Canvas/world coordinates, creator metadata and wave-announcement geometry

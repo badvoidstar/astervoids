@@ -302,16 +302,15 @@ async function personalPoints(page, points) {
     }, points);
 }
 
-async function personalResults(page, expected, teamScore) {
+async function personalResults(page, expected, teamScore, yourScore = null) {
     const overlay = page.locator('#gameover-overlay');
     await expect(overlay).toBeVisible();
     await expect.poll(async () => personalRows(await overlay.innerText()),
         { message: 'Actual rendered result rows match the converged durable ranking' }).toEqual(expected);
-    await expect.poll(async () => {
-        const text = (await page.locator('#gameover-score').innerText()).replaceAll(',', '');
-        const values = text.match(/\d+/g);
-        return values?.length === 1 ? Number(values[0]) : null;
-    }, { message: 'The rendered final team score settles with the personal result rows' }).toBe(teamScore);
+    await expect(page.locator('#gameover-score')).toHaveText(`Team Score: ${teamScore}`);
+    await expect(page.locator('#gameover-personal-score')).toHaveText(`Your Score: ${yourScore ?? '--'}`);
+    await expect(page.locator('#gameover-personal-score')).toHaveAttribute('aria-label',
+        yourScore === null ? 'No personal score: spectating' : `Your Score ${yourScore}`);
     expect(await overlay.innerText(), 'Public results never display raw participant identities')
         .not.toMatch(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
 }
@@ -355,6 +354,7 @@ function personalLayoutEvidence(stage, geometry) {
         score: bounds(geometry.score), session: bounds(geometry.session),
         wave: bounds(geometry.wave), lives: bounds(geometry.lives),
         overlay: bounds(geometry.overlay), title: bounds(geometry.title),
+        personalTotal: bounds(geometry.personalTotal),
         total: bounds(geometry.total), prompt: bounds(geometry.prompt),
         results: bounds(geometry.results),
         scroll: geometry.results && [
@@ -371,7 +371,7 @@ async function containedPersonalHud(page, yourScore, teamScore) {
     }, longName);
     await expect(page.locator('#session-indicator')).toContainText(longName);
     await expect.poll(async () => personalHudScores(await page.locator('#hud').innerText()),
-        { message: 'The lowercase individual and team HUD counters display the accepted totals' })
+        { message: 'The capitalized individual and team HUD counters display the accepted totals' })
         .toEqual({ your: yourScore, team: teamScore });
     await expect(page.locator('#wave')).toHaveText(/^Wave: [1-9]\d*$/);
     await expect(page.locator('#lives')).toHaveText(/^Lives: [1-9]\d*$/);
@@ -379,7 +379,7 @@ async function containedPersonalHud(page, yourScore, teamScore) {
     personalLayoutEvidence('HUD', geometry);
     expect(geometry.your, 'The individual counter has real rendered geometry').not.toBeNull();
     expect(geometry.team, 'The team counter has real rendered geometry').not.toBeNull();
-    expect(geometry.your.bottom, 'your score stays above team score')
+    expect(geometry.your.bottom, 'Your Score stays above Team Score')
         .toBeLessThanOrEqual(geometry.team.top + 1);
     const boxes = [geometry.score, geometry.session, geometry.wave, geometry.lives];
     boxInRegion(geometry.hud, geometry.gameView, 'The whole HUD stays inside the creator game-view');
@@ -423,11 +423,20 @@ async function readablePersonalResults(page, expected, requireScroll = false) {
     let geometry = await page.evaluate(personalScoreGeometry);
     personalLayoutEvidence('results at first row', geometry);
     expect(geometry.rows.map(({ number, score }) => ({ number, score }))).toEqual(expected);
-    for (const box of [geometry.overlay, geometry.title, geometry.total, geometry.prompt, geometry.results]) {
-        boxInRegion(box, geometry.gameView, 'Final title, team total, prompt and results stay in the creator view');
+    for (const box of [geometry.overlay, geometry.title, geometry.personalTotal, geometry.total,
+        geometry.prompt, geometry.results]) {
+        boxInRegion(box, geometry.gameView, 'Final title, personal and team totals, prompt and results stay in the creator view');
     }
     expect(geometry.title.fontSize, 'The game-over heading remains readable').toBeGreaterThanOrEqual(20);
+    expect(geometry.personalTotal.fontSize, 'The complete six-digit personal total remains readable')
+        .toBeGreaterThanOrEqual(12);
     expect(geometry.total.fontSize, 'The complete six-digit team total remains readable').toBeGreaterThanOrEqual(12);
+    expect(geometry.title.bottom, 'The personal summary does not overlap the title')
+        .toBeLessThanOrEqual(geometry.personalTotal.top + 1);
+    expect(geometry.personalTotal.bottom, 'Your Score stays above Team Score at game over')
+        .toBeLessThanOrEqual(geometry.total.top + 1);
+    expect(geometry.total.bottom, 'The score summary does not overlap the scrollable standings')
+        .toBeLessThanOrEqual(geometry.results.top + 1);
     expect(geometry.prompt.fontSize, 'The desktop menu instruction remains readable').toBeGreaterThanOrEqual(10);
     expect(['auto', 'scroll'], 'Only the bounded results region scrolls').toContain(geometry.results.overflowY);
     expect(geometry.results.scrollWidth, 'Results require no horizontal scrolling')
@@ -704,14 +713,14 @@ for (const { mode, layout } of ['deterministic', 'buffered']
                 .toBe(true);
             expect(expected.some(({ number }) => number === participants.length),
                 'The last historical arrival is included because top-K keeps the highest scorers').toBe(true);
-            await personalResults(guest.page, expected, teamScore);
+            await personalResults(guest.page, expected, teamScore, participants[1].score);
             await personalResults(watcher.page, expected, teamScore);
             await readablePersonalResults(guest.page, expected, creatorAspect > 1);
             await resizePersonalView(guest.page, layout.guest, creatorAspect);
-            await personalResults(guest.page, expected, teamScore);
+            await personalResults(guest.page, expected, teamScore, participants[1].score);
             await readablePersonalResults(guest.page, expected);
             await resizePersonalView(guest.page, layout.resized, creatorAspect);
-            await personalResults(guest.page, expected, teamScore);
+            await personalResults(guest.page, expected, teamScore, participants[1].score);
             await readablePersonalResults(guest.page, expected, creatorAspect > 1);
             late = await players.open({ path });
             await join(late.page, sessionId);
@@ -767,6 +776,7 @@ test('personal scores leave solo score and game-over controls unchanged', async 
     await page.evaluate(() => handleShipHit(game.ship));
     await expect(page.locator('#gameover-overlay')).toBeVisible();
     await expect(page.locator('#gameover-score')).toHaveText('Final Score: 654321');
+    await expect(page.locator('#gameover-personal-score')).toBeHidden();
     expect(personalRows(await page.locator('#gameover-overlay').innerText())).toEqual([]);
     expect(await page.evaluate(() => SessionClient.isInSession()),
         'Solo play still has no multiplayer membership').toBe(false);

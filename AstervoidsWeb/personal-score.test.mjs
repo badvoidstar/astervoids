@@ -680,7 +680,7 @@ test('session reset retires the local ship without pre-deleting the durable depa
     assert.equal(game.ship, soloShip, 'solo menu keeps its existing ship presentation');
 });
 
-function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false } = {}) {
+function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false, participantId = participantA } = {}) {
     const writes = [];
     function element(tag = 'div') {
         const classes = new Set();
@@ -716,7 +716,7 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false } = {
     };
     const elements = Object.fromEntries([
         'hudDisplay', 'scoreDisplay', 'yourScoreDisplay', 'teamScoreDisplay', 'waveDisplay',
-        'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverScoreEl',
+        'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverPersonalScoreEl', 'gameoverScoreEl',
         'gameoverResultsEl', 'gameoverPromptEl', 'sessionIndicator',
     ].map(name => [name, element()]));
     const errors = [];
@@ -738,7 +738,7 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false } = {
         isGameOver: () => game.lives === 0,
         isLobbySpectating: () => false,
         SessionClient: {
-            getSessionEpoch: () => 1, getParticipantId: () => participantA,
+            getSessionEpoch: () => 1, getParticipantId: () => participantId,
             getCurrentSession: () => ({ metadata: { schemas: legacy
                 ? SCHEMAS.map(schema => schema.id === 4 ? { ...schema, fields: schema.fields.slice(0, 16) } : schema)
                 : SCHEMAS } }),
@@ -796,7 +796,9 @@ test('multiplayer final standings replace the playing HUD while solo retains Sco
     h.updateHUD();
     h.updateGameplayOverlays();
     assert.equal(h.hudDisplay.style.display, 'none');
-    assert.equal(h.gameoverScoreEl.textContent, 'team score: 120');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 100');
+    assert.equal(h.gameoverPersonalScoreEl.hidden, false);
+    assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 120');
     assert.equal(h.gameoverResultsEl.hidden, false);
     h.game.mode = 'solo';
     h.updateHUD();
@@ -804,6 +806,7 @@ test('multiplayer final standings replace the playing HUD while solo retains Sco
     assert.equal(h.hudDisplay.style.display, 'flex');
     assert.equal(h.scoreDisplay.textContent, 'Score: 999');
     assert.equal(h.gameoverScoreEl.textContent, 'Final Score: 999');
+    assert.equal(h.gameoverPersonalScoreEl.hidden, true);
 });
 
 test('multiplayer HUD projects your lifetime score above team score, and solo keeps Score', () => {
@@ -811,6 +814,7 @@ test('multiplayer HUD projects your lifetime score above team score, and solo ke
     h.game.ship = { syncObjectId: shipA, score: 25 };
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '125');
+    assert.equal(h.yourScoreDisplay.attributes['aria-label'], 'Your Score 125');
     assert.equal(h.teamScoreDisplay.textContent, '120');
     assert.equal(h.hudDisplay.classList.contains('multiplayer'), true);
     const writes = h.writes.length;
@@ -848,7 +852,8 @@ test('final rows use persisted historical scores, never unprocessed local projec
     });
     h.game.ship = { syncObjectId: shipA, score: 999 };
     h.updateGameplayOverlays();
-    assert.equal(h.gameoverScoreEl.textContent, 'team score: 100');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 100');
+    assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 100');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [
         ['1', 'Player 8', '100'], ['2', 'Player 2', '0'], ['3', 'Player 4', '0'],
     ]);
@@ -864,10 +869,41 @@ test('final rows use persisted historical scores, never unprocessed local projec
         [participantA]: 100, [participantB]: 30, [participantC]: 0,
     });
     h.updateGameplayOverlays();
-    assert.equal(h.gameoverScoreEl.textContent, 'team score: 130');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 100');
+    assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 130');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [
         ['1', 'Player 8', '100'], ['2', 'Player 4', '30'], ['3', 'Player 2', '0'],
     ]);
+    h.record.data.groupScore = 167;
+    h.record.data.participantScores = AstervoidsWireCodec.packCounterMap({
+        [participantA]: 137, [participantB]: 30, [participantC]: 0,
+    });
+    h.updateGameplayOverlays();
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 137',
+        'accepted late points update the personal summary, not an unprocessed ship projection');
+    assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 167');
+});
+
+test('game-over personal totals belong to the viewer even when their row is outside the ranked limit', () => {
+    const data = {
+        groupScore: 900,
+        participantScores: AstervoidsWireCodec.packCounterMap({
+            [participantA]: 0, [participantB]: 500, [participantC]: 400,
+        }),
+        participantNumbers: AstervoidsWireCodec.packCounterMap({
+            [participantA]: 3, [participantB]: 1, [participantC]: 2,
+        }),
+    };
+    for (const [participantId, score] of [
+        [participantA.toUpperCase(), 0], [participantB, 500], [participantC, 400],
+    ]) {
+        const h = scoreUiHarness({ data, participantId, maxMembers: 1 });
+        h.updateGameplayOverlays();
+        assert.equal(h.gameoverPersonalScoreEl.textContent, `Your Score: ${score}`);
+        assert.equal(h.gameoverPersonalScoreEl.attributes['aria-label'], `Your Score ${score}`);
+        assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 900');
+        assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '500']]);
+    }
 });
 
 test('missing capacity keeps the full team total visible and defers rows until the advertised cap arrives', () => {
@@ -879,7 +915,8 @@ test('missing capacity keeps the full team total visible and defers rows until t
             participantNumbers: AstervoidsWireCodec.packCounterMap(numbers) },
     });
     h.updateGameplayOverlays();
-    assert.equal(h.gameoverScoreEl.textContent, 'team score: 4500');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 0');
+    assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 4500');
     assert.match(h.gameoverResultsEl.textContent, /session capacity unknown/);
     assert.deepEqual(standingsRows(h.gameoverResultsEl), []);
     for (const [maxMembers, rows] of [[3, 4], [5, 7]]) {
@@ -897,7 +934,8 @@ test('legacy and malformed score histories are visibly unavailable, not fabricat
         h.updateGameplayOverlays();
         assert.equal(h.yourScoreDisplay.textContent, 'unavailable');
         assert.equal(h.teamScoreDisplay.textContent, '987654');
-        assert.equal(h.gameoverScoreEl.textContent, 'team score: 987654');
+        assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: unavailable');
+        assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 987654');
         assert.match(h.gameoverResultsEl.textContent, /unavailable for this session/);
         assert.deepEqual(standingsRows(h.gameoverResultsEl), []);
     }
@@ -911,10 +949,12 @@ test('legacy and malformed score histories are visibly unavailable, not fabricat
     assert.equal(h.errors.length, 1, 'report a malformed version once');
     assert.equal(h.teamScoreDisplay.textContent, '200');
     assert.equal(h.yourScoreDisplay.textContent, 'unavailable');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: unavailable');
     h.record.data.participantScores = AstervoidsWireCodec.packCounterMap({ [participantA]: 200 });
     h.updateHUD();
     h.updateGameplayOverlays();
     assert.equal(h.yourScoreDisplay.textContent, '200');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 200');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '200']]);
 });
 
@@ -928,6 +968,7 @@ test('partial history from an older GameState owner is unavailable instead of pr
     h.updateGameplayOverlays();
     assert.equal(h.teamScoreDisplay.textContent, '200');
     assert.equal(h.yourScoreDisplay.textContent, 'unavailable');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: unavailable');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), []);
     assert.equal(AstervoidsWireCodec.unpackCounterMap(h.record.data.participantScores)[participantA], 50,
         'never fabricate the missing historic attribution');
@@ -945,6 +986,8 @@ test('pure spectators are absent from histories, and solo Final Score hides pers
     h.updateHUD();
     h.updateGameplayOverlays();
     assert.equal(h.yourScoreDisplay.textContent, '--');
+    assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: --');
+    assert.equal(h.gameoverPersonalScoreEl.attributes['aria-label'], 'No personal score: spectating');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '10']]);
     assert.equal(h.yourScoreDisplay.attributes['aria-label'], 'No personal score: spectating');
     assert.equal(Object.values(h.yourScoreDisplay.attributes).some(value => value.includes(participantA)), false);
@@ -952,13 +995,15 @@ test('pure spectators are absent from histories, and solo Final Score hides pers
     h.game.score = 50;
     h.updateGameplayOverlays();
     assert.equal(h.gameoverScoreEl.textContent, 'Final Score: 50');
+    assert.equal(h.gameoverPersonalScoreEl.hidden, true);
     assert.equal(h.gameoverResultsEl.hidden, true);
 });
 
 test('HUD layout and scroll exceptions stay localized to the score column and visible final results', () => {
     const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
         .replace(/\r\n/g, '\n');
-    assert.match(source, /class="score-label">your score<\/span>[\s\S]*class="score-label">team score<\/span>/);
+    assert.match(source, /class="score-label">Your Score<\/span>[\s\S]*class="score-label">Team Score<\/span>/);
+    assert.match(source, /id="gameover-personal-score"[\s\S]*id="gameover-score"/);
     assert.match(source, /#session-indicator \{[^}]*min-width: 0;[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;/);
     assert.match(source, /#hud\.multiplayer #wave,[\s\S]*#hud\.multiplayer #lives \{[^}]*flex-shrink: 0;/);
     assert.match(source, /#gameover-results \{[^}]*width: min\(420px, 90%\);/);

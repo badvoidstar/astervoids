@@ -37,7 +37,7 @@ test('personal score expectation is independent of peer insertion order', () => 
 });
 
 test('personal result reader retains zero scores, stable labels and six-digit values', () => {
-    assert.deepEqual(personalRows('team score 246,912\nPlayer 2 (you)\n123,456\nPlayer 1\n123456\nPlayer 3\n0'), [
+    assert.deepEqual(personalRows('Your Score: 123,456\nTeam Score: 246,912\nPlayer 2 (you)\n123,456\nPlayer 1\n123456\nPlayer 3\n0'), [
         { number: 2, score: 123456 }, { number: 1, score: 123456 }, { number: 3, score: 0 },
     ]);
     assert.deepEqual(personalRows('Final Score: 123456'), []);
@@ -47,11 +47,14 @@ test('personal result reader retains zero scores, stable labels and six-digit va
     ]);
 });
 
-test('personal HUD reader distinguishes lowercase individual and shared score labels', () => {
-    assert.deepEqual(personalHudScores('your score\n123456\nteam score\n316,932\nWave: 1\nLives: 5'), {
+test('personal score reader distinguishes capitalized individual and shared HUD and final labels', () => {
+    assert.deepEqual(personalHudScores('Your Score\n123456\nTeam Score\n316,932\nWave: 1\nLives: 5'), {
         your: 123456, team: 316932,
     });
+    assert.deepEqual(personalHudScores('Your Score: 0\nTeam Score: 316,932'), { your: 0, team: 316932 });
+    assert.deepEqual(personalHudScores('Your Score: --\nTeam Score: 316,932'), { your: null, team: 316932 });
     assert.deepEqual(personalHudScores('Score: 123456'), { your: null, team: null });
+    assert.deepEqual(personalHudScores('your score 1 team score 2'), { your: null, team: null });
     assert.deepEqual(personalHudScores('Your score 1 Team score 2'), { your: null, team: null });
 });
 

@@ -268,6 +268,7 @@
             font-size: calc(var(--vp-ref, 600) / 600 * 48 * 1px);
         }
 
+        #gameover-personal-score,
         #gameover-score {
             font-size: calc(var(--vp-ref, 600) / 600 * 24 * 1px);
             margin-top: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
@@ -278,6 +279,7 @@
         }
 
         #gameover-overlay.multiplayer #gameover-title,
+        #gameover-overlay.multiplayer #gameover-personal-score,
         #gameover-overlay.multiplayer #gameover-score,
         #gameover-overlay.multiplayer #gameover-prompt {
             max-width: 90%;
@@ -291,6 +293,7 @@
                 calc(var(--vp-width, 800) * 0.15 * 1px), calc(var(--vp-height, 600) * 0.16 * 1px));
         }
 
+        #gameover-overlay.multiplayer #gameover-personal-score,
         #gameover-overlay.multiplayer #gameover-score {
             font-size: min(max(12px, calc(var(--vp-ref, 600) / 600 * 24 * 1px)),
                 calc(var(--vp-height, 600) * 0.12 * 1px));
@@ -818,8 +821,8 @@
         <div id="hud" style="display: none;">
             <span id="score">Score: 0</span>
             <span id="multiplayer-scores">
-                <span class="score-row"><span class="score-label">your score</span><span id="your-score" class="score-value">0</span></span>
-                <span class="score-row"><span class="score-label">team score</span><span id="team-score" class="score-value">0</span></span>
+                <span class="score-row"><span class="score-label">Your Score</span><span id="your-score" class="score-value">0</span></span>
+                <span class="score-row"><span class="score-label">Team Score</span><span id="team-score" class="score-value">0</span></span>
             </span>
             <span id="session-indicator"></span>
             <span id="wave">Wave: 1</span>
@@ -882,6 +885,7 @@
         <!-- Game-over overlay -->
         <div id="gameover-overlay" class="gameplay-overlay">
             <div id="gameover-title">GAME OVER</div>
+            <div id="gameover-personal-score" hidden>Your Score: 0</div>
             <div id="gameover-score">Final Score: 0</div>
             <div id="gameover-results" role="region" aria-label="Personal scores" tabindex="0" hidden></div>
             <div id="gameover-prompt" class="desktop-only">Press ENTER for menu</div>
@@ -4728,6 +4732,7 @@
     const waveOverlay = document.getElementById('wave-overlay');
     const waveTextEl = document.getElementById('wave-text');
     const gameoverOverlay = document.getElementById('gameover-overlay');
+    const gameoverPersonalScoreEl = document.getElementById('gameover-personal-score');
     const gameoverScoreEl = document.getElementById('gameover-score');
     const gameoverResultsEl = document.getElementById('gameover-results');
     const gameoverPromptEl = document.getElementById('gameover-prompt');
@@ -8238,7 +8243,7 @@
                 yourScoreDisplay.textContent = personalText;
                 yourScoreDisplay.setAttribute('aria-label', personal === null
                     ? view?.history ? 'No personal score: spectating' : 'Personal score unavailable'
-                    : `your score ${personal}`);
+                    : `Your Score ${personal}`);
                 hudCache.personalScore = personalText;
                 layoutChanged = true;
             }
@@ -9681,15 +9686,28 @@
             const sessionMode = isSessionMode();
             const view = sessionMode ? getSessionScoreView() : null;
             const score = view?.groupScore ?? game.score;
+            const history = view?.history;
+            const participantId = sessionMode ? SessionClient.getParticipantId() : null;
+            const personal = history && GuidUtils.isGuid(participantId)
+                ? history.scores.counters[participantId.toLowerCase()] ?? null : null;
+            const personalText = history ? personal ?? '--' : 'unavailable';
+            if (sessionMode && (overlayCache.personalScore !== personalText
+                || overlayCache.sessionMode !== sessionMode)) {
+                gameoverPersonalScoreEl.textContent = `Your Score: ${personalText}`;
+                gameoverPersonalScoreEl.setAttribute('aria-label', personal === null
+                    ? history ? 'No personal score: spectating' : 'Personal score unavailable'
+                    : `Your Score ${personal}`);
+                overlayCache.personalScore = personalText;
+            }
             if (overlayCache.score !== score || overlayCache.sessionMode !== sessionMode) {
-                gameoverScoreEl.textContent = sessionMode ? `team score: ${score}` : `Final Score: ${score}`;
+                gameoverScoreEl.textContent = sessionMode ? `Team Score: ${score}` : `Final Score: ${score}`;
                 overlayCache.score = score;
             }
             if (overlayCache.sessionMode !== sessionMode) {
+                gameoverPersonalScoreEl.hidden = !sessionMode;
                 gameoverResultsEl.hidden = !sessionMode;
                 gameoverOverlay.classList.toggle('multiplayer', sessionMode);
             }
-            const history = view?.history;
             const capacity = game.sessionInfo?.maxMembers;
             if (sessionMode && (overlayCache.scores !== history?.scores
                 || overlayCache.numbers !== history?.numbers || overlayCache.capacity !== capacity

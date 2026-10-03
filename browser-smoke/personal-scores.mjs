@@ -20,8 +20,8 @@ export function personalRows(text) {
 }
 
 export function personalHudScores(text) {
-    const your = text.match(/\byour score\s*:?\s*(\d[\d,]*)\b/);
-    const team = text.match(/\bteam score\s*:?\s*(\d[\d,]*)\b/);
+    const your = text.match(/\bYour Score\s*:?\s*(\d[\d,]*)\b/);
+    const team = text.match(/\bTeam Score\s*:?\s*(\d[\d,]*)\b/);
     return {
         your: your ? Number(your[1].replaceAll(',', '')) : null,
         team: team ? Number(team[1].replaceAll(',', '')) : null,
@@ -107,8 +107,8 @@ export function personalScoreGeometry() {
         const match = hudText.text.match(new RegExp(`\\b${label}\\s*:?\\s*(\\d[\\d,]*)\\b`));
         return match ? textBox(hudText, match.index, match[0].length) : null;
     };
-    const your = counter('your score');
-    const team = counter('team score');
+    const your = counter('Your Score');
+    const team = counter('Team Score');
     const score = your && team ? {
         left: Math.min(your.left, team.left), right: Math.max(your.right, team.right),
         top: Math.min(your.top, team.top), bottom: Math.max(your.bottom, team.bottom),
@@ -152,6 +152,7 @@ export function personalScoreGeometry() {
         rows,
         overlay: elementBox('gameover-overlay'),
         title: elementBox('gameover-title'),
+        personalTotal: elementBox('gameover-personal-score'),
         total: elementBox('gameover-score'),
         prompt: prompt && getComputedStyle(prompt).display !== 'none'
             ? elementBox('gameover-prompt') : null,
