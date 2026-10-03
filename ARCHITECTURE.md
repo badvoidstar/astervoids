@@ -242,7 +242,12 @@ The game continues to own orchestration in `wwwroot/index.html`:
   too. A newly owning spectator adopts canonical GameState before publication;
   it acquires no personal
   history unless it has published a ship.
-- Multiplayer HUD shows `Your Score` above `Team Score`. The personal value
+- Multiplayer HUD shows `Your Score: value : Player N` above
+  `Team Score: value : session name`. The viewer's placeholder uses their
+  immutable participant ordinal, not their current score rank, ship or member
+  position. Spectators show `Spectator`; a new ship whose ordinal has not yet
+  been published shows `Player --`, and unavailable histories show `--`.
+  These names add no identity fields or network queries. The personal value
   projects the persisted lifetime total plus positive, unprocessed counters
   for that participant; it is not a second accumulator. Long session names
   ellipsize. The creator-aspect gameplay viewport is the hard boundary for all

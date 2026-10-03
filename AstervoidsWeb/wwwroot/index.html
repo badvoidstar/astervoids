@@ -86,14 +86,21 @@
 
         #hud.multiplayer #multiplayer-scores {
             display: grid;
-            flex-shrink: 0;
+            flex: 1;
+            min-width: 0;
+            grid-template-columns: auto auto minmax(0, 1fr);
+            column-gap: 0.25em;
             line-height: 1.15;
         }
 
         .score-row {
+            display: contents;
+        }
+
+        .score-counter {
             display: grid;
             grid-template-columns: auto 1fr;
-            column-gap: 0.5em;
+            column-gap: 0.25em;
         }
 
         .score-label {
@@ -105,6 +112,7 @@
             font-variant-numeric: tabular-nums;
         }
 
+        #player-indicator,
         #session-indicator {
             min-width: 0;
             overflow: hidden;
@@ -112,9 +120,9 @@
             white-space: nowrap;
         }
 
-        #hud.multiplayer #session-indicator {
-            flex: 1;
-            min-width: 2em;
+        #player-indicator {
+            justify-self: start;
+            max-width: 100%;
         }
 
         #hud.multiplayer #wave,
@@ -124,6 +132,10 @@
 
         #hud.multiplayer.compact {
             flex-wrap: wrap;
+        }
+
+        #hud.multiplayer.compact #multiplayer-scores {
+            flex-basis: 100%;
         }
 
         #hud.multiplayer.compact #wave,
@@ -821,10 +833,17 @@
         <div id="hud" style="display: none;">
             <span id="score">Score: 0</span>
             <span id="multiplayer-scores">
-                <span class="score-row"><span class="score-label">Your Score</span><span id="your-score" class="score-value">0</span></span>
-                <span class="score-row"><span class="score-label">Team Score</span><span id="team-score" class="score-value">0</span></span>
+                <span class="score-row">
+                    <span class="score-counter"><span class="score-label">Your Score:</span><span id="your-score" class="score-value">0</span></span>
+                    <span class="score-field-separator" aria-hidden="true">:</span>
+                    <span id="player-indicator">Player --</span>
+                </span>
+                <span class="score-row">
+                    <span class="score-counter"><span class="score-label">Team Score:</span><span id="team-score" class="score-value">0</span></span>
+                    <span class="score-field-separator" aria-hidden="true">:</span>
+                    <span id="session-indicator"></span>
+                </span>
             </span>
-            <span id="session-indicator"></span>
             <span id="wave">Wave: 1</span>
             <span id="lives">Lives: 3</span>
         </div>
@@ -3167,14 +3186,18 @@
         const fontSize = Math.max(10, Math.round(Math.min(vp.width, vp.height) * 0.035 * 0.9));
         hud.style.fontSize = `${fontSize}px`;
         hud.classList.remove('compact');
-        const scoreWidth = scores.getBoundingClientRect().width;
+        // Measure the intrinsic fields, not the flex-filled score column.
+        const scoreWidth = scores.querySelector('.score-counter').getBoundingClientRect().width
+            + scores.querySelector('.score-field-separator').getBoundingClientRect().width
+            + Math.max(document.getElementById('player-indicator').scrollWidth, fontSize * 2)
+            + fontSize * 0.5;
         const waveWidth = wave.getBoundingClientRect().width;
         const livesWidth = lives.getBoundingClientRect().width;
         const gap = fontSize * 0.5;
-        const compact = scoreWidth + waveWidth + livesWidth + gap * 3 + fontSize * 2 > hud.clientWidth;
+        const compact = scoreWidth + waveWidth + livesWidth + gap * 2 > hud.clientWidth;
         hud.classList.toggle('compact', compact);
         const availableHeight = vp.y + vp.height - parseFloat(hud.style.top);
-        const scale = Math.min(1, hud.clientWidth / (scoreWidth + (compact ? gap + fontSize * 2 : 0)),
+        const scale = Math.min(1, hud.clientWidth / scoreWidth,
             compact ? (hud.clientWidth - gap) / (2 * Math.max(waveWidth, livesWidth)) : 1,
             availableHeight / hud.getBoundingClientRect().height);
         if (scale < 1) hud.style.fontSize = `${Math.max(1, Math.floor(fontSize * scale * 10) / 10)}px`;
@@ -4690,6 +4713,7 @@
     const scoreDisplay = document.getElementById('score');
     const yourScoreDisplay = document.getElementById('your-score');
     const teamScoreDisplay = document.getElementById('team-score');
+    const playerIndicatorDisplay = document.getElementById('player-indicator');
     const waveDisplay = document.getElementById('wave');
     const livesDisplay = document.getElementById('lives');
 
@@ -8234,10 +8258,20 @@
         if (sessionMode) {
             const view = getSessionScoreView();
             const teamScore = view?.groupScore ?? game.score;
+            const participantId = SessionClient.getParticipantId();
             const personal = view?.history ? projectParticipantScore(
                 view.history, view.processedScores.counters,
                 ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP),
-                SessionClient.getParticipantId(), game.ship) : null;
+                participantId, game.ship) : null;
+            const playerNumber = view?.history && GuidUtils.isGuid(participantId)
+                ? view.history.numbers.counters[participantId.toLowerCase()] : null;
+            const playerName = playerNumber ? `Player ${playerNumber}`
+                : view?.history ? personal === null ? 'Spectator' : 'Player --' : '--';
+            if (hudCache.playerName !== playerName || hudCache.sessionMode !== sessionMode) {
+                playerIndicatorDisplay.textContent = playerName;
+                hudCache.playerName = playerName;
+                layoutChanged = true;
+            }
             const personalText = view?.history ? personal ?? '--' : 'unavailable';
             if (hudCache.personalScore !== personalText || hudCache.sessionMode !== sessionMode) {
                 yourScoreDisplay.textContent = personalText;
@@ -8272,7 +8306,7 @@
         const sessionIndicator = document.getElementById('session-indicator');
         if (sessionIndicator) {
             const inSession = isSessionMode() && game.sessionInfo;
-            const desiredText = inSession ? `🎮 ${game.sessionInfo.name}` : '';
+            const desiredText = inSession ? game.sessionInfo.name : '';
             const desiredVisible = inSession ? '' : 'none';
             if (hudCache.sessionIndicatorText !== desiredText) {
                 sessionIndicator.textContent = desiredText;

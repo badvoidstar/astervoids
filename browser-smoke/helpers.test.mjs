@@ -52,6 +52,9 @@ test('personal score reader distinguishes capitalized individual and shared HUD 
         your: 123456, team: 316932,
     });
     assert.deepEqual(personalHudScores('Your Score: 0\nTeam Score: 316,932'), { your: 0, team: 316932 });
+    assert.deepEqual(personalHudScores('Your Score: 123456 : Player 42\nTeam Score: 316,932 : Session 2026'), {
+        your: 123456, team: 316932,
+    });
     assert.deepEqual(personalHudScores('Your Score: --\nTeam Score: 316,932'), { your: null, team: 316932 });
     assert.deepEqual(personalHudScores('Score: 123456'), { your: null, team: null });
     assert.deepEqual(personalHudScores('your score 1 team score 2'), { your: null, team: null });

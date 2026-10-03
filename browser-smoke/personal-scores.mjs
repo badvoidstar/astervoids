@@ -115,6 +115,7 @@ export function personalScoreGeometry() {
     } : null;
     const session = document.getElementById('session-indicator');
     const sessionStyle = session ? getComputedStyle(session) : null;
+    const playerText = visibleText('player-indicator');
     const terminalText = visibleText('gameover-overlay');
     const rows = [...terminalText.text.matchAll(
         /\bPlayer ([1-9]\d*)(?:\s+\([Yy]ou\))?(?:\s*[:|\u2014]\s*|\s+)(\d{1,3}(?:,\d{3})+|\d+)(?![\d,])\b/g,
@@ -141,6 +142,9 @@ export function personalScoreGeometry() {
         gameView,
         documentWidth: document.documentElement.scrollWidth,
         your, team, score,
+        scoreColumn: elementBox('multiplayer-scores'),
+        player: elementBox('player-indicator'),
+        playerText: textBox(playerText, 0, playerText.text.trimEnd().length),
         hud: elementBox('hud'),
         compactHud: document.getElementById('hud')?.classList.contains('compact') ?? false,
         session: elementBox('session-indicator'),

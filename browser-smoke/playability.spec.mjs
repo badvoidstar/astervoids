@@ -351,7 +351,7 @@ function personalLayoutEvidence(stage, geometry) {
     console.info(`Creator-view ${stage}: ${JSON.stringify({
         view: bounds(geometry.gameView),
         hud: bounds(geometry.hud), compact: geometry.compactHud,
-        score: bounds(geometry.score), session: bounds(geometry.session),
+        score: bounds(geometry.score), player: bounds(geometry.player), session: bounds(geometry.session),
         wave: bounds(geometry.wave), lives: bounds(geometry.lives),
         overlay: bounds(geometry.overlay), title: bounds(geometry.title),
         personalTotal: bounds(geometry.personalTotal),
@@ -363,13 +363,17 @@ function personalLayoutEvidence(stage, geometry) {
     })}`);
 }
 
-async function containedPersonalHud(page, yourScore, teamScore) {
+async function containedPersonalHud(page, yourScore, teamScore, playerNumber) {
     const longName = 'A remarkably long multiplayer session name';
     await page.evaluate(name => {
         game.sessionInfo.name = name;
         updateHUD();
     }, longName);
-    await expect(page.locator('#session-indicator')).toContainText(longName);
+    await expect(page.locator('#session-indicator')).toHaveText(longName);
+    await expect(page.locator('#player-indicator')).toHaveText(`Player ${playerNumber}`);
+    const rows = page.locator('#multiplayer-scores .score-row');
+    await expect(rows.nth(0)).toHaveText(new RegExp(`^\\s*Your Score:\\s*${yourScore}\\s*:\\s*Player ${playerNumber}\\s*$`));
+    await expect(rows.nth(1)).toHaveText(new RegExp(`^\\s*Team Score:\\s*${teamScore}\\s*:\\s*${longName}\\s*$`));
     await expect.poll(async () => personalHudScores(await page.locator('#hud').innerText()),
         { message: 'The capitalized individual and team HUD counters display the accepted totals' })
         .toEqual({ your: yourScore, team: teamScore });
@@ -381,7 +385,7 @@ async function containedPersonalHud(page, yourScore, teamScore) {
     expect(geometry.team, 'The team counter has real rendered geometry').not.toBeNull();
     expect(geometry.your.bottom, 'Your Score stays above Team Score')
         .toBeLessThanOrEqual(geometry.team.top + 1);
-    const boxes = [geometry.score, geometry.session, geometry.wave, geometry.lives];
+    const boxes = [geometry.scoreColumn, geometry.wave, geometry.lives];
     boxInRegion(geometry.hud, geometry.gameView, 'The whole HUD stays inside the creator game-view');
     for (const box of boxes) {
         boxInRegion(box, geometry.gameView, 'Every HUD item fits the creator game-view, not its letterbox');
@@ -392,8 +396,22 @@ async function containedPersonalHud(page, yourScore, teamScore) {
             const box = boxes[index];
             expect(box.right <= other.left + 1 || other.right <= box.left + 1
                 || box.bottom <= other.top + 1 || other.bottom <= box.top + 1,
-            'Scores, session, Wave and Lives never overlap even in a compact creator view').toBe(true);
+            'Named score rows, Wave and Lives never overlap even in a compact creator view').toBe(true);
         }
+        for (const box of [geometry.your, geometry.team, geometry.player, geometry.session]) {
+            boxInRegion(box, geometry.scoreColumn, 'Each named score field stays inside the score column');
+        }
+        expect(geometry.your.right, 'The player name follows Your Score in its row')
+            .toBeLessThanOrEqual(geometry.player.left + 1);
+        expect(geometry.team.right, 'The session name follows Team Score in its row')
+            .toBeLessThanOrEqual(geometry.session.left + 1);
+        expect(geometry.player.bottom, 'The player and session names stay on separate score rows')
+            .toBeLessThanOrEqual(geometry.session.top + 1);
+        boxInRegion(geometry.playerText, geometry.player, 'The complete placeholder player name remains readable');
+        expect(Math.max(geometry.your.top, geometry.player.top), 'The player name shares the personal-score line')
+            .toBeLessThan(Math.min(geometry.your.bottom, geometry.player.bottom));
+        expect(Math.max(geometry.team.top, geometry.session.top), 'The session name shares the team-score line')
+            .toBeLessThan(Math.min(geometry.team.bottom, geometry.session.bottom));
     }
     if (!geometry.compactHud) {
         for (let index = 1; index < boxes.length; index++) {
@@ -553,6 +571,9 @@ for (const { mode, layout } of ['deterministic', 'buffered']
                 number: 1, score: 0,
             });
             await personalConvergence([host.page, guest.page], participants);
+            await expect(host.page.locator('#player-indicator')).toHaveText('Player 1');
+            await expect(guest.page.locator('#player-indicator')).toHaveText('Spectator');
+            await expect(guest.page.locator('#your-score')).toHaveText('--');
             await guest.page.locator('#btn-start-enter').click();
             await playing(guest.page);
             for (const page of [host.page, guest.page]) {
@@ -571,6 +592,8 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             scoreThreshold = config.threshold;
             startingLives = config.lives;
             await personalConvergence([host.page, guest.page], participants);
+            await expect(guest.page.locator('#player-indicator')).toHaveText('Player 2');
+            await expect(guest.page.locator('#your-score')).toHaveText('0');
             await guest.page.evaluate(() => enableTouchControls());
         });
 
@@ -638,7 +661,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             guestShip = rejoinedShip;
             await personalConvergence([host.page, guest.page], participants);
             await containedPersonalHud(guest.page, participants[1].score,
-                participants.reduce((sum, participant) => sum + participant.score, 0));
+                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].number);
         });
 
         await test.step('exclude a pure watcher and continue score updates after the original authority departs', async () => {
@@ -648,6 +671,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             await expect.poll(() => watcher.page.evaluate(() => game.ship == null),
                 { message: 'A joined lobby watcher has no player ship' }).toBe(true);
             await personalConvergence([host.page, guest.page, watcher.page], participants);
+            await expect(watcher.page.locator('#player-indicator')).toHaveText('Spectator');
             const watchingParticipant = await watcher.page.evaluate(() => SessionClient.getParticipantId());
             expect(participants.some(({ id }) => id === watchingParticipant),
                 'A pure spectator is not a historical scoring participant').toBe(false);
@@ -672,7 +696,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             expect(await guest.page.evaluate(() => game.sessionInfo.metadata.aspectRatio),
                 'Resizing a guest never rewrites creator viewport metadata').toBe(creatorAspect);
             await containedPersonalHud(guest.page, participants[1].score,
-                participants.reduce((sum, participant) => sum + participant.score, 0));
+                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].number);
         });
 
         let terminal;

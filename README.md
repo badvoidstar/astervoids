@@ -4,10 +4,13 @@ A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
 ## Multiplayer scores
 
-During play, `Your Score` appears above `Team Score` in the status row. Game over
-shows your final `Your Score` above the full `Team Score` total, alongside historical
-players, including departed and zero-score players, as stable anonymous `Player 1`,
-`Player 2`, etc. Pure spectators show `Your Score: --` and do not get a player row.
+During play, the status rows read `Your Score: 125 : Player 1` and
+`Team Score: 450 : Session name`. Your placeholder name uses the same stable
+player number as the final standings; spectators show `Spectator`.
+Game over shows your final `Your Score` above the full `Team Score` total,
+alongside historical players, including departed and zero-score players, as stable
+anonymous `Player 1`, `Player 2`, etc. Pure spectators show `Your Score: --` and do
+not get a player row.
 Standings sort by score, then the original
 player number, and show the highest-scoring `floor(session capacity * 1.5)`
 entries; longer results scroll without hiding the exit controls.
