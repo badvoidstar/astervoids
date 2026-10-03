@@ -7,6 +7,7 @@ import { waitForPreview } from './target.mjs';
 async function withOrigins(browser, action, status = 302) {
     let destinationRequests = 0;
     let sameOriginDestinationRequests = 0;
+    let streamResponse;
     const sockets = new Set();
     const destination = createServer((_, response) => {
         destinationRequests++;
@@ -31,6 +32,7 @@ async function withOrigins(browser, action, status = 302) {
             response.writeHead(200, { 'Content-Type': 'application/javascript' })
                 .end("fetch('/redirect').then(() => postMessage('escaped'), () => postMessage('blocked'));");
         } else if (request.url === '/stream') {
+            streamResponse = response;
             response.writeHead(200, { 'Content-Type': 'text/event-stream' }).write('data: live-stream\n\n');
         } else if (request.url === '/echo') {
             let body = '';
@@ -74,6 +76,8 @@ async function withOrigins(browser, action, status = 302) {
             destinationURL: `http://127.0.0.1:${destination.address().port}`,
             destinationRequests: () => destinationRequests,
             sameOriginDestinationRequests: () => sameOriginDestinationRequests,
+            isStreamOpen: () => !!streamResponse && !streamResponse.writableEnded && !streamResponse.destroyed,
+            finishStream: () => streamResponse.end(),
         });
     } finally {
         try {
@@ -199,16 +203,29 @@ test('origin guard preserves a direct live WebSocket handshake and received fram
 });
 
 test('origin guard preserves a live streaming HTTP response without waiting for completion', async ({ browser }) => {
-    await withOrigins(browser, async ({ page, baseURL, health }) => {
+    await withOrigins(browser, async ({ page, baseURL, health, isStreamOpen, finishStream }) => {
         await page.goto(baseURL);
         const result = await page.evaluate(() => new Promise(resolve => {
-            const source = new EventSource('/stream');
-            const finish = result => { clearTimeout(timer); source.close(); resolve(result); };
+            const source = window.guardStreamSource = new EventSource('/stream');
+            const finish = result => { clearTimeout(timer); resolve(result); };
             const timer = setTimeout(() => finish('timed out'), 5_000);
             source.onmessage = event => finish(event.data);
             source.onerror = () => finish('failed');
         }));
         expect(result).toBe('live-stream');
+        expect(isStreamOpen(), 'The browser receives a live event before the response ends').toBe(true);
+        // Closing an unfinished EventSource cancels its request and races the health check.
+        const completed = page.waitForEvent('requestfinished', {
+            predicate: request => request.url() === `${baseURL}/stream`,
+            timeout: 5_000,
+        });
+        finishStream();
+        await completed;
+        await page.evaluate(() => {
+            window.guardStreamSource.close();
+            delete window.guardStreamSource;
+        });
+        expect(isStreamOpen()).toBe(false);
         expect(health).toEqual({ offOrigin: 0, redirects: 0, requestFailures: 0 });
     });
 });
