@@ -194,24 +194,7 @@ public class WireSizeBenchTests
         });
 
     private static readonly PositionalSchemaCodec.Schema GameStateSchema =
-        new(4, new[] {
-            new PositionalSchemaCodec.FieldSpec("type", "str"),
-            new PositionalSchemaCodec.FieldSpec("gameStarted", "bool"),
-            new PositionalSchemaCodec.FieldSpec("wave", "u16"),
-            new PositionalSchemaCodec.FieldSpec("state", "str"),
-            new PositionalSchemaCodec.FieldSpec("lives", "u16"),
-            new PositionalSchemaCodec.FieldSpec("groupScore", "u32"),
-            new PositionalSchemaCodec.FieldSpec("speedMultiplier", "f32"),
-            new PositionalSchemaCodec.FieldSpec("waveDelayTimer", "f32"),
-            new PositionalSchemaCodec.FieldSpec("processedHits", "bytes"),
-            new PositionalSchemaCodec.FieldSpec("processedScores", "bytes"),
-            new PositionalSchemaCodec.FieldSpec("peakShipCount", "u8"),
-            new PositionalSchemaCodec.FieldSpec("gameOverAt", "f64"),
-            new PositionalSchemaCodec.FieldSpec("terminalAt", "f64"),
-            new PositionalSchemaCodec.FieldSpec("scoreLifeAwardCount", "u32"),
-            new PositionalSchemaCodec.FieldSpec("countedParticipants", "bytes"),
-            new PositionalSchemaCodec.FieldSpec("terminalShipId", "guid"),
-        });
+        GameStateSchemaFixture.Current;
 
     // ── Per-payload baselines (current main, as of wireopt phase 0) ────────────
 
@@ -502,12 +485,46 @@ public class WireSizeBenchTests
         };
         var encoded = PositionalSchemaCodec.Encode(GameStateSchema, data);
         Convert.ToHexString(encoded).ToLowerInvariant().Should().Be(
-            "109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff");
+            "10980000000000000000408f400000000000589b4033221100554477668899aabbccddeeff");
         var decoded = PositionalSchemaCodec.Decode(GameStateSchema, encoded);
         decoded["terminalShipId"].Should().Be(shipId);
         PositionalSchemaCodec.Encode(GameStateSchema, decoded).Should().Equal(encoded);
         PositionalSchemaCodec.Encode(GameStateSchema,
-            new Dictionary<string, object?> { ["lives"] = 3 }).Length.Should().Be(4);
+            new Dictionary<string, object?> { ["lives"] = 3 }).Length.Should().Be(5);
+    }
+
+    [Theory]
+    [InlineData(0, 11, 20)]
+    [InlineData(1, 51, 60)]
+    [InlineData(2, 91, 100)]
+    [InlineData(6, 251, 260)]
+    [InlineData(7, 291, 301)]
+    public void Production_PersonalMapDelta_BodyAndMessagePackBudgets(
+        int participantCount, int bodyBytes, int dtoBytes)
+    {
+        var scores = new byte[participantCount * 20];
+        var numbers = new byte[participantCount * 20];
+        for (var i = 0; i < participantCount; i++)
+        {
+            var participantId = new Guid(i + 1, 0, 0, new byte[8]);
+            participantId.TryWriteBytes(scores.AsSpan(i * 20, 16)).Should().BeTrue();
+            participantId.TryWriteBytes(numbers.AsSpan(i * 20, 16)).Should().BeTrue();
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+                scores.AsSpan(i * 20 + 16, 4), i == 0 ? 0u : 123456u);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+                numbers.AsSpan(i * 20 + 16, 4), (uint)(i + 1));
+        }
+        var body = PositionalSchemaCodec.Encode(GameStateSchema,
+            new Dictionary<string, object?>
+            {
+                ["participantScores"] = scores,
+                ["participantNumbers"] = numbers
+            });
+
+        body.Take(3).Should().Equal(0, 0, 3);
+        body.Length.Should().Be(bodyBytes);
+        Size(new ObjectUpdateInfo(SampleHandle, new SyncPayload(4, body), 42L))
+            .Should().Be(dtoBytes, "the binary length prefix grows past 255 body bytes");
     }
 
     [Fact]
@@ -561,6 +578,23 @@ public class WireSizeBenchTests
         shipCreate.Length.Should().Be(64);
         asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
-        gameStateCreate.Length.Should().Be(52);
+        gameStateCreate.Length.Should().Be(53, "18 optional slots require a three-byte mask");
+        var withEmptyPersonalMaps = new Dictionary<string, object?>(
+            PositionalSchemaCodec.Decode(GameStateSchema, gameStateCreate))
+        {
+            ["participantScores"] = Array.Empty<byte>(),
+            ["participantNumbers"] = Array.Empty<byte>()
+        };
+        PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
+            .Length.Should().Be(61, "two present empty byte maps each add a four-byte length");
+        withEmptyPersonalMaps["countedParticipants"] = Array.Empty<byte>();
+        PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
+            .Length.Should().Be(65, "a fresh production GameState also carries the counted-participant ledger");
+        withEmptyPersonalMaps["participantScores"] =
+            Convert.FromHexString(GameStateSchemaFixture.ScoreEntries);
+        withEmptyPersonalMaps["participantNumbers"] =
+            Convert.FromHexString(GameStateSchemaFixture.NumberEntries);
+        PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
+            .Length.Should().Be(145, "two two-participant ledgers each add forty entry bytes");
     }
 }

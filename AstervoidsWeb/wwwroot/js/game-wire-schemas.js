@@ -66,6 +66,8 @@ const AstervoidsWireSchemas = (function() {
             ['scoreLifeAwardCount', 'u32'],
             ['countedParticipants', 'bytes'],
             ['terminalShipId', 'guid'],
+            ['participantScores', 'bytes'],
+            ['participantNumbers', 'bytes'],
         ]},
     ];
 

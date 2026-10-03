@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -209,24 +210,78 @@ test('known terminal updates do not fall back to schema zero', () => {
     }
 });
 
-test('GameState appends a sparse final-life ship identity for updates and join snapshots', () => {
+test('GameState appends personal history after the stable final-life ship slot', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(4);
-    assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]),
-        [['terminalShipId', 'guid']]);
+    assert.equal(schema.fields.length, 18);
+    assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]), [
+        ['terminalShipId', 'guid'],
+        ['participantScores', 'bytes'],
+        ['participantNumbers', 'bytes'],
+    ]);
     const terminal = {
         lives: 0, gameOverAt: 1000, terminalAt: 1750,
         terminalShipId: '00112233-4455-6677-8899-aabbccddeeff',
     };
     const encoded = SchemaCodec.encode(schema, terminal);
     assert.equal(Buffer.from(encoded).toString('hex'),
-        '109800000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
+        '10980000000000000000408f400000000000589b4033221100554477668899aabbccddeeff',
         'shared with the C# production schema fixture');
     const decoded = SchemaCodec.decode(schema, encoded);
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
-    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 4,
-        'the appended optional field leaves the live two-byte mask unchanged');
+    assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5,
+        'eighteen optional slots use a three-byte presence mask');
+});
+
+test('rare ship score updates reuse the existing uint32 slot and eight-byte body', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(1);
+    const payload = { score: 999999 };
+    const encoded = SchemaCodec.encode(schema, payload);
+    assert.equal(encoded.length, 8, 'four-byte Ship mask plus the existing score counter');
+    assert.deepEqual(SchemaCodec.decode(schema, encoded), payload);
+});
+
+test('personal history has sparse three-byte masks and packed zero-score entries', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(4);
+    const id = '00112233-4455-6677-8899-aabbccddeeff';
+    const payload = {
+        participantScores: WireCodec.packCounterMap({ [id]: 0 }),
+        participantNumbers: WireCodec.packCounterMap({ [id]: 1 }),
+    };
+    const encoded = SchemaCodec.encode(schema, payload);
+    assert.equal(encoded.length, 51, '3-byte mask plus two length-prefixed 20-byte maps');
+    assert.deepEqual(Array.from(encoded.subarray(0, 3)), [0, 0, 3]);
+    assert.deepEqual(SchemaCodec.decode(schema, encoded), payload);
+});
+
+test('fresh GameState producer initializes all five empty ledgers with a sixty-five-byte body', async () => {
+    registerProductionSchemas();
+    let created;
+    const game = {
+        wave: 1, state: 'playing', lives: 3, score: 0,
+        speedMultiplier: 1, waveDelayTimer: 0, multiplayer: {},
+    };
+    const { createSyncedGameState } = loadInlineGameFunctions([
+        'createSyncedGameState', 'hasParticipantScoreSchema',
+    ], {
+        game, OBJECT_TYPES: { GAME_STATE: 'gameState' }, AstervoidsWireCodec: WireCodec,
+        isSessionMode: () => true,
+        SessionClient: { getCurrentSession: () => ({ metadata: { schemas: WireSchemas.SCHEMAS } }) },
+        ObjectSync: { createObject: async data => { created = data; return { id: 'gs' }; } },
+        syncGameState: immediate => assert.equal(immediate, true),
+        _error: (...args) => assert.fail(args.join(' ')),
+    });
+    await createSyncedGameState();
+    const bytes = SchemaCodec.encode(SchemaCodec.get(4), created);
+    assert.equal(bytes.length, 65);
+    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 3]);
+    for (const field of ['processedHits', 'processedScores', 'countedParticipants',
+        'participantScores', 'participantNumbers']) {
+        assert.deepEqual(WireCodec.unpackCounterMap(created[field]), {});
+    }
 });
 
 test('production serializers keep optional high-cost data sparse', () => {
@@ -247,5 +302,11 @@ test('production serializers keep optional high-cost data sparse', () => {
         /processedScores: AstervoidsWireCodec\.packCounterMap\(processedScores\)/);
     assert.match(
         source,
-        /try \{[\s\S]*unpackCounterMap\([\s\S]*Refusing malformed GameState ledgers/);
+        /function readGameStateLedger\([\s\S]*unpackCounterMap\(value\)/);
+    assert.match(
+        source,
+        /try \{\s*cache\.hits = readGameStateLedger[\s\S]*catch \(error\) \{\s*reportMalformedGameStateLedgers\(gsObj, error\);\s*return;/);
+    assert.match(
+        source,
+        /function reportMalformedGameStateLedgers\([\s\S]*Refusing malformed GameState ledgers/);
 });

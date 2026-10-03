@@ -115,7 +115,7 @@ const SessionClient = (function() {
 
     function beginSessionTransition(kind, clearLastSession = false, targetSessionId = null) {
         const epoch = ++sessionEpoch;
-        pendingSessionTransition = { kind, epoch, targetSessionId, memberEvents: [] };
+        pendingSessionTransition = { kind, epoch, targetSessionId, events: [] };
         currentSession = null;
         currentMember = null;
         clearObjectHandles();
@@ -233,19 +233,30 @@ const SessionClient = (function() {
     }
 
     function handleMemberEvent(event) {
-        if (!currentSession && pendingSessionTransition?.memberEvents) {
-            pendingSessionTransition.memberEvents.push(event);
-            return;
-        }
         applyMemberEvent(event);
         dispatchMemberEvent(event);
     }
 
-    function applyPendingMemberEvents(epoch) {
-        if (pendingSessionTransition?.epoch !== epoch) return [];
-        const events = pendingSessionTransition.memberEvents.splice(0);
-        for (const event of events) applyMemberEvent(event);
-        return events;
+    function replayPendingSessionEvents(context) {
+        const transition = pendingSessionTransition;
+        if (transition?.epoch !== context.sessionEpoch) return false;
+        for (const event of transition.events) {
+            if (!isSessionContextCurrent(context)) return false;
+            event.dispatch();
+        }
+        return isSessionContextCurrent(context);
+    }
+
+    function failSessionEntry(epoch) {
+        if (pendingSessionTransition?.epoch !== epoch) return;
+        if (pendingSessionTransition.replaying) {
+            // Snapshot seeds and earlier callbacks may already have mutated
+            // consumers. Invalidate their async work as well as the raw tail.
+            invalidateSession('entryFailed');
+        } else {
+            finishSessionTransition(epoch);
+            clearObjectHandles();
+        }
     }
 
     function acceptsExpirationForSession(expiredSessionId) {
@@ -509,6 +520,8 @@ const SessionClient = (function() {
     }
 
     function completeSessionEntry(context, session, member, identity, eventName) {
+        const transition = pendingSessionTransition;
+        if (transition?.epoch !== context.sessionEpoch) return null;
         currentSession = session;
         currentMember = member;
         reconnectIdentity = identity;
@@ -519,16 +532,25 @@ const SessionClient = (function() {
         if (!participantIdentities.has(session.id)) {
             rememberParticipantIdentity(session.id, member.id);
         }
-        const pendingMemberEvents = applyPendingMemberEvents(context.sessionEpoch);
         lastSessionId = session.id;
+
+        transition.replaying = true;
+        // Seed through ordinary object registration without advancing any
+        // member sequence. Migrations must see these owners before live deltas.
+        for (const objectInfo of session.objects || []) {
+            if (!isSessionContextCurrent(context)) return null;
+            if (callbacks.onObjectCreated) {
+                callbacks.onObjectCreated(
+                    objectInfo, null, 0, session.validAts?.[objectInfo.id]);
+            }
+        }
+        if (!replayPendingSessionEvents(context)) return null;
         finishSessionTransition(context.sessionEpoch);
 
+        // Snapshot consumers retain their version-aware final backfill; neither
+        // an older owner nor an already deleted object can replace live state.
         if (callbacks[eventName]) {
             callbacks[eventName](session, member);
-        }
-        for (const event of pendingMemberEvents) {
-            if (!isSessionContextCurrent(context)) break;
-            dispatchMemberEvent(event);
         }
 
         return isSessionContextCurrent(context) ? { session, member } : null;
@@ -822,6 +844,7 @@ const SessionClient = (function() {
         {
             name: 'OnSessionExpired',
             sessionScoped: true,
+            deferDuringEntry: false,
             handler: (expiredSessionId, reason) => {
                 if (!acceptsExpirationForSession(expiredSessionId)) return;
 
@@ -832,6 +855,15 @@ const SessionClient = (function() {
             }
         }
     ];
+
+    function dispatchHubEvent(handler, args, transformGuids) {
+        if (transformGuids) {
+            for (let i = 0; i < args.length; i++) {
+                args[i] = GuidUtils.transformBinaryGuids(args[i]);
+            }
+        }
+        handler(...args);
+    }
 
     /**
      * Setup SignalR event handlers.
@@ -845,16 +877,17 @@ const SessionClient = (function() {
         // Guard wrapper: skips stale handlers and normally transforms binary
         // GUIDs in all arguments. Opaque byte payload handlers opt out and
         // transform only their known GUID slots.
-        const guard = (fn, sessionScoped = false, transformGuids = true) => (...args) => {
+        const guard = (fn, sessionScoped = false, transformGuids = true, deferDuringEntry = true) => (...args) => {
             if (connection === thisConnection
                 && connectionEpoch === thisConnectionEpoch
                 && (!sessionScoped || acceptsSessionEvents())) {
-                if (transformGuids) {
-                    for (let i = 0; i < args.length; i++) {
-                        args[i] = GuidUtils.transformBinaryGuids(args[i]);
-                    }
+                if (sessionScoped && deferDuringEntry && pendingSessionTransition?.events) {
+                    pendingSessionTransition.events.push({
+                        dispatch: () => dispatchHubEvent(fn, args, transformGuids)
+                    });
+                    return;
                 }
-                fn(...args);
+                dispatchHubEvent(fn, args, transformGuids);
             }
         };
 
@@ -895,7 +928,8 @@ const SessionClient = (function() {
         for (const event of HUB_EVENTS) {
             thisConnection.on(
                 event.name,
-                guard(event.handler, event.sessionScoped === true, event.transformGuids !== false));
+                guard(event.handler, event.sessionScoped === true,
+                    event.transformGuids !== false, event.deferDuringEntry !== false));
         }
     }
 
@@ -990,7 +1024,7 @@ const SessionClient = (function() {
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
-            finishSessionTransition(thisSessionEpoch);
+            failSessionEntry(thisSessionEpoch);
             _error('[SessionClient] Create session failed:', err);
             if (callbacks.onError) {
                 callbacks.onError('Failed to create session: ' + err.message);
@@ -1039,9 +1073,8 @@ const SessionClient = (function() {
                 return null;
             }
 
-            // Install the session contract before decoding any snapshot object.
-            // The local registry is already populated for same-version clients;
-            // metadata remains authoritative for this specific session.
+            // The creator's registry must precede both snapshot and live decode.
+            // Snapshot handles and object seeds must also precede replay.
             replaceSessionSchemas(response.metadata);
 
             // Translate compact enums/pairs to the ergonomic game-side shapes.
@@ -1071,7 +1104,7 @@ const SessionClient = (function() {
             if (!isSessionContextCurrent(context)) {
                 return null;
             }
-            finishSessionTransition(thisSessionEpoch);
+            failSessionEntry(thisSessionEpoch);
             _error('[SessionClient] Join session failed:', err);
             if (callbacks.onError) {
                 callbacks.onError('Failed to join session: ' + err.message);

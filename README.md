@@ -2,6 +2,30 @@
 
 A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
+## Multiplayer scores
+
+During play, the status rows read `Your Score: 125 : Player 1` and
+`Team Score: 450 : Session name`. Your placeholder name uses the same stable
+player number as the final standings; spectators show `Spectator`.
+Game over shows your final `Your Score` above the full `Team Score` total,
+alongside historical players, including departed and zero-score players, as stable
+anonymous `Player 1`, `Player 2`, etc. Pure spectators show `Your Score: --` and do
+not get a player row.
+Standings sort by score, then the original
+player number, and show the highest-scoring `floor(session capacity * 1.5)`
+entries; longer results scroll without hiding the exit controls.
+The HUD and game-over content stay inside the session creator's game-view
+rectangle, including on differently shaped or resized guest screens. Long
+session names ellipsize, narrow HUDs use a second status row, and results scroll
+within that same view; the surrounding letterbox margins are not extra UI space.
+
+Personal totals survive ship recreation, same-tab rejoin, and GameState ownership
+migration within that session. They follow the existing team accounting, including
+accepted late awards after game over. Older sessions or detected inconsistent
+histories show personal results as unavailable; missing advertised capacity defers
+the rows, never the team total. Old game owners in mixed-version sessions
+cannot guarantee personal history. Solo `Score` and `Final Score` are unchanged.
+
 ## Local Development
 
 ```powershell
