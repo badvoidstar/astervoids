@@ -153,6 +153,7 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("invulnerabilityRevision", "u32"),
             new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
+            new PositionalSchemaCodec.FieldSpec("participantTag", "str"),
         });
 
     private static readonly PositionalSchemaCodec.Schema AsteroidSchema =
@@ -578,7 +579,7 @@ public class WireSizeBenchTests
         shipCreate.Length.Should().Be(64);
         asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
-        gameStateCreate.Length.Should().Be(53, "18 optional slots require a three-byte mask");
+        gameStateCreate.Length.Should().Be(53, "19 optional slots still require a three-byte mask");
         var withEmptyPersonalMaps = new Dictionary<string, object?>(
             PositionalSchemaCodec.Decode(GameStateSchema, gameStateCreate))
         {
@@ -596,5 +597,11 @@ public class WireSizeBenchTests
             Convert.FromHexString(GameStateSchemaFixture.NumberEntries);
         PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
             .Length.Should().Be(145, "two two-participant ledgers each add forty entry bytes");
+        withEmptyPersonalMaps["participantTags"] = Array.Empty<byte>();
+        PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
+            .Length.Should().Be(149, "an empty name ledger adds only its four-byte length");
+        withEmptyPersonalMaps["participantTags"] = Convert.FromHexString(GameStateSchemaFixture.TagEntries);
+        PositionalSchemaCodec.Encode(GameStateSchema, withEmptyPersonalMaps)
+            .Length.Should().Be(173, "one seven-character tag adds twenty-four entry bytes");
     }
 }

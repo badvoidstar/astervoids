@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Hubs;
+using AstervoidsWeb.Identity;
 using AstervoidsWeb.Services;
 using Microsoft.Net.Http.Headers;
 
@@ -12,6 +13,7 @@ builder.Services.Configure<SessionSettings>(
     builder.Configuration.GetSection(SessionSettings.SectionName));
 builder.Services.Configure<RegionSettings>(
     builder.Configuration.GetSection(RegionSettings.SectionName));
+builder.Services.AddPlayerIdentity(builder.Configuration);
 
 // Register services
 builder.Services.AddSingleton<ISessionNameGenerator, FruitNameGenerator>();
@@ -28,7 +30,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
 });
 
-// Add response compression (Brotli + Gzip for all HTTP responses).
+// Add response compression (Brotli + Gzip for non-identity HTTP responses).
 // Compresses static files (HTML/JS/CSS), SignalR negotiation, and fallback transports.
 // EnableForHttps is safe here: payloads contain game state, not secrets susceptible to
 // CRIME/BREACH side-channel attacks.
@@ -144,7 +146,16 @@ var app = builder.Build();
 // work) so they can answer before SignalR initialisation completes.
 //
 // CORS must run before these endpoints so cross-origin preflights succeed.
-app.UseCors("RegionalApi");
+app.UseWhen(IdentityEndpoints.IsIdentityRequest, identity =>
+{
+    identity.UseMiddleware<IdentityRequestMiddleware>();
+    identity.UseCors(IdentityHosting.CorsPolicy);
+    identity.UseMiddleware<IdentityValidationMiddleware>();
+});
+app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context),
+    regional => regional.UseCors("RegionalApi"));
+app.UseRateLimiter();
+app.MapPlayerIdentity();
 
 // GET /api/ping — minimal latency probe. The client measures RTT by timing the
 // round trip; we return the server wall-clock so cold-start vs network-only RTT
@@ -174,7 +185,10 @@ app.MapGet("/api/regions", (Microsoft.Extensions.Options.IOptions<RegionSettings
     });
 }).RequireCors("RegionalApi");
 
-app.UseResponseCompression();
+// Identity responses contain bearer capabilities and must never be compressed,
+// including failures. Endpoint registration order cannot exclude this middleware.
+app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context),
+    nonIdentity => nonIdentity.UseResponseCompression());
 app.UseDefaultFiles();
 
 // Build a content-hash ETag table once at startup.

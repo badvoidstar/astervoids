@@ -47,6 +47,16 @@ test('personal result reader retains zero scores, stable labels and six-digit va
     ]);
 });
 
+test('durable tag rows preserve ranking and do not parse titles as players', () => {
+    assert.deepEqual(personalRows('GAME OVER\nTeam Score: 123456\nRank\tPlayer\tScore\n1\tNova-2\t123456\n2\tPilot_1\t0'), [
+        { tag: 'Nova-2', score: 123456 }, { tag: 'Pilot_1', score: 0 },
+    ]);
+    assert.deepEqual(rankedPersonalResults([
+        { id: 'a', number: 1, tag: 'Pilot_1', score: 0 },
+        { id: 'b', number: 2, tag: 'Nova-2', score: 123456 },
+    ], 3), [{ tag: 'Nova-2', score: 123456 }, { tag: 'Pilot_1', score: 0 }]);
+});
+
 test('personal score reader distinguishes capitalized individual and shared HUD and final labels', () => {
     assert.deepEqual(personalHudScores('Your Score\n123456\nTeam Score\n316,932\nWave: 1\nLives: 5'), {
         your: 123456, team: 316932,
@@ -73,6 +83,7 @@ test('score geometry measures the offset creator view, not the fullscreen canvas
         ]) {
             globalThis.game = { viewport };
             globalThis.document = {
+                querySelectorAll: () => [],
                 getElementById: id => id === 'game' ? {
                     width: 960, height: 800,
                     getBoundingClientRect: () => ({
@@ -112,6 +123,7 @@ test('resize readiness requires the canvas backing size and game viewport, not C
             }),
         };
         globalThis.document = {
+            querySelectorAll: () => [],
             getElementById: id => id === 'game' ? canvas : null,
             documentElement: { scrollWidth: 640 },
         };

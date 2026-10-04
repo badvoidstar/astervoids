@@ -2,6 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="referrer" content="no-referrer">
+    <script src="/js/player-identity.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <!-- iOS standalone mode (Add to Home Screen) -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -409,14 +411,16 @@
             display: none;
         }
 
-        /* Keep the backdrop full-screen while reducing the title and picker together. */
+        /* Keep native text and allow short viewports to scroll the menu. */
         #start-screen-content {
             display: flex;
             flex-direction: column;
             align-items: center;
             width: 100%;
-            transform: scale(0.8);
-            transform-origin: center;
+            max-height: 100%;
+            overflow-y: auto;
+            padding: 16px 0;
+            touch-action: pan-y;
         }
 
         #start-screen h1 {
@@ -448,6 +452,79 @@
             width: 100%;
             max-width: 300px;
             padding: 0 15px;
+        }
+
+        #menu-columns {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 12px;
+            width: 100%;
+        }
+
+        #menu-utilities {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+        }
+
+        #menu-utilities .picker-btn {
+            min-height: 44px;
+        }
+
+        #identity-status {
+            font-size: 13px;
+            margin-bottom: 10px;
+            color: #cde;
+        }
+
+        @media (orientation: landscape) {
+            #session-picker { max-width: 640px; }
+            #menu-columns { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); }
+        }
+
+        .identity-dialog {
+            margin: auto;
+            color: #fff;
+            background: #101829;
+            border: 1px solid #889ab8;
+            border-radius: 8px;
+            width: min(420px, calc(100vw - 32px));
+            max-height: calc(100dvh - 32px);
+            overflow-y: auto;
+            padding: 20px;
+            font: 16px/1.4 'Courier New', monospace;
+            touch-action: pan-y;
+        }
+
+        .identity-dialog::backdrop { background: rgba(0, 0, 0, 0.85); }
+        .identity-dialog h2 { margin: 0 0 12px; font-size: 22px; }
+        .identity-dialog p { margin: 0 0 12px; overflow-wrap: anywhere; }
+        .identity-dialog input {
+            width: 100%;
+            min-height: 44px;
+            padding: 8px;
+            color: #fff;
+            background: #080d18;
+            border: 1px solid #889ab8;
+            font: inherit;
+        }
+        .identity-dialog .dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+        .identity-dialog button { min-height: 44px; flex: 1; }
+        #identity-error { color: #ffb4a9; margin-top: 12px; }
+        #identity-notice {
+            position: fixed;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 200;
+            max-width: calc(100vw - 32px);
+            padding: 12px 16px;
+            color: #fff;
+            background: #203448;
+            border: 1px solid #9ac;
+            border-radius: 6px;
+            text-align: center;
+            font-size: 16px;
         }
 
         #session-picker .picker-status {
@@ -876,10 +953,13 @@
             <div id="start-screen-content">
                 <h1>ASTERVOIDS</h1>
                 <div id="session-picker">
+                    <div id="identity-status" aria-live="polite">Loading player identity...</div>
                     <div id="picker-status" class="picker-status connecting">Connecting...</div>
                     <div id="region-banner" style="display: none;"></div>
-                    <div id="session-list"></div>
-                    <div id="picker-buttons">
+                    <div id="menu-columns">
+                      <div id="menu-play">
+                        <div id="session-list"></div>
+                        <div id="picker-buttons">
                         <div class="region-select-row" id="create-region-row" style="display: none;">
                             <label for="create-region-select">Host region</label>
                             <select id="create-region-select"></select>
@@ -889,10 +969,45 @@
                             <button id="btn-start-enter" class="picker-btn action" style="display: none;">Start</button>
                         </div>
                         <button id="btn-solo" class="picker-btn solo">Start Solo Play</button>
+                        </div>
+                      </div>
+                      <div id="menu-utilities">
                         <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
                         <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
+                        <button id="btn-invite-self" class="picker-btn solo">Invite Self</button>
+                        <button id="btn-invite-friend" class="picker-btn solo">Invite Friend</button>
+                      </div>
                     </div>
                 </div>
+
+                <dialog id="identity-dialog" class="identity-dialog" aria-labelledby="identity-title">
+                    <form id="identity-form">
+                        <h2 id="identity-title">Welcome to Astervoids</h2>
+                        <p id="identity-description"></p>
+                        <div id="identity-name-field" hidden>
+                            <label for="identity-tag">Player tag (1-8 letters, numbers, _ or -)</label>
+                            <input id="identity-tag" name="tag" maxlength="8" pattern="[A-Za-z0-9_-]{1,8}"
+                                autocomplete="nickname" autocapitalize="off" spellcheck="false">
+                        </div>
+                        <p id="identity-error" role="alert"></p>
+                        <div class="dialog-actions">
+                            <button id="identity-accept" class="picker-btn action" type="submit">Continue</button>
+                            <button id="identity-ignore" class="picker-btn solo" type="button">Not now</button>
+                        </div>
+                    </form>
+                </dialog>
+                <dialog id="invite-share-dialog" class="identity-dialog" aria-labelledby="invite-share-title">
+                    <h2 id="invite-share-title">Your invite is ready</h2>
+                    <p id="invite-share-description"></p>
+                    <label for="invite-share-url">Private invitation link</label>
+                    <input id="invite-share-url" readonly autocomplete="off">
+                    <p id="invite-share-error" role="alert"></p>
+                    <div class="dialog-actions">
+                        <button id="invite-share-copy" class="picker-btn action" type="button">Copy invite</button>
+                        <button id="invite-share-close" class="picker-btn solo" type="button">Close</button>
+                    </div>
+                </dialog>
+                <div id="identity-notice" role="status" hidden></div>
             </div>
         </div>
 
@@ -3847,7 +3962,7 @@
             'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed',
             'thrusting', 'thrustInput', 'brakeInput',
             'turnTarget', 'turnTargetAngle', 'turnMagnitude', 'turnBias',
-            'colorIndex', 'memberId', 'participantId', 'score', 'hitCount'
+            'colorIndex', 'memberId', 'participantId', 'participantTag', 'score', 'hitCount'
         ];
 
         constructor(x, y, colorIndex = 0) {
@@ -3883,6 +3998,7 @@
             // Survives the reconnect that mints a new memberId, so the shared
             // extra-life ledger counts each player exactly once.
             this.participantId = null;
+            this.participantTag = '';
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
             // Local-only predicted-fatal hold: { hitCount, startedAtMs } while
@@ -3948,6 +4064,7 @@
                 colorIndex: this.colorIndex,
                 memberId: this.memberId,
                 participantId: this.participantId,
+                participantTag: this.participantTag,
                 score: this.score || 0,
                 hitCount: this.hitCount || 0
             };
@@ -5313,6 +5430,7 @@
         const ship = new Ship(0.5, 0.5, colorIndex);
         ship.memberId = memberId;
         ship.participantId = SessionClient.getParticipantId();
+        ship.participantTag = SessionClient.getParticipantIdentity?.()?.tag || '';
         ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
         // Published before the await because createObject's liveness predicate
         // reads game.ship to decide whether the caller still wants the object.
@@ -6306,6 +6424,9 @@
             if (hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata)) {
                 gameStateData.participantScores = AstervoidsWireCodec.packCounterMap({});
                 gameStateData.participantNumbers = AstervoidsWireCodec.packCounterMap({});
+                if (hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true)) {
+                    gameStateData.participantTags = AstervoidsWireCodec.packTagMap({});
+                }
             }
             
             const objectInfo = await ObjectSync.createObject(
@@ -6327,6 +6448,8 @@
             && ledgers.participantNumbers != null;
         const participantScores = hasPersonalHistory ? { ...ledgers.participantScores } : null;
         const participantNumbers = hasPersonalHistory ? { ...ledgers.participantNumbers } : null;
+        const participantTags = hasPersonalHistory && ledgers.participantTags != null
+            ? { ...ledgers.participantTags } : null;
         if (hasPersonalHistory) {
             const unseen = new Set();
             let lastNumber = 0;
@@ -6338,6 +6461,10 @@
                 if (!GuidUtils.isGuid(participantId)) continue;
                 const id = participantId.toLowerCase();
                 if (!Object.hasOwn(participantNumbers, id)) unseen.add(id);
+                if (participantTags && !Object.hasOwn(participantTags, id)
+                    && AstervoidsWireCodec.isParticipantTag(ship.data?.participantTag)) {
+                    participantTags[id] = ship.data.participantTag;
+                }
             }
             // Registration is independent of entry lives, including fatal and
             // departure pivots. Only the owner assigns these durable ordinals.
@@ -6486,6 +6613,7 @@
             countedParticipants,
             participantScores,
             participantNumbers,
+            ...(participantTags ? { participantTags } : {}),
             peakShipCount,
             scoreLifeAwardCount,
             observedScoreLifeAwardCount,
@@ -6527,7 +6655,7 @@
 
     function serializeGameState(next, terminal, packedLedgers = null) {
         const { processedHits, processedScores, countedParticipants,
-            participantScores, participantNumbers } = next;
+            participantScores, participantNumbers, participantTags } = next;
         const ledgers = packedLedgers ?? {
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
@@ -6535,6 +6663,9 @@
             ...(participantScores != null && participantNumbers != null ? {
                 participantScores: AstervoidsWireCodec.packCounterMap(participantScores),
                 participantNumbers: AstervoidsWireCodec.packCounterMap(participantNumbers)
+            } : {}),
+            ...(participantTags != null ? {
+                participantTags: AstervoidsWireCodec.packTagMap(participantTags)
             } : {})
         };
         return {
@@ -6553,6 +6684,7 @@
                 participantScores: ledgers.participantScores,
                 participantNumbers: ledgers.participantNumbers
             } : {}),
+            ...(ledgers.participantTags != null ? { participantTags: ledgers.participantTags } : {}),
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -6565,10 +6697,13 @@
     let gameStateSyncCache = null;
     let gameStateScoreViewCache = null;
 
-    function hasParticipantScoreSchema(metadata) {
+    function hasParticipantScoreSchema(metadata, includeTags = false) {
         const fields = metadata?.schemas?.find(schema => schema.id === 4)?.fields;
+        const shipFields = metadata?.schemas?.find(schema => schema.id === 1)?.fields;
         return fields?.[16]?.[0] === 'participantScores' && fields[16][1] === 'bytes'
-            && fields?.[17]?.[0] === 'participantNumbers' && fields[17][1] === 'bytes';
+            && fields?.[17]?.[0] === 'participantNumbers' && fields[17][1] === 'bytes'
+            && (!includeTags || (fields?.[18]?.[0] === 'participantTags' && fields[18][1] === 'bytes'
+                && shipFields?.[27]?.[0] === 'participantTag' && shipFields[27][1] === 'str'));
     }
 
     function resetGameStateSyncCache() {
@@ -6637,8 +6772,9 @@
     function readGameStateLedger(value, previous, packed, minimum = null) {
         if (gameStateLedgerMatches(value, packed)) return packed;
         if (gameStateLedgerMatches(value, previous)) return previous;
-        const decoded = AstervoidsWireCodec.unpackCounterMap(value);
-        const counters = minimum === null ? decoded
+        const decoded = minimum === 'tag' ? AstervoidsWireCodec.unpackTagMap(value)
+            : AstervoidsWireCodec.unpackCounterMap(value);
+        const counters = minimum === null || minimum === 'tag' ? decoded
             : normalizeParticipantLedger(decoded, value, minimum);
         return {
             counters,
@@ -6649,7 +6785,7 @@
         };
     }
 
-    function readParticipantScoreHistory(data, previous = null, packed = null) {
+    function readParticipantScoreHistory(data, previous = null, packed = null, tagged = false) {
         if (data?.participantScores == null && data?.participantNumbers == null) return null;
         if (data?.participantScores == null || data?.participantNumbers == null) {
             throw new Error('Participant score history is incomplete');
@@ -6658,13 +6794,26 @@
             data.participantScores, previous?.scores, packed?.scores, 0);
         const numbers = readGameStateLedger(
             data.participantNumbers, previous?.numbers, packed?.numbers, 1);
-        if (scores === previous?.scores && numbers === previous?.numbers) return previous;
+        let tags;
+        if (tagged) {
+            try {
+                tags = readGameStateLedger(data.participantTags, previous?.tags, packed?.tags, 'tag');
+            } catch (error) {
+                _warn('[Multiplayer] Player tag metadata is unavailable');
+                tags = {
+                    counters: {},
+                    snapshot: data.participantTags instanceof Uint8Array
+                        ? new Uint8Array(data.participantTags) : { ...data.participantTags }
+                };
+            }
+        }
+        if (scores === previous?.scores && numbers === previous?.numbers && tags === previous?.tags) return previous;
         const ids = Object.keys(scores.counters);
         if (ids.length !== Object.keys(numbers.counters).length
             || ids.some(id => !Object.hasOwn(numbers.counters, id))) {
             throw new Error('Participant score history has mismatched players');
         }
-        return { scores, numbers };
+        return { scores, numbers, ...(tagged ? { tags } : {}) };
     }
 
     function projectParticipantScore(history, processedScores, ships, participantId, localShip = null) {
@@ -6692,7 +6841,9 @@
             scores[right] - scores[left] || numbers[left] - numbers[right]
                 || (left < right ? -1 : left > right ? 1 : 0));
         return ids.slice(0, Math.floor(maxMembers * 1.5)).map((id, index) => ({
-            participantId: id, rank: index + 1, label: `Player ${numbers[id]}`, score: scores[id]
+            participantId: id, rank: index + 1,
+            label: history.tags ? history.tags.counters[id] || 'Unknown' : `Player ${numbers[id]}`,
+            score: scores[id]
         }));
     }
 
@@ -6701,17 +6852,19 @@
         if (!record) return null;
         const epoch = SessionClient.getSessionEpoch();
         const supported = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata);
+        const tagged = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true);
         if (!gameStateScoreViewCache || gameStateScoreViewCache.record !== record
             || gameStateScoreViewCache.epoch !== epoch
-            || gameStateScoreViewCache.supported !== supported) {
+            || gameStateScoreViewCache.supported !== supported || gameStateScoreViewCache.tagged !== tagged) {
             gameStateScoreViewCache = {
-                record, epoch, supported, history: null, errorVersion: null
+                record, epoch, supported, tagged, history: null, errorVersion: null
             };
         }
         const cache = gameStateScoreViewCache;
         cache.groupScore = record.data?.groupScore ?? game.score;
         try {
-            const history = supported ? readParticipantScoreHistory(record.data, cache.decodedHistory) : null;
+            const history = supported ? readParticipantScoreHistory(
+                record.data, cache.decodedHistory, null, tagged) : null;
             if (history !== cache.decodedHistory) {
                 cache.decodedHistory = history;
                 cache.personalTotal = history
@@ -6735,13 +6888,13 @@
         return cache;
     }
 
-    function packGameStateLedger(counters, previous) {
+    function packGameStateLedger(counters, previous, pack = AstervoidsWireCodec.packCounterMap) {
         if (previous && gameStateCounterMapsEqual(counters, previous.counters)
             && AstervoidsWireCodec.bytesEqual(previous.bytes, previous.snapshot)) {
             previous.counters = counters;
             return previous;
         }
-        const bytes = AstervoidsWireCodec.packCounterMap(counters);
+        const bytes = pack(counters);
         return { counters, bytes, snapshot: new Uint8Array(bytes) };
     }
 
@@ -6749,7 +6902,7 @@
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
             data?.peakShipCount, data?.state, hits, scores, counted,
-            history?.scores, history?.numbers,
+            history?.scores, history?.numbers, history?.tags,
             data?.terminalShipId,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
             CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
@@ -6758,7 +6911,7 @@
         // Preserve membership and iteration order (damage clamps per ship).
         for (const ship of ships) {
             inputs.push(ship.id, ship.ownerMemberId, ship.data?.participantId,
-                ship.data?.score, ship.data?.hitCount);
+                ship.data?.score, ship.data?.hitCount, ship.data?.participantTag);
         }
         return inputs;
     }
@@ -6807,7 +6960,8 @@
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, cache.packedCounted);
             cache.history = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata)
-                ? readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory) : null;
+                ? readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory,
+                    hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true)) : null;
         } catch (error) {
             reportMalformedGameStateLedgers(gsObj, error);
             return;
@@ -6826,7 +6980,8 @@
                         processedScores: cache.scores.counters,
                         countedParticipants: cache.counted.counters,
                         participantScores: cache.history?.scores.counters,
-                        participantNumbers: cache.history?.numbers.counters
+                        participantNumbers: cache.history?.numbers.counters,
+                        participantTags: cache.history?.tags.counters
                     },
                     ships,
                     {
@@ -6867,13 +7022,17 @@
         if (next.participantScores != null) {
             const scores = packGameStateLedger(next.participantScores, cache.packedHistory?.scores);
             const numbers = packGameStateLedger(next.participantNumbers, cache.packedHistory?.numbers);
+            const tags = next.participantTags != null ? packGameStateLedger(
+                next.participantTags, cache.packedHistory?.tags, AstervoidsWireCodec.packTagMap) : undefined;
             packedHistory = scores === cache.packedHistory?.scores
-                && numbers === cache.packedHistory?.numbers ? cache.packedHistory : { scores, numbers };
+                && numbers === cache.packedHistory?.numbers && tags === cache.packedHistory?.tags
+                ? cache.packedHistory : { scores, numbers, ...(tags ? { tags } : {}) };
         }
         const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores
             || packedCounted !== cache.packedCounted
             || packedHistory?.scores !== cache.packedHistory?.scores
-            || packedHistory?.numbers !== cache.packedHistory?.numbers;
+            || packedHistory?.numbers !== cache.packedHistory?.numbers
+            || packedHistory?.tags !== cache.packedHistory?.tags;
         cache.packedHits = packedHits;
         cache.packedScores = packedScores;
         cache.packedCounted = packedCounted;
@@ -6881,13 +7040,15 @@
         const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores
             || cache.counted !== packedCounted
             || cache.history?.scores !== packedHistory?.scores
-            || cache.history?.numbers !== packedHistory?.numbers;
+            || cache.history?.numbers !== packedHistory?.numbers
+            || cache.history?.tags !== packedHistory?.tags;
         const gameStateData = serializeGameState(next, terminal, {
             processedHits: packedHits.bytes, processedScores: packedScores.bytes,
             countedParticipants: packedCounted.bytes,
             ...(packedHistory ? {
                 participantScores: packedHistory.scores.bytes,
-                participantNumbers: packedHistory.numbers.bytes
+                participantNumbers: packedHistory.numbers.bytes,
+                ...(packedHistory.tags ? { participantTags: packedHistory.tags.bytes } : {})
             } : {})
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
@@ -6904,7 +7065,8 @@
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, packedCounted);
             if (cache.history) {
-                cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory);
+                cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory,
+                    hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true));
             }
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
@@ -6982,6 +7144,7 @@
                     game.ship = new Ship(0.5, 0.5, colorIndex);
                     game.ship.memberId = member?.id;
                     game.ship.participantId = SessionClient.getParticipantId();
+                    game.ship.participantTag = SessionClient.getParticipantIdentity?.()?.tag || '';
                     game.ship.invulnerable = CONFIG.INVULNERABILITY_TIME;
                     game.multiplayer.myColorIndex = colorIndex;
                 }
@@ -8265,7 +8428,10 @@
                 participantId, game.ship) : null;
             const playerNumber = view?.history && GuidUtils.isGuid(participantId)
                 ? view.history.numbers.counters[participantId.toLowerCase()] : null;
-            const playerName = playerNumber ? `Player ${playerNumber}`
+            const playerName = view?.tagged
+                ? SessionClient.getParticipantIdentity?.()?.tag
+                    || view.history?.tags?.counters[participantId?.toLowerCase()] || 'Unknown'
+                : playerNumber ? `Player ${playerNumber}`
                 : view?.history ? personal === null ? 'Spectator' : 'Player --' : '--';
             if (hudCache.playerName !== playerName || hudCache.sessionMode !== sessionMode) {
                 playerIndicatorDisplay.textContent = playerName;
@@ -8286,9 +8452,12 @@
                 hudCache.score = teamScore;
                 layoutChanged = true;
             }
-        } else if (hudCache.score !== game.score || hudCache.sessionMode !== sessionMode) {
-            scoreDisplay.textContent = `Score: ${game.score}`;
+        } else if (hudCache.score !== game.score || hudCache.sessionMode !== sessionMode
+            || hudCache.soloTag !== game.playerIdentity?.tag) {
+            const suffix = game.playerIdentity?.tag ? ` : ${game.playerIdentity.tag}` : '';
+            scoreDisplay.textContent = `Score: ${game.score}${suffix}`;
             hudCache.score = game.score;
+            hudCache.soloTag = game.playerIdentity?.tag;
         }
         hudCache.sessionMode = sessionMode;
         if (hudCache.wave !== game.wave) {
@@ -9267,6 +9436,11 @@
     }
 
     function gameLoop(timestamp) {
+        if (game.identityChanging) {
+            game.lastFrameTime = timestamp;
+            requestAnimationFrame(gameLoop);
+            return;
+        }
         // Calculate delta time (normalized to 60fps: dt=1.0 at 60fps, dt=0.5 at 120fps)
         if (!game.lastFrameTime) game.lastFrameTime = timestamp;
         const elapsed = timestamp - game.lastFrameTime;
@@ -9744,7 +9918,8 @@
             }
             const capacity = game.sessionInfo?.maxMembers;
             if (sessionMode && (overlayCache.scores !== history?.scores
-                || overlayCache.numbers !== history?.numbers || overlayCache.capacity !== capacity
+                || overlayCache.numbers !== history?.numbers || overlayCache.tags !== history?.tags
+                || overlayCache.capacity !== capacity
                 || overlayCache.sessionMode !== sessionMode)) {
                 const rows = rankParticipantScores(history, capacity);
                 const message = !history ? 'Personal scores unavailable for this session.'
@@ -9752,6 +9927,7 @@
                 renderParticipantScoreRows(rows, message);
                 overlayCache.scores = history?.scores;
                 overlayCache.numbers = history?.numbers;
+                overlayCache.tags = history?.tags;
                 overlayCache.capacity = capacity;
             }
             overlayCache.sessionMode = sessionMode;
@@ -11267,7 +11443,7 @@
                         type: 't', x: 'x', y: 'y', angle: 'a',
                         velocityX: 'vx', velocityY: 'vy', rotationSpeed: 'rs',
                         thrusting: 'th', invulnerable: 'iv', colorIndex: 'ci',
-                        memberId: 'mi', participantId: 'pa', score: 'sc', hitCount: 'hc',
+                        memberId: 'mi', participantId: 'pa', participantTag: 'pt', score: 'sc', hitCount: 'hc',
                         radius: 'r', seed: 'sd',
                         lifetime: 'lt', ownerMemberId: 'om',
                         pendingHit: 'ph', hitTargetId: 'ht', hitImpactTorque: 'hi',
@@ -11276,7 +11452,7 @@
                         speedMultiplier: 'sm', waveDelayTimer: 'wd',
                         processedHits: 'pi', processedScores: 'ps',
                         countedParticipants: 'cp',
-                        participantScores: 'pp', participantNumbers: 'pn',
+                        participantScores: 'pp', participantNumbers: 'pn', participantTags: 'pg',
                         groupScore: 'gr', peakShipCount: 'pk',
                         scoreLifeAwardCount: 'sa',
                         gameOverAt: 'go', terminalAt: 'ta',
@@ -11317,6 +11493,7 @@
     // region BEFORE invoking JoinSession, so the joined hub matches the
     // region that holds the session's authoritative state.
     async function handleSelectSession(sessionId) {
+        if (game.identityChanging) return;
         if (sessionId === sessionPicker.currentSessionId) return; // Already in this session
         
         const session = sessionPicker.sessions.find(s => s.id === sessionId);
@@ -11471,6 +11648,7 @@
 
     // Handle create session - creates and enters lobby
     async function handleCreateSession() {
+        if (game.identityChanging) return;
         const createEligibility = getCreateEligibility();
         if (!createEligibility.canCreateNow) {
             updatePickerButtons();
@@ -11565,6 +11743,7 @@
 
     // Handle solo play without waiting for multiplayer services.
     async function handleSoloPlay() {
+        if (game.identityChanging) return;
         cancelPickerOperations();
         const shouldLeaveSessionInBackground = sessionPicker.currentSessionId
             && SessionClient.isConnected();
@@ -11677,6 +11856,8 @@
     }
 
     async function startGameFromPicker() {
+        if (game.identityChanging) return;
+        game.playerIdentity = typeof PlayerIdentity !== 'undefined' ? PlayerIdentity.current() : null;
         const context = captureGameStartContext();
         if (startGameOperation
             && startGameOperation.context.mode === context.mode
@@ -11831,7 +12012,7 @@
      * @param {string} sessionId - The session ID to rejoin
      */
     async function attemptAutoRejoin(sessionId) {
-        if (rejoinInProgress || leavingSession || !isSessionMode()) {
+        if (rejoinInProgress || leavingSession || game.identityChanging || !isSessionMode()) {
             _log('[Rejoin] Skipped — rejoinInProgress:', rejoinInProgress,
                 'leavingSession:', leavingSession, 'isSessionMode:', isSessionMode());
             return;
@@ -12222,6 +12403,7 @@
                 const targetFrameTime = 1000 / CONFIG.TARGET_FPS;
                 let lastTime = performance.now();
                 backgroundInterval = setInterval(() => {
+                    if (game.identityChanging) return;
                     const now = performance.now();
                     const elapsed = now - lastTime;
                     lastTime = now;
@@ -12622,10 +12804,343 @@
                 : null);
     }
 
-    initRegionService();
+    // A dialog's input remains native HTML text; it never passes through game controls.
+    const identityDialog = document.getElementById('identity-dialog');
+    const shareDialog = document.getElementById('invite-share-dialog');
+    const identityTagInput = document.getElementById('identity-tag');
+    const identityAccept = document.getElementById('identity-accept');
+    const identityIgnore = document.getElementById('identity-ignore');
+    const identityError = document.getElementById('identity-error');
+    let identityAction = null;
+    let identityIgnoreAction = null;
+    let identitySuccess = null;
+    let identityBusy = false;
+    let identityStarted = false;
+    let identityFlowEpoch = 0;
+    let identityInvite = PlayerIdentity.takeInvite();
+    let identityRefresh = null;
+    let identityRefreshRequested = false;
+    let identityLeave = null;
+    let noticeTimer = null;
+    game.identityChanging = true;
 
-    // Initialize session connection
-    connectToSessionHub();
+    // Move dialogs outside the menu's visibility/scroll layout.
+    document.body.append(identityDialog, shareDialog, document.getElementById('identity-notice'));
+    for (const dialog of [identityDialog, shareDialog]) {
+        for (const event of ['keydown', 'keyup']) {
+            dialog.addEventListener(event, e => e.stopPropagation());
+        }
+    }
+
+    function identityMessage(error) {
+        const messages = {
+            invalid_tag: 'Use 1-8 letters, numbers, underscores or hyphens.',
+            invite_not_found: 'This invitation is not available.',
+            invalid_browser_credential: 'The saved browser binding is invalid. Use a fresh browser profile with your self link.',
+            storage_unavailable: 'Durable browser storage and Web Locks are required. Check your browser privacy settings.',
+            identity_required: 'Create a player identity before making an invitation.',
+            binding_changed: 'This browser identity changed. Review the new choice before continuing.',
+            invite_changed: 'Someone has already accepted this invitation. Confirm the established identity instead.',
+            request_reused: 'The previous operation no longer matches. Review your identity before continuing.',
+            rate_limited: 'Too many identity requests. Wait a moment and retry.',
+            operation_pending: 'The last request may have completed. Retry it before making another choice.',
+        };
+        return messages[error?.code]
+            || 'Identity service unavailable. Your choice has not been confirmed. Retry when connected.';
+    }
+
+    function identityNotice(message) {
+        const notice = document.getElementById('identity-notice');
+        clearTimeout(noticeTimer);
+        notice.textContent = message;
+        notice.hidden = false;
+        noticeTimer = setTimeout(() => { notice.hidden = true; }, 7000);
+    }
+
+    function setIdentityBusy(busy) {
+        identityBusy = busy;
+        identityAccept.disabled = busy;
+        identityIgnore.disabled = busy || PlayerIdentity.hasPendingOperation();
+        identityTagInput.readOnly = busy || PlayerIdentity.hasPendingOperation();
+        document.getElementById('btn-invite-self').disabled = busy;
+        document.getElementById('btn-invite-friend').disabled = busy;
+        if (!busy && identityRefreshRequested) refreshBrowserIdentity();
+    }
+
+    function releaseIdentityInput() {
+        Object.keys(keys).forEach(key => { keys[key] = false; });
+        resetStickInput();
+        game.ship?.resetControls();
+        AudioSystem.thrustSound.stop();
+    }
+
+    function showIdentityDialog(title, description, naming, acceptLabel, action, ignoreAction) {
+        document.getElementById('identity-title').textContent = title;
+        document.getElementById('identity-description').textContent = description;
+        document.getElementById('identity-name-field').hidden = !naming;
+        identityTagInput.required = naming;
+        identityTagInput.value = '';
+        identityError.textContent = '';
+        identityAccept.textContent = acceptLabel;
+        identityAccept.hidden = !action;
+        identityAction = action;
+        identityIgnoreAction = ignoreAction;
+        identityIgnore.textContent = identityInvite ? 'Ignore invite' : 'Play as guest';
+        setIdentityBusy(false);
+        releaseIdentityInput();
+        if (!identityDialog.open) identityDialog.showModal();
+        (naming ? identityTagInput : identityAccept.hidden ? identityIgnore : identityAccept).focus();
+    }
+
+    function activateIdentityMenu() {
+        identityDialog.close();
+        game.identityChanging = false;
+        setIdentityBusy(false);
+        const identity = PlayerIdentity.current();
+        document.getElementById('identity-status').textContent = identity
+            ? `Playing as ${identity.tag}` : 'Playing as guest';
+        if (!identityStarted) {
+            identityStarted = true;
+            initRegionService();
+            connectToSessionHub();
+        }
+    }
+
+    function redirectIdentityRoot() {
+        window.location.replace(new URL('/', window.location.origin).href);
+    }
+
+    async function leaveIdentityGame() {
+        game.identityChanging = true;
+        if (!identityStarted) return;
+        if (identityLeave) return identityLeave;
+        cancelPickerOperations();
+        startGameOperation = null;
+        pendingRejoinSessionId = null;
+        beginVoluntarySessionLeave();
+        releaseIdentityInput();
+        // Disconnect invalidates membership/queued operations synchronously,
+        // including a join whose snapshot has not arrived yet.
+        identityLeave = (async () => {
+            await SessionClient.disconnect();
+            await returnToStartScreen();
+            game.playerIdentity = null;
+        })();
+        try { await identityLeave; } finally { identityLeave = null; }
+    }
+
+    async function beginIdentityFlow(forceNaming = false) {
+        const epoch = ++identityFlowEpoch;
+        const inviteToken = identityInvite?.token;
+        const ignore = identityInvite ? redirectIdentityRoot : activateIdentityMenu;
+        if (identityInvite?.invalid) {
+            showIdentityDialog('Invitation unavailable', 'The invitation link is invalid.',
+                false, '', null, ignore);
+            return;
+        }
+        showIdentityDialog('Player identity', 'Checking your browser binding...',
+            false, '', null, ignore);
+        setIdentityBusy(true);
+        try {
+            const result = await PlayerIdentity.resolve(inviteToken);
+            if (epoch !== identityFlowEpoch) return;
+            const current = result.binding.identity;
+            const invite = result.invite;
+            if (invite && invite.identityId.toLowerCase() === current?.id.toLowerCase()) {
+                redirectIdentityRoot();
+                return;
+            }
+            if (!invite && (current || (!result.promptOnRoot && !forceNaming))) {
+                activateIdentityMenu();
+                return;
+            }
+            const naming = !invite || invite.state === 'pending';
+            const description = naming
+                ? `${current ? `Accepting replaces ${current.tag} in this browser. ` : ''}Choose your permanent player tag. You can use a private self link to add other browsers.`
+                : `${current ? `Replace ${current.tag} in this browser with ${invite.tag}?` : `Is ${invite.tag} your player identity?`} Accept only if you intend to use this identity.`;
+            const expectedBinding = { identityId: current?.id ?? null, etag: result.binding.etag };
+            identitySuccess = redirectIdentityRoot;
+            showIdentityDialog(naming ? 'Welcome to Astervoids' : 'Confirm player identity',
+                description, naming, naming ? 'Save player tag' : 'Use this identity', async () => {
+                    await leaveIdentityGame();
+                    const tag = identityTagInput.value;
+                    const accepted = invite
+                        ? await PlayerIdentity.accept(inviteToken, invite, tag, expectedBinding)
+                        : await PlayerIdentity.create(tag, expectedBinding);
+                    identitySuccess(accepted);
+                }, ignore);
+        } catch (error) {
+            if (epoch !== identityFlowEpoch) return;
+            const cleanup = leaveIdentityGame();
+            PlayerIdentity.deactivate();
+            await cleanup;
+            showIdentityDialog('Player identity unavailable', identityMessage(error), false,
+                'Retry', () => beginIdentityFlow(forceNaming), ignore);
+        }
+    }
+
+    async function submitIdentityAction() {
+        if (identityBusy || !identityAction) return;
+        setIdentityBusy(true);
+        identityError.textContent = '';
+        try {
+            await identityAction();
+        } catch (error) {
+            if (['binding_changed', 'invite_changed', 'request_reused'].includes(error.code)) {
+                await beginIdentityFlow();
+                identityError.textContent = identityMessage(error);
+            } else {
+                identityError.textContent = identityMessage(error);
+                if (PlayerIdentity.hasPendingOperation()) {
+                    identityAccept.textContent = 'Retry last request';
+                    identityAction = async () => identitySuccess(await PlayerIdentity.retry());
+                }
+            }
+        } finally {
+            setIdentityBusy(false);
+        }
+    }
+
+    document.getElementById('identity-form').addEventListener('submit', event => {
+        event.preventDefault();
+        void submitIdentityAction();
+    });
+    identityIgnore.addEventListener('click', () => {
+        if (!identityBusy && !PlayerIdentity.hasPendingOperation()) identityIgnoreAction?.();
+    });
+    identityDialog.addEventListener('cancel', event => {
+        event.preventDefault();
+        if (!identityBusy && !PlayerIdentity.hasPendingOperation()) identityIgnoreAction?.();
+    });
+
+    async function offerInviteLink(kind, result) {
+        const link = PlayerIdentity.link(result.inviteToken);
+        identityDialog.close();
+        game.identityChanging = false;
+        const label = kind === 'self' ? 'Self invite' : 'Friend invite';
+        const warning = kind === 'self'
+            ? 'Anyone with this private link can use your player identity. Share only with your own browsers.'
+            : 'Share this private link with one friend. After naming, it also grants access to their identity.';
+        try {
+            await navigator.clipboard.writeText(link);
+            identityNotice(`${label} copied. Ready to share. ${warning}`);
+        } catch {
+            document.getElementById('invite-share-description').textContent =
+                `Clipboard access was not available. Copy the link below. ${warning}`;
+            document.getElementById('invite-share-url').value = link;
+            document.getElementById('invite-share-error').textContent = '';
+            shareDialog.showModal();
+            document.getElementById('invite-share-url').select();
+        }
+    }
+
+    async function sharePlayerInvite(kind) {
+        if (identityBusy || game.identityChanging || shareDialog.open) return;
+        if (!PlayerIdentity.current()) {
+            await beginIdentityFlow(true);
+            return;
+        }
+        setIdentityBusy(true);
+        identitySuccess = result => offerInviteLink(kind, result);
+        try {
+            const result = kind === 'self' ? await PlayerIdentity.inviteSelf() : await PlayerIdentity.inviteFriend();
+            await offerInviteLink(kind, result);
+        } catch (error) {
+            if (['binding_changed', 'identity_required', 'request_reused'].includes(error.code)) {
+                await beginIdentityFlow();
+                identityNotice(identityMessage(error));
+                return;
+            }
+            showIdentityDialog('Invitation not confirmed', identityMessage(error), false, 'Retry',
+                async () => {
+                    const result = PlayerIdentity.hasPendingOperation() ? await PlayerIdentity.retry()
+                        : kind === 'self' ? await PlayerIdentity.inviteSelf() : await PlayerIdentity.inviteFriend();
+                    await offerInviteLink(kind, result);
+                }, activateIdentityMenu);
+        } finally {
+            setIdentityBusy(false);
+        }
+    }
+
+    document.getElementById('btn-invite-self').addEventListener('click', () => void sharePlayerInvite('self'));
+    document.getElementById('btn-invite-friend').addEventListener('click', () => void sharePlayerInvite('friend'));
+    document.getElementById('invite-share-copy').addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(document.getElementById('invite-share-url').value);
+            shareDialog.close();
+            identityNotice('Invite copied. Ready to share.');
+        } catch {
+            document.getElementById('invite-share-error').textContent =
+                'Clipboard access was denied. Select the link and copy it manually.';
+            document.getElementById('invite-share-url').select();
+        }
+    });
+    document.getElementById('invite-share-close').addEventListener('click', () => shareDialog.close());
+    shareDialog.addEventListener('close', () => {
+        document.getElementById('invite-share-url').value = '';
+    });
+
+    SessionClient.setParticipantIdentityResolver(session =>
+        hasParticipantScoreSchema(session.metadata, true) ? PlayerIdentity.current() : null);
+    function handlePlayerIdentityChange(identity, previous) {
+        document.getElementById('identity-status').textContent = identity
+            ? `Playing as ${identity.tag}` : 'Playing as guest';
+        if (previous?.id !== identity?.id) shareDialog.close();
+        if (identityStarted && previous?.id !== identity?.id) {
+            void leaveIdentityGame().then(() => {
+                game.identityChanging = false;
+                identityNotice('Player identity changed in this browser. Returned to the menu.');
+            }).catch(error => {
+                identityNotice(identityMessage(error));
+            });
+        }
+    }
+    PlayerIdentity.subscribe(handlePlayerIdentityChange);
+
+    function refreshBrowserIdentity() {
+        if (!identityStarted) return;
+        identityRefreshRequested = true;
+        game.identityChanging = true;
+        if (identityBusy || identityRefresh) return;
+        identityRefreshRequested = false;
+        identityRefresh = PlayerIdentity.resolve().then(async () => {
+            await identityLeave;
+            game.identityChanging = false;
+            const sessionId = SessionClient.getLastSessionId();
+            if (sessionId && isSessionMode() && !SessionClient.isConnected()) void attemptAutoRejoin(sessionId);
+        }).catch(async error => {
+            // Do not publish under an identity whose current binding is unknown.
+            const cleanup = leaveIdentityGame();
+            PlayerIdentity.deactivate();
+            await cleanup;
+            showIdentityDialog('Player identity unavailable', identityMessage(error),
+                false, 'Retry', () => beginIdentityFlow(), activateIdentityMenu);
+        }).finally(() => {
+            identityRefresh = null;
+            if (identityRefreshRequested) refreshBrowserIdentity();
+        });
+    }
+    window.addEventListener('storage', event => {
+        if ([PlayerIdentity.STORAGE_KEY, PlayerIdentity.CHANGE_KEY, null].includes(event.key)) refreshBrowserIdentity();
+    });
+    window.addEventListener('focus', refreshBrowserIdentity);
+    function refreshVisibleIdentity() {
+        if (!document.hidden) refreshBrowserIdentity();
+    }
+    document.addEventListener('visibilitychange', refreshVisibleIdentity, true);
+    window.addEventListener('hashchange', () => {
+        const invite = PlayerIdentity.takeInvite();
+        if (invite) {
+            if (identityBusy || PlayerIdentity.hasPendingOperation()) {
+                identityNotice('Finish the current identity request before opening another invitation.');
+                return;
+            }
+            identityInvite = invite;
+            void beginIdentityFlow();
+        }
+    });
+
+    void beginIdentityFlow();
     
     requestAnimationFrame(gameLoop);  // Use rAF to provide timestamp
 

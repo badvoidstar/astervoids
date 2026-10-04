@@ -164,6 +164,15 @@ deployment_mode() {
   fi
 }
 
+validate_preview_environment_name() {
+  case "$1" in
+    production|production-*)
+      echo "::error::Preview environment names cannot use the reserved production namespace." >&2
+      return 2
+      ;;
+  esac
+}
+
 validate_deployment_settings() {
   local -n settings="$1"
   local environment_name="${settings[environmentName]}"
@@ -175,6 +184,18 @@ validate_deployment_settings() {
   local cert_reader_identity_id="${settings[certReaderIdentityId]}"
   local manage_acmebot_permissions="${settings[manageAcmebotPermissions]}"
   local region_count
+
+  if [ "${settings[useSharedInfra]:-false}" = true ]; then
+    validate_preview_environment_name "$environment_name" || return
+  fi
+
+  case "${settings[identityPromptOnRoot]:-true}" in
+    true|false) ;;
+    *)
+      echo "::error::IDENTITY_PROMPT_ON_ROOT must be exactly true or false. Deployment was aborted before Azure resources were created." >&2
+      return 2
+      ;;
+  esac
 
   if { [ -n "$custom_domain_name" ] && [ -z "$custom_subdomain" ]; } ||
     { [ -z "$custom_domain_name" ] && [ -n "$custom_subdomain" ]; }; then
@@ -278,6 +299,8 @@ load_deployment_settings() {
   settings[regions]=$(normalize_deployment_regions "$regions") || return
   settings[useSharedInfra]=$(azd_env_value USE_SHARED_INFRA "$values")
   settings[useSharedInfra]="${settings[useSharedInfra]:-false}"
+  settings[identityPromptOnRoot]=$(azd_env_value IDENTITY_PROMPT_ON_ROOT "$values")
+  settings[identityPromptOnRoot]="${settings[identityPromptOnRoot]:-true}"
   settings[customDomainName]=$(azd_env_value CUSTOM_DOMAIN_NAME "$values")
   settings[customSubdomain]=$(azd_env_value CUSTOM_SUBDOMAIN "$values")
   settings[certKeyVaultSecretUrl]=$(azd_env_value CERT_KEY_VAULT_SECRET_URL "$values")
@@ -293,7 +316,7 @@ deploy_bicep() {
   local -n settings="$1"
   local deployment_name="$2" verification_id="$3" key
   local -a parameters=()
-  for key in environmentName location useSharedInfra regions customDomainName customSubdomain \
+  for key in environmentName location useSharedInfra identityPromptOnRoot regions customDomainName customSubdomain \
     certKeyVaultSecretUrl certKeyVaultCertName certReaderIdentityId manageAcmebotPermissions; do
     parameters+=("$key=${settings[$key]}")
   done

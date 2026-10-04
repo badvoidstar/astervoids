@@ -167,6 +167,60 @@ const AstervoidsWireCodec = (function () {
         return counters;
     }
 
+    function isParticipantTag(value) {
+        return typeof value === 'string' && /^[A-Za-z0-9_-]{1,8}$/.test(value);
+    }
+
+    function packTagMap(tags) {
+        if (tags == null) tags = {};
+        if (typeof tags !== 'object' || Array.isArray(tags) || isByteArray(tags)) {
+            throw new TypeError('participant tags must be a plain object');
+        }
+        const entries = Object.entries(tags).map(([id, tag]) => [id.toLowerCase(), tag])
+            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+        let size = 0;
+        let previous = null;
+        for (const [id, tag] of entries) {
+            if (!guidUtils.isGuid(id) || id === previous || !isParticipantTag(tag)) {
+                throw new TypeError('participant tags contain an invalid or duplicate entry');
+            }
+            size += 17 + tag.length;
+            previous = id;
+        }
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const [id, tag] of entries) {
+            bytes.set(guidUtils.guidToBytes(id), offset);
+            bytes[offset + 16] = tag.length;
+            for (let i = 0; i < tag.length; i++) bytes[offset + 17 + i] = tag.charCodeAt(i);
+            offset += 17 + tag.length;
+        }
+        return bytes;
+    }
+
+    function unpackTagMap(value) {
+        if (value == null) return {};
+        if (!isByteArray(value)) {
+            // Reuse the strict encoder to normalize dictionary-shaped local data.
+            return unpackTagMap(packTagMap(value));
+        }
+        const tags = {};
+        for (let offset = 0; offset < value.length;) {
+            if (offset + 17 > value.length) throw new Error('participant tags are truncated');
+            const id = guidUtils.bytesToGuid(value, offset);
+            const length = value[offset + 16];
+            if (length < 1 || length > 8 || offset + 17 + length > value.length
+                || Object.hasOwn(tags, id)) {
+                throw new Error('participant tags contain an invalid or duplicate entry');
+            }
+            const tag = String.fromCharCode(...value.subarray(offset + 17, offset + 17 + length));
+            if (!isParticipantTag(tag)) throw new Error('participant tag has invalid characters');
+            tags[id] = tag;
+            offset += 17 + length;
+        }
+        return tags;
+    }
+
     return {
         bytesEqual,
         hasAsteroidVertices,
@@ -174,7 +228,10 @@ const AstervoidsWireCodec = (function () {
         packAsteroidVertices,
         unpackAsteroidVertices,
         packCounterMap,
-        unpackCounterMap
+        unpackCounterMap,
+        isParticipantTag,
+        packTagMap,
+        unpackTagMap
     };
 })();
 

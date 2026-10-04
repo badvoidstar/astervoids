@@ -70,6 +70,9 @@ env:
   # Optional. Defaults to true when unset, but is consulted only by a
   # production BYO deployment that omits CERT_READER_IDENTITY_ID.
   MANAGE_ACMEBOT_PERMISSIONS: ${{ vars.MANAGE_ACMEBOT_PERMISSIONS }}
+  # Optional boolean, defaults to true. Controls root onboarding only;
+  # every deployed app always uses its environment's durable identity table.
+  IDENTITY_PROMPT_ON_ROOT: ${{ vars.IDENTITY_PROMPT_ON_ROOT }}
 
 jobs:
   build:
@@ -167,6 +170,8 @@ jobs:
             echo "is_production=true" >> $GITHUB_OUTPUT
             echo "env_name=production" >> $GITHUB_OUTPUT
           else
+            source .github/scripts/deployment-helpers.sh
+            validate_preview_environment_name "$SANITIZED"
             echo "is_production=false" >> $GITHUB_OUTPUT
             echo "env_name=$SANITIZED" >> $GITHUB_OUTPUT
           fi
@@ -214,6 +219,7 @@ jobs:
           # Register Microsoft.App provider (required for Container Apps)
           az provider register -n Microsoft.App --wait || true
           az provider register -n Microsoft.OperationalInsights --wait || true
+          az provider register -n Microsoft.Storage --wait
 
       - name: Authenticate azd with federated credentials
         run: |
@@ -255,6 +261,7 @@ jobs:
             [certKeyVaultCertName]="$CERT_KEY_VAULT_CERT_NAME"
             [certReaderIdentityId]="$CERT_READER_IDENTITY_ID"
             [manageAcmebotPermissions]="${MANAGE_ACMEBOT_PERMISSIONS:-true}"
+            [identityPromptOnRoot]="${IDENTITY_PROMPT_ON_ROOT:-true}"
           )
           validate_deployment_settings PRECHECK_SETTINGS || exit 1
 
@@ -288,6 +295,7 @@ jobs:
           # Pass through region matrix so non-production shared-infra deploys
           # can resolve the primary shared CAE deterministically.
           azd env set REGIONS_JSON "${REGIONS_JSON:-[]}"
+          azd env set IDENTITY_PROMPT_ON_ROOT "${IDENTITY_PROMPT_ON_ROOT:-true}"
 
           # For branch deployments, set resource group to production's resource group
           # This tells azd deploy where to find the container app

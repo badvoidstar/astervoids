@@ -2,15 +2,51 @@
 
 A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
+## Player identities and invitations
+
+Choose a permanent 1-8 character player tag (letters, numbers, `_` or `-`).
+The backend retains the identity independently of games, including solo play.
+Tags need not be unique. Each browser profile and site origin has at most one
+active identity; clearing its site storage removes that local access, not the
+backend identity. Private browsing and other site origins are separate environments.
+
+**Invite Friend** creates a unique link for a new player. Their first acceptance
+names that identity; later visits to the same link recover it after confirmation.
+**Invite Self** returns your original link, including for root-created identities.
+Both buttons copy the link and show a readiness message; denied clipboard access
+offers the same selectable link and a Copy retry, without generating another invite.
+Controller, fullscreen, and invitation controls stack in portrait and sit beside
+the main actions in landscape, including short phone viewports.
+
+**Treat a self link like a password:** anyone possessing an accepted invite can
+use that identity. Confirmation is protection against accidental switches, not
+proof of ownership. Links do not expire automatically in this version. They use
+the running site's origin and a `#invite=...` fragment; no deployment hostname is
+embedded in the code. The fragment is removed immediately and completed flows
+replace the address with the site root.
+
+Recognized browsers enter silently. An invitation to a different identity offers
+Accept or Ignore; acceptance atomically replaces only this browser's binding,
+and other tabs stop using the previous identity. Other browsers remain bound.
+Root onboarding is controlled by `Identity:PromptOnRoot` (default `true`).
+When disabled, an unbound visitor remains a guest until explicitly naming through
+an invite button. No durable high scores or cross-game score totals are stored.
+
+Development uses `App_Data/identity.json`, ignored by git. Azure deployments use
+managed identity and Azure Table Storage, shared across production regions and
+isolated for branch previews. Storage errors are reported rather than replaced
+with an ephemeral identity. See [identity architecture](ARCHITECTURE.md#durable-player-identity)
+and the deployment/retention runbook in `CICD_SETUP.md`.
+
 ## Multiplayer scores
 
-During play, the status rows read `Your Score: 125 : Player 1` and
-`Team Score: 450 : Session name`. Your placeholder name uses the same stable
-player number as the final standings; spectators show `Spectator`.
+During play, the status rows read `Your Score: 125 : Pilot_1` and
+`Team Score: 450 : Session name`. Your durable tag also appears in final standings;
+named spectators retain their tag and show `Your Score: --`.
 Game over shows your final `Your Score` above the full `Team Score` total,
-alongside historical players, including departed and zero-score players, as stable
-anonymous `Player 1`, `Player 2`, etc. Pure spectators show `Your Score: --` and do
-not get a player row.
+alongside historical tags, including departed and zero-score players. Pure
+spectators do not get a player row. Multiple browsers using one identity share
+one participant total and entry-life award, while retaining separate ships.
 Standings sort by score, then the original
 player number, and show the highest-scoring `floor(session capacity * 1.5)`
 entries; longer results scroll without hiding the exit controls.
@@ -24,7 +60,10 @@ migration within that session. They follow the existing team accounting, includi
 accepted late awards after game over. Older sessions or detected inconsistent
 histories show personal results as unavailable; missing advertised capacity defers
 the rows, never the team total. Old game owners in mixed-version sessions
-cannot guarantee personal history. Solo `Score` and `Final Score` are unchanged.
+cannot guarantee personal history or new names. Sessions created with older
+schemas retain their original `Player N` labels and session-local identities.
+Missing/malformed tag metadata shows `Unknown` without hiding valid scores.
+Solo retains its existing score mechanics and shows the active tag beside `Score`.
 
 ## Local Development
 
@@ -50,6 +89,8 @@ npm run test:browser
 
 The runner builds/starts its own Release server on `http://127.0.0.1:5189`,
 refuses to reuse an existing listener, and stops its server when finished.
+Its Production-mode local host explicitly opts into a separate temporary file
+identity store; remote runs use the deployment's real configured storage.
 On Linux, use `npx playwright install --with-deps chromium` to install browser
 system dependencies as well.
 
@@ -59,6 +100,10 @@ bidirectional keyboard-input replication, and leave/rejoin. It checks live ship
 pose/version changes, not just HTTP success or a stale session label. It leaves
 its own session and verifies it disappears from the active list; the server
 expires the now-empty session normally.
+Identity scenarios cover naming/reload, repeat/self invitations, new-browser
+confirmation, competing claims, atomic replacement across tabs, clipboard denial,
+and responsive native-text menu layout. Gameplay fixtures create synthetic tags
+through the real backend; no identity or transport responses are fabricated.
 
 To test an **already deployed branch preview**, copy its non-secret default ACA
 URL from the deployment summary (the following hostname is a placeholder):

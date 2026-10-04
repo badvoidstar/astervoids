@@ -44,6 +44,9 @@ ehthumbs.db
 test-output.log
 test_output.log
 
+# Local durable identity data, lock, and atomic replacement files
+App_Data/
+
 # Bicep compiled output
 infra/*.json
 !infra/main.parameters.json

@@ -37,7 +37,7 @@ public class SchemaCrossWireFixturesTests
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
         ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"),
-        ("participantId", "guid"));
+        ("participantId", "guid"), ("participantTag", "str"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
@@ -245,7 +245,7 @@ public class SchemaCrossWireFixturesTests
 
         GameStateSchemaFixture.Legacy.Fields.Should().HaveCount(16);
         GameStateSchemaFixture.Legacy.BitmaskBytes.Should().Be(2);
-        GameStateSchemaFixture.Current.Fields.Should().HaveCount(18);
+        GameStateSchemaFixture.Current.Fields.Should().HaveCount(19);
         GameStateSchemaFixture.Current.BitmaskBytes.Should().Be(3);
         GameStateSchemaFixture.Current.Fields[16].Should().Be(
             new PositionalSchemaCodec.FieldSpec("participantScores", "bytes"));
@@ -305,6 +305,7 @@ public class SchemaCrossWireFixturesTests
     [Theory]
     [InlineData("participantScores", "00000100000000")]
     [InlineData("participantNumbers", "00000200000000")]
+    [InlineData("participantTags", "00000400000000")]
     public void Fixture_GameState_PersonalMapSlots_AreIndependentlyOptional(string field, string hex)
     {
         var encoded = PositionalSchemaCodec.Encode(GameStateSchemaFixture.Current,
@@ -333,6 +334,34 @@ public class SchemaCrossWireFixturesTests
         decoded.Should().HaveCount(2);
         decoded["participantScores"].Should().BeOfType<byte[]>().Which.Should().BeEmpty();
         decoded["participantNumbers"].Should().BeOfType<byte[]>().Which.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Fixture_DurableParticipantIdentity_AppendsWithoutChangingPoseMasks()
+    {
+        var schema = ShipSchema();
+        var data = new Dictionary<string, object?>
+        {
+            ["participantId"] = "00112233-4455-6677-8899-aabbccddeeff",
+            ["participantTag"] = "Pilot_1"
+        };
+        var encoded = PositionalSchemaCodec.Encode(schema, data);
+        Hex(encoded).Should().Be("0000000c" + "33221100554477668899aabbccddeeff" + "070050696c6f745f31");
+        PositionalSchemaCodec.Decode(schema, encoded).Should().BeEquivalentTo(data);
+        PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?> { ["score"] = 1 })
+            .Should().HaveCount(8);
+    }
+
+    [Fact]
+    public void Fixture_ParticipantTags_AreOpaqueCompactBytes()
+    {
+        var schema = GameStateSchemaFixture.Current;
+        var tags = Convert.FromHexString(GameStateSchemaFixture.TagEntries);
+        var encoded = PositionalSchemaCodec.Encode(schema,
+            new Dictionary<string, object?> { ["participantTags"] = tags });
+        Hex(encoded).Should().Be("00000418000000" + GameStateSchemaFixture.TagEntries);
+        PositionalSchemaCodec.Decode(schema, encoded)["participantTags"]
+            .Should().BeOfType<byte[]>().Which.Should().Equal(tags);
     }
 
     [Fact]

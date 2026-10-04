@@ -1,5 +1,6 @@
 import { defineConfig } from '@playwright/test';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { remoteBaseURL } from './browser-smoke/target.mjs';
 
 const remote = Object.hasOwn(process.env, 'BROWSER_SMOKE_BASE_URL');
@@ -44,6 +45,9 @@ export default defineConfig({
             ASPNETCORE_ENVIRONMENT: 'Production',
             ASPNETCORE_HTTP_PORTS: '',
             ASPNETCORE_HTTPS_PORTS: '',
+            Identity__Provider: 'File',
+            Identity__AllowFileInProduction: 'true',
+            Identity__DataFile: join(tmpdir(), `astervoids-browser-identity-${process.pid}.json`),
         },
     },
 });

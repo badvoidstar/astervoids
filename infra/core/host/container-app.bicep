@@ -13,6 +13,15 @@ param containerAppsEnvironmentName string
 @description('Name of the Container Registry')
 param containerRegistryName string
 
+@description('Name of the provisioned identity storage account in this resource group. All regions use the same account; previews use their own account.')
+param identityStorageAccountName string
+
+@description('Provisioned identity table. The application does not create it.')
+param identityTableName string
+
+@description('Prompt for player onboarding when visiting the root URL. Disabling the prompt does not disable durable identity storage.')
+param identityPromptOnRoot bool = true
+
 @description('Container image name (leave empty for initial deployment)')
 param imageName string = ''
 
@@ -80,6 +89,20 @@ resource containerRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' e
   name: containerRegistryName
 }
 
+resource identityStorageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
+  name: identityStorageAccountName
+}
+
+resource identityTableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' existing = {
+  parent: identityStorageAccount
+  name: 'default'
+}
+
+resource identityTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' existing = {
+  parent: identityTableService
+  name: identityTableName
+}
+
 // Merge the caller-provided env array with the regional env vars synthesised from
 // regionId / regionDisplayName, and with the peer-region manifest synthesised
 // from regionsManifest. The regional pair takes precedence over any duplicate
@@ -103,7 +126,15 @@ var manifestEnvNested = [for (r, i) in regionsManifest: [
   { name: 'Region__Regions__${i}__Hostname', value: r.hostname }
 ]]
 var manifestEnv = flatten(manifestEnvNested)
-var effectiveEnv = concat(env, regionalEnv, apexEnv, manifestEnv, additionalOriginEnv)
+var identityEnv = [
+  { name: 'Identity__Provider', value: 'AzureTable' }
+  { name: 'Identity__TableEndpoint', value: identityStorageAccount.properties.primaryEndpoints.table }
+  { name: 'Identity__TableName', value: identityTable.name }
+  { name: 'Identity__PromptOnRoot', value: string(identityPromptOnRoot) }
+]
+// Deployment identity configuration cannot be shadowed by an arbitrary env
+// entry (especially a file provider, credential, or external table endpoint).
+var effectiveEnv = concat(filter(env, item => !startsWith(toLower(item.name), 'identity__')), regionalEnv, apexEnv, manifestEnv, additionalOriginEnv, identityEnv)
 
 // Container App.
 //
@@ -115,6 +146,9 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
   name: name
   location: location
   tags: tags
+  identity: {
+    type: 'SystemAssigned'
+  }
   properties: {
     managedEnvironmentId: containerAppsEnvironment.id
     configuration: {
@@ -211,6 +245,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
         ]
       }
     }
+  }
+}
+
+// The app must start without waiting for table access: its system principal is
+// created first, then RBAC propagates. Identity APIs fail closed/retry while
+// permissions settle; do not make startup probes depend on table readiness.
+module identityTableAccess '../security/player-identity-role.bicep' = {
+  name: 'identity-access-${uniqueString(name)}'
+  params: {
+    storageAccountName: identityStorageAccountName
+    tableName: identityTableName
+    principalId: containerApp.identity.principalId
   }
 }
 

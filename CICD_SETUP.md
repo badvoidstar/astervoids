@@ -45,7 +45,7 @@ Note the `appId` from the output - this is your `AZURE_CLIENT_ID`.
 az ad sp create --id <app-id>
 ```
 
-### Step 3: Assign Contributor Role
+### Step 3: Assign deployment and role-assignment permissions
 
 ```bash
 # Get your subscription ID
@@ -57,6 +57,23 @@ az role assignment create \
   --assignee <app-id> \
   --scope /subscriptions/$SUBSCRIPTION_ID
 ```
+
+**Contributor alone is not sufficient.** Every app deployment now creates a
+system-assigned managed identity and a table-scoped **Storage Table Data
+Contributor** assignment. The deploying principal also needs
+`Microsoft.Authorization/roleAssignments/write` at the identity table's scope
+or an ancestor. Have an administrator grant appropriately scoped/conditioned
+**Role Based Access Control Administrator** permissions in addition to
+Contributor. Cover `rg-production` for production and shared-infrastructure
+previews, and each standalone resource group; creating those scopes from
+scratch requires an administrator-approved subscription-level arrangement.
+Constrain delegation to the required role and service principals where
+possible rather than granting unrestricted Owner. The optional ACMEbot path
+has its own existing DNS/Key Vault role-assignment requirements.
+
+The workflow also registers `Microsoft.Storage`. Subscription policy must
+allow StorageV2 accounts, Entra-authenticated Table access, and managed
+identities in the selected resource groups.
 
 ### Step 4: Create GitHub Environment
 
@@ -136,7 +153,7 @@ direct Bicep/azd invocation exposes the same reason through
 `DEPLOYMENT_WARNING`.
 
 CI writes custom-domain values, all three certificate inputs, the ACMEbot
-management flag, and the domain verification ID into the selected azd
+management flag, the root-onboarding flag, and the domain verification ID into the selected azd
 environment even when values are empty. This prevents restored environments
 from retaining removed domain or certificate configuration. Local standalone
 azd inputs are unchanged.
@@ -148,7 +165,11 @@ continues to use only a default Azure hostname.
 Run `bash .github/scripts/workflow-helpers.test.sh` to compile/check the Bicep
 origin wiring and exercise these procedures with mocked Azure/Docker commands,
 including provisioning failures, retries, branch fallback, restored azd state,
-certificate bootstrap, and public-output privacy. The generated static bootstrap
+certificate bootstrap, and public-output privacy. The suite also runs
+`identity-infrastructure.test.mjs` against the compiled ARM template to verify
+all four identity-storage paths, shared regional configuration, isolated
+environment naming, table-scoped managed-identity grants, and credential-free
+runtime settings. The generated static bootstrap
 is also loaded by the production region client to check regional request routing.
 These checks do not establish live DNS/certificate readiness, permissions
 propagation, or successful Azure deployment. Custom
@@ -293,6 +314,10 @@ Branch names are sanitized for DNS compatibility:
   full branch name is appended as `{name}-{hash}` (e.g. a long branch →
   `feature-super-long-b-71b3`). The hash guarantees that two long branches
   sharing the same truncated 20-char prefix never collide.
+- `production` and `production-*` are reserved for production resources.
+  Preview deployment rejects sanitized names in that namespace before
+  selecting an azd environment, so a preview cannot overwrite a production
+  app or its identity-storage configuration.
 
 ### Resource Naming
 
@@ -300,6 +325,7 @@ Branch names are sanitized for DNS compatibility:
 |---|---|---|---|
 | Container App | `ca-web-production` | `ca-web-production-<region>` | `ca-web-feature-login` (long branches: `ca-web-<name>-<hash>`) |
 | Container Apps Environment | `cae-production` | `cae-production-<primary-region>` and peers | shared production CAE (`cae-production` or `cae-production-<primary-region>`) |
+| Identity storage | one stable environment account / `PlayerIdentity` table | the same single production account/table in every region | separate stable account/table for the preview environment |
 | Subdomain | `app.domain.com` | `app.domain.com` (static apex) + `app-<region>.domain.com` (regional ACA) | `app-feature-login.domain.com` (long branches: `app-<name>-<hash>.domain.com`) |
 
 ### Prerequisites for Branch Deployments
@@ -573,6 +599,9 @@ serves a stale cert until you redeploy.
 
 - The cleanup workflow only targets branch-ephemeral resources (`ca-web-<branch>`, matching branch DNS/cert artifacts).
 - Production resources (`ca-web-production` and `ca-web-production-*`, production DNS/certs) are protected from automated deletion.
+- Identity storage accounts/tables are intentionally retained, including those
+  belonging to deleted branches. See [Durable player identity](#durable-player-identity)
+  for the explicit retirement procedure and ongoing storage costs.
 - Legacy resources no longer referenced by IaC (for example old Traffic Manager profiles) should be removed intentionally via a manual ops cleanup pass.
 
 ### Automatic Cleanup
@@ -581,8 +610,115 @@ The cleanup workflow runs daily and can be started manually. It:
 1. Deletes orphaned branch Container Apps
 2. Removes matching DNS records (CNAME and TXT)
 3. Leaves shared production certificate resources intact
+4. Leaves durable identity accounts/tables intact; it never purges player data
 
 **Note:** The main branch cleanup is blocked to prevent accidental deletion of production.
+
+## Durable player identity
+
+`infra/core/storage/player-identity.bicep` provisions exactly one StorageV2
+account and its `PlayerIdentity` table per deployment environment. Account
+names are stable hashes of subscription, resource group, and azd environment;
+they do not depend on image tags, revisions, custom domains, CAE names, or the
+selected gameplay region. Production single-region and multi-region use the
+same production account. Every regional app, including the first-region API
+used by the Free Static Web App apex, accesses that one primary Table endpoint.
+There are no per-region databases or independently writable replicas.
+
+Shared-infrastructure previews share only RG/CAE/ACR infrastructure with
+production, **not identity storage or identity principals**. Each preview has
+its own account even in `rg-production`. Standalone azd deployments get their
+own account in `rg-{env}`. A changed environment name or resource group selects
+a different store; it is not an identity-data migration.
+
+### Runtime configuration and authorization
+
+Every deployed app receives these settings from Bicep:
+
+| Setting | Deployed value |
+|---|---|
+| `Identity__Provider` | `AzureTable` (mandatory on every Azure path) |
+| `Identity__TableEndpoint` | the provisioned account's primary Table endpoint |
+| `Identity__TableName` | `PlayerIdentity` |
+| `Identity__PromptOnRoot` | string form of the boolean `identityPromptOnRoot` parameter |
+
+Set the GitHub repository variable or local azd value
+`IDENTITY_PROMPT_ON_ROOT` to exactly `true` or `false`; unset/empty defaults to
+`true`. For example, `azd env set IDENTITY_PROMPT_ON_ROOT false` disables the
+root onboarding prompt, **not** durable identity or any authorization check.
+CI validates the boolean before provisioning and rewrites the selected azd
+value on every run. Direct Bicep uses `identityPromptOnRoot`, a boolean
+parameter. No endpoint, connection-string, or provider override is exposed by
+the deployment entrypoint, and the container module filters caller-supplied
+`Identity__*` environment overrides.
+
+Each Container App has its own **SystemAssigned** managed identity.
+`DefaultAzureCredential` uses that identity without storage keys, SAS tokens,
+or client secrets. Only **Storage Table Data Contributor** on the exact
+`.../tableServices/default/tables/PlayerIdentity` scope is assigned; no
+account-, RG-, or subscription-wide data role is granted to an app. The CAE's
+existing certificate-reader identity remains certificate-only and is not
+attached to the app or reused for storage. Shared-key account authorization
+and blob public access are disabled, with HTTPS and TLS 1.2 required.
+Consumption CAEs reach the Entra-authenticated public storage endpoint;
+private endpoints/VNet integration are not provisioned by this topology.
+
+The static payload recursively copies all `wwwroot` assets, including
+`js/player-identity.js`; no separate identity bundle or SWA backend is needed.
+The existing regional bootstrap routes the static apex's API requests to the
+first configured region. Browsers call app APIs, never the storage endpoint.
+The existing exact-origin apex/peer/default-SWA manifest remains the CORS
+input; identity credentials are not added to public deployment URLs or outputs.
+
+### Provisioning order and readiness
+
+The account/table are provisioned first, then each app/system principal, then
+its table-scoped role assignment. The grant name includes the principal, so
+recreating an app does not try to change the principal of an existing role
+assignment. Startup and ACA TCP/liveness checks must not await Table access:
+that would prevent the app deployment from finishing before ARM can grant
+its identity permissions. The app does not create tables at runtime.
+
+[Storage role assignments can take up to ten minutes to propagate](https://learn.microsoft.com/azure/storage/tables/assign-azure-role-data-access).
+During that interval, or during a storage outage, identity APIs fail closed
+with retryable unavailability; never enable a file/in-memory production
+fallback or shared keys to make a readiness check pass. `/api/ping` alone is
+not evidence of identity-storage readiness. Retry onboarding/identity checks
+after RBAC propagation and rerun the browser gate if it raced a first-time
+grant. Persistent failures require checking the exact table, managed
+principal, role scope, and network/policy configuration in a private
+administrative environment.
+
+### Retention, cost, and retirement
+
+- Normal incremental Bicep/azd provisioning, image updates, scale-to-zero,
+  process restarts, and region selection retain the account and table.
+  Identity, tag, binding, and invite data are durable; this does not make
+  sessions or high scores persistent.
+- Accounts use `Standard_LRS` in their resource group's home location.
+  Storage/transaction charges and regional account quotas still apply while
+  apps are at zero replicas. LRS is not cross-region disaster recovery:
+  a storage-region outage can make identity operations unavailable everywhere.
+  No backup/export schedule, data TTL, or automatic store deletion is
+  provisioned. Evaluate recovery and data-retention requirements separately.
+- The orphan workflow deliberately leaves identity storage indefinitely,
+  including branch data. Tags `astervoids-data=player-identity`,
+  `astervoids-deployment-kind`, `azd-env-name`, and
+  `astervoids-retention=manual` identify its ownership privately. Recreating
+  the same preview environment reuses that store, not production data.
+- To retire a store, an authorized administrator must first verify its exact
+  environment and account/table scope and confirm no live app/branch still
+  uses it. Export data under an approved retention policy if necessary, then
+  intentionally delete that environment's table/account and obsolete
+  table-scoped role assignments. Never delete `rg-production` to clean up a
+  preview. Review stale grants to deleted system principals when recreating
+  apps; new apps receive distinct grants.
+- This template does not add deletion locks. `azd down` or deleting a
+  standalone resource group also deletes its identity store. Deleting rows,
+  a table, or an account can permanently invalidate browser bindings and
+  invites; a subsequent empty reprovision is not recovery. Keep exports,
+  resource IDs, credentials, and actual endpoints out of commits, PRs,
+  workflow summaries, and public artifacts.
 
 ## Monitoring Deployments
 
@@ -623,10 +759,10 @@ locally when editing Squad setup files.
 
 | Deployment form | Trigger | Infra shape |
 |---|---|---|
-| Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app path (greenfield-capable) |
-| Production multi-region | `main` push/manual with valid nonempty `REGIONS_JSON`, custom domain, and BYO cert URL/name | `rg-production`, per-region CAE/apps + Static Web App apex (greenfield-capable) |
-| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared primary CAE, creates branch app and optional DNS from scratch |
-| Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own safely derived ACR/CAE/app names |
+| Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app + durable production identity table (greenfield-capable) |
+| Production multi-region | `main` push/manual with valid nonempty `REGIONS_JSON`, custom domain, and BYO cert URL/name | `rg-production`, per-region CAE/apps + Static Web App apex; every app shares the same production identity table |
+| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared primary CAE; branch app, isolated durable identity account/table, and optional DNS |
+| Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own safely derived ACR/CAE/app names and durable identity account/table |
 
 ## Customization
 
@@ -634,7 +770,7 @@ locally when editing Squad setup files.
 
 Primary CI/CD customization points are configured in GitHub repository settings:
 
-- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`, `MANAGE_ACMEBOT_PERMISSIONS`
+- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`, `MANAGE_ACMEBOT_PERMISSIONS`, `IDENTITY_PROMPT_ON_ROOT` (boolean text; defaults to `true`)
 - Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`
 
 ### Infrastructure
@@ -642,6 +778,8 @@ Primary CI/CD customization points are configured in GitHub repository settings:
 The infrastructure is defined using Bicep templates in the `/infra` directory:
 - `main.bicep` - Main infrastructure definition
 - `main.parameters.json` - Parameters for the Bicep template
+- `core/storage/player-identity.bicep` - retained per-environment identity account/table
+- `core/security/player-identity-role.bicep` - table-scoped access for each app's system identity
 
 To modify the infrastructure, edit these files and the changes will be applied on the next deployment.
 

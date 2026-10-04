@@ -7,13 +7,24 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, 'wwwroot', 'index.html'), 'utf8');
 
-test('main-screen content is scaled without shrinking its backdrop', () => {
+test('main-screen content uses native layout without scaling text or shrinking its backdrop', () => {
+    const contentStyle = source.match(/#start-screen-content \{([^}]+)\}/)?.[1];
+    assert.ok(contentStyle);
+    assert.doesNotMatch(contentStyle, /transform/);
     assert.match(
-        source,
-        /#start-screen-content \{[\s\S]*?transform: scale\(0\.8\);[\s\S]*?transform-origin: center;/);
+        contentStyle, /max-height: 100%;[\s\S]*overflow-y: auto;/);
     assert.match(
         source,
         /<div id="start-screen">\s*<div id="start-screen-content">\s*<h1>ASTERVOIDS<\/h1>/);
+});
+
+test('portrait menu utilities stack and landscape uses a native two-column layout', () => {
+    assert.match(source, /#menu-columns \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
+    assert.match(source, /@media \(orientation: landscape\) \{/);
+    assert.match(source, /#menu-utilities \.picker-btn \{[\s\S]*?min-height: 44px;/);
+    for (const id of ['btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend']) {
+        assert.match(source, new RegExp(`<button id="${id}"`));
+    }
 });
 
 test('main-screen vertical spacing is compressed without reducing font sizes', () => {
