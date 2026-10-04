@@ -20,6 +20,15 @@ assert_equal() {
   [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
 }
 
+WORKFLOW_SOURCE=$(tr -d '\r' < "$SCRIPT_DIR/../workflows/azure-deploy.yml")
+for certificate_input in CERT_KEY_VAULT_SECRET_URL CERT_KEY_VAULT_CERT_NAME CERT_READER_IDENTITY_ID; do
+  grep -Fxq "  $certificate_input: "'${{ secrets.'"$certificate_input"' }}' <<< "$WORKFLOW_SOURCE" \
+    || fail "workflow must source $certificate_input only from a repository secret"
+  if grep -Fq "vars.$certificate_input" <<< "$WORKFLOW_SOURCE"; then
+    fail "workflow must not read the unmasked $certificate_input repository variable"
+  fi
+done
+
 is_protected_deployment_suffix production "" || fail "production must be protected"
 is_protected_deployment_suffix production-westus "" || fail "regional production must be protected"
 is_protected_deployment_suffix feature-a "feature-a feature-b" || fail "active suffix must be protected"
@@ -101,9 +110,10 @@ CALL_LOG="$TEST_DIR/calls.jsonl"
 # the one-way static-apex -> regional-app dependency without contacting Azure.
 az bicep build --file infra/main.bicep --outfile "$TEST_DIR/main.compiled.json"
 jq -e \
-  --arg origin_count "[length(parameters('additionalAllowedOrigins'))]" \
-  --arg origin_name "[format('Region__AdditionalAllowedOrigins__{0}', copyIndex('additionalOriginEnv'))]" \
-  --arg origin_value "[parameters('additionalAllowedOrigins')[copyIndex('additionalOriginEnv')]]" \
+  --arg origin_count "[length(variables('configuredAdditionalOrigins'))]" \
+  --arg origin_name "[format('Region__AdditionalAllowedOrigins__{0}', add(copyIndex('additionalOriginEnv'), 1))]" \
+  --arg origin_value "[variables('configuredAdditionalOrigins')[copyIndex('additionalOriginEnv')]]" \
+  --arg merged_origins_prefix "[union(parameters('additionalAllowedOrigins')," \
   '
   [.resources[] | select(.copy.name == "webRegional")][0] as $regional |
   [.resources[] | select(.name == "static-apex")][0] as $static |
@@ -116,10 +126,13 @@ jq -e \
   ($origins | contains("staticApexEnabled") and contains("https://{0}") and
     contains("static-apex") and contains(".outputs.defaultHostname.value") and
     endswith("createArray()))]") and (contains("*") | not)) and
+  ($module.variables.configuredAdditionalOrigins | startswith($merged_origins_prefix)) and
   ($env.count == $origin_count) and
   ($env.input.name == $origin_name) and
   ($env.input.value == $origin_value) and
   ($runtime_env | startswith("[concat(") and
+    contains("Region__AdditionalAllowedOrigins__0") and
+    contains("Microsoft.App/managedEnvironments") and contains(".defaultDomain") and
     contains("variables('\''additionalOriginEnv'\'')") and
     contains("variables('\''apexEnv'\'')") and
     contains("variables('\''manifestEnv'\'')")) and

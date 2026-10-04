@@ -251,7 +251,7 @@ module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (shouldMan
 // container-apps / container-app module that takes certReaderIdentityId.
 // Resolution order (first non-empty wins):
 //   1. Caller-supplied `certReaderIdentityId` param (e.g. from the
-//      workflow's CERT_READER_IDENTITY_ID GitHub variable) — preserves
+//      workflow's CERT_READER_IDENTITY_ID GitHub secret) — preserves
 //      backward compatibility for non-production deploys.
 //   2. The identity bicep just created via acmebotPermissions module when a
 //      production BYO cert explicitly takes the ACMEbot-managed path.
@@ -677,7 +677,7 @@ output DEPLOYMENT_WARNING string = deploymentWarning
 // string when BYO is not configured. Useful for the workflow to assert that
 // the identity it expects to use is the one bicep is wiring up, and for the
 // branch-deploy bootstrap step to discover the ID without needing the
-// CERT_READER_IDENTITY_ID GitHub variable.
+// CERT_READER_IDENTITY_ID GitHub secret.
 @description('Resource ID of the user-assigned managed identity used to pull the BYO cert from Key Vault. Empty when BYO is not configured.')
 output CERT_READER_IDENTITY_ID string = effectiveCertReaderIdentityId
 

@@ -116,8 +116,21 @@ var regionalEnv = empty(regionId) ? [] : [
 var apexEnv = empty(apexHostname) ? [] : [
   { name: 'Region__ApexHostname', value: apexHostname }
 ]
-var additionalOriginEnv = [for (origin, i) in additionalAllowedOrigins: {
-  name: 'Region__AdditionalAllowedOrigins__${i}'
+// Ingress terminates TLS, so the backend's HTTP request scheme cannot identify
+// its public HTTPS origins. Declare the exact default and bound custom origins.
+var appOriginEnv = [
+  {
+    name: 'Region__AdditionalAllowedOrigins__0'
+    value: 'https://${name}.${containerAppsEnvironment.properties.defaultDomain}'
+  }
+]
+var configuredAdditionalOrigins = union(
+  additionalAllowedOrigins,
+  empty(customDomainName) ? [] : ['https://${customDomainName}'],
+  empty(additionalCustomDomain) ? [] : ['https://${additionalCustomDomain}']
+)
+var additionalOriginEnv = [for (origin, i) in configuredAdditionalOrigins: {
+  name: 'Region__AdditionalAllowedOrigins__${i + 1}'
   value: origin
 }]
 var manifestEnvNested = [for (r, i) in regionsManifest: [
@@ -134,7 +147,7 @@ var identityEnv = [
 ]
 // Deployment identity configuration cannot be shadowed by an arbitrary env
 // entry (especially a file provider, credential, or external table endpoint).
-var effectiveEnv = concat(filter(env, item => !startsWith(toLower(item.name), 'identity__')), regionalEnv, apexEnv, manifestEnv, additionalOriginEnv, identityEnv)
+var effectiveEnv = concat(filter(env, item => !startsWith(toLower(item.name), 'identity__')), regionalEnv, apexEnv, manifestEnv, appOriginEnv, additionalOriginEnv, identityEnv)
 
 // Container App.
 //

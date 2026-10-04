@@ -112,6 +112,28 @@ test('runtime identity configuration cannot fall back, override credentials, or 
   }
 });
 
+test('every deployment declares exact HTTPS origins for identity requests behind TLS termination', () => {
+  for (const deployment of apps) {
+    const module = deployment.properties.template;
+    const [app] = resources(module, 'Microsoft.App/containerApps');
+    const env = app.properties.template.containers[0].env;
+    assert.match(env, /'Region__AdditionalAllowedOrigins__0', 'value', format\('https:\/\/\{0\}\.\{1\}', parameters\('name'\), reference\(resourceId\('Microsoft\.App\/managedEnvironments', parameters\('containerAppsEnvironmentName'\)\).*\.defaultDomain\)/,
+      'the default HTTPS app origin must come from the app name and its actual environment');
+    assert.equal(module.variables.configuredAdditionalOrigins,
+      "[union(parameters('additionalAllowedOrigins'), if(empty(parameters('customDomainName')), createArray(), createArray(format('https://{0}', parameters('customDomainName')))), if(empty(parameters('additionalCustomDomain')), createArray(), createArray(format('https://{0}', parameters('additionalCustomDomain')))))]");
+    const additionalOrigins = module.variables.copy.find(copy => copy.name === 'additionalOriginEnv');
+    assert.equal(additionalOrigins.count, "[length(variables('configuredAdditionalOrigins'))]");
+    assert.equal(additionalOrigins.input.name,
+      "[format('Region__AdditionalAllowedOrigins__{0}', add(copyIndex('additionalOriginEnv'), 1))]");
+    assert.equal(additionalOrigins.input.value,
+      "[variables('configuredAdditionalOrigins')[copyIndex('additionalOriginEnv')]]");
+    assert.match(env, /variables\('additionalOriginEnv'\)/);
+    assert.doesNotMatch(env, /ASPNETCORE_FORWARDEDHEADERS_ENABLED/,
+      'origin validation must not trust arbitrary forwarded headers');
+    assert.equal(app.properties.configuration.ingress.allowInsecure, false);
+  }
+});
+
 test('identity resource details do not become public deployment outputs', () => {
   assert.doesNotMatch(JSON.stringify(template.outputs),
     /identityStorage|identityTable|identity-access|primaryEndpoints\.table/);

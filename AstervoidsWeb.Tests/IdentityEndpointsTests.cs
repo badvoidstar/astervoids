@@ -353,6 +353,54 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
     }
 
     [Theory]
+    [InlineData("https://ca-web-preview.test-env.westus2.azurecontainerapps.io")]
+    [InlineData("https://preview.example.com")]
+    [InlineData("https://preview-region.example.com")]
+    public async Task ConfiguredHttpsIngressOriginsSupportIdentityWhenTheBackendReceivesHttp(string origin)
+    {
+        using var factory = new Factory { ConfigureOrigins = false, EnvironmentName = "Production" };
+        factory.Overrides["Identity:AllowFileInProduction"] = "true";
+        factory.Overrides["Region:AdditionalAllowedOrigins:0"] =
+            "https://ca-web-preview.test-env.westus2.azurecontainerapps.io";
+        factory.Overrides["Region:AdditionalAllowedOrigins:1"] = "https://preview.example.com";
+        factory.Overrides["Region:AdditionalAllowedOrigins:2"] = "https://preview-region.example.com";
+        using var client = factory.CreateClient(new()
+        {
+            BaseAddress = new Uri($"http://{new Uri(origin).Authority}"),
+            AllowAutoRedirect = false
+        });
+        client.DefaultRequestHeaders.Add("Origin", origin);
+        client.DefaultRequestHeaders.Add("X-Forwarded-Proto", "https");
+
+        var browser = IdentitySecrets.NewToken();
+        await CreateRoot(client, browser);
+        using var response = await Send(client, "/resolve", browser, new { });
+        var identity = (await Body(response, 200)).GetProperty("binding").GetProperty("identity");
+        Assert.Equal("Pilot", identity.GetProperty("tag").GetString());
+        Assert.NotEqual(Guid.Empty, identity.GetProperty("id").GetGuid());
+        Assert.Equal(origin, Assert.Single(response.Headers.GetValues("Access-Control-Allow-Origin")));
+        Assert.False(response.Headers.Contains("Access-Control-Allow-Credentials"));
+    }
+
+    [Fact]
+    public async Task ForwardedHeadersDoNotAuthorizeAnUnconfiguredHttpsOrigin()
+    {
+        using var factory = new Factory { ConfigureOrigins = false };
+        using var client = factory.CreateClient(new()
+        {
+            BaseAddress = new Uri("http://untrusted.example.com"),
+            AllowAutoRedirect = false
+        });
+        using var request = Request("/resolve", IdentitySecrets.NewToken(), "{}");
+        request.Headers.Add("Origin", "https://untrusted.example.com");
+        request.Headers.Add("X-Forwarded-Proto", "https");
+        request.Headers.Add("X-Forwarded-Host", "untrusted.example.com");
+        using var response = await client.SendAsync(request);
+        await Error(response, 400, "invalid_request");
+        Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task ProductionFileProviderRequiresExplicitOptInWithoutBreakingOtherApis(bool optIn)

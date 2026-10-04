@@ -292,7 +292,7 @@ When you push to any branch, the workflow automatically:
 1. Builds and tests the application
 2. Deploys to a branch-specific Container App
 3. Creates DNS records for a branch-specific subdomain
-4. Binds HTTPS using the shared BYO wildcard certificate (when BYO cert variables are configured)
+4. Binds HTTPS using the shared BYO wildcard certificate (when BYO cert secrets are configured)
 5. Runs the real-browser playability smoke against the default ACA URL
 
 ### Subdomain Naming
@@ -392,7 +392,9 @@ az containerapp show -g rg-production \
 > `CUSTOM_DOMAIN_NAME`/`CUSTOM_SUBDOMAIN` (including the full custom hostname or
 > cert names built from it) — to any of those surfaces. Public surfaces may only
 > show the non-secret default `*.azurecontainerapps.io`/`*.azurestaticapps.net`
-> FQDNs. Logs are fine (the secret substrings are auto-masked there).
+> FQDNs. GitHub masks registered secret values in logs only; transformed values
+> may still be visible. Certificate URLs/names and cert-reader identity IDs must
+> therefore be repository secrets, not unmasked repository variables.
 
 ### Greenfield expectations
 
@@ -529,7 +531,10 @@ KV_NAME=kv-astervoids
 CERT_NAME=wildcard-<sanitised-domain>  # whatever you named it in step 3
 CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
 
-# 7. [REQUIRED, ONE-TIME] Set GitHub repo variables so the workflow knows where to find everything.
+# 7. [REQUIRED, ONE-TIME] Set GitHub repo secrets so the workflow knows where to find everything.
+#    These commands are for new setup. For existing variables/secrets, follow
+#    the migration guidance below instead; do not overwrite an existing secret.
+#    Run privately with shell tracing disabled and pass values only via stdin.
 #    CERT_READER_IDENTITY_ID is OPTIONAL only for the explicit production
 #    ACMEbot path (MANAGE_ACMEBOT_PERMISSIONS=true). It IS required for branch
 #    deploys because the bootstrap step must attach the identity to the shared
@@ -537,11 +542,37 @@ CERT_KV_URL="https://${KV_NAME}.vault.azure.net/secrets/${CERT_NAME}"
 CERT_READER_IDENTITY_ID=$(az identity show \
   --resource-group rg-production --name id-acme-cert-reader \
   --query id -o tsv)
-gh variable set CERT_KEY_VAULT_SECRET_URL --body "$CERT_KV_URL"
-gh variable set CERT_KEY_VAULT_CERT_NAME --body "$CERT_NAME"
-gh variable set CERT_READER_IDENTITY_ID --body "$CERT_READER_IDENTITY_ID"
+printf '%s' "$CERT_KV_URL" | gh secret set CERT_KEY_VAULT_SECRET_URL
+printf '%s' "$CERT_NAME" | gh secret set CERT_KEY_VAULT_CERT_NAME
+printf '%s' "$CERT_READER_IDENTITY_ID" | gh secret set CERT_READER_IDENTITY_ID
 gh variable set MANAGE_ACMEBOT_PERMISSIONS --body true
 ```
+
+##### Migrating existing certificate variables
+
+`CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, and
+`CERT_READER_IDENTITY_ID` are repository **secrets**. Certificate metadata can
+reveal the private deployment hostname by correlation; repository variables
+are not automatically masked in GitHub Actions logs.
+
+1. List repository secret **names only** (`gh secret list --json name`). Keep
+   any existing same-name secret unchanged; it may be newer than the variable.
+2. For each missing secret, capture `gh variable get NAME --json value` inside
+   a private process, parse the value in memory, and stream it to
+   `gh secret set NAME` via stdin. Recheck secret names before writing. Never
+   print the value, put it in command-line arguments, enable shell tracing, or
+   write it to disk; suppress command output/errors that might disclose it.
+3. Verify only secret names/existence. The updated workflow reads `secrets.*`
+   directly, with no fallback to repository variables.
+4. **Retain the old repository variables until every active workflow ref has
+   migrated**, including `main`, long-lived branches, and revisions that might
+   be rerun. Adding secrets on a feature branch does not update older workflow
+   definitions. Remove the variables only after those consumers are retired or
+   updated; removing them earlier breaks their certificate configuration.
+
+Secrets mask exact values in logs, not summaries, comments, deployment URLs, or
+workflow outputs. Keep certificate metadata off those public surfaces.
+`MANAGE_ACMEBOT_PERMISSIONS` remains a non-secret repository variable.
 
 ##### Opting out of bicep-managed ACMEbot permissions
 
@@ -667,8 +698,12 @@ The static payload recursively copies all `wwwroot` assets, including
 `js/player-identity.js`; no separate identity bundle or SWA backend is needed.
 The existing regional bootstrap routes the static apex's API requests to the
 first configured region. Browsers call app APIs, never the storage endpoint.
-The existing exact-origin apex/peer/default-SWA manifest remains the CORS
-input; identity credentials are not added to public deployment URLs or outputs.
+Azure terminates HTTPS before forwarding HTTP to the container. Bicep therefore
+explicitly configures each app's default and bound custom HTTPS origins through
+`Region__AdditionalAllowedOrigins`, preserving the existing exact-origin
+apex/peer/default-SWA configuration. Identity POST origin validation stays strict
+without trusting arbitrary forwarded headers or allowing wildcard hosts.
+Identity credentials are not added to public deployment URLs or outputs.
 
 ### Provisioning order and readiness
 
@@ -770,8 +805,12 @@ locally when editing Squad setup files.
 
 Primary CI/CD customization points are configured in GitHub repository settings:
 
-- Variables: `REGIONS_JSON`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`, `MANAGE_ACMEBOT_PERMISSIONS`, `IDENTITY_PROMPT_ON_ROOT` (boolean text; defaults to `true`)
-- Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`
+- Variables: `REGIONS_JSON`, `MANAGE_ACMEBOT_PERMISSIONS`, `IDENTITY_PROMPT_ON_ROOT` (boolean text; defaults to `true`)
+- Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`
+
+For existing certificate variables, follow
+[Migrating existing certificate variables](#migrating-existing-certificate-variables);
+retain them until all active workflow refs have migrated to secrets.
 
 ### Infrastructure
 

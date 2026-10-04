@@ -2110,6 +2110,12 @@ Successful acceptance and ignored invitations replace the address with `/`.
 No custom hostname, browser credential or invite token enters game data,
 SignalR URLs, public logs or committed configuration.
 
+Identity POST requests retain strict `Origin` validation. Azure terminates TLS
+before the container's HTTP hop, so Bicep explicitly configures default and
+bound custom HTTPS app origins through `Region__AdditionalAllowedOrigins`.
+This supplements existing apex/peer origins without trusting arbitrary forwarded
+headers or allowing wildcard hosts.
+
 All endpoints are JSON POST requests under `/api/identity`: `resolve`, `root`,
 `invites`, `invites/accept`, and `invites/self`. Responses contain public
 `{ id, tag }` identities, binding ETags/revisions, and (where needed) invite state
@@ -2376,9 +2382,10 @@ invalidates old generations so delayed responses cannot repopulate the picker.
 - **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
   Manifest in `appsettings.json` under `Region:Regions`. CORS permits the
   configured region hosts, `Region:ApexHostname`, and exact origins in
-  `Region:AdditionalAllowedOrigins`. Bicep supplies the default Static Web App
-  origin in that additional list so the public deployment URL can reach
-  regional HTTP and SignalR endpoints without publishing private hostnames.
+  `Region:AdditionalAllowedOrigins`. Bicep supplies each app's default and bound
+  custom HTTPS origins, plus the default Static Web App origin where applicable.
+  This supports deployed self-origin identity requests after TLS termination
+  and public-URL regional HTTP/SignalR traffic without publishing private hostnames.
   Only when no origins are configured does the local-development permissive
   fallback apply; deployed origins do not use wildcard host matching.
 - **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
@@ -2434,6 +2441,11 @@ rather than architectural contracts. They live in
 
 The contract this document pins down is narrower:
 
+- CI sources `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, and
+  `CERT_READER_IDENTITY_ID` from repository secrets, never repository variables.
+  Certificate metadata can reveal the private hostname by correlation and must
+  not appear in public outputs. Legacy variables remain only for older workflow
+  refs until the runbook's migration is complete.
 - Multi-region production **requires** `CUSTOM_DOMAIN_NAME`,
   `CUSTOM_SUBDOMAIN`, and the `CERT_KEY_VAULT_SECRET_URL` /
   `CERT_KEY_VAULT_CERT_NAME` pair; incomplete input is rejected before any
