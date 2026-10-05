@@ -200,7 +200,7 @@ test('page boots and solo play responds to keyboard input', async ({ players }) 
     }
 });
 
-test('main-menu buttons match Solo Play in portrait, landscape and multiplayer lobbies', async ({ players }) => {
+test('main-menu buttons share size and brightness with compact spacing in portrait, landscape and lobbies', async ({ players }) => {
     const { page } = await players.open();
     async function expectMatchingButtons(inSession) {
         const ids = [
@@ -219,6 +219,7 @@ test('main-menu buttons match Solo Play in portrait, landscape and multiplayer l
                     const style = getComputedStyle(button);
                     return {
                         id: button.id, width: box.width, height: box.height,
+                        disabled: button.disabled,
                         fontSize: style.fontSize, nativeText: style.transform === 'none',
                         fits: box.left >= 0 && box.right <= innerWidth
                             && button.scrollWidth <= button.clientWidth
@@ -233,8 +234,47 @@ test('main-menu buttons match Solo Play in portrait, landscape and multiplayer l
                 expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
                 expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
                 expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
+                if (!button.disabled) {
+                    await expect(page.locator(`#${button.id}`), `${label} has a full-bright label`)
+                        .toHaveCSS('color', 'rgb(255, 255, 255)');
+                    await expect(page.locator(`#${button.id}`), `${label} is not dimmed`)
+                        .toHaveCSS('opacity', '1');
+                }
             }
             expect(solo.height, 'Solo Play retains its compact reference height').toBe(32);
+            const spacing = await page.evaluate(() => {
+                const box = selector => document.querySelector(selector).getBoundingClientRect();
+                const banner = box('#region-banner');
+                const statusNext = banner.height ? banner : box('#menu-columns');
+                const utilities = [...document.querySelectorAll('#menu-utilities .picker-btn')]
+                    .map(button => button.getBoundingClientRect()).filter(rect => rect.height);
+                return {
+                    title: box('#identity-status').top - box('#start-screen h1').bottom,
+                    identity: box('#picker-status').top - box('#identity-status').bottom,
+                    status: statusNext.top - box('#picker-status').bottom,
+                    sessions: box('#picker-buttons').top - box('#session-list').bottom,
+                    solo: box('#btn-solo').top - box('#picker-buttons .button-row').bottom,
+                    utilities: utilities.slice(1).map((rect, index) => rect.top - utilities[index].bottom),
+                    groups: innerWidth > innerHeight
+                        ? box('#menu-utilities').left - box('#menu-play').right
+                        : utilities[0].top - box('#btn-solo').bottom,
+                    lobby: box('#btn-start-enter').height
+                        ? box('#btn-start-enter').top - box('#btn-leave-create').bottom : null,
+                };
+            });
+            const titleMargin = Math.min(27, Math.max(14, Math.min(viewport.width, viewport.height) * 0.027));
+            for (const [name, previous] of [
+                ['title', titleMargin], ['identity', 10], ['status', 14],
+                ['sessions', 18], ['solo', 14],
+            ]) {
+                expect(spacing[name], `${name} gap is 20% smaller`).toBeCloseTo(previous * 0.8, 1);
+            }
+            for (const gap of spacing.utilities) {
+                expect(gap, 'Utility gaps are 20% smaller').toBeCloseTo(14 * 0.8, 1);
+            }
+            expect(spacing.groups, 'Only vertical spacing between groups is reduced')
+                .toBeCloseTo(viewport.width > viewport.height ? 12 : 19 * 0.8, 1);
+            if (inSession) expect(spacing.lobby, 'Lobby action gap is 20% smaller').toBeCloseTo(9 * 0.8, 1);
         }
     }
 

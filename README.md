@@ -18,7 +18,8 @@ offers the same selectable link and a Copy retry, without generating another inv
 Controller, fullscreen, and invitation controls stack in portrait and sit beside
 the main actions in landscape, including short phone viewports. All main-menu
 buttons match Solo Play's compact dimensions, including the full-width multiplayer
-lobby actions.
+lobby actions. Enabled labels use bright white text, with compact vertical spacing
+and distinct disabled-button indicators.
 
 **Treat a self link like a password:** anyone possessing an accepted invite can
 use that identity. Confirmation is protection against accidental switches, not

@@ -425,7 +425,7 @@
 
         #start-screen h1 {
             font-size: clamp(24px, 5vmin, 38px);
-            margin-bottom: clamp(14px, 2.7vmin, 27px);
+            margin-bottom: clamp(11.2px, 2.16vmin, 21.6px);
             letter-spacing: clamp(3px, 0.7vmin, 6px);
         }
 
@@ -457,14 +457,15 @@
         #menu-columns {
             display: grid;
             grid-template-columns: minmax(0, 1fr);
-            gap: 12px;
+            row-gap: 9.6px;
+            column-gap: 12px;
             width: 100%;
         }
 
         #menu-utilities {
             display: flex;
             flex-direction: column;
-            gap: 7px;
+            gap: 5.6px;
         }
 
         #menu-columns .picker-btn {
@@ -476,9 +477,17 @@
             transition-property: background-color, border-color, color, opacity;
         }
 
+        #menu-columns .picker-btn:not(:disabled) {
+            color: #fff;
+        }
+
+        #menu-columns .picker-btn.solo {
+            margin-top: 5.6px;
+        }
+
         #identity-status {
             font-size: 13px;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
             color: #cde;
         }
 
@@ -535,7 +544,7 @@
         #session-picker .picker-status {
             font-size: 11px;
             color: #888;
-            margin-bottom: 14px;
+            margin-bottom: 11.2px;
             min-height: 18px;
         }
 
@@ -555,7 +564,7 @@
             width: 100%;
             max-height: 135px;
             overflow-y: auto;
-            margin-bottom: 18px;
+            margin-bottom: 14.4px;
             border: 1px solid #444;
             border-radius: 4px;
         }
@@ -695,7 +704,7 @@
             border: 1px solid rgba(255, 182, 109, 0.5);
             border-radius: 4px;
             padding: 5px 10px;
-            margin-bottom: 9px;
+            margin-bottom: 7.2px;
             text-align: center;
             white-space: nowrap;
             overflow: hidden;
@@ -714,8 +723,8 @@
             display: flex;
             flex-direction: column;
             align-items: stretch;
-            gap: 5px;
-            margin-bottom: 7px;
+            gap: 4px;
+            margin-bottom: 5.6px;
         }
         .region-select-row label {
             font-size: 11px;
@@ -745,7 +754,7 @@
         #picker-buttons {
             display: flex;
             flex-direction: column;
-            gap: 7px;
+            gap: 5.6px;
             width: 100%;
         }
 
@@ -816,7 +825,7 @@
         #picker-buttons .button-row {
             display: flex;
             flex-direction: column;
-            gap: 9px;
+            gap: 7.2px;
         }
 
         /* Mobile touch controls */
