@@ -20,6 +20,11 @@ the main actions in landscape, including short phone viewports. All main-menu
 buttons match Solo Play's compact dimensions, including the full-width multiplayer
 lobby actions. Enabled labels use bright white text, with compact vertical spacing
 and distinct disabled-button indicators.
+Landscape columns share top and bottom edges: device controls sit at the top,
+and the invitation pair aligns with the bottom play actions. Optional controls
+collapse naturally without reserved empty button slots. Regional create buttons
+put the destination on a second line, ellipsized when necessary; the Host region
+selector and accessible button label retain the full name.
 
 **Treat a self link like a password:** anyone possessing an accepted invite can
 use that identity. Confirmation is protection against accidental switches, not

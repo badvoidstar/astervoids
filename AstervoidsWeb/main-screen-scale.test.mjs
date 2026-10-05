@@ -5,7 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(resolve(here, 'wwwroot', 'index.html'), 'utf8');
+const source = readFileSync(resolve(here, 'wwwroot', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
 test('main-screen content uses native layout without scaling text or shrinking its backdrop', () => {
     const contentStyle = source.match(/#start-screen-content \{([^}]+)\}/)?.[1];
@@ -27,6 +27,18 @@ test('portrait menu utilities stack and landscape uses a native two-column layou
     }
 });
 
+test('landscape aligns the play and utility groups without reserving hidden button slots', () => {
+    const landscape = source.match(/@media \(orientation: landscape\) \{([\s\S]*?)\n {8}\}/)?.[1];
+    assert.ok(landscape);
+    assert.match(landscape, /#menu-play \{[^}]*display: flex;[^}]*flex-direction: column;/);
+    assert.match(landscape, /#picker-buttons \{ margin-top: auto; \}/);
+    assert.match(landscape, /#menu-utilities \{[^}]*justify-content: space-between;[^}]*gap: 11\.2px;/);
+    assert.match(landscape, /\.menu-utility-group \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*gap: 11\.2px;/);
+    assert.match(landscape, /#menu-utilities \.picker-btn\.solo \{ margin-top: 0; \}/);
+    assert.match(source, /\.menu-utility-group \{ display: contents; \}/);
+    assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
+});
+
 test('every main-menu button shares Solo Play sizing without split-width lobby actions', () => {
     const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
     assert.ok(buttonStyle);
@@ -37,6 +49,8 @@ test('every main-menu button shares Solo Play sizing without split-width lobby a
     assert.match(buttonStyle, /padding-inline: min\(18px, 2vw\);/);
     assert.match(buttonStyle, /transition-property: background-color, border-color, color, opacity;/);
     assert.match(source, /#picker-buttons \.button-row \{[^}]*flex-direction: column;/);
+    assert.match(source, /#menu-columns \.picker-btn\.regional-create \{[^}]*padding-block: 2px;/);
+    assert.match(source, /#menu-columns \.create-region-label \{[^}]*display: block;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/);
 });
 
 test('enabled main-menu labels are uniformly bright without removing disabled indicators', () => {
@@ -73,9 +87,11 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         ['#picker-buttons .button-row', 'gap', 9],
     ]) {
         const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const style = source.match(new RegExp(`${escaped} \\{([^}]+)\\}`))?.[1];
-        assert.ok(style, `${selector} exists`);
-        const value = Number(style.match(new RegExp(`${property}: ([\\d.]+)px;`))?.[1]);
+        const propertyPattern = new RegExp(`${property}: ([\\d.]+)px;`);
+        const style = [...source.matchAll(new RegExp(`${escaped} \\{([^}]+)\\}`, 'g'))]
+            .map(match => match[1]).find(rule => propertyPattern.test(rule));
+        assert.ok(style, `${selector} defines ${property}`);
+        const value = Number(style.match(propertyPattern)[1]);
         assert.equal(value, Number((previous * 0.8).toFixed(1)), `${selector} ${property} is reduced by 20%`);
     }
     assert.match(source, /#menu-columns \{[^}]*column-gap: 12px;/);

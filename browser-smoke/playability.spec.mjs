@@ -246,31 +246,53 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                 const box = selector => document.querySelector(selector).getBoundingClientRect();
                 const banner = box('#region-banner');
                 const statusNext = banner.height ? banner : box('#menu-columns');
-                const utilities = [...document.querySelectorAll('#menu-utilities .picker-btn')]
-                    .map(button => button.getBoundingClientRect()).filter(rect => rect.height);
+                const utilityButtons = [...document.querySelectorAll('#menu-utilities .picker-btn')]
+                    .filter(button => button.getBoundingClientRect().height);
+                const utilities = utilityButtons.map(button => button.getBoundingClientRect());
                 return {
                     title: box('#identity-status').top - box('#start-screen h1').bottom,
                     identity: box('#picker-status').top - box('#identity-status').bottom,
                     status: statusNext.top - box('#picker-status').bottom,
                     sessions: box('#picker-buttons').top - box('#session-list').bottom,
                     solo: box('#btn-solo').top - box('#picker-buttons .button-row').bottom,
-                    utilities: utilities.slice(1).map((rect, index) => rect.top - utilities[index].bottom),
+                    utilities: utilities.slice(1).map((rect, index) => ({
+                        gap: rect.top - utilities[index].bottom,
+                        sharedGroup: utilityButtons[index].parentElement === utilityButtons[index + 1].parentElement,
+                    })),
                     groups: innerWidth > innerHeight
                         ? box('#menu-utilities').left - box('#menu-play').right
                         : utilities[0].top - box('#btn-solo').bottom,
                     lobby: box('#btn-start-enter').height
                         ? box('#btn-start-enter').top - box('#btn-leave-create').bottom : null,
+                    topAlignment: utilities[0].top - box('#session-list').top,
+                    bottomAlignment: utilities.at(-1).bottom - box('#btn-solo').bottom,
+                    inviteAlignment: box('#btn-invite-self').top
+                        - box(box('#btn-start-enter').height ? '#btn-start-enter' : '#btn-leave-create').top,
                 };
             });
+            const landscape = viewport.width > viewport.height;
             const titleMargin = Math.min(27, Math.max(14, Math.min(viewport.width, viewport.height) * 0.027));
             for (const [name, previous] of [
                 ['title', titleMargin], ['identity', 10], ['status', 14],
-                ['sessions', 18], ['solo', 14],
+                ['solo', 14],
             ]) {
                 expect(spacing[name], `${name} gap is 20% smaller`).toBeCloseTo(previous * 0.8, 1);
             }
-            for (const gap of spacing.utilities) {
-                expect(gap, 'Utility gaps are 20% smaller').toBeCloseTo(14 * 0.8, 1);
+            if (landscape) {
+                expect(spacing.sessions, 'Extra space aligns the play actions at the bottom')
+                    .toBeGreaterThanOrEqual(18 * 0.8 - 0.05);
+                for (const name of ['topAlignment', 'bottomAlignment', 'inviteAlignment']) {
+                    expect(spacing[name], name).toBeCloseTo(0, 1);
+                }
+            } else {
+                expect(spacing.sessions, 'Portrait session gap stays compact').toBeCloseTo(18 * 0.8, 1);
+            }
+            for (const { gap, sharedGroup } of spacing.utilities) {
+                if (landscape && !sharedGroup) {
+                    expect(gap, 'Extra space separates device and invitation groups').toBeGreaterThanOrEqual(11.2 - 0.05);
+                } else {
+                    expect(gap, 'Gaps within utility groups stay compact').toBeCloseTo(14 * 0.8, 1);
+                }
             }
             expect(spacing.groups, 'Only vertical spacing between groups is reduced')
                 .toBeCloseTo(viewport.width > viewport.height ? 12 : 19 * 0.8, 1);
@@ -288,6 +310,133 @@ test('main-menu buttons share size and brightness with compact spacing in portra
         await page.locator('#btn-leave-create').click();
         await expect.poll(() => page.evaluate(() => SessionClient.isInSession())).toBe(false);
     }
+});
+
+test('landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states', async ({ players }) => {
+    const { page } = await players.open();
+    await expect(page.locator('#btn-leave-create')).toBeEnabled();
+    await page.locator('#btn-control-mode').click();
+    for (const viewport of [
+        { width: 1280, height: 900 }, { width: 900, height: 550 },
+        { width: 568, height: 320 }, { width: 400, height: 300 },
+    ]) {
+        await page.setViewportSize(viewport);
+        const cases = await page.evaluate(() => {
+            const saved = { ...sessionPicker };
+            const container = document.getElementById('game-container');
+            const originalClass = container.className;
+            const invites = ['btn-invite-self', 'btn-invite-friend'].map(id => document.getElementById(id));
+            const disabledInvites = invites.map(button => button.disabled);
+            const region = saved.regions.find(candidate => candidate.id === getCreateRegionId());
+            if (!region) throw new Error('Menu layout coverage requires an assessed create region');
+            const box = id => document.getElementById(id).getBoundingClientRect();
+            const cases = [];
+            // Project display states through production renderers in one browser turn,
+            // then restore the live picker before any transport callbacks can run.
+            try {
+                for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen'])
+                for (const multiRegion of [false, true])
+                for (const sessionCount of [0, 6])
+                for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
+                for (const unavailable of [false, true]) {
+                    container.className = `${originalClass} ${mode}`;
+                    Object.assign(sessionPicker, {
+                        regions: multiRegion ? [
+                            { ...region, displayName: 'Northwestern Europe' },
+                            { id: 'layout-secondary', displayName: 'Secondary Region' },
+                        ] : [region],
+                        selectedCreateRegion: region.id,
+                        sessions: Array.from({ length: sessionCount }, (_, index) => ({
+                            id: `layout-${index}`, name: `Layout ${index + 1}`,
+                            regionId: region.id, memberCount: index + 1, maxMembers: 6,
+                        })),
+                        currentSessionId: role === 'outside' ? null : 'layout-0',
+                        isServer: role === 'host',
+                        gameStarted: role === 'running-member',
+                        canCreate: !unavailable,
+                        connected: !unavailable,
+                    });
+                    for (const button of invites) button.disabled = unavailable;
+                    renderCreateRegionSelector();
+                    renderSessionList();
+                    updatePickerButtons();
+                    const buttons = [...document.querySelectorAll('#menu-columns .picker-btn')]
+                        .filter(button => button.getBoundingClientRect().height);
+                    const solo = box('btn-solo');
+                    cases.push({
+                        mode, multiRegion, sessionCount, role, unavailable,
+                        top: box('btn-control-mode').top - box('session-list').top,
+                        bottom: box('btn-invite-friend').bottom - solo.bottom,
+                        invite: box('btn-invite-self').top
+                            - box(role === 'outside' ? 'btn-leave-create' : 'btn-start-enter').top,
+                        columnGap: box('menu-utilities').left - box('menu-play').right,
+                        fullscreenVisible: box('btn-fullscreen').height > 0,
+                        regionVisible: box('create-region-row').height > 0,
+                        startVisible: box('btn-start-enter').height > 0,
+                        startDisabled: sessionPicker.btnStartEnter.disabled,
+                        destination: sessionPicker.btnLeaveCreate.getAttribute('aria-label'),
+                        createText: sessionPicker.btnLeaveCreate.textContent,
+                        clipped: buttons.filter(button => {
+                            const rect = button.getBoundingClientRect();
+                            return Math.abs(rect.width - solo.width) > 0.05 || rect.height !== 32
+                                || rect.left < 0 || rect.right > innerWidth
+                                || button.scrollWidth > button.clientWidth
+                                || button.scrollHeight > button.clientHeight
+                                || getComputedStyle(button).transform !== 'none';
+                        }).map(button => button.id),
+                    });
+                }
+            } finally {
+                const btnLeaveCreate = sessionPicker.btnLeaveCreate;
+                Object.assign(sessionPicker, saved, { btnLeaveCreate });
+                container.className = originalClass;
+                invites.forEach((button, index) => { button.disabled = disabledInvites[index]; });
+                renderCreateRegionSelector();
+                renderSessionList();
+                updatePickerButtons();
+            }
+            return cases;
+        });
+        expect(cases).toHaveLength(128);
+        for (const state of cases) {
+            const label = `${viewport.width}x${viewport.height} ${state.mode || 'windowed'}`
+                + ` regions=${state.multiRegion ? 2 : 1} sessions=${state.sessionCount}`
+                + ` ${state.role} unavailable=${state.unavailable}`;
+            for (const edge of ['top', 'bottom', 'invite']) {
+                expect(state[edge], `${label} ${edge} alignment`).toBeCloseTo(0, 1);
+            }
+            expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
+            expect(state.fullscreenVisible, label).toBe(state.mode === '');
+            expect(state.regionVisible, label).toBe(state.multiRegion);
+            expect(state.startVisible, label).toBe(state.role !== 'outside');
+            if (state.role !== 'outside') {
+                expect(state.startDisabled, label).toBe(state.role === 'waiting-member');
+                expect(state.destination, `${label} Leave has no stale create label`).toBeNull();
+            } else if (state.multiRegion && !state.unavailable) {
+                expect(state.destination, `${label} full destination remains accessible`)
+                    .toBe('Create Multiplayer in Northwestern Europe');
+                expect(state.createText, label).toBe(state.destination);
+            }
+            expect(state.clipped, `${label} buttons retain their dimensions without clipping`).toEqual([]);
+        }
+    }
+    await page.setViewportSize({ width: 900, height: 550 });
+    await page.locator('#btn-fullscreen').click();
+    try {
+        await expect(page.locator('#btn-fullscreen')).toBeHidden();
+        const offsets = await page.evaluate(() => {
+            const box = id => document.getElementById(id).getBoundingClientRect();
+            return [
+                box('btn-control-mode').top - box('session-list').top,
+                box('btn-invite-self').top - box('btn-leave-create').top,
+                box('btn-invite-friend').bottom - box('btn-solo').bottom,
+            ];
+        });
+        for (const offset of offsets) expect(offset, 'Live fullscreen transition keeps alignment').toBeCloseTo(0, 1);
+    } finally {
+        await page.evaluate(() => toggleFullscreen());
+    }
+    await expect(page.locator('#btn-fullscreen')).toBeVisible();
 });
 
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
