@@ -1,2716 +1,1650 @@
 # Astervoids Architecture
 
-## System Overview
+Astervoids is an HTML5 Canvas game with an ASP.NET Core backend. Browsers own
+gameplay simulation; a regional backend owns membership, object ownership checks,
+and ordered shared records. A separate HTTP identity service persists player
+identities, tags, invitations, and browser bindings, but not sessions or scores.
+This document describes the implemented contracts, not an inventory of a
+particular live Azure deployment.
+
+**Read the overview for orientation, then the relevant contract before changing
+code.** Diagrams explain relationships and execution order. The accompanying
+prose defines the invariants. Source links point to the current checkout rather
+than frozen line numbers. Setup commands live in [README.md](README.md), and
+deployment procedures live in [CICD_SETUP.md](CICD_SETUP.md).
+
+View the rendered document on GitHub or in a Markdown preview with Mermaid
+support. Opening a raw `.md` file in a browser does not itself provide a Markdown
+or Mermaid renderer. Without Mermaid support, the diagram source remains
+readable and the contracts below still stand on their own.
+
+## Contents
+
+- [System overview](#system-overview)
+- [Client architecture](#client-architecture)
+- [Discovery and session lifecycle](#discovery-and-session-lifecycle)
+- [Durable player identity](#durable-player-identity)
+- [Replication contracts](#replication-contracts)
+- [Timing, simulation and presentation](#timing-simulation-and-presentation)
+- [Gameplay flows](#gameplay-flows)
+- [Backend state and concurrency](#backend-state-and-concurrency)
+- [Wire protocol](#wire-protocol)
+- [Infrastructure and deployment](#infrastructure-and-deployment)
+- [Diagnostics and static delivery](#diagnostics-and-static-delivery)
+- [Change map and regression evidence](#change-map-and-regression-evidence)
+- [Maintaining this document](#maintaining-this-document)
+
+## System overview
 
 ```mermaid
-graph TB
-    subgraph "Browser (HTML5 Canvas)"
-        UI["index.html<br/>Single-file frontend<br/>Game loop · Rendering · Input"]
-        RR["ReplicationRuntime<br/>Replica lifecycle · Versions · Ownership"]
-        RP["Replication policies<br/>Clock · Presentation · Send decisions"]
-        OS["ObjectSync<br/>object-sync.js"]
-        SC["SessionClient<br/>session-client.js"]
+flowchart TB
+    subgraph Browser["One game browser"]
+        Game["Game and adapters"]
+        Replication["Replication and presentation"]
+        Client["SessionClient"]
+        Picker["Regional picker and watchers"]
+        IdentityClient["PlayerIdentity and identity UI"]
+        Game <--> Replication
+        Replication <--> Client
+        Game -.->|"Membership"| Client
+        IdentityClient -->|"Public identity only"| Game
     end
-
-    subgraph "ASP.NET Core Server"
-        HUB["SessionHub<br/>SignalR Hub · /sessionHub"]
-        SS["SessionService<br/>Session lifecycle"]
-        OBS["ObjectService<br/>Object CRUD · Versioning"]
+    subgraph Backend["One regional ASP.NET Core process"]
+        Hub["SessionHub"]
+        Services["SessionService and ObjectService"]
+        Records[("In-memory session records")]
+        APIs["HTTP discovery and metrics"]
+        IdentityAPI["Identity HTTP API and service"]
+        Hub --> Services --> Records
+        APIs --> Records
     end
-
-    UI -->|"reconcileType at game-owned pivots"| RR
-    RR -->|"pull canonical records"| OS
-    RR -->|"ingest / sample / reset"| RP
-    RP -->|"sampled state"| UI
-    UI -->|"send decision + tick(dt)"| OS
-    OS -->|"updateObjects / createObject / deleteObject"| SC
-    SC <-->|"WebSocket (SignalR)"| HUB
-    HUB --> SS
-    HUB --> OBS
-    SC -->|"onBatchReceived · onObjectCreated · onObjectDeleted"| OS
+    Identities[("Durable identity store (no scores)")]
+    Client <-->|"SignalR and MessagePack"| Hub
+    Others["Other session browsers"] <--> Hub
+    Picker <--> Hub
+    Picker <-->|"HTTP"| APIs
+    IdentityClient <-->|"HTTPS and JSON"| IdentityAPI
+    IdentityAPI <--> Identities
 ```
 
----
+The browser's inline
+[`wwwroot/index.html`](AstervoidsWeb/wwwroot/index.html) is the game composition
+root: input, physics, collisions, waves, shared-life calculations, Canvas
+rendering, HUD, picker, and procedural Web Audio. Classic-script modules provide
+replication, presentation policies, transport, and regional discovery. There is
+no frontend bundler, transpilation step, or third-party physics engine.
 
-## Client Architecture
+The backend in [`Program.cs`](AstervoidsWeb/Program.cs) hosts `/sessionHub`, HTTP
+APIs, and static content. Its session and object services are process-local
+singletons. The client communicates through the hub, not directly with peers.
+SignalR uses MessagePack; WebSockets are the normal realtime transport, but the
+client leaves transport negotiation to SignalR.
 
-The browser client uses classic-script modules loaded before `index.html`'s
-inline composition root. There is no bundler or transpilation step. Each module
-exposes an explicit public object while retaining internal state in closures.
-The game composes the layers and supplies Astervoids-specific adapters.
+### Authority is not one role
 
-### Layer Boundaries
+| Authority or role | Responsibility | Does not imply |
+| --- | --- | --- |
+| Regional backend | Membership, ownership authorization, lifecycle, accepted mutation order, versions, snapshots | Server-computed physics, collision validation, or anti-cheat validation of scores |
+| Object-owning browser | Simulation and game-specific decisions for that object | Authority over every object in the session |
+| `Server` member role | First member, initial round start, deterministic successor promotion | Permanent ownership of GameState or all asteroids |
+| GameState object owner | Shared score/life ledgers, wave progression, terminal state | That this member has the `Server` role or is actively playing |
+| Identity service | Public player GUID/tag, browser bindings, invitations, atomic naming/rebinding | Server-authenticated score attribution, persistent gameplay, or an account/password system |
 
-```mermaid
-graph TB
-    GAME["index.html<br/>Game loop · Rendering · Input · Gameplay rules"]
-    RR["ReplicationRuntime  (replication-runtime.js)<br/>Replica lifecycle · Version consumption<br/>Join markers · Ownership transitions"]
-    POL["Replication policies<br/>replication-clock.js · replication-presentation.js<br/>replication-send-policy.js"]
-    OS["ObjectSync  (object-sync.js)<br/>Object registry · Delta encoding · Batched flush<br/>Per-member sequencing · Reconciliation · Schema dispatch"]
-    SC["SessionClient  (session-client.js)<br/>SignalR lifecycle · Hub RPC wrappers<br/>Stale-connection guard() · GUID normalization<br/>Object handle ↔ GUID translation"]
-    GU["GuidUtils  (guid-utils.js)<br/>bytesToGuid · transformBinaryGuids"]
-    HUB["/sessionHub<br/>ASP.NET Core SignalR — MessagePack"]
+GameState ownership can migrate independently of the `Server` role, including
+to a joined lobby spectator. Server-accepted gameplay data is owner-authored
+data, not a backend-computed physical truth.
 
-    GAME -->|"register adapters · reconcileType at existing pivots"| RR
-    RR -->|"getObjectsByType · getObject"| OS
-    RR -->|"ingest · sample · remove · reset"| POL
-    GAME -->|"send-policy decisions"| POL
-    GAME -->|"tick(dt) · create/update/delete/replaceObject · on(event)"| OS
-    GAME -->|"connect · createSession · joinSession · leaveSession · on(event)"| SC
-    OS -->|"createObject · updateObjects · deleteObject<br/>replaceObject · getSessionState"| SC
-    SC -->|"transformBinaryGuids(result / args)"| GU
-    SC <-->|"WebSocket · MessagePack binary"| HUB
-```
+### Boundaries and non-guarantees
 
-### Dependency Invariants
+- A session belongs to one app process in one region. Discovery merges regional
+  lists, not running game state. There is no distributed session backplane,
+  gameplay database, or transparent cross-region session failover. Shared
+  identity storage does not change that boundary.
+- Process termination, deployment, or scale-to-zero can end sessions. Object
+  records are durable across client recovery only while that session exists,
+  not durable across server restarts.
+- Fixed-step owner simulation is not peer lockstep or rollback. Receivers
+  predict presentation, not authoritative collision outcomes.
+- A successful transport reconnect is not restored membership. A local event
+  callback is not a persistence acknowledgement. A failed mutation is not an
+  automatically retried reliable message.
+- Once identity onboarding resolves or the user explicitly chooses guest play,
+  solo gameplay is local and does not wait for a session hub to start.
 
-These rules are enforced purely by module structure and must not be violated when extending the client:
+## Client architecture
 
-- **Only `SessionClient` holds a `signalR.HubConnection`.** The hub URL `/sessionHub` and `MessagePackHubProtocol` are referenced nowhere outside `session-client.js`. `index.html` contains no `signalR.*` references.
-- **Only `SessionClient` calls `GuidUtils.transformBinaryGuids`.** It is applied in both the `guard()` event wrapper (all hub push callbacks) and `invokeHub()` (all RPC responses), so nothing above `SessionClient` ever observes a raw 16-byte `Uint8Array` GUID.
-- **Outbound transport IDs are binary only for typed `Guid` contracts.**
-  `SessionClient` uses `GuidUtils.guidToBytes` for join/rejoin IDs and object
-  mutation/event IDs. String-typed owner overrides, reconnect tokens, and opaque
-  payloads remain unchanged; callers above the transport keep readable IDs.
-- **Full-object decoding is shared across receive paths.** Creation events and
-  responses, replacements, joins, and reconciliation use the same positional
-  DTO, scope, and payload decoder. Join installs session schemas first; sparse
-  update DTOs keep their separate shape.
-- **`ObjectSync` is the sole consumer of `SessionClient.{createObject, updateObjects, deleteObject, replaceObject, getSessionState}`.** The game never calls these transport methods directly.
-- **The game never directly manages `memberSequence`, delta encoding, or reconciliation.** Per-member sequence tracking, gap detection, and `GetSessionState` calls are entirely encapsulated inside `ObjectSync`.
-- **Transport reports uncertain state; replication decides how to recover.**
-  `SessionClient` emits `onSessionStateUncertain(reason, epoch)` after a transport
-  reconnect or an ambiguous leave failure. `ObjectSync.init()` subscribes and
-  starts its existing epoch-guarded reconciliation. `SessionClient` has no
-  dependency on a global `ObjectSync` and remains usable without replication.
-- **Send rate is decoupled from frame rate.** The game calls `ObjectSync.tick(frameTimeSec)` at its existing reconciliation pivot; ObjectSync accumulates elapsed time against its RTT-derived interval. Immediate updates retain urgency under backpressure; at most one update invocation is in flight, with no catch-up bursts after stalls.
-- **`ReplicationRuntime` is pull-driven.** It never owns a frame loop, calls
-  `ObjectSync.tick`, sends a mutation, or subscribes to SignalR. The game invokes
-  one type reconciliation at each existing collision-visible simulation pivot.
-- **`ReplicationRuntime` never interprets game data.** Record classification
-  and entity create/apply/adopt/remove behavior are adapter callbacks.
-  Reusable kinematic/control policies define explicit input state contracts and
-  receive geometry, prediction, replay, wrapping, and clock behavior through
-  injection.
-- **Serialization has one seam.** Entity `toSyncData`, `toUpdateData`, and
-  `fromSyncData` methods plus the schema selector remain authoritative; runtime
-  descriptors do not duplicate wire mappings.
-- **The game owns exactly one `requestAnimationFrame` driver.** `gameLoop` is
-  the only self-scheduling rAF callback. Auxiliary per-frame work (analog stick
-  sampling, mobile HUD refresh) registers through `addFrameCallback` and runs
-  at the top of the frame, before `ObjectSync.tick` and the simulation steps, so
-  input sampled this frame is visible to this frame's steps. Callbacks are
-  isolated so a throwing callback cannot stall the loop. This keeps the browser
-  to one animation callback per frame on the most constrained devices, and it
-  keeps auxiliary work correctly suspended when the hidden-tab interval
-  fallback takes over.
-
-> These are the client-side analogues of the server-side lock ordering described in the [Thread Safety](#sessionservice-thread-safety) section.
-
-### Replication Responsibilities and State Ownership
+### Responsibilities and state ownership
 
 | Layer | Owns | Does not own |
-|---|---|---|
-| `SessionClient` | SignalR connection, session identity/epoch, RPC lifecycle | Replicated entities or presentation |
-| `ObjectSync` | Canonical records, versions, deltas, batching, sequencing, reconciliation | Game fields, physics, concrete entities |
-| Replication policies | Clock estimates, interpolation/dead-reckoning state, send eligibility | Transport, collections, frame scheduling |
-| `ReplicationRuntime` | Consumed versions, one-shot join markers, role bindings, migration-pending state | Serialization, simulation, collisions, audio |
-| Astervoids adapters | Record-to-entity mapping and game-specific transition effects | SignalR and wire mechanics |
-| Astervoids game | Local authority, rules, physics, collisions, rendering, UX | Generic record ordering and migration gates |
+| --- | --- | --- |
+| Game and type adapters | Input, simulation, collisions, serialization, local authority, entity collections, UI/audio | Hub internals, sequencing, generic reconciliation |
+| `ReplicationRuntime` | Consumed versions, one-shot join markers, role bindings, migration transitions | A frame loop, outbound mutations, game-data interpretation |
+| Replication policies | Clock estimates, interpolation/dead reckoning, send eligibility | Transport, entity collections, frame scheduling |
+| `ObjectSync` | Canonical records, type index, versions, deltas, batching, sequencing, reconciliation | Concrete game entities and physics rules |
+| `SessionClient` | Joined-session connection, identity/epochs, RPC lifecycle, GUID/handle translation | Replica collections or presentation |
+| `SpectatorClient` | Separate sessionless regional picker connections | Joined-session gameplay, membership, or object synchronization |
+| `PlayerIdentity` | Identity HTTP, origin-local browser credential, binding validation and retry state | Game/session authority, score storage, consent/naming/clipboard UI |
 
-The canonical record in `ObjectSync`, a locally authoritative entity, a remote
-game instance, and transient presentation state are deliberately separate
-objects with one owner each. `ReplicationRuntime` coordinates them without
-copying canonical data into a second generic store.
+The canonical record in ObjectSync, an authoritative local entity, a remote game
+instance, and its presentation state are deliberately distinct. Runtime
+reconciliation coordinates them without creating another generic object store.
 
-### Pull-Driven Frame Contract
+Sources: [ReplicationRuntime](AstervoidsWeb/wwwroot/js/replication-runtime.js),
+[ObjectSync](AstervoidsWeb/wwwroot/js/object-sync.js),
+[SessionClient](AstervoidsWeb/wwwroot/js/session-client.js),
+[SpectatorClient](AstervoidsWeb/wwwroot/js/spectator-client.js),
+[PlayerIdentity](AstervoidsWeb/wwwroot/js/player-identity.js).
 
-The extraction preserves the existing order rather than introducing one global
-replication update:
+### Dependency invariants
 
-1. `ObjectSync.tick` pumps the outbound scheduler once per frame.
-2. Local authoritative entities simulate and enqueue their latest state.
-3. `updateRemoteShips`, `updateAstervoidsFromSync`,
-   `updateBulletsFromSync`, and `updateGameStateFromSync` reconcile their type
-   at their original game-owned pivots.
-4. Collision detection observes the same local and sampled remote state as
-   before extraction. Bullet hits sweep each local bullet's step-relative path
-   against the current asteroid polygon, including translational asteroid
-   motion and wrap-aware broad-phase rejection.
-5. Rendering remains outside the runtime.
+- **SessionClient owns the joined-session hub connection.** Gameplay code never
+  constructs a `signalR.HubConnection`. SpectatorClient is the deliberate
+  exception for independent, read-only regional discovery connections.
+- **ObjectSync is the game-facing object transport boundary.** Gameplay never
+  directly calls SessionClient's object create/update/delete/replace/snapshot
+  wrappers. It also never manages `memberSequence`, delta baselines, or sequence
+  gap recovery itself.
+- **Serialization has one seam.** Entity `toSyncData`, `toUpdateData`, and
+  `fromSyncData` methods and game schema selection remain authoritative.
+  Descriptors must not duplicate those mappings.
+- **ReplicationRuntime is pull-driven.** It never schedules frames, calls
+  `ObjectSync.tick`, sends a mutation, or subscribes to SignalR. The game calls
+  `reconcileType` at its collision-visible pivots.
+- **Generic layers do not interpret gameplay payloads.** Adapters classify
+  records and implement entity create/apply/adopt/remove behavior. Prediction,
+  controls, wrapping, and clocks enter reusable policies through explicit
+  contracts and injection.
+- **Send eligibility and flushing remain separate.** Send policies return
+  `{ send, immediate, reason }`; the game serializes/enqueues, and ObjectSync
+  decides when bytes can leave. There is no combined authority publisher.
+- **One foreground animation driver.** `gameLoop` is the only self-scheduling
+  `requestAnimationFrame` callback. Auxiliary work registers with
+  `addFrameCallback`, runs before transport/simulation, and is isolated so a
+  throwing callback cannot stall the loop.
 
-The hidden-tab fallback keeps its own established order: outbound tick, local
-ownership simulation, asteroid and bullet reconciliation, collision handling,
-then ship reconciliation. Consolidating these calls into a single automatic
-runtime tick is prohibited because it would change collision-visible state.
+Only SessionClient calls `GuidUtils.transformBinaryGuids` for transport events
+and RPC responses. Typed GUID arguments use binary GUID encoding; string-typed
+owner overrides, reconnect tokens, and opaque payload bytes remain unchanged.
+Game callers keep readable IDs. Shared full-object decoding serves create,
+replace, join, and resync paths; sparse updates retain their separate shape.
 
-Outbound authority remains game-owned. `replication-send-policy.js` returns
-explicit `{ send, immediate, reason }` decisions, but the game still invokes
-entity serializers and `ObjectSync.updateObject`; `ObjectSync` still owns
-coalescing, immediate edge flushes, cadence, and backpressure. An
-`AuthorityPublisher` was intentionally not introduced because it would combine
-independently tested scheduling layers without adding receive-side reuse.
+### Replica lifecycle contract
 
-### Replica Lifecycle Contract
+A runtime record includes identity, type/data, creator, owner, scope, version,
+`validAt`, and optional migration metadata. Its adapter classifies it as
+`owned`, `replica`, or `ignore`.
 
-`ReplicationRuntime` consumes plain records with `id`, `type`, `data`,
-`creatorMemberId`, `ownerMemberId`, `scope`, `version`, `validAt`, and optional
-ownership-migration metadata. A registered type adapter classifies each record
-as `owned`, `replica`, or `ignore` and supplies collection and lifecycle hooks.
-
-- `beginSession({ epoch, snapshotObjectIds })` scopes all work to a
-  `SessionClient` epoch and installs one-shot join markers.
-- A join marker is consumed only by the first applicable replica ingest or
-  owned adoption.
-- Equal consumed versions continue to sample existing presentation state but
-  do not ingest another anchor.
+- `beginSession({ epoch, snapshotObjectIds })` scopes work and installs
+  one-shot join markers. The first applicable ingest or owned adoption consumes
+  a marker.
+- Equal consumed versions continue sampling existing presentation without
+  ingesting a second anchor.
 - A metadata-only ownership version advances consumption without re-anchoring
-  an existing replica. The first later data-bearing version receives a
+  an existing replica. The first later data-bearing version receives the
   `preserveDirection` transition fact.
-- Delete, ownership gain, ignored role, missing type, and session reset use
-  explicit removal reasons so game adapters can suppress inappropriate
-  cosmetic effects.
+- Ownership gain adopts the currently displayed instance where applicable.
+  It does not rewind an asteroid to a stale stored pose.
+- Delete, ownership gain, ignored role, missing type, and reset have explicit
+  removal reasons so adapters can suppress inappropriate cosmetic effects.
 - Stale-epoch reconciliation, deletion, migration, and reset work is rejected.
 
-This remains a client-side boundary for one joined session. Server authority is
-still the in-memory, per-session state protected by `Session.SyncRoot` inside
-one application instance; the runtime does not add cross-process or
-cross-region session replication.
-
-### Inline Gameplay Workflows and Test Boundaries
-
-The game continues to own orchestration in `wwwroot/index.html`:
-
-- Session entry shares snapshot initialization and membership/configuration
-  bookkeeping. Create, join, and auto-rejoin retain explicit cancellation
-  checks and viewport/picker updates. Rejoin resets old state **before** the
-  join RPC installs its snapshot. Voluntary leave establishes its synchronous
-  guard before asynchronous cleanup.
-- Visible and hidden simulation share owned-asteroid updates, local-bullet
-  expiration, and wave progression. Their orchestration and remote-ship
-  reconciliation points remain separate; hidden-tab timing is not the
-  deterministic foreground accumulator.
-- Prefer `test-support/inline-game.mjs` for behavior tests of inline declarations
-  rather than copying their implementation. Source-order guards still protect
-  intentional foreground/hidden pivots; normalize line endings before matching
-  multiline source markers so a Windows checkout exercises the same assertions.
-- `calculateGameState` computes score awards, damage, and historical
-  player-count bonuses from explicit inputs without mutating them. The
-  player-count bonus is identity-based, not a concurrent-ship count: every
-  participant that has ever published a ship is recorded in the persisted
-  `countedParticipants` ledger, and `peakShipCount` is the high-water count of
-  participants already paid. The first participant plays on the base lives and
-  each later one adds exactly one, so the award depends on the player rather
-  than on who else happens to be aboard, who owns the GameState object, or how
-  much the session has churned. Ships publish a `participantId` that survives
-  the evict-and-re-register of a rejoin (`SessionClient.getParticipantId`), so a
-  reconnect is never paid twice; a ship without one is skipped rather than
-  attributed to its (unstable) owning member.
-  `calculateGameStateTerminal` computes immutable terminal anchors from an
-  explicit server time. `syncGameState` retains ledger validation, local
-  effects, game-specific serialization, and publication through `ObjectSync`.
-  Its decoded/packed ledger and calculation caches compare actual inputs,
-  including score/hit events that do not advance object versions. Private
-  ledger snapshots detect in-place mutations. Session/ownership/recovery
-  changes invalidate the cache, and cached publication still queues updates
-  against `ObjectSync`'s confirmed baseline rather than treating a local write
-  as an acknowledgement.
-- Personal score history is separate from the entry-life ledger. New sessions
-  persist `participantScores`, `participantNumbers`, and `participantTags` on GameState, keyed by
-  normalized `participantId` GUIDs. The GameState **owner**, not the Server
-  role, registers every observed ship participant at zero, even on fatal and
-  departure transitions. Unseen IDs in one calculation are GUID-sorted before
-  assigning the next positive ordinal; existing ordinals never change.
-  The same accepted positive `Ship.score - processedScores[shipId]` delta
-  increases both the team total and that participant's lifetime total.
-  Duplicate/lower counters are ignored, retired ship baselines remain, and a
-  recreated ship starts at zero rather than inheriting the lifetime score.
-  `countedParticipants`, its 255-entry limit, score-life-before-damage order,
-  and entry-life-after-damage order retain their existing meanings. Personal
-  histories are not evicted to satisfy a presentation row limit.
-  Supported sessions pin the backend's public identity/tag before membership
-  snapshot callbacks. Ship creation carries the tag; pose updates do not.
-  The owner retains each first valid tag in the historical map, including after
-  departures and migration. Multiple browser bindings for one identity aggregate
-  their independent ship counters into one participant and one entry-life award.
-- Rare ship score changes are persisted through the existing Ship `score`
-  slot with `ObjectSync.updateObject`, independently of the motion send gate.
-  Unconfirmed counters retry at the existing visible/hidden and terminal
-  maintenance pivots; confirmed scores add no steady-state motion traffic.
-  Ship-state events still provide prompt counter/hit feedback, but are not the
-  durable score source. Before member cleanup removes ships, the game captures
-  their calculation inputs, applies ownership migration, and invokes the same
-  calculator if this member now owns GameState. Voluntary exits leave ship
-  removal to that atomic member-departure path, rather than pre-deleting the
-  inputs while the previous owner's GameState publication may be unconfirmed.
-  Manual ship-delete callbacks retain the deleted record for that calculation
-  too. A newly owning spectator adopts canonical GameState before publication;
-  it acquires no personal
-  history unless it has published a ship.
-- Multiplayer HUD shows `Your Score: value : player tag` above
-  `Team Score: value : session name`. The viewer's name is their membership-pinned
-  public tag, never a current score rank, ship or member position. Named spectators
-  retain that tag with no personal score. Historical names use replicated tag
-  metadata, not a public directory or per-frame backend queries. Missing or malformed
-  tag metadata yields `Unknown` without discarding otherwise valid score ledgers.
-  Sessions created with older schemas retain `Player N`/`Spectator` labels.
-  The personal value
-  projects the persisted lifetime total plus positive, unprocessed counters
-  for that participant; it is not a second accumulator. Long session names
-  ellipsize. The creator-aspect gameplay viewport is the hard boundary for all
-  HUD items, including on letterboxed peers and after resizing. Typography fits
-  that rectangle, not the surrounding browser window; narrow views place Wave
-  and Lives on a second row instead of expanding into the black margins.
-  Layout measurements run only on changed HUD content or viewport dimensions.
-  Multiplayer final standings replace the playing HUD so they cannot collide
-  with its status columns; solo retains its existing HUD. Game over shows the
-  viewer's persisted `Your Score` above `Team Score`, even when their personal
-  row is outside the ranked limit or capacity is unknown. Pure spectators show
-  `Your Score: --`; unavailable histories do not fabricate a total. The game-over
-  title, personal and team totals, results region and menu prompt use the same
-  creator viewport and native HTML/CSS text rendering.
-  Results size against the overlay, wrap player labels when narrow, and scroll
-  within their bounded region rather than borrowing window width or height.
-  Canvas/world coordinates, creator metadata and wave-announcement geometry
-  remain unchanged. Standings use only
-  persisted histories, including departed and zero-score players, and label
-  them with their retained tag (never a member ID or rank).
-  Sort is score descending, ordinal ascending, then normalized GUID lexical
-  order, independent of locale and live membership. Only the highest-scoring
-  `floor(maxMembers * 1.5)` entries are displayed. Capacity comes from a
-  matching active-session advertisement and is retained on same-session
-  reentry; if absent, at most one query per entry uses the already joined hub's
-  existing `getActiveSessions` API. Unknown capacity keeps the full team total
-  visible but defers the personal rows. The results region alone enables native
-  keyboard/touch scrolling; normal game controls and exits remain unchanged.
-- The creator's schema registry remains authoritative. Sixteen-slot GameState
-  sessions are not reinterpreted as eighteen- or nineteen-slot sessions. Missing, malformed,
-  or incomplete personal history is visibly unavailable rather than reconstructed
-  from currently live ships or the entry-life ledger. A personal-history sum
-  that does not match the persisted team total is also unavailable, without
-  inventing the missing attribution. A mixed-version old GameState owner is
-  **not** guaranteed to maintain the new histories. Solo score mechanics and
-  `Final Score` are unchanged; its HUD includes the active player tag.
-- A session ship that takes a hit its owner predicts to be fatal stops being
-  controlled instead of respawning, so the final frames everyone sees are the
-  collision that ended the game rather than a fresh ship at centre. The owner
-  re-runs the same pure `calculateGameState` locally with its incremented
-  `hitCount` applied, which reproduces the lives the authority is about to
-  publish — including other ships' unprocessed hits and pending extra-life
-  awards — with no extra traffic and regardless of who owns the ship or the
-  GameState object. A held ship accepts no input and cannot collide again, but
-  it keeps simulating and coasts: `beginShipDeathHold` clears the control
-  intent and rotation, leaving `Ship.update` as friction decay, integration,
-  and wrap, so the wreck carries its momentum into the terminal stop rather
-  than halting under the player. Translation velocity is preserved and spin is
-  not, because turn ramping is instantaneous at the shipped
-  `SHIP_TURN_DECEL_TIME` and a replica would damp a spinning wreck the moment
-  it saw the cleared intent. `buildTerminalTargetPayload` then treats the wreck
-  like any other moving object and projects its stopping distance; buffered
-  sessions settle onto the same final snapshot. Keeping the instance simulating
-  is what makes this safe: published velocity is integrated forward by
-  deterministic replay, buffered extrapolation, terminal projection, and
-  late-join seeding, so an instance parked while it still advertised a velocity
-  would leave every replica extrapolating motion the owner never performed,
-  with no heartbeat to correct it. The hold is local state, never replicated:
-  peers replay the published motion, not the prediction behind it, and the
-  wreck stays drawn. Prediction can be wrong, so a hold is never permanent. It
-  releases into a normal respawn once the authority records that hit in
-  `processedHits` while lives remain — the only proof of survival, since lives
-  are legitimately still positive for the frames before the hit reaches the
-  authority. A completed respawn never inherits the coast, because `reset()`
-  returns the ship to centre at zero velocity. `hitCount`
-  travels only on the per-object event channel, so a hold whose verdict never
-  arrives expires after `SHIP_DEATH_HOLD_TIMEOUT_MS` into today's respawn
-  rather than leaving that player shipless. Solo play needs none of this: it
-  reads its own lives directly and already leaves the wreck where it died.
-- Entering an in-progress session adopts shared lives from the GameState record
-  (`adoptSharedLives`), never from the local starting default. Reconciliation
-  re-applies a replica only when its version is new, and a lobby spectator has
-  already consumed the current one, so resetting to the default at entry would
-  hold a stale value until the owner next published a change. The GameState
-  owner and a plain client take the same value, so entry is symmetric.
-- A rejoin restores the role this client actually held, keyed on whether it owned
-  a ship rather than on `game.state`. A lobby spectator also reads `playing` from
-  the GameState record, so a state-only test re-entered the game on their behalf
-  and minted a ship when a backgrounded tab came back. A spectator re-adopts the
-  watched GameState on rejoin for the same version-suppression reason as entry.
-- Debug snapshot publication is separate from HUD rendering, with the same
-  listener gating and update cadence. Entity collections remain ordered arrays.
-  Asteroid/bullet reconciliation builds a reference-only ID index once at each
-  synchronous pivot; adapter creates/removals update that index for the rest of
-  the pass. Rebuilding it at the next pivot observes local expiry, asynchronous
-  ID assignment, replacement, and reset without persistent duplicate state.
-  Runtime membership facts are shared for that pass; record and cleanup
-  snapshots retain callback-mutation safety.
-
-Stationary and swept collision tests share polygon containment and
-squared-distance primitives in `collision-geometry.js`, including degenerate
-edges and inclusive tangency. Fracture calculation stays in
-`asteroid-fracture.js`: parent geometry, impulse response, polygon construction,
-and disk fallback are separate stages. Parent mass is density times radius
-squared; polygon-area calibration still determines child radii.
-
-Asteroid polar vertices remain authoritative for fracture and serialization.
-`rebuildShapeCache()` derives local Cartesian offsets and the true bounding
-radius after shape/aspect changes. Movement, rotation, and viewport changes
-refresh reusable world points with one rotation transform, shared by drawing
-and collision. `getWorldVertices()` returns borrowed read-only storage, valid
-until the next refresh; consumers must not retain a pose across refreshes.
-
-Aspect compensation caches immutable results against session mode, effective
-severity and both balance/difficulty settings. Motion caps remain enforced at
-simulation and serialization boundaries. Collision passes lazily prepare each
-asteroid's pixel bounds and wrapped displacement once, sharing exact borrowed
-geometry between bullet and ship checks without freezing collection membership:
-same-pass split children remain eligible in the existing traversal order.
-
-Local render interpolation uses reentrant scratch storage rather than aggregate
-entity arrays and per-entity pose tuples. Restoration remains in `finally`,
-including preparation failures; entity references are cleared after use.
-Retained storage is bounded to four buffers of at most 1,024 poses each.
-Rendered overlays/mobile visibility use change-gated writes. Analog input skips
-idle mapping and reuses its result until input, anchor identity, viewport scale,
-control mode or mapping configuration changes.
-
-Tests import production modules directly where possible. For declarations that
-remain inline, `AstervoidsWeb/test-support/inline-game.mjs` loads selected
-functions/classes using Node's parser and explicitly supplied dependencies,
-without starting the browser runtime. Expected results and deliberate
-architecture/order assertions remain independent of the implementation.
-
-Performance regressions use these same production-function harnesses: repeated
-aspect queries reuse one derivation, 600 frames of 200 entities reuse one flat
-render buffer, and a 32-bullet/200-asteroid pass prepares asteroid movement once
-per object rather than once per pair. These operation/allocation assertions and
-wire-size budgets are not substitutes for device frame-time, GC or end-to-end
-network profiling.
-
-### Future Native Client Contract
-
-The JavaScript callbacks and `Map` usage are implementation details, not the
-cross-language API. A native client should reproduce these protocol-neutral
-contracts:
-
-- plain record fields, session epochs, role transitions, version acceptance,
-  and removal reasons;
-- explicit wall, server-UTC, and monotonic clock domains in milliseconds;
-- primitive-input prediction/interpolation kernels and documented clamp rules;
-- explicit send decisions, while retaining a separate transport scheduler;
-- golden codec, timing, join, migration, and cadence fixtures.
-
-Normative behavior must not depend on DOM APIs, JavaScript object identity, or
-hidden calls to `performance.now()`. The existing JS/C# cross-wire fixtures and
-policy/runtime vectors are the starting point for a future C/C++ implementation.
-Packaging, code generation, a full ECS, distributed authority, and a separate
-session/reconnect coordinator remain deferred until a second client proves
-those seams.
-
-### SessionClient Public API
-
-#### RPC Wrappers
-
-All wrappers route through `invokeHub()`, which enforces session membership and applies `GuidUtils.transformBinaryGuids` to the result before returning it to the caller.
-
-Create and join/rejoin retain distinct RPCs and snapshot construction, then
-share session-entry completion: install validated identity, seed snapshot
-objects, replay pending broadcasts in receive order, finish the transition, and
-notify listeners for final snapshot backfill. Epoch checks stop seeds and
-pending callbacks and suppress the result if a listener resets the session.
-
-| Wrapper | Hub method | Wire args | Return (after GUID normalization) |
-|---|---|---|---|
-| `createSession(metadata?)` | `CreateSession` | `metadata?` | `{ session, member }` or `null` |
-| `joinSession(sessionId, evictMemberId?)` | `JoinSession` | `sessionId, evictMemberId?` | `{ session, member }` or `null` |
-| `leaveSession()` | `LeaveSession` | — | `boolean`; failed/uncertain leaves return `false` and preserve recoverable identity |
-| `getActiveSessions()` | `GetActiveSessions` | — | `{ sessions[], maxSessions, canCreateSession }` |
-| `createObject(data, scope, ownerMemberId?, clientValidAt?)` | `CreateObject` | `data, scope, ownerMemberId?, clientValidAt?` | `{ objectInfo, memberSequence }` |
-| `updateObjects(updates, senderSequence, senderSendIntervalMs, clientValidAt?)` | `UpdateObjects` | `updates[], senderSequence, senderSendIntervalMs, clientValidAt?` | `{ versions{}, memberSequence, serverTimestamp }` |
-| `replaceObject(deleteObjectId, replacements, scope, ownerMemberId?, clientValidAt?)` | `ReplaceObject` | `deleteObjectId, replacements[], scope, ownerMemberId?, clientValidAt?` | `createdInfos[]` (normalized from `[createdObjects, memberSequence, validAt]`; applied before resolution) |
-| `deleteObject(objectId)` | `DeleteObject` | `objectId` | `{ success, memberSequence }` |
-| `getSessionState()` | `GetSessionState` | — | `{ members[], objects[], memberSequences{} }` |
-
-† `clientValidAt` is the owner's NTP-aligned operation timestamp. Updates sample
-it once at flush, after latest-state coalescing, so it is not an exact timestamp
-for every simulation pose. The server clamps it to ±2s of its own UtcNow and
-forwards `validAt`; if `null`, it falls back to hub-entry time. See
-"Networking: Unified `validAt` Interpolation Axis" below.
-
-#### Lifecycle and State Methods
-
-These methods have no corresponding hub RPC.
-
-| Method | Description |
-|---|---|
-| `connect(force?)` | Opens `/sessionHub` with `MessagePackHubProtocol`; `force=true` tears down the existing connection first (awaits `stop()` with a 3 s timeout before creating a new one) |
-| `disconnect()` | Stops the connection and clears all state including `lastSessionId` |
-| `on(eventName, callback)` | Registers a named callback from the fixed `callbacks` set |
-| `getCurrentSession()` | Returns the current session object (`id, name, members[], objects[], metadata`) or `null` |
-| `getCurrentMember()` | Returns the current member object (`id, role`) or `null` |
-| `getSessionEpoch()` | Returns the monotonically changing local lifecycle epoch used to reject stale async work |
-| `isConnected()` | `true` when the connection is `HubConnectionState.Connected` |
-| `isInSession()` | `true` when `currentSession !== null` |
-| `getLastSessionId()` | Returns the session id from the most recent join; preserved across unexpected disconnects for auto-rejoin |
-| `clearSessionState()` | Blanks `currentSession` and `currentMember` without stopping the transport; used during auto-rejoin |
-
-### SessionClient Event Callbacks
-
-`SessionClient.on(name, fn)` registers callbacks from its supported event set. The regular mapping is `OnFooBar` (hub broadcast) → `onFooBar` (JS callback). Typed identifier arguments are normalized before dispatch; opaque event payload bytes are not interpreted as GUIDs.
-
-| JS callback | Hub source | Notes |
-|---|---|---|
-| `onConnected` | `onreconnected` / initial `connect()` | Fires on first connect and after every successful automatic reconnection |
-| `onReconnecting` | `onreconnecting` | Transport lost; SignalR is retrying |
-| `onDisconnected` | `onclose` | Connection permanently closed; `error` is `null` for intentional disconnect |
-| `onSessionCreated` | `createSession()` response | Not a hub broadcast; fired after local state is populated from the RPC response |
-| `onSessionJoined` | `joinSession()` response | Not a hub broadcast |
-| `onSessionLeft` | `leaveSession()` | Not a hub broadcast |
-| `onSessionTransition` | Local session lifecycle | `(kind, epoch)`; invalidates old asynchronous state |
-| `onSessionStateUncertain` | Reconnected transport / failed leave | `(reason, epoch)` with `reconnected` or `leaveFailed`; recovery subscribers run before reconnect's `onConnected` notification |
-| `onMemberJoined` | `OnMemberJoined` | `(memberInfo, senderMemberId, memberSequence)` |
-| `onMemberLeft` | `OnMemberLeft` | `(info, senderMemberId, memberSequence)`; may be immediately followed by `onRoleChanged` if the local member was promoted |
-| `onRoleChanged` | Derived from `OnMemberLeft` | Fired only when `info.promotedMemberId === currentMember.id`; arg: `(newRole)` |
-| `onObjectCreated` | `OnObjectCreated` / entry snapshot seed | `(objectInfo, senderMemberId, memberSequence)`; seeds carry `null` sender, sequence `0`, and the object's snapshot `validAt` |
-| `onObjectsUpdated` | `OnObjectsUpdated` | Arg reorder: hub sends `serverTimestamp` at position 4; callback puts it at position 1 → `(objects, serverTimestamp, senderMemberId, senderSequence, memberSequence, senderSendIntervalMs)` |
-| `onObjectDeleted` | `OnObjectDeleted` | `(objectId, senderMemberId, memberSequence)` |
-| `onObjectReplaced` | `OnObjectReplaced` | `(event, senderMemberId, memberSequence)` |
-| `onObjectEvent` | `OnObjectEvent` | `(eventInfo, senderMemberId, memberSequence, validAt)`; opaque transient payload, not replayed to later joiners |
-| `onSessionsChanged` | `OnSessionsChanged` | No args; signal only — caller must call `getActiveSessions()` to get the updated list |
-| `onSessionExpired` | `OnSessionExpired` | `(reason)` — server-driven session destroy via `SessionCleanupService` |
-| `onError` | Internal | `(errorMessage)` — fired on connection or RPC errors |
-
-While a create or join RPC is pending, membership broadcasts can overtake its
-older response snapshot. `SessionClient` queues membership and object broadcasts
-together. Validated identity and snapshot objects are installed before their
-handlers and callbacks replay in receive order, including membership changes
-and ownership migrations. Entry completion callbacks run after that replay.
-
-`onConnected` reports transport readiness, not completed state reconciliation.
-The uncertainty notification starts recovery without awaiting its snapshot.
-If that snapshot no longer recognizes the member, ObjectSync's existing
-`onReconciliationFailed` callback drives the game-owned auto-rejoin path.
-An ambiguous leave emits the same recovery signal while retaining the current
-identity. Superseded connections and session epochs cannot request recovery for
-a replacement session.
-
-### ObjectSync Public API
-
-#### Lifecycle / Config
-
-| Method | Description |
-|---|---|
-| `init()` | Subscribes to object CRUD/events, session transitions/join/leave, and `onSessionStateUncertain`; the sync layer owns reconciliation |
-| `configure(config)` | Sets `nominalFrameTime`, `minFrameTime`, `deltaEncoding`, `adaptiveSendRate`, and `fieldMap` |
-| `clear()` | Resets all local state (objects, sequences, pending updates); called on session leave |
-
-#### Object Mutations
-
-| Method | Description |
-|---|---|
-| `createObject(data, scope?, ownerMemberId?, isStillNeeded?)` | **Response-first**: invokes `CreateObject`, registers the server-assigned id + version; if `isStillNeeded()` returns `false` after the round-trip, fires a fire-and-forget delete to clean up the orphan |
-| `updateObject(id, data, immediate?)` | Mutates the local object immediately and queues for batched flush; `immediate=true` flushes now if possible, otherwise retains urgency for the next eligible tick |
-| `deleteObject(id)` | **Local-first**: removes from the local map and `pendingUpdates`, adds to `pendingDeletes`, then invokes `DeleteObject` |
-| `replaceObject(deleteId, replacements, scope?, ownerMemberId?)` | Atomic delete-plus-create round-trip; sender applies the response through the same replacement handler as remote broadcasts, before returning the children array |
-| `flushUpdates()` | Builds the wire batch (delta or full), compresses field names via `fieldMap`, and calls `SessionClient.updateObjects` |
-
-#### Frame Pump
-
-| Method | Description |
-|---|---|
-| `tick(frameTimeSec)` | Accumulates nonnegative finite elapsed seconds, capped at one interval; services elapsed eligibility or pending urgency when no update invocation is in flight |
-
-#### Queries
-
-| Method | Description |
-|---|---|
-| `getObject(id)` | Returns the local object with the given id, or `undefined` |
-| `getAllObjects()` | Returns an array of all locally tracked objects |
-| `getObjectsByOwner(memberId)` | Returns all objects where `ownerMemberId === memberId` |
-| `getObjectsByType(type)` | O(n-matching) type lookup via the internal `typeIndex` |
-| `getObjectsByTypeSnapshot(type)` | Same implementation, explicitly transferring ownership of the membership array; records remain canonical references. ReplicationRuntime avoids a second copy when this optional store method exists, and otherwise snapshots legacy stores defensively |
-| `getObjectByType(type)` | O(1) singleton lookup (e.g. `GameState`) via `typeIndex` |
-| `getObjectCount()` | Returns the number of locally tracked objects |
-| `getReconciliationCount()` | Returns the number of completed reconciliations in this session |
-| `isDataConfirmed(id, data)` | Shallow-checks fields against the latest server-confirmed response or authoritative snapshot |
-| `getSendRate()` | Returns the current effective send rate in Hz (`round(1 / nominalFrameTime)`) |
-| `isReconciling()` | `true` while a `GetSessionState` reconciliation round-trip is in progress |
-
-#### Adaptive Send Rate
-
-| Method | Description |
-|---|---|
-| `updateSendRate(rttMs)` | Scales `nominalFrameTime` linearly from measured RTT (only when `adaptiveSendRate` is enabled); low RTT → 20 Hz, high RTT → 1 Hz |
-
-#### Reconciliation Control
-
-| Method | Description |
-|---|---|
-| `triggerReconciliation()` | Fetches a full state snapshot from the server and syncs the local object map; no-op while suspended or already reconciling |
-| `suspendReconciliation()` | Increments the suspend counter; while `> 0`, `triggerReconciliation()` is a silent no-op |
-| `resumeReconciliation()` | Decrements the suspend counter |
-
-#### Cross-Layer Coordination Hooks
-
-| Method | Description |
-|---|---|
-| `handleOwnershipMigration(migratedObjects)` | Applies server-authoritative `{ objectId, newOwnerId, newVersion }` entries from `MemberLeftInfo`; prevents version drift from blind local increments |
-| `handleMemberDeparture(deletedObjectIds)` | Removes member-scoped objects from the local map and fires `onObjectDeleted` for each |
-| `trackEventSequence(senderMemberId, memberSequence)` | Public alias for `trackMemberSequence`; keeps the per-member sequence map current for events not handled internally by `ObjectSync` |
-
-#### Event Registration
-
-| Method | Description |
-|---|---|
-| `on(eventName, callback)` | Registers a callback from the fixed 7-name `callbacks` set |
-
-### ObjectSync Event Callbacks
-
-`ObjectSync.on(name, fn)` registers callbacks from a fixed set of **7** names.
-
-| Callback | Signature | Notes |
-|---|---|---|
-| `onObjectCreated` | `(obj)` | Fires when an object is first registered locally (from remote creation, reconciliation, or own `createObject` response) |
-| `onObjectUpdated` | `(obj)` | Fires when a remote update is applied to a locally tracked object |
-| `onObjectDeleted` | `(obj)` | Fires when an object is removed from the local map (remote delete, member departure, or reconciliation ghost removal) |
-| `onBatchReceived` | `(serverTimestamp, clientTimestamp?, senderSendIntervalMs?, senderMemberId?, responseTimestamp?)` | Powers the full RTT→TX→BUF pipeline (see [Networking: RTT → TX → BUF Pipeline](#networking-rtt--tx--buf-pipeline)). For remote batches `clientTimestamp` is `null`; for own flush responses `clientTimestamp` is set and RTT is computable as `responseTimestamp - clientTimestamp` |
-| `onSyncError` | `(operation, error)` | Fires when a `createObject`, `updateObject`, or `deleteObject` RPC fails |
-| `onReconciliationFailed` | `()` | Fires when `GetSessionState` returns `null` or throws — the server no longer recognizes this connection as a session member; drives `attemptAutoRejoin` in the game |
-| `onReconciliationComplete` | `()` | Fires at the end of a successful reconciliation round-trip |
-
-### Cross-Layer Coordination Contracts
-
-The following implicit protocols are promoted here to explicit contracts.
-
-#### Member Departure Ordering
-
-Inside the game's `onMemberLeft(info, ...)` handler, the game **must** call `ObjectSync.handleOwnershipMigration(info.migratedObjects)` and `ObjectSync.handleMemberDeparture(info.deletedObjectIds)` **before** reading ownership from the local object map. These calls apply the server-authoritative versions from `MemberLeftInfo` — skipping them would cause blind local increments to diverge from the server version, triggering spurious reconciliations.
-
-#### Auto-Rejoin Reentry
-
-The `attemptAutoRejoin` path wraps its multi-step reentry with `suspendReconciliation` / `resumeReconciliation` (counter-based, so nested calls compose correctly) and uses `clearSessionState()` to drop stale refs without tearing down the transport:
-
-```
-ObjectSync.suspendReconciliation()      // prevent snapshot races mid-rejoin
-SessionClient.clearSessionState()       // drop stale currentSession/currentMember
-                                        //   without stopping the SignalR connection
-SessionClient.joinSession(sessionId, evictMemberId)   // evict own stale member if still present
-ObjectSync.resumeReconciliation()
-```
-
-Cross-reference: [SignalR Reconnection & Reconciliation](#signalr-reconnection--reconciliation).
-
-#### Local-First Delete Safety
-
-`ObjectSync.deleteObject` adds the object id to `pendingDeletes` immediately after removing it from the local map, before the `DeleteObject` invoke resolves. A concurrent `triggerReconciliation` snapshot skips ids in `pendingDeletes` on the "add missing object" pass, preventing a racing snapshot from resurrecting a locally-deleted object. `pendingDeletes` is cleared when the invoke resolves (success or failure).
-
-#### Field-Name Compression Boundary
-
-`ObjectSync.compressData` / `expandData` apply the configured `fieldMap` exactly at the wire boundary:
-
-- **Schema 0 and object events**: after delta computation, field names are
-  compressed (for example, `velocityX` → `vx`) before MessagePack map
-  encoding, then expanded after decoding.
-- **Positional schemas**: readable names are used only to select slots locally;
-  no field names are transmitted, so applying `fieldMap` would be both
-  redundant and incorrect.
-
-Game logic always uses readable field names. An empty `fieldMap` (the default)
-means pass-through; map-key compression is opt-in via
-`configure({ fieldMap: { ... } })`.
-
----
-
-## Backend Data Model
-
-```mermaid
-classDiagram
-    class Session {
-        +Guid Id
-        +string Name (from ISessionNameGenerator)
-        +Dictionary~string,object?~ Metadata (immutable after create)
-        +long Version (incremented on promotion)
-        +DateTime CreatedAt
-        +DateTime? LastMemberLeftAt
-        +SessionLifecycleState LifecycleState
-        +ConcurrentDictionary~Guid,Member~ Members
-        +ConcurrentDictionary~Guid,SessionObject~ Objects
-        -object SyncRoot
-    }
-
-    class SessionLifecycleState {
-        <<enumeration>>
-        Active
-        Destroying
-        Destroyed
-    }
-
-    class Member {
-        +Guid Id
-        +string ConnectionId
-        +MemberRole Role (Server|Client)
-        +DateTime JoinedAt
-        +Guid SessionId
-        +long EventSequence (Interlocked)
-    }
-
-    class SessionObject {
-        +Guid Id
-        +Guid SessionId
-        +Guid CreatorMemberId (immutable)
-        +Guid OwnerMemberId (mutable)
-        +ObjectScope Scope (Member|Session)
-        +Dictionary~string,object?~ Data
-        +long Version
-        +DateTime CreatedAt
-        +DateTime UpdatedAt
-    }
-
-    Session "1" --> "*" Member : Members
-    Session "1" --> "*" SessionObject : Objects
-    Member "1" --> "*" SessionObject : owns (OwnerMemberId)
-    Session --> SessionLifecycleState : LifecycleState
-```
-
-## Service Layer
-
-```mermaid
-graph TB
-    subgraph "SessionService"
-        direction TB
-        SS_DICT["State:<br/>_sessions: ConcurrentDictionary&lt;Guid, Session&gt;<br/>_connectionToMember: ConcurrentDictionary&lt;string, Guid&gt;<br/>_memberToSession: ConcurrentDictionary&lt;Guid, Guid&gt;"]
-        SS_CFG["Config:<br/>MaxSessions: 6<br/>MaxMembersPerSession: 4<br/>Names from ISessionNameGenerator<br/>(default: FruitNameGenerator, 50 names)"]
-        SS_DEP["Member departure (atomic in LeaveSession):<br/>• Remove from indexes<br/>• Promote oldest remaining if Server left<br/>• HandleObjectDeparture: delete Member-scoped,<br/>  migrate Session-scoped (round-robin)<br/>• Mark LastMemberLeftAt for deferred cleanup"]
-    end
-
-    subgraph "ObjectService"
-        direction TB
-        OS_OPS["Operations (all enforce ownership + lifecycle<br/>under session.SyncRoot):<br/>CreateObject → Id, Version=1, validated Owner/Scope<br/>UpdateObject → owner-checked merge, Version++<br/>UpdateObjects → Batch, owner-filtered atomically<br/>DeleteObject → ownership-checked TryRemove<br/>ReplaceObject → validate all children, then atomic delete + create"]
-    end
-
-    subgraph "FruitNameGenerator (ISessionNameGenerator)"
-        direction TB
-        FNG["50-fruit pool (Apple, Banana, ...)<br/>Pick random unused name<br/>If all used → append counter (Apple2)"]
-    end
-
-    subgraph "ServerMetricsService (singleton)"
-        direction TB
-        SMS["Tracks: CPU/memory/GC/thread pool,<br/>connection counts, hub invocations,<br/>per-member TX/RX bytes, reconciliations,<br/>reconnects.<br/>Exposed via GET /api/srvmon (camelCase JSON)."]
-    end
-
-    subgraph "SessionCleanupService (BackgroundService)"
-        direction TB
-        SCS_OPS["Runs every 10 seconds<br/>Empty timeout: destroy sessions with no members<br/>Absolute timeout: destroy sessions exceeding max lifetime<br/>Notifies connected members via SignalR OnSessionExpired<br/>Broadcasts OnSessionsChanged on any cleanup"]
-        SCS_CFG["Config source:<br/>appsettings.json Session section<br/>bound to SessionSettings"]
-    end
-```
-
-## SessionService: Lookup Chain
-
-```mermaid
-flowchart LR
-    CID["ConnectionId<br/>(string)"]
-    MID["MemberId<br/>(Guid)"]
-    SID["SessionId<br/>(Guid)"]
-    S["Session"]
-    M["Member"]
-
-    CID -->|"_connectionToMember"| MID
-    MID -->|"_memberToSession"| SID
-    SID -->|"_sessions"| S
-    S -->|"Members[MemberId]"| M
-```
-
-## SessionService: Create & Join
-
-```mermaid
-flowchart TB
-    subgraph "CreateSession(metadata?)"
-        CS1{"Connection already<br/>in a session?"}
-        CS2{"Active sessions<br/>>= maxSessions (6)?"}
-        CS4["Pick session name via ISessionNameGenerator<br/>(default FruitNameGenerator: random unused fruit;<br/>append counter if pool exhausted)"]
-        CS5["Create Session with Name + Metadata"]
-        CS6["Create Member with Role=Server"]
-        CS7["Add to _sessions, _connectionToMember,<br/>_memberToSession, session.Members"]
-        CS8["Return CreateSessionResult<br/>{Success, Session, Creator}"]
-        CSE["Return error"]
-
-        CS1 -->|Yes| CSE
-        CS1 -->|No| CS2
-        CS2 -->|Yes| CSE
-        CS2 -->|No| CS4 --> CS5 --> CS6 --> CS7 --> CS8
-    end
-
-    subgraph "JoinSession(sessionId, evictMemberId?)"
-        JS1{"Connection already<br/>in a session?"}
-        JS2{"Session exists<br/>AND Active?"}
-        JSE_EVICT{"evictMemberId given<br/>AND stale member found<br/>(different connection)?"}
-        EVI["EvictMemberInternal:<br/>remove from indexes, promote if was Server,<br/>HandleObjectDeparture (delete + migrate)"]
-        JS3{"Members.Count<br/>>= maxMembers (4)?"}
-        WAS{"Session was empty<br/>(rejoining)?"}
-        JS4S["Create Member with Role=Server"]
-        JS4C["Create Member with Role=Client"]
-        ADOPT["AdoptOrphanedObjects:<br/>reassign session-scoped objects<br/>without a current owner"]
-        JS5["Clear session.LastMemberLeftAt"]
-        JS6["Return JoinSessionResult<br/>{Success, Session, Member, Eviction?}"]
-        JSE["Return error"]
-
-        JS1 -->|Yes| JSE
-        JS1 -->|No| JS2
-        JS2 -->|No| JSE
-        JS2 -->|Yes| JSE_EVICT
-        JSE_EVICT -->|Yes| EVI --> JS3
-        JSE_EVICT -->|No| JS3
-        JS3 -->|Yes| JSE
-        JS3 -->|No| WAS
-        WAS -->|Yes| JS4S --> ADOPT --> JS5
-        WAS -->|No| JS4C --> JS5
-        JS5 --> JS6
-    end
-```
-
-## SessionService: Leave & Server Promotion
-
-`LeaveSession` is **atomic** under `session.SyncRoot` — membership change, server
-promotion, and object cleanup happen in one critical section and a single
-`LeaveSessionResult` is returned to the hub. There is no separate
-`HandleMemberDeparture` call (that responsibility moved out of `ObjectService`).
-
-```mermaid
-flowchart TB
-    L1["LeaveSession(connectionId, distributeOrphanedObjects=true)"]
-    L1A{"connectionId in<br/>_connectionToMember?"}
-    L1B["Return null (idempotent no-op)"]
-    L2["lock(session.SyncRoot)<br/>Re-check connection still registered<br/>Bail if session already Destroyed"]
-    L3["TryRemove from _connectionToMember,<br/>_memberToSession, session.Members"]
-    L4{"Departing member<br/>was Server AND<br/>any members remain?"}
-    L5["Promote oldest remaining member<br/>(min JoinedAt, then min Id — deterministic)<br/>Set Role = Server, session.Version++"]
-    L6["HandleObjectDeparture (under same lock):<br/>• Member-scoped → delete<br/>• Session-scoped → migrate round-robin<br/>  (or to first remaining if !distribute)"]
-    L7{"session.Members<br/>now empty?"}
-    L8["Set session.LastMemberLeftAt = now<br/>(deferred destruction by SessionCleanupService;<br/>orphaned session-scoped objects retained for<br/>AdoptOrphanedObjects on rejoin)"]
-    L9["Return LeaveSessionResult {<br/>  SessionId, SessionName, MemberId,<br/>  SessionDestroyed=false, PromotedMember?,<br/>  RemainingMemberIds, DeletedObjectIds,<br/>  MigratedObjects }"]
-
-    L1 --> L1A
-    L1A -->|No| L1B
-    L1A -->|Yes| L2 --> L3 --> L4
-    L4 -->|Yes| L5 --> L6
-    L4 -->|No| L6
-    L6 --> L7
-    L7 -->|Yes| L8 --> L9
-    L7 -->|No| L9
-```
-
-## ObjectService: Update Flow
-
-All mutations run under `Session.SyncRoot`. Ownership and session lifecycle are
-validated atomically inside `ObjectService` itself (the hub still pre-checks for
-fast early-return / logging, but correctness does not rely on it).
-
-Object updates use **last-write-wins field merging**, not optimistic concurrency.
-The wire request has no expected-version field. Each accepted patch merges into
-the latest state and receives a new server-assigned version; disjoint fields
-accumulate, and later writes to the same field win. Client version checks reject
-stale incoming state and acknowledgements; they are not a server-side
-compare-and-swap precondition. Adding expected-version rejection would be a
-separate wire-contract and behavior change.
-
-```mermaid
-flowchart TB
-    subgraph "UpdateObject (single, ownership enforced in service)"
-        U1["UpdateObject(sessionId, objectId, ownerMemberId, data)"]
-        U2{"Session active?<br/>Caller is a current member?<br/>Object exists and caller owns it?"}
-        U4["Replace obj.Data with merged copy<br/>obj.Version++<br/>obj.UpdatedAt = now"]
-        U5["Return updated SessionObject"]
-        UF["Return null (failure)"]
-
-        U1 --> U2
-        U2 -->|No| UF
-        U2 -->|Yes| U4 --> U5
-    end
-
-    subgraph "UpdateObjects (batch, ownership enforced in service)"
-        B1["UpdateObjects(sessionId, ownerMemberId, updates)"]
-        B2{"For each update:<br/>object exists AND<br/>OwnerMemberId == ownerMemberId?"}
-        B3["Merge data, Version++,<br/>UpdatedAt = now"]
-        B4["Skip (continue)"]
-        B5["Return ONLY successfully<br/>updated objects"]
-
-        B1 --> B2
-        B2 -->|Yes| B3 --> B5
-        B2 -->|No| B4 --> B5
-    end
-
-    subgraph "DeleteObject (ownership enforced in service)"
-        D1["DeleteObject(sessionId, objectId, ownerMemberId)"]
-        D2{"Object exists AND<br/>owned by ownerMemberId?"}
-        D3["TryRemove from session.Objects<br/>Return deleted SessionObject"]
-        D4["Return null (no-op)"]
-
-        D1 --> D2
-        D2 -->|Yes| D3
-        D2 -->|No| D4
-    end
-
-    subgraph "ReplaceObject (atomic delete + create)"
-        R1["ReplaceObject(sessionId, deleteObjectId,<br/>ownerMemberId, replacements[])"]
-        R2{"Session active AND<br/>delete target owned by current caller?<br/>All child scopes and explicit owners valid?"}
-        R3["Delete target,<br/>create each replacement<br/>(Version=1, owner = caller or override)"]
-        R4["Return created list"]
-        R5["Return null (no changes applied)"]
-
-        R1 --> R2
-        R2 -->|Yes| R3 --> R4
-        R2 -->|No| R5
-    end
-```
-
-## SessionService: Member Departure & Ownership Redistribution
-
-`HandleObjectDeparture` is a private helper of `SessionService`, called inside
-`LeaveSession` and `EvictMemberInternal` while `session.SyncRoot` is held. The
-results (`DeletedObjectIds`, `MigratedObjects`) are bundled into
-`LeaveSessionResult` / `EvictionInfo` so the hub can broadcast a single
-`OnMemberLeft` event.
-
-```mermaid
-flowchart TB
-    HD["HandleObjectDeparture<br/>(session, departingMemberId,<br/>remainingMemberIds[], distribute)"]
-    ITER["Iterate session.Objects<br/>where OwnerMemberId == departingMemberId"]
-
-    subgraph "Per Object Decision"
-        CHK{"Object Scope?"}
-
-        subgraph "Member-Scoped (Ship, Bullet)"
-            DEL["TryRemove from session.Objects<br/>Add Id to deletedIds"]
-        end
-
-        subgraph "Session-Scoped (Asteroid, GameState)"
-            REM{"remainingMembers > 0?"}
-            DIST{"distribute<br/>AND members > 1?"}
-            RR["Round-robin:<br/>newOwner = remaining[index % count]<br/>index++"]
-            FIRST["First member:<br/>newOwner = remaining[0]"]
-            ASSIGN["obj.OwnerMemberId = newOwner<br/>Replace obj.Data (copy-on-write)<br/>obj.Version++; obj.UpdatedAt = now<br/>Add ObjectMigration(id, newOwner, newVersion)"]
-            ORPHAN["Object stays with departing owner-id<br/>Adopted on next JoinSession via<br/>AdoptOrphanedObjects"]
-        end
-    end
-
-    RES["Return (deletedIds[], migratedObjects[])"]
-
-    HD --> ITER --> CHK
-    CHK -->|Member| DEL
-    CHK -->|Session| REM
-    REM -->|No| ORPHAN
-    REM -->|Yes| DIST
-    DIST -->|Yes| RR --> ASSIGN
-    DIST -->|No| FIRST --> ASSIGN
-    DEL --> RES
-    ASSIGN --> RES
-    ORPHAN --> RES
-```
-
-### Round-Robin Example (3 players, Player B leaves)
-
-```mermaid
-flowchart LR
-    subgraph "Before Departure"
-        B_A1["🪨 Asteroid 1<br/>Owner: B"]
-        B_A2["🪨 Asteroid 2<br/>Owner: B"]
-        B_A3["🪨 Asteroid 3<br/>Owner: B"]
-        B_GS["📊 GameState<br/>Owner: B"]
-        B_S["🚀 B's Ship<br/>Owner: B (Member-scoped)"]
-    end
-
-    subgraph "After Departure (remaining: [A, C])"
-        A_A1["🪨 Asteroid 1<br/>Owner: A (index 0 % 2)"]
-        A_A2["🪨 Asteroid 2<br/>Owner: C (index 1 % 2)"]
-        A_A3["🪨 Asteroid 3<br/>Owner: A (index 2 % 2)"]
-        A_GS["📊 GameState<br/>Owner: C (index 3 % 2)"]
-        A_S["🚀 B's Ship<br/>DELETED"]
-    end
-
-    B_A1 -.->|migrated| A_A1
-    B_A2 -.->|migrated| A_A2
-    B_A3 -.->|migrated| A_A3
-    B_GS -.->|migrated| A_GS
-    B_S -.->|deleted| A_S
-```
-
-## SessionHub: Method Signatures & Broadcast Patterns
-
-`SessionService` convenience constructors delegate to its configured constructor
-using `SessionSettings` defaults. `ObjectService` depends only on the session
-service. Hubs and cleanup require an explicitly supplied
-`ISessionOperationCoordinator`; production DI shares one singleton rather than
-allowing either consumer to create a private fallback. Backend fixtures use
-`TestServiceFactory` for defaults and share the coordinator across collaborating
-hubs and cleanup services. Coordination across awaits does not replace session
-locks.
-
-```mermaid
-flowchart TB
-    subgraph "Hub Methods → Broadcast Targets"
-        direction TB
-        CREATE["CreateSession(metadata?)<br/>→ Add to AllClients (in OnConnectedAsync) + SessionGroup<br/>→ Broadcast: OnSessionsChanged to AllClients<br/>→ Response: sessionId, name, memberId, role, metadata"]
-        JOIN["JoinSession(sessionId, evictMemberId?)<br/>→ If evictMemberId: EvictMemberInternal + broadcast OnMemberLeft<br/>  to existing group BEFORE adding new member<br/>→ Add to SessionGroup FIRST (so concurrent broadcasts<br/>  reach the joiner; client dedups vs snapshot by Version)<br/>→ Snapshot members + objects<br/>→ Broadcast: OnMemberJoined to OthersInGroup<br/>→ Response: memberId, role, members[], objects[], metadata"]
-        LEAVE["LeaveSession()<br/>→ Atomic SessionService.LeaveSession (promotion + object cleanup)<br/>→ Remove from SessionGroup<br/>→ Broadcast: OnMemberLeft to Group (all remaining)<br/>→ Broadcast: OnSessionsChanged to AllClients"]
-        GAS["GetActiveSessions()<br/>→ No broadcast (read-only)<br/>→ Response: ActiveSessionsResponse"]
-        CO["CreateObject(data, scope, ownerMemberId?)<br/>→ Broadcast: OnObjectCreated to OthersInGroup<br/>→ Response: objectInfo + memberSequence"]
-        UO["UpdateObjects(updates[], senderSeq,<br/>clientTimestamp, senderSendIntervalMs)<br/>→ ObjectService filters to caller-owned objects atomically<br/>→ Broadcast: OnObjectsUpdated to OthersInGroup<br/>→ Response: versions{} + memberSequence + serverTimestamp"]
-        DO["DeleteObject(objectId)<br/>→ ObjectService enforces ownership atomically<br/>→ Broadcast: OnObjectDeleted to OthersInGroup<br/>→ Response: success + memberSequence"]
-        RO["ReplaceObject(deleteId, replacements[],<br/>scope, ownerMemberId?)<br/>→ ObjectService atomic delete + create (ownership enforced)<br/>→ Broadcast: OnObjectReplaced to OthersInGroup<br/>→ Response: children, memberSequence, validAt"]
-        GS["GetSessionState()<br/>→ No broadcast (read-only)<br/>→ Response: full snapshot (members, objects, sequences)"]
-    end
-```
-
-## SessionHub: UpdateObjects Detail
-
-```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant HUB as SessionHub
-    participant OS as ObjectService
-    participant OTH as Other Members
-
-    C->>HUB: UpdateObjects(updates[], senderSeq,<br/>clientTimestamp, senderSendIntervalMs)
-    HUB->>HUB: GetMemberByConnectionId(connectionId)
-    HUB->>HUB: Filter updates: only objects where<br/>obj.OwnerMemberId == caller.Id
-    HUB->>OS: UpdateObjects(sessionId, authorizedUpdates)
-    OS-->>HUB: List of successfully updated objects<br/>(partial success — unknown/unowned objects skipped)
-    HUB->>HUB: memberSequence = Interlocked.Increment(member.EventSequence)
-    HUB->>HUB: serverTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-
-    par Broadcast to others
-        HUB->>OTH: OnObjectsUpdated(<br/>  updateInfos[{Id, Data, Version}],<br/>  member.Id,<br/>  senderSequence,<br/>  memberSequence,<br/>  serverTimestamp,<br/>  clientTimestamp,<br/>  senderSendIntervalMs)
-    and Response to caller
-        HUB-->>C: UpdateObjectsResponse(<br/>  versions: long[] positional, 0 = not applied,<br/>  memberSequence,<br/>  serverTimestamp)
-    end
-
-    Note over C: clientTimestamp echoed back in broadcast<br/>→ null for others (RTT discriminator)<br/>→ original value in response
-```
-
-## SessionHub: Leave & Disconnect Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Leaving Member
-    participant HUB as SessionHub
-    participant SS as SessionService
-    participant REM as Remaining Members
-    participant ALL as AllClients
-
-    C->>HUB: LeaveSession() or OnDisconnectedAsync()
-    HUB->>SS: LeaveSession(connectionId)
-    Note over SS: Atomic under session.SyncRoot:<br/>• Remove from 3 dictionaries<br/>• Promote oldest remaining if Server left<br/>• HandleObjectDeparture: delete Member-scoped,<br/>  migrate Session-scoped (round-robin)<br/>• If now empty: set LastMemberLeftAt<br/>  (deferred destroy by SessionCleanupService)
-    SS-->>HUB: LeaveSessionResult { sessionId, sessionName,<br/>memberId, sessionDestroyed=false, promotedMember?,<br/>remainingMemberIds, deletedObjectIds, migratedObjects }
-
-    HUB->>HUB: RemoveFromGroupAsync(sessionGroup)
-
-    HUB->>REM: OnMemberLeft(MemberLeftInfo {<br/>  memberId,<br/>  promotedMemberId?,<br/>  promotedRole?,<br/>  deletedObjectIds[],<br/>  migratedObjects[{objectId, newOwnerId, newVersion}]<br/>})
-    HUB->>ALL: OnSessionsChanged
-```
-
-## SignalR Group Management
-
-```mermaid
-flowchart TB
-    subgraph "Groups"
-        AC["AllClients<br/>(all connected browsers)"]
-        SG["SessionGroup<br/>(session.Id.ToString())<br/>per-session"]
-    end
-
-    subgraph "Lifecycle"
-        CONN["OnConnectedAsync()"] -->|"AddToGroupAsync"| AC
-        CRS["CreateSession()"] -->|"AddToGroupAsync"| SG
-        JN["JoinSession()"] -->|"AddToGroupAsync"| SG
-        LV["LeaveSession()"] -->|"RemoveFromGroupAsync"| SG
-        DC["OnDisconnectedAsync()"] -->|"calls LeaveSession()"| LV
-    end
-
-    subgraph "Broadcast Targets"
-        ALL_BC["OnSessionsChanged<br/>→ AllClients"]
-        OTHERS["OnObjectCreated/Updated/Deleted/Replaced<br/>→ OthersInGroup (sender excluded)"]
-        GROUP["OnMemberLeft<br/>→ Group (ALL in session)"]
-    end
-```
-
-## SessionHub: ReplaceObject (Atomic Delete + Create)
-
-```mermaid
-sequenceDiagram
-    participant C as Caller (asteroid owner)
-    participant HUB as SessionHub
-    participant OS as ObjectService
-    participant ALL as Other Session Members
-
-    Note over C: Asteroid split — need atomic delete + create children
-    C->>HUB: ReplaceObject(deleteId, [{child1Data}, {child2Data}],<br/>scope="Session", ownerMemberId=null)
-
-    HUB->>OS: ReplaceObject(sessionId, deleteId, callerId, replacements)
-    Note over OS: Single critical section under session.SyncRoot:<br/>• Verify session active + caller owns delete target<br/>• Remove delete target<br/>• Create each replacement (Version=1, owner=caller or override)<br/>• Either fully committed or no changes applied
-
-    OS-->>HUB: createdObjects[] (or null on failure)
-
-    HUB->>HUB: memberSequence = Interlocked.Increment
-
-    HUB->>ALL: OnObjectReplaced({<br/>  deletedObjectId,<br/>  createdObjects[{Id, Owner, Scope, Data, Version}]<br/>}, memberId, memberSequence, serverTimestamp, validAt)
-
-    Note over ALL: Only other members receive the broadcast
-
-    HUB-->>C: Response: [createdInfos[], memberSequence, validAt]
-    Note over C: Shared replacement application installs children<br/>and removes parent before lifecycle callbacks;<br/>public API still returns createdInfos[]
-```
-
-SessionClient's optional seventh replacement argument supplies the result
-handler; ObjectSync uses it to enforce its replication epoch before applying the
-response. Newer updates, migrations, tombstones and reconciled children are not
-rewound or re-anchored by a late result. If the invocation fails after the server
-may have committed, ObjectSync requests reconciliation rather than retaining a
-ghost parent indefinitely.
-
-## Session & Member Model
+ObjectSync's type index avoids scanning every object for each type query.
+`getObjectsByTypeSnapshot` transfers a membership array, not deep-cloned
+records. Runtime passes preserve callback-mutation safety and canonical record
+identity; optional legacy stores are snapshotted defensively.
+
+### Portability boundary
+
+JavaScript callbacks, Maps, DOM APIs, and object identity are implementation
+details, not the protocol-neutral contract. A future native client must reproduce
+record/version/epoch rules, role transitions, removal reasons, explicit clock
+domains, bounded prediction kernels, and send decisions independent of its
+transport scheduler.
+
+Use the existing JS/C# codec fixtures and policy/runtime vectors as the starting
+point. Hidden reads of `performance.now()` must not enter portable kernels.
+Packaging, code generation, a full ECS, distributed authority, and another
+session/reconnect coordinator remain deferred until a second client needs them.
+
+## Discovery and session lifecycle
+
+### Regional discovery
+
+[RegionService](AstervoidsWeb/wwwroot/js/region-service.js) prefers injected
+`region-bootstrap.js` configuration on the static entrypoint, otherwise
+`GET /api/regions`. An empty manifest synthesizes the same-origin region.
+Picker-facing names come from deployment configuration, never hardcoded labels.
+
+The picker measures regional `/api/ping` RTT in bursts, excludes warm-up and
+initial cold-start contamination, and exposes an EMA and assessment confidence.
+Best-region selection uses hysteresis. Stable successful bursts back off;
+failure, meaningful latency change, visibility, and network changes cause
+reassessment. Create waits for a usable assessed route; join always follows the
+chosen session's `regionId`, not whichever region currently has the lowest RTT.
+
+[MultiRegionSessions](AstervoidsWeb/wwwroot/js/multi-region-sessions.js) merges
+fresh `/api/sessions` slices. Refreshes are single-flight per region, with one
+coalesced follow-up for hints received in flight. A failed region loses its stale
+slice without blocking healthy regions. Push hints coalesce for 250 ms; a
+30-second visible-picker poll is the fallback.
+
+SpectatorClient opens read-only hub connections to other regions, excluding the
+active SessionClient host. `OnSessionsChanged` is only a refetch hint; watchers
+never invoke a session join or take a member slot. Active-connection hints refresh
+only that connection's region. Explicit refreshes can cover every region.
+
+### Two meanings of spectator
+
+| Kind | Membership | Lifetime |
+| --- | --- | --- |
+| Regional picker watcher | No session membership, no game slot | Picker visibility only |
+| Joined lobby spectator | A real member, counts toward capacity, can inherit session-scoped objects | Joined session, even before creating a ship |
+
+Entering gameplay closes extra regional watchers and stops picker assessment.
+A hidden picker stops probes, polling, and watchers so it does not intentionally
+keep every region warm. Delayed bootstrap or fetch completions cannot restart
+picker work after teardown. Returning to the picker restarts assessment.
+The joined game's clock and hidden-tab simulation have a separate lifecycle.
+
+### Entry and recovery
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Lobby: Page load
-    Lobby --> Creating: CreateSession(metadata?)
-    Lobby --> Joining: JoinSession(sessionId, evictMemberId?)
-    Creating --> InSession: Response (memberId, sessionId, role=Server, metadata)
-    Joining --> InSession: Response (memberId, sessionId, role, members[], objects[], metadata)
-    InSession --> Lobby: LeaveSession()
-    InSession --> InSession: Server leaves → oldest remaining member promoted (deterministic)
-
-    state InSession {
-        [*] --> Playing
-        Playing --> Playing: Game loop
+    state "Session picker" as Picker
+    state "Joined session" as JoinedSession
+    state "Recovering membership" as Recovering
+    state JoinedSession {
+        state "Lobby spectator" as Spectator
+        state "Playing with own ship" as Playing
+        state "Terminal view" as TerminalView
+        Spectator --> Playing: Enter the round
+        Spectator --> TerminalView: Round is terminal
+        Playing --> TerminalView: Shared lives reach zero
     }
+    [*] --> Picker
+    Picker --> JoinedSession: Create or join
+    JoinedSession --> Recovering: Connection lost
+    Recovering --> JoinedSession: Restore snapshot and prior role
+    Recovering --> Picker: Session gone or retries exhausted
+    JoinedSession --> Picker: Leave
 ```
 
-```mermaid
-graph LR
-    subgraph "Session (max 6 concurrent)"
-        direction TB
-        S["Session<br/>Id: Guid<br/>Name: string (from ISessionNameGenerator)<br/>Metadata: Dictionary&lt;string, object?&gt;<br/>Version: long<br/>Max members: 4"]
-        M1["Member (Server)<br/>Id: Guid<br/>Role: Server<br/>ConnectionId: string<br/>EventSequence: long<br/>JoinedAt: DateTime"]
-        M2["Member (Client)<br/>Id: Guid<br/>Role: Client<br/>ConnectionId: string<br/>EventSequence: long<br/>JoinedAt: DateTime"]
-        M3["Member (Client)<br/>...up to 4 total"]
-        S --- M1
-        S --- M2
-        S --- M3
-    end
-```
+Initial entry is through the lobby. Recovery restores the prior player or
+spectator role, unless the recovered round is terminal, in which case entry is
+view-only. Any joined role can disconnect or leave.
 
-## Object Model & Ownership
+SessionClient serializes session transitions and fences asynchronous work with
+connection identity and session epochs. Create and join have distinct RPCs and
+snapshots. Membership and object broadcasts can overtake their response, so
+SessionClient queues raw arguments together until the response installs the
+creator's schema registry. Snapshot decoding first teaches GUID/handle mappings;
+shared entry completion then installs member and public participant identity,
+seeds snapshot objects, and replays queued handlers and callbacks in receive order.
 
-```mermaid
-graph TB
-    subgraph "Object Scopes"
-        direction TB
-        MS["Member-Scoped<br/>Deleted when owner leaves"]
-        SS["Session-Scoped<br/>Ownership migrates on departure<br/>Round-robin to remaining members"]
-    end
+Snapshot seeds use ordinary object registration with a null sender, sequence
+zero, and the snapshot object's `validAt`. Ownership migrations therefore see
+the snapshot owner before a later delta advances its version. Final
+`onSessionCreated`/`onSessionJoined` callbacks run **after** replay;
+ObjectSync's version-aware backfill preserves newer data/owners and deletion
+tombstones rather than overwriting them with the older snapshot.
 
-    subgraph "Object Types"
-        SHIP["🚀 Ship<br/>Scope: Member<br/>Owner: creating player<br/>One per member"]
-        BULLET["• Bullet<br/>Scope: Member<br/>Owner: firing player<br/>Lifetime: 60 frames"]
-        AST["🪨 Asteroid<br/>Scope: Session<br/>Owner: creator (migrates)<br/>Splitting via ReplaceObject"]
-        GS["📊 GameState<br/>Scope: Session<br/>Owner: authority player<br/>Score, lives, hitCounts"]
-    end
+The queue belongs to one connection/session epoch and entry RPC. Failed,
+cancelled, rejected, expired, or superseded entry discards it; callback-triggered
+resets stop seeding/replay immediately. Invalid queued payloads fail entry through
+the logged error/`onError` path and invalidate already replayed state, not just
+the remaining queue. Session-list signals and expiration are not deferred.
 
-    SHIP --> MS
-    BULLET --> MS
-    AST --> SS
-    GS --> SS
-```
+The hub entry contracts are distinct:
 
-```mermaid
-graph TB
-    subgraph "SessionObject"
-        OBJ["Id: Guid<br/>Type: string<br/>Scope: Member | Session<br/>CreatorMemberId: Guid (immutable)<br/>OwnerMemberId: Guid (mutable)<br/>Version: long (change counter)<br/>Data: Dictionary&lt;string, object?&gt;"]
-    end
+| Operation | Contract |
+| --- | --- |
+| `CreateSession(metadata)` | Creates a session and its first `Server` member |
+| `JoinSession(sessionId)` | Joins without permission to evict an existing member |
+| `RejoinSession(sessionId, staleMemberId, reconnectToken)` | Proves authority over a stale identity before eviction/re-registration |
+| `LeaveSession()` | Leaves through the atomic departure path |
 
-    subgraph "Member Departure"
-        LEAVE["Member leaves"]
-        DEL["Delete all Member-scoped<br/>objects owned by departing member<br/>(ships, bullets)"]
-        MIG["Migrate all Session-scoped<br/>objects to remaining members<br/>(asteroids, gamestate)<br/>Version incremented"]
-        BC["Broadcast OnMemberLeft<br/>{memberId, deletedObjects[],<br/>migratedObjects[],<br/>promotedMemberId?}"]
-    end
+The public client `joinSession(sessionId)` chooses join or proven rejoin from
+its retained reconnect identity. A caller-supplied member ID alone is not a
+rejoin credential. Reconnect tokens are returned to their caller, not published
+in member lists. Exact signatures and response fields live in
+[SessionHub](AstervoidsWeb/Hubs/SessionHub.cs) and
+[HubDtos](AstervoidsWeb/Hubs/HubDtos.cs).
 
-    LEAVE --> DEL
-    LEAVE --> MIG
-    DEL --> BC
-    MIG --> BC
-```
+### Reconnect is not rejoin
 
-## Async Send/Receive & Sequencing
+Transport reconnect emits
+`onSessionStateUncertain(reason, epoch)` before `onConnected`. ObjectSync
+subscribes and starts epoch-guarded reconciliation without delaying the
+transport-ready callback. SessionClient does not depend on a global ObjectSync.
+
+Unfreezing waits for `onReconciliationComplete` or completed full session entry,
+not merely `onConnected`.
+
+If `GetSessionState` no longer recognizes the member, `onReconciliationFailed`
+drives game-owned auto-rejoin. An ambiguous leave failure also reports uncertain
+state while retaining recoverable identity. Voluntary leave establishes its
+synchronous guard before asynchronous cleanup so it cannot trigger unwanted
+rejoin.
+
+The full rejoin path freezes gameplay, neutralizes controls/audio, and restores
+the same region. It suspends reconciliation with a counter, resets old game state
+before the new snapshot is installed, replaces obsolete connections with bounded
+stop waits, and resumes reconciliation on completion. Hidden tabs defer full
+rejoin until visible. A long background interval can force rejoin even if a
+connection appeared healthy.
+
+Rejoin can assign a new member ID and recreate member-scoped objects. In
+identity-capable sessions, a resolved public player identity is pinned before
+snapshot callbacks and remains fixed for that membership. Guests and older
+schema sessions use the bounded per-tab, per-session participant mapping that
+survives reload/rejoin. Neither participant identity is the reconnect credential.
+
+Restore the role the client actually held, based on whether it owned a ship.
+A lobby spectator can read `playing` from GameState without being a player.
+Using that state alone would incorrectly mint a ship on recovery.
+Entry/reentry adopts shared lives and watched state from the canonical GameState
+record: a spectator may already have consumed its current version, so waiting
+for another replica ingest would leave reset defaults visible.
+
+## Durable player identity
+
+### Identity, browser binding, and invitation
+
+[PlayerIdentity](AstervoidsWeb/wwwroot/js/player-identity.js) owns the identity
+HTTP/storage boundary; inline `index.html` owns consent, naming, invitation
+sharing, and gameplay gating. Identity is independent of a session member, ship,
+or GameState record.
+
+| Value | Meaning and lifetime |
+| --- | --- |
+| Public identity | Backend-generated GUID and immutable, case-preserved `[A-Za-z0-9_-]{1,8}` tag; tags are not globally unique |
+| Browser credential | Random 256-bit bearer capability in `localStorage`, scoped to one top-level origin and browser profile/storage context |
+| Browser binding | One credential-hash row pointing to zero or one public identity, with an ETag and monotonic revision |
+| Invitation | Random 256-bit base64url capability; identifies a pending player until first naming, then remains that identity's access/recovery link |
+| Session participant | Public identity pinned when the session schema supports it, otherwise the existing session-local fallback; not an authentication proof |
+
+An identity can have any number of independent browser bindings, not a growing
+binding array. Self invitations return the original capability. Possession of
+an active link authorizes assuming that identity; the confirmation dialog is not
+a second authentication factor. The current protocol has no automatic invitation
+expiry or rotation. Changing origin or clearing storage requires link recovery;
+identity storage is not a persistent high-score service.
+
+Credential creation and requests use Web Locks. Unavailable storage/locking does
+not silently mint a temporary per-tab credential. Known bindings activate without
+a naming prompt. `Identity:PromptOnRoot=true` prompts unbound root visitors;
+false leaves them anonymous, while invitation controls still permit explicit
+naming. Same-identity invitations return silently to `/`; different identities
+require Accept/Ignore, and first naming fixes the permanent tag.
+
+### HTTP and consistency contract
+
+The API authority is the regional app's own origin, or the first configured
+region in the static entrypoint's bootstrap manifest. URL parameters cannot
+select an identity authority. All identity operations are JSON POSTs under
+`/api/identity`: `resolve`, `root`, `invites`, `invites/accept`, and `invites/self`.
+The browser sends its credential only in `X-Astervoids-Browser`; requests omit
+cookies, disable caching/referrers, and reject redirects.
+
+Invitations use the current site's origin and `#invite=...`. The early-loaded
+identity script captures and scrubs the fragment before normal startup.
+Accepted or ignored invitations navigate to `/`. Neither capabilities nor
+private deployment hostnames enter game payloads, SignalR URLs, public logs, or
+committed configuration.
+
+Consent captures expected browser identity/binding ETag and invitation ETag.
+Competing first claims or rebindings conflict, re-resolve, and require a new
+decision. Mutations carry request IDs with body-bound idempotent receipts;
+an uncertain response retains the exact pending request for retry. Cancellation
+is not rollback, and a receipt superseded by a newer binding cannot restore the
+old one. Public ETags/revisions describe browser decisions; native storage ETags
+separately enforce compare-and-swap transactions.
+
+Foreground/focus and storage notifications re-resolve bindings. Requests
+coalesce without losing a refresh received while another action is pending.
+During verification/rebinding, `game.identityChanging` pauses foreground and
+hidden gameplay. A changed or unverifiable identity cancels pending picker
+entry/rejoin, invalidates membership, releases controls/audio, and returns to
+the menu before new play. Verification failure requires Retry or explicit guest
+play, never continued publication under an unverified old binding.
+
+### Backend storage and HTTP isolation
+
+[PlayerIdentityService](AstervoidsWeb/Identity/PlayerIdentityService.cs) uses
+[IIdentityStore](AstervoidsWeb/Identity/IdentityStore.cs) independently of session
+locks and the session operation coordinator. Rows share one transaction partition:
+`I:` identity, `V:` invitation-hash lookup, `B:` browser-hash binding, and `O:`
+request receipt. First naming, binding replacement, and their receipt commit
+atomically. Identity rows retain the original invitation capability for self
+recovery; friend-creation receipts retain the private response for exact retries.
+The backend stores the browser bearer credential only as a hash.
+
+- Development uses [FileIdentityStore](AstervoidsWeb/Identity/FileIdentityStore.cs):
+  a stable exclusive lock and same-directory atomic file replacement. Corrupt
+  storage is unavailable, never silently reset. File storage outside development
+  requires explicit opt-in and is not the Azure deployment path.
+- Azure uses [AzureTableIdentityStore](AstervoidsWeb/Identity/AzureTableIdentityStore.cs)
+  with `DefaultAzureCredential`, preprovisioned tables, and native conditional
+  transactions. Missing tables, permission failures, and outages do not fall
+  back to files or memory. Regional apps share the environment's primary
+  endpoint, not independent writable replicas.
+
+[IdentityEndpoints](AstervoidsWeb/Identity/IdentityEndpoints.cs) and
+[IdentityHosting](AstervoidsWeb/Identity/IdentityHosting.cs) bound bodies and JSON
+shape, validate supplied origins exactly, and isolate identity CORS from the
+permissive unconfigured regional fallback. Root/invite/accept mutations have
+per-instance browser-hash and connection-IP rate limits with `Retry-After`.
+Responses, including failures, are uncompressed and `no-store`; error responses
+and SDK diagnostics must not expose capabilities or storage details. Identity
+availability is separate from `/api/ping` and app startup readiness.
+
+## Replication contracts
+
+### Mutation pipeline
 
 ```mermaid
 sequenceDiagram
-    participant GL as Game Loop (60fps)
+    participant Game as Game adapter
     participant OS as ObjectSync
     participant SC as SessionClient
-    participant HUB as SessionHub
-    participant R as Remote Client
-
-    Note over GL,OS: Tick/Flush cycle (send rate ≠ frame rate)
-    loop Every frame
-        GL->>OS: tick(frameTimeSec)
-        OS->>OS: Accumulate elapsed seconds, capped at nominalFrameTime
-        Note over OS: Keep pending immediate-update urgency<br/>until a flush can service it
-    end
-
-    Note over OS: Interval elapsed or urgent update → flush if idle
-    OS->>OS: Compute deltas (only changed fields)
-    OS->>OS: Check inFlightCount > 0? → skip (backpressure)
-    OS->>OS: inFlightCount++, senderSequence++
-    OS->>SC: updateObjects(updates, senderSeq, senderSendIntervalMs)
-    SC->>HUB: Invoke UpdateObjects(updates, senderSeq, senderSendIntervalMs, clientValidAt?)
-
-    Note over HUB: Server processes batch atomically<br/>Ownership/lifecycle checks; patches merge in request order<br/>memberSequence = Interlocked.Increment<br/>validAt = clamp(clientValidAt, ServerTimestamp ± 2s) ?? ServerTimestamp
-
-    par Response to sender
-        HUB-->>SC: Response {versions{}, memberSequence, serverTimestamp}
-        SC-->>OS: Apply versions, track own memberSequence
-        OS-->>OS: inFlightCount--
-        Note over OS: RTT = responseTimestamp - clientTimestamp (locally captured)
-    and Broadcast to others
-        HUB->>R: OnObjectsUpdated(objects[], senderMemberId,<br/>senderSeq, memberSeq, serverTimestamp,<br/>senderSendIntervalMs, validAt)
-        Note over R: validAt is the unified interpolation axis:<br/>receiver converts validAt → perf.now via<br/>validAt - offsetMs + wallToPerfDelta<br/>and stores as snapshot.time
-    end
+    participant Hub as Regional hub
+    participant Peers as Other members
+    Game->>OS: Queue eligible fields
+    OS->>OS: Coalesce and delta-encode
+    OS->>SC: Flush one batch
+    SC->>Hub: UpdateObjects
+    Hub->>Hub: Authorize and merge
+    Hub->>Peers: Accepted deltas
+    Hub-->>SC: Version ACK
+    SC-->>OS: Normalized result
+    OS->>OS: Confirm accepted fields
+    Note over Peers: Store records first
+    Note over Peers: Reconcile at game pivots
 ```
 
-## Sequence Gap Detection & Reconciliation
+The backend merges owner-authorized patches into current records in request
+order. Disjoint fields accumulate; the last accepted write to a field wins.
+There is **no expected-version/CAS input precondition**. Server-assigned versions
+order replicas and acknowledgements; they are not optimistic-concurrency tokens
+submitted with a patch.
+
+Broadcasts normally target `OthersInGroup`; the sender uses its RPC response.
+Do not assume network arrival order between the response and broadcasts.
+Wire layouts are defined once in [Wire protocol](#wire-protocol), not in every
+sequence diagram.
+
+### Mutation and failure semantics
+
+| Operation | Local behavior and confirmation | Failure/race obligation |
+| --- | --- | --- |
+| Create | Response-first, server assigns ID/handle/version | If no longer needed when the response arrives, clean up the created orphan |
+| Update | Local canonical write plus coalesced outbound fields | Only accepted response versions advance the confirmed delta baseline |
+| Delete | Local-first, remove pending updates and track `pendingDeletes` | A racing snapshot must not resurrect an in-flight local delete |
+| Replace | Atomic backend parent removal and child creation, response-first installation | Apply sender response through the same epoch-guarded path as broadcasts |
+| Object event | Immediate local dispatch, then owner-authorized relay | No persistence, replay, or recovery of the occurrence itself |
+
+Replacement installs the children and removes the parent before lifecycle
+callbacks. Late replies must not rewind newer updates, migrations, tombstones,
+or reconciled children. An invocation failure may occur after backend commit;
+ambiguous replacement failure requests reconciliation rather than retaining a
+ghost parent. A valid empty replacement list intentionally deletes the parent.
+
+On member departure, the game first captures ship calculation inputs, then applies
+`ObjectSync.handleOwnershipMigration(info.migratedObjects)` and
+`handleMemberDeparture(info.deletedObjectIds)` before deciding who now owns
+GameState. The new owner adopts canonical GameState and calculates from the
+pre-cleanup ships so departed participants and their last accepted score counters
+are not lost. Use the server's new versions, not blind local increments.
+
+### Delta baselines and retries
+
+ObjectSync retains the latest queued value per field and compares it to
+server-confirmed `lastSentData`. Ordinary values retain shallow comparison
+semantics; nested mutable values require appropriate replacement references.
+Byte arrays compare by content and are copied when capturing sent baselines.
+Repacking an unchanged counter map must not force another update.
+
+**A failed flush does not automatically requeue its sent entries.** The
+confirmed baseline remains old, so unconfirmed fields are included when a
+producer next enqueues that object. Critical pending-hit claims, ship scores, and
+terminal targets explicitly retry until confirmed. This distinction matters when a
+send-on-change producer otherwise has nothing new to send.
+
+The periodic full-data bypass is counted in delta-enabled flushes, not render
+frames. It is not an independent timer or a blanket retransmission service.
+`isDataConfirmed` checks confirmed fields, not optimistic local state.
+
+Field aliasing applies after delta selection only to schema-0 map payloads and
+object events. Positional schemas select slots using readable names and transmit
+no field names; applying `fieldMap` there would erase matching fields.
+
+### Sequencing and snapshot recovery
+
+Each member's accepted operations carry a sequence. A gap from another member
+requests `GetSessionState`; own-member gaps are not treated the same way because
+response and broadcast channels can race. The snapshot includes members,
+objects, member sequences, and individual object `validAt` values.
+
+Reconciliation adds missing records, updates older versions, removes ghosts,
+and resets sequence knowledge without undoing newer work received during the
+snapshot round trip. Session epochs, per-object revisions, pending deletes, and
+parked ownership migrations guard that merge.
+
+Delete tombstones and migrations parked for not-yet-registered IDs stay separate
+from the live object map. Do not collapse them into a single collection.
+Unknown-handle updates are parked at the transport boundary until identity
+metadata arrives; they cannot invent a full object from an integer handle.
+
+### Durable records and transient events
+
+Object records are the client recovery contract. Object events are notifications,
+not an event log. Sequence-gap recovery can restore a record, but cannot recreate
+an occurrence that left no durable state.
+
+State that must survive reconnect or late join belongs in adapter serialization.
+Use events where a missed occurrence is acceptable, or pair an event with
+recoverable record state. New fields still require a schema/default strategy and
+JS/C# compatibility coverage; a new event is not a shortcut around that review.
+
+Ship score/hit notifications and same-owner impact cues use the transient channel.
+Rare ship score changes also persist through `syncLocalShipScore`, outside the
+motion send gate; ordinary hit-count notifications remain event-only. Shared
+totals and history become recoverable when the GameState owner publishes the
+corresponding ledgers. Local event dispatch is neither durable score storage
+nor a backend acknowledgement.
+
+## Timing, simulation and presentation
+
+Sources: [game loop and adapters](AstervoidsWeb/wwwroot/index.html),
+[clock](AstervoidsWeb/wwwroot/js/replication-clock.js),
+[send policies](AstervoidsWeb/wwwroot/js/replication-send-policy.js),
+[presentation policies](AstervoidsWeb/wwwroot/js/replication-presentation.js),
+[shared configuration](AstervoidsWeb/wwwroot/js/game-config.js).
+
+### Foreground execution order
 
 ```mermaid
 flowchart TB
-    RX["Receive event from member X<br/>with memberSequence N"]
-    CHK{"lastSeq[X] exists<br/>AND N > lastSeq[X] + 1?"}
-    OK["Update lastSeq[X] = N<br/>Process event normally"]
-    GAP["Sequence gap detected!<br/>Expected lastSeq+1, got N"]
-    RECON["triggerReconciliation()"]
-    FETCH["GetSessionState() from server"]
-    SYNC["Sync local objects:<br/>• Add missing<br/>• Update stale versions<br/>• Remove ghosts<br/>Reset memberSequences from snapshot"]
-
-    RX --> CHK
-    CHK -->|No gap| OK
-    CHK -->|Gap detected| GAP
-    GAP --> RECON
-    RECON --> FETCH
-    FETCH --> SYNC
-
-    NOTE["Note: own-member gaps NOT checked<br/>(response/broadcast channels can race)"]
+    Frame["Animation frame and auxiliary input callbacks"]
+    Tick["ObjectSync.tick with elapsed time"]
+    Policy["Choose bounded owner simulation steps"]
+    subgraph Step["Each selected simulation step"]
+        Input["Capture previous poses and handle controls"]
+        Ship["Own ship, then remote ship reconciliation"]
+        Asteroid["Owned asteroids, then asteroid reconciliation"]
+        Bullet["Own bullets and expiry, then bullet reconciliation"]
+        Collision["Collisions and pending-hit confirmations"]
+        State["Waves, GameState publication and reconciliation"]
+        Input --> Ship --> Asteroid --> Bullet --> Collision --> State
+    end
+    Render["Presentation, temporary local interpolation, draw"]
+    Frame --> Tick --> Policy --> Input
+    State --> Render
+    Policy -->|"No simulation step due"| Render
 ```
 
-## Networking: RTT → TX → BUF Pipeline
+The selected step body may run repeatedly before one render. Outbound tick comes
+first, so it may flush state queued by an earlier simulation step. There is no
+private ObjectSync timer or independent ReplicationRuntime loop.
+Receive pivots are gameplay-visible: moving remote reconciliation across a
+collision check changes the state that check observes.
+Identity verification/rebinding temporarily bypasses this foreground path and
+the hidden interval; it does not introduce another simulation clock.
 
-```mermaid
-flowchart LR
-    subgraph "RTT Estimation"
-        SAMPLE["RTT sample =<br/>responseTimestamp - clientTimestamp<br/>(captured on accepted update-batch echoes)"]
-        EMA["Asymmetric EMA:<br/>spike: α=0.3 (fast up)<br/>decay: α=0.1 (slow down)<br/>rtt += α × (sample - rtt)"]
-        SAMPLE --> EMA
-    end
+The default deterministic policy runs nominal 60 Hz owner steps, at most five
+per foreground frame, with elapsed accumulation capped at 250 ms. Excess backlog
+is dropped rather than replayed as a catch-up burst. Buffered mode instead uses
+one variable-dt step bounded to three nominal ticks.
 
-    subgraph "TX (Send Rate)"
-        FORMULA["nominalFrameTime =<br/>clamp(rtt/1000,<br/>1/20, 1/1)"]
-        TABLE["RTT 4ms → TX 50ms (20Hz)<br/>RTT 100ms → TX 100ms (10Hz)<br/>RTT 500ms → TX 500ms (2Hz)<br/>RTT 1500ms → TX 1000ms (1Hz)"]
-        FORMULA --- TABLE
-    end
+### Hidden multiplayer is a distinct path
 
-    subgraph "Backpressure"
-        BP["flushInProgress?<br/>→ retain elapsed eligibility and urgency<br/>→ flush on next eligible tick after completion<br/>→ no completion-driven or catch-up bursts"]
-    end
+When the foreground animation loop is suspended, a separate interval pumps
+transport and advances owned objects with bounded dt. Browser throttling can
+reduce it to roughly one callback per second; this is not wall-clock catch-up
+or the deterministic foreground accumulator.
 
-    EMA --> FORMULA
-    EMA --> BP
+The hidden order preserves asteroid and bullet reconciliation **before**
+collision handling and ship reconciliation **after** it. Terminal maintenance
+continues after gameplay stops. Returning after more than five seconds hidden
+can require full rejoin. Do not combine foreground and background orchestration
+merely because they share individual update helpers.
+
+### Coordinates, units and integration
+
+| Quantity | Domain |
+| --- | --- |
+| Position `x/y` | Normalized gameplay viewport |
+| Radius, size, linear velocity | Isotropic reference based on `min(viewport width, height)` |
+| Linear velocity | Reference dimensions per second |
+| Angular velocity and gameplay timers | Nominal 60 Hz ticks |
+| Local scheduling and presentation | Monotonic milliseconds |
+| `validAt` and terminal epochs | Server UTC milliseconds, explicitly converted when sampled locally |
+
+The session fixes aspect ratio and aspect compensation inputs at creation.
+Clients letterbox/pillarbox rather than changing the simulation's space.
+Wrapping waits for the whole object bound to exit; asteroid margins use its true
+vertex bound, not its area-equivalent radius.
+
+Owner integration is game-specific:
+
+- Ships apply turn/angular motion, `0.99^dt` friction, thrust, speed cap,
+  braking, translation/wrap, and timer updates. Braking does not reverse motion.
+  Turn ramp defaults currently make control changes immediate.
+- Normal bullets use muzzle-direction velocity **without adding ship velocity**,
+  wrap, and expire on their simulation lifetime. A crash-generated hidden bullet
+  is different: it carries the ship's contact velocity.
+- Asteroids move ballistically and spin. Owners enforce motion caps before
+  simulation and serialization, including replacement creation.
+
+Defaults and tunable bounds belong to the owning `CONFIG` and
+`GameConfig.DEFAULTS`, not a second exhaustive constants catalog here.
+Session metadata locks mode, seed, schemas, and selected gameplay configuration;
+local URL/debug overrides must not override those shared invariants.
+
+### Send eligibility, cadence and backpressure
+
+Ship-intent and ballistic policies decide whether a state is worth sending.
+Control edges can request an immediate flush; stationary objects still receive
+heartbeat eligibility. Neither implies an immediate network packet.
+
+ObjectSync coalesces fields and allows **one update invocation in flight**.
+Elapsed eligibility and urgency remain pending under backpressure. Completion
+does not create a catch-up burst; a subsequent eligible tick services the queue.
+Elapsed eligibility remains latched if the adaptive interval increases.
+Legacy `minFrameTime` remains accepted/validated but does not invent elapsed time.
+
+The requested send interval is RTT-adaptive, currently bounded from 50 to
+1,000 ms. Actual tick-bound opportunities are:
+
+```text
+achievable interval = ceil(requested interval / tick spacing) * tick spacing
 ```
 
-TX is the shared ObjectSync flush cadence for both simulation modes. It is not
-the same as buffered BUF (render delay), and it is not a packet guarantee:
-game-layer send-on-change gates may queue nothing, while in-flight backpressure
-can coalesce multiple simulation frames into a later batch.
-Once elapsed eligibility is reached, it remains latched across adaptive interval
-increases until serviced. Legacy `minFrameTime` configuration remains accepted
-and validated, but elapsed scheduling never invents time for short/zero ticks.
+The accumulator caps at one interval and resets to zero without carrying surplus
+time. Empty queues or an in-flight invocation can make traffic sparser still.
 
-### Advertised send cadence
+`senderSendIntervalMs` advertises achievable cadence, not the requested interval.
+It is derived on read from smoothed tick spacing, with stall/clamp protection;
+it is never written back into the adaptive request. `getSendRate()` reports the
+request, whereas `getEffectiveSendIntervalMs()` and debug telemetry report the
+claim. An exaggerated rate would make receivers reject genuine packet intervals
+as outliers and under-buffer that owner's objects.
 
-`senderSendIntervalMs` is the cadence a sender claims on every batch. It is the
-**achievable** interval, not the requested TX above: a batch can only be released
-on a game-owned tick and the accumulator does not carry surplus time forward, so
-the real period is `ceil(TX / tickInterval) × tickInterval`. A 10fps client asked
-for 50 ms sends every 100 ms; a backgrounded tab, whose timers the browser clamps
-to ~1 s, sends every ~1 s while still requesting 50 ms.
+### Heartbeats and invulnerability
 
-Advertising the request instead would be a claim the sender cannot keep, and
-receivers act on it. They seed adaptive delay from it before enough lag samples
-exist, size the dead-reckoning prediction window with it, and — most
-consequentially — reject observed packet intervals wider than twice its value as
-outliers. A sender that overstates its rate by more than 2× has *all* of its
-intervals discarded, so the interval variance that feeds steady-state buffering
-never accumulates for the objects it owns. Because session-scoped objects
-concentrate under one owner, a single degraded member can under-buffer a shared
-object set for every other member in the session, while itself seeing nothing
-wrong.
+The 250 ms heartbeat grid is anchored to each document's **local monotonic**
+clock. Quantized deadlines bring objects on one sender onto shared flushes,
+without synchronizing every browser's network bursts. A shared server/wall-clock
+grid would correlate ingress/fan-out, and wall-clock slewing would move deadlines.
 
-`ObjectSync` therefore derives the value from a smoothed estimate of tick
-spacing:
+Grid alignment can make the next heartbeat earlier, never later than an
+unaligned deadline; steady-state cadence remains unchanged. The period must not
+be made per-device or derived from measured FPS. Send policies still read an
+injected clock and leave frame scheduling to ObjectSync.
 
-- **Smoothed, not instantaneous.** Frame jitter would otherwise move the claim
-  every batch, disturbing receivers' gates and a wire field that is otherwise
-  constant and nearly free to compress.
-- **Clamped at 1 s**, per sample and again on the result, so a GC pause or a
-  suspended machine cannot advertise a stall as a cadence and inflate buffering
-  session-wide. The clamp never reduces the claim below the configured request.
-- **Derived on read**, never written back into `nominalFrameTime`, which would
-  couple it to adaptive RTT updates into a feedback loop.
+Ship invulnerability is authoritative in simulation ticks. Reset/respawn and
+expiry advance `invulnerabilityRevision`; ordinary countdown ticks do not.
+The revision is the send gate's transition key, while `invulnerableAt` captures
+server time for receiver countdown/blink presentation. Before clock bootstrap,
+receivers use receipt time; zero authored time falls back to record `validAt`.
 
-Quantization only ever rounds up, so the advertised interval is always ≥ TX and
-this can add buffering but never remove it. `getSendRate()` continues to report
-the request; `getEffectiveSendIntervalMs()` reports the claim, and debug
-telemetry uses the latter so `tx:` matches the wire.
-`AstervoidsWeb/send-interval-advertisement.test.mjs` pins the advertised value to
-the spacing actually achieved across a display-cadence × TX matrix, along with
-the clamp, the smoothing, and the unticked-sender fallback.
+Explicit revisions distinguish respawn teleports from heartbeat corrections,
+including repeated resets to the same duration. Heartbeat captures re-anchor
+simulation-versus-wall-time drift without publishing every countdown tick.
+These meanings stay in the ship adapter/schema, not in generic replication.
 
-### Heartbeat grid alignment
+### Clocks and validAt
 
-Send-on-change gates fall back to a periodic heartbeat so idle objects still
-refresh. That heartbeat deadline is quantized onto a fixed monotonic grid
-(`heartbeatDue` in `replication-send-policy.js`): the next deadline is
-`floor((lastSentMs + HEARTBEAT) / HEARTBEAT) × HEARTBEAT` rather than
-`lastSentMs + HEARTBEAT`. Objects whose sends drifted apart therefore converge
-onto shared deadlines and ride the same flush, instead of each holding an
-independent phase that forces its own packet. `HEARTBEAT` is the fixed
-`CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS` (250 ms), shared by the ballistic and ship
-gates. `AstervoidsWeb/heartbeat-grid.test.mjs` holds the claims below.
+ReplicationClock estimates server time with minimum-RTT samples, bootstrap
+bursts, rejection/smoothing, periodic refresh, and visibility refresh.
+Minimum-RTT selection reduces queue bias, not persistent path asymmetry.
+Projection callers must gate uninitialized clocks and bound elapsed time.
 
-Three properties make this safe:
+The explicit conversion is:
 
-- **Latency never regresses.** The aligned deadline lies in
-  `(lastSent, lastSent + HEARTBEAT]`, so a heartbeat can only fire earlier than
-  the unaligned one, never later.
-- **Steady-state rate is unchanged.** Firing at or after a grid point pushes the
-  next deadline a full period out, so a settled object still heartbeats once per
-  period.
-- **Frame scheduling stays out of the policy layer.** The gate reads only the
-  injected `nowMs`; `ObjectSync` remains the sole authority over when bytes
-  leave, and its cap-no-carry flush accumulator still makes the effective send
-  period `ceil(TX / displayFrameInterval) × displayFrameInterval`.
-
-The grid is deliberately anchored to the caller's **local monotonic** clock: both
-gates inject `nowMs: () => performance.now()`, whose origin is that document's
-navigation time. Neither shared-time alternative is safe here. The NTP-style
-synchronized server clock and `Date.now()` are both *common* axes, so quantizing
-against either would put every member of a session on the same 250 ms boundary
-and correlate server fan-out and ingress queueing — the opposite of the intent.
-`Date.now()` is additionally slewable, which would drag deadlines around under
-NTP correction. Per-document `performance.now()` origins keep senders naturally
-decorrelated and immune to slewing. The grid period is the fixed heartbeat
-constant and must not become per-device or derived from measured FPS — that
-would re-couple send rate to frame rate.
-
-The effect is largest where packet count, not payload size, is the cost:
-alignment collapses per-object phases into shared flushes, so flush rate and
-battery cost stop varying with the sender's display refresh rate, and observers
-see a more regular packet interval (lower `intervalStddev`, hence a shorter
-turn-prediction horizon in `calculateRateAngularPredictionWindow`).
-
-Ship invulnerability remains authoritative in simulation ticks. The game schema
-appends `invulnerabilityRevision` (`u32`) and `invulnerableAt` (`f64` server-time
-capture timestamp) to the existing counter. Respawn/reset and expiry advance the
-revision; ordinary countdown ticks do not. The game injects that revision as the
-ship send gate's transition key, so unchanged invulnerable ships send on the
-existing heartbeat rather than every simulation step.
-
-Receivers derive the presentation countdown and blink phase from the captured
-remaining ticks/time, including buffered render delay. Before clock bootstrap
-they use receipt time; a zero authored timestamp falls back to record `validAt`.
-Explicit revisions distinguish respawn teleports from heartbeat timing
-corrections, including repeated resets to the same duration. Heartbeat captures
-re-anchor any simulation-versus-wall-time drift; owner hidden-tab/step-clamp
-semantics remain unchanged. These fields and their interpretation stay in the
-game adapter/schema; generic transport treats them as opaque payload data.
-
-Deterministic ship rotation uses two presentation paths. Target-heading touch
-controls replay toward their transmitted target angle and cannot turn past it.
-Keyboard rate controls replay continuously through the greater of the 250 ms
-ship heartbeat, the owner's advertised send interval, and its observed packet
-interval. A jitter margin extends that full-rate horizon; if the next packet is
-late, angular input tapers linearly to zero within the global 30-frame
-dead-reckoning bound. Immediate start, stop, and reversal edges still request a
-throttle-bypassing send, and ordinary shortest-angle correction absorbs
-remaining prediction error when the authoritative packet arrives.
-
-```mermaid
-flowchart TB
-    subgraph "Per-Member BUF Calculation"
-        direction TB
-        PKT["Packet arrives from member X<br/>(remote broadcast only: clientTimestamp=null)"]
-        MEM["getMemberDelay(senderMemberId)<br/>Independent state per member"]
-        LAG["lag = arrivalServerTime - validAt<br/>(post-flush transit + clock residual)"]
-        LAGREC["Retain valid lag sample<br/>(0-5000ms)"]
-        INT["interval = serverTimestamp - lastServerTimestamp"]
-        OUT{"interval > 2 × remoteSendInterval?"}
-        SKIP["Outlier: skip interval<br/>(idle gap / delta suppression)"]
-        INTREC["Retain packet interval<br/>(30-sample window)"]
-
-        PKT --> MEM
-        MEM --> LAG
-        LAG --> LAGREC
-        MEM --> INT
-        INT --> OUT
-        OUT -->|Yes| SKIP
-        OUT -->|No| INTREC
-    end
-
-    subgraph "BUF Formula"
-        direction TB
-        READY{"At least 5 lag samples?"}
-        WARMREADY{"At least 5 interval samples?"}
-        LAGCALC["raw = max(16.67ms,<br/>lagMean + 2×lagStddev<br/>+ intervalStddev)"]
-        WARM["Warm-up fallback:<br/>mean = advertised interval ∥ observed mean<br/>factor = min(1, 0.8 + RTT/(2×mean))<br/>raw = max(16.67ms, mean×factor + 2σ)"]
-        HOLD["Keep current delay"]
-        EMA2["computedDelay += 0.1 ×<br/>(raw - computedDelay)"]
-        READY -->|Yes| LAGCALC
-        READY -->|No| WARMREADY
-        WARMREADY -->|Yes| WARM
-        WARMREADY -->|No| HOLD
-        LAGCALC --> EMA2
-        WARM --> EMA2
-    end
-
-    LAGREC --> READY
-    INTREC --> READY
+```text
+offsetMs = estimated server UTC - local wall time
+wallToPerfDelta = performance.now() - Date.now()
+local presentation time = validAt - offsetMs + wallToPerfDelta
 ```
 
-## Networking: Unified `validAt` Interpolation Axis
+Owner create, update, replace, and event calls can supply `clientValidAt`.
+Updates sample it **at flush**, after coalescing; it is not the exact simulation
+timestamp of every pose. Values within 2 seconds of server receive time are
+accepted. Missing/out-of-range values fall back to receive time, then previous
+accepted time establishes a monotonic floor. This is validation/fallback, not
+clipping an invalid value to the nearest edge of a time window.
 
-Owner operations (`CreateObject`, `UpdateObjects`, `ReplaceObject`, and object
-events) carry `validAt`, an NTP-aligned estimate sampled before invocation.
-`UpdateObjects` samples once at flush and fans that value across the coalesced
-batch, so it is an ordering/presentation anchor rather than an exact simulation
-timestamp for every pose. Buffered interpolation uses this axis; deterministic
-live updates normally remain arrival-anchored.
+An accepted update batch shares the newest relevant prior `ValidAt` as its
+floor, and the broadcast carries one resolved anchor. Join/resync snapshots
+instead carry individual object times. The backend policy is defined in
+[ValidAtPolicy](AstervoidsWeb/Services/ValidAtPolicy.cs) and
+[ObjectService](AstervoidsWeb/Services/ObjectService.cs).
 
-```mermaid
-flowchart LR
-    subgraph "Owner (sender)"
-        QUEUE["Game queues latest state<br/>(updates may coalesce)"]
-        STAMP["At operation/flush:<br/>clientValidAt = Math.round(serverNowMs())<br/>or null before clock bootstrap"]
-        QUEUE --> STAMP
-    end
+### Deterministic and buffered presentation
 
-    subgraph "Server hub"
-        CLAMP["validAt =<br/>±2s clamp(clientValidAt) ?? hub-entry ServerTimestamp<br/>then max prior ValidAt in batch"]
-    end
+These are alternatives, not two sequential interpolation layers.
 
-    subgraph "Receiver"
-        CONV["snapshot.time =<br/>validAt - clock.offsetMs + wallToPerfDelta"]
-        BRACKET["Bracket search runs in<br/>perf.now domain<br/>(monotonic, immune to wall-clock slewing)"]
-        CONV --> BRACKET
-    end
+| Policy | Anchors and sampling | Bounds and corrections |
+| --- | --- | --- |
+| Deterministic | Live updates normally anchor on receiver ingest time; replay owner controls and ballistic motion | Prediction capped at 30 nominal ticks, ordinary correction smoothing about 90 ms, explicit teleport/large-error handling |
+| Buffered | Up to six snapshots on the validated `validAt` axis; sample behind current time using per-owner delay | Wrap-aware Hermite position/angle interpolation, clamping before oldest, extrapolation after newest capped by `MAX_EXTRAPOLATION` (currently 2 seconds) |
 
-    STAMP -->|"clientValidAt"| CLAMP
-    CLAMP -->|"validAt"| CONV
+Deterministic mode uses fixed-step owner simulation and seeded owner-side
+decisions, not shared lockstep. Receivers do not repeat other owners' random
+spawn/fracture decisions. Join age can be projected within bounds, but ordinary
+live motion is not blindly advanced through estimated network transit.
+
+Target-heading touch controls replay toward the transmitted heading without
+turning past it. Rate controls replay through a horizon based on heartbeat,
+advertised/observed packet cadence, and jitter, then taper angular input within
+the global prediction bound. Immediate start/stop/reversal edges still request
+urgency; shortest-angle correction absorbs residual error.
+
+Buffered delay is independent per owner. Valid arrival-lag and packet-interval
+samples feed a target based on mean lag, lag variation, and interval variation,
+with a nominal-frame floor and smoothing. Warm-up uses advertised/observed
+cadence until enough samples exist. Intervals wider than twice the advertised
+cadence are excluded as likely idle/delta-suppression gaps. Initial delay is
+about 33 ms, not an assertion that every link has that latency.
+
+Hermite tangents convert reference-space velocity and tick-based angular speed
+to the sampling axis. Position and angle interpolation respect wrapping;
+large-error guards can snap. Extrapolation samples from an anchor, rather than
+integrating previously predicted output and accumulating quantization drift.
+
+### Replacement and migration continuity
+
+A deterministic replacement child inherits the parent's receiver timeline:
+
+```text
+child anchor = min(nowPerf, parent.recvPerf + max(0, child.validAt - parent.validAt))
 ```
 
-* **`clock.offsetMs`** is the NTP-style estimate `serverTime - wall` (5-ping bootstrap, 30 s refresh, min-RTT-per-burst selection). Min-RTT sampling reduces transient queue bias, but persistent path asymmetry remains as clock error; projection callers gate initialization and cap elapsed time.
-* **`clock.wallToPerfDelta = performance.now() - Date.now()`** is refreshed on every accepted ping burst. The conversion `validAt → snapshot.time` runs through it so bracket-search stays on a monotonic clock while the snapshot key still encodes the global server-time agreement.
-* **Causal deterministic replacements.** Normal deterministic updates arrival-anchor, but a replacement child inherits the parent's local presentation timeline: `min(nowPerf, parent.recvPerf + max(0, child.validAt - parent.validAt))`. The timestamp difference cancels absolute shared-clock offset and removes discontinuities from one-off replacement latency. The invoking owner records a local monotonic baseline, so adoption also works before clock bootstrap. Existing dead-reckoning and spawn-projection caps still bound stale estimates.
-* **Buffered replacement projection.** Buffered mode keys the first snapshot at `validAt` and adds a parent-pose bridge on that shared axis. Its locally owned children retain bounded `validAt` projection.
-* **Migration handoff.** A newly promoted owner deliberately retains the asteroid's currently displayed puppet pose and clears both remote presentation states; `getMigrationSeed` is not used. Observers skip the metadata-only version. Deterministic mode direction-smooths the first data-bearing new-owner correction; buffered mode temporarily uses its fallback delay after removing the departed owner's samples, then switches to the new owner's delay.
+The timestamp difference cancels absolute shared-clock offset. The invoking owner
+also records a monotonic baseline, allowing adoption before clock bootstrap.
+Existing prediction/projection caps still apply. Buffered replacement instead
+uses a parent-pose bridge on the shared `validAt` axis.
 
-### Shared batch `validAt` on `OnObjectsUpdated`
+A new asteroid owner keeps its live displayed pose and clears remote
+presentation state; it does not seed from a speculative migration projection.
+Observers skip the metadata-only ownership version. The next data-bearing update
+gets direction-preserving correction in deterministic mode. Buffered mode drops
+the departed owner's samples, uses fallback delay, then learns the new owner's.
 
-The hot-path `OnObjectsUpdated` broadcast carries one `validAt` for the whole
-batch (rather than one per object), saving 8 B per object:
+### Rendering and allocation invariants
 
-* **One owner flush stamp.** ObjectSync samples one `clientValidAt` after coalescing the batch, so all outbound entries begin with the same operation timestamp. It does not retain each pose's original simulation time.
-* **One server monotonic floor.** `ObjectService.UpdateObjects` validates that
-  stamp once against the newest previous `ValidAt` among accepted objects, then
-  stores the resolved value on every object. The broadcast timestamp therefore
-  includes the effect of server-side monotonic clamping for the entire batch.
-* **Receiver insertion remains monotonic.** The snapshot presentation policy
-  still prevents regressing keys, and its near-coincident-key cushion avoids an
-  immediate Hermite jump.
+Render sampling is not authoritative simulation. Local previous/current pose
+interpolation is temporary and restored in `finally`, including preparation
+failures. Remote presentation refresh, terminal/rest processing, and final ship
+visual cleanup precede drawing. Canvas batching, overlays, sound, and input
+anchors do not create another physics clock.
 
-Snapshot/join paths are not batch-collapsed: `JoinSessionResponse` and
-`SessionStateSnapshot` carry `validAts: Dictionary<string, long>`, preserving
-each object's last accepted operation timestamp. Those timestamps can still be
-older/newer than the exact underlying pose time because update writes coalesce.
+Asteroid polar vertices are authoritative for fracture/serialization.
+`rebuildShapeCache()` derives Cartesian offsets and a true bound after shape
+changes. Movement, rotation, or viewport changes refresh reusable world points
+shared by drawing and collision. `getWorldVertices()` returns borrowed read-only
+storage, valid only until the next refresh.
 
-## Deterministic Terminal Convergence
+Collision passes lazily prepare asteroid bounds and wrapped displacement once
+per object without freezing collection membership: same-pass split children
+remain eligible in the established traversal. Per-type reference indexes are
+rebuilt at game-owned pivots and maintained for the duration of each pass.
 
-Deterministic sessions persist a canonical end pose instead of freezing each
-member at its latency-dependent displayed pose:
+Aspect compensation caches immutable results keyed by all relevant inputs.
+Reentrant render scratch storage is bounded and releases entity references.
+HUD/overlay writes are change-gated; analog input avoids idle remapping and
+invalidates cached results on input, anchor, viewport, mode, or mapping changes.
+Operation/allocation regressions protect these properties, not device frame-time
+or end-to-end network performance.
 
-1. The GameState owner stamps immutable `gameOverAt` and `terminalAt` values
-   when shared lives first reach zero.
-2. Each ship, asteroid, and bullet owner projects its authoritative object over
-   the smooth-deceleration stopping distance (half its ballistic displacement
-   through `terminalAt`) and writes `terminalEpoch`, `terminalX`, `terminalY`,
-   and, when applicable, `terminalAngle` onto that same object record.
-3. Existing members start from the exact transform rendered on their preceding
-   frame and normally preserve position, velocity, and acceleration in a
-   quintic trajectory while reaching the persisted target at rest.
-4. A member joining an already-terminal session creates no ship and seeds
-   replicas directly at persisted targets. Target-less snapshot or late-create
-   records remain hidden until their target-bearing version arrives.
+## Gameplay flows
 
-A ship whose owner predicts its hit was fatal is uncontrolled but still
-coasting, with its rotation cut, so step 2 treats it exactly like an asteroid
-or bullet and projects its remaining stopping distance. Every member converges
-on that wreck rather than on a respawned ship, and the motion into the terminal
-stop is continuous rather than an abrupt halt. Nothing about this depends on
-who owns the ship or the GameState object, and it costs no additional
-replicated state.
+### Collision and cross-owner hit confirmation
 
-Terminal writes retry until `ObjectSync` reports their fields in a
-server-confirmed response; this works whether delta encoding is enabled or not.
-A failed write or ownership race therefore remains eligible without creating
-ongoing wire traffic. Member-scoped ships and bullets
-still disappear when their owner leaves. Session-scoped asteroids retain the
-target through migration; if migration happens before any target was accepted,
-the new owner derives a stable bounded target from the canonical record.
-Create, replace, delete, migration, reconciliation, and hidden-tab paths keep
-running terminal maintenance after gameplay physics and collisions stop.
-
-The target fields remain opaque replicated data below the Astervoids adapter:
-`ReplicationRuntime`, `ObjectSync`, SignalR, and the backend do not interpret
-kinematics. Each known object type has one superset positional schema containing
-both its live and terminal fields. This is essential because the server retains
-an object's creation schema when it re-encodes later updates and join snapshots.
-Optional presence bits keep mode-specific and terminal fields absent from the
-body until needed.
-
-Every canonical position and angle transition selects the nearest topologically
-equivalent target that the object's own motion can still reach. An axis normally
-retains its incoming derivatives; preserving them can require a complete
-toroidal winding, which is kept only when the incoming speed covers that travel
-within the convergence window — a fast spin or crossing whose target genuinely
-lies more than half a span ahead keeps turning or moving forward into its rest
-pose instead of reversing onto a target that reads as nearer only because the
-persisted value is normalized. A winding beyond that ballistic reach is
-gratuitous (the object has effectively reached its target already), so that axis
-falls back to the nearest target, clamps its presentation velocity to the
-monotone shortest-path bound, and clears its acceleration. The velocity can fall
-to zero when the target is coincident or lies in the opposite direction. If a
-target arrives too late to use the shared `terminalAt` without a
-visible discontinuity, that member also uses a short local settle window. Exact
-eventual pose and continuous position take precedence over pretending it stopped
-at a time that has already passed. Buffered adaptive-delay sessions retain their
-existing authoritative-snapshot settle behavior and do not wait for terminal
-targets.
-
-Terminal convergence covers pose only. Animated ship visuals settle separately
-in the render pass, after both the deterministic and buffered rest passes have
-re-applied authoritative ship data and before anything is drawn: the thrust
-flame is cleared — input handling stops at game over, leaving the flag latched
-at its last value — and invulnerability blinking ends with the ship visible, so
-no wreck freezes on a hidden blink frame. The settle clears the local countdown
-and replica anchor only; the invulnerability revision stays untouched because it
-is the wire transition key, not a presentation value.
-
-Neither the team nor personal score is frozen at the pose terminal anchor.
-Late/in-flight ship awards accepted by the existing team calculator update both
-totals and the persisted standings; `gameOverAt`, `terminalAt`, and the final-life
-ship remain immutable. There is no additional score deadline or terminal authority.
-
-In multiplayer, only the ship whose damage exhausts the shared lives pool
-decomposes into three detached triangle edges. The GameState owner records
-`terminalShipId` on the first positive-to-zero lives transition, after score-life
-awards and in the existing hit-processing order. It remains immutable through
-later hits, ship departure, and authority migration. This optional GUID is
-appended to the GameState schema (no additional live payload bytes or ship
-updates); the local predicted death hold is not used to select the wreck.
-
-Edge offsets are render-only, seeded from that ship ID and `gameOverAt`, and
-sampled in server time over `gameOverAt` → `terminalAt` in both multiplayer modes.
-A small initial linear/angular impulse decays to exact rest at the shared end
-time. Each rigid edge rotates about its midpoint and separates outward while
-following the ship's current moving/rotating origin; collision vertices, pose,
-and replication are unchanged. Late joiners sample the same settled shape
-without replaying the effect. Late pose targets may still use the existing local
-grace interval; the edge offsets retain the shared clock. Solo play and older
-terminal records without `terminalShipId` retain the intact triangle.
-
-Tune the effect on the session creator's URL:
-`?cfg.SHIP_TERMINAL_SEPARATION=0.35&cfg.SHIP_TERMINAL_ROTATION=2`.
-Separation is the maximum edge-midpoint displacement in ship radii (default
-`0.35`); rotation is the maximum absolute edge rotation in radians (default
-`2`, about 115°). Each edge receives a seeded fraction of those limits.
-Zero disables the respective component; negative values are treated as zero.
-Both settings are session metadata, so members and spectators adopt the
-creator's values rather than diverging with their own URL overrides.
-
-## Ring Buffer Interpolation
-
-```mermaid
-flowchart TB
-    subgraph "Per-Object Ring Buffer (max 6 snapshots)"
-        S1["snapshot[0]<br/>data, time, velocity, rotationSpeed"]
-        S2["snapshot[1]"]
-        S3["snapshot[2]"]
-        S4["snapshot[3]"]
-        S5["..."]
-        S6["snapshot[5]<br/>(newest)"]
-        S1 --- S2 --- S3 --- S4 --- S5 --- S6
-    end
-
-    TARGET["targetTime = renderTime - getDelayForMember(ownerMemberId)"]
-
-    subgraph "Bracket Search (reverse scan)"
-        direction TB
-        BEFORE{"targetTime ≤ oldest?"}
-        CLAMP["Return oldest snapshot (clamped)"]
-        BRACKET{"Find i where<br/>snap[i].time ≤ targetTime < snap[i+1].time"}
-        HERMITE["Build pseudo-state from snap[i] & snap[i+1]<br/>Hermite interpolate with t ∈ (0,1]"]
-        AFTER{"targetTime ≥ newest?"}
-        EXTRAP["Extrapolate with velocity<br/>capped at MAX_EXTRAPOLATION (1.0s)"]
-    end
-
-    TARGET --> BEFORE
-    BEFORE -->|Yes| CLAMP
-    BEFORE -->|No| AFTER
-    AFTER -->|Yes| EXTRAP
-    AFTER -->|No| BRACKET
-    BRACKET --> HERMITE
-```
-
-```mermaid
-flowchart LR
-    subgraph "Hermite Interpolation"
-        BASIS["Basis functions:<br/>h00 = 2t³ - 3t² + 1<br/>h10 = t³ - 2t² + t<br/>h01 = -2t³ + 3t²<br/>h11 = t³ - t²"]
-        POS["Position (x,y):<br/>p = h00·p₀ + h10·m₀ + h01·p₁ + h11·m₁<br/><br/>Tangents m = velocity × velScale × dt<br/>velScale = refDim / gameWidth<br/>Wrap-aware Δ for p₁ - p₀"]
-        ANG["Angle:<br/>Same Hermite with rotationSpeed tangents<br/>rpsToPerSec = TARGET_FPS (60)<br/>Shortest-arc via ±π wrapping"]
-        SNAP{"‖p₁ - p₀‖ > SNAP_THRESHOLD (0.25)?"}
-        SNAPR["Skip interpolation → snap to p₁"]
-
-        BASIS --> POS
-        BASIS --> ANG
-        POS --> SNAP
-        SNAP -->|Yes| SNAPR
-    end
-```
-
-## Cross-Owner Collision
+The bullet owner tests only its own bullets, using relative swept translation,
+wrap-aware bounds, then the asteroid's current polygon. Ship collision uses
+bounding-circle rejection and vertex inclusion, not a general continuous
+rigid-body solver. Only the local ship owner decides its damage.
 
 ```mermaid
 sequenceDiagram
-    participant A as Player A (bullet owner)
-    participant SRV as Server
-    participant B as Player B (asteroid owner)
-
-    Note over A: A's bullet hits B's asteroid locally
-    A->>A: Mark bullet pendingHit=true, hitTargetId=asteroidId
-    A->>SRV: UpdateObjects(bullet with pendingHit)
-    SRV->>B: OnObjectsUpdated (bullet data with pendingHit)
-
-    Note over B: B scans remote bullets for pendingHit on own asteroids
-    B->>B: Process split: create child asteroids
-    B->>SRV: ReplaceObject(asteroidId, [child1, child2])
-    SRV->>A: OnObjectReplaced (broadcast to others)
-    SRV-->>B: Replacement response (same application path)
-
-    Note over A: A sees asteroid replaced → confirms hit, awards points
+    participant Shooter as Bullet owner
+    participant Hub as Regional backend
+    participant Target as Asteroid owner
+    Shooter->>Shooter: Detect hit and hide bullet
+    Shooter->>Hub: Persist pending-hit claim
+    Hub->>Target: Replicated claim on owned target
+    Target->>Target: Deduplicate and calculate fracture
+    Target->>Hub: ReplaceObject or delete target
+    Hub->>Shooter: Parent removal and replacement children
+    Hub-->>Target: Replacement response
+    Shooter->>Shooter: Confirm hit, award score, retire bullet
 ```
 
-The first pending-hit publication includes the collision pose and claim.
-Subsequent publications retry only unconfirmed claim fields, using ObjectSync's
-existing confirmation baseline; hidden pending bullets no longer publish motion
-or lifetime. The owner still advances local lifetime and deletes on expiry or
-target-removal confirmation.
+Every remote hop is relayed through ObjectSync, SessionClient, and the hub.
+The asteroid owner, bullet owner, and GameState owner can be different members.
+For cross-owner splits, session-scoped children are assigned to the shooter.
+Same-owner hits resolve directly; solo play requires no replicated transaction.
 
-A ship crashing into an asteroid also strikes it: the survivable crash spawns a
-hidden bullet at the contact point carrying the ship's velocity, and hands it to
-the same resolution paths (owned split, cross-owner claim, or solo removal), so
-scoring, split geometry, cues and replication are unchanged from a shot. A
-cross-owner crash claim rides the bullet's creation payload, because the crash
-bullet has no synced object yet. A crash that ends the run — a predicted-fatal
-hit that begins a death hold, or the last solo life — keeps its existing
-terminal behavior and leaves the asteroid untouched.
+The first pending-hit publication includes collision pose and claim fields.
+Later attempts retry only unconfirmed claim fields, not hidden-bullet motion or
+lifetime. Local lifetime still advances, and expiry or target removal retires
+the bullet. The target owner deduplicates processed bullet IDs.
 
-Wave spawning uses at most four concurrent create calls in multiplayer, awaiting
-each bounded group before scheduling more. Random generation/invocation order,
-ownership, cancellation checks and stale-create cleanup remain game-owned.
-Solo spawning remains sequential. This reduces serialized round trips, not the
-number of create messages or server-side operation ordering.
+A survivable ship crash creates a hidden contact bullet with ship velocity and
+uses the same hit paths. Its cross-owner claim rides the creation payload because
+no synchronized bullet exists yet. A predicted-fatal crash or final solo-life
+crash leaves the asteroid intact. Same-owner impact cues are transient events.
 
-## Response-First vs Local-First Patterns
+### Fracture physics
+
+[Collision geometry](AstervoidsWeb/wwwroot/js/collision-geometry.js) shares
+containment and squared-distance primitives, including degenerate edges and
+inclusive tangency. [Asteroid fracture](AstervoidsWeb/wwwroot/js/asteroid-fracture.js)
+separates geometry preparation, impulse response, polygon construction, and
+disk fallback.
+
+The owner clips a seeded jagged cut through the parent polygon and recenters
+children around their centroids. Parent mass is density times radius squared;
+polygon geometry supplies centroid/inertia and calibrates child radii. Impact
+changes center-of-mass motion and contact torque; children inherit motion and
+receive mass-weighted separation energy.
+
+Invalid clipping uses a disk fallback. Undersized-fragment removal, shooter
+avoidance, and final speed/spin caps are gameplay modifiers, not a guarantee of
+global conservation. Replicas consume the authored outcome rather than rerunning
+another owner's fracture randomness.
+
+### Deterministic randomness
+
+Shared seeds are not a shared PRNG cursor or a lockstep simulation. The following
+are the cross-member-relevant random choices; local flame/audio/menu cosmetics
+and cryptographic identity/invitation generation are separate.
+
+| Behavior | Random inputs and consuming authority | What another member reconstructs |
+| --- | --- | --- |
+| Wave spawning | Owner's session-seeded `simRng` chooses safe-position candidates, direction/speed, shape seed, angle, and spin in deterministic mode; buffered mode uses ordinary randomness | Authored asteroid records, not the owner's sequence of draws |
+| Base asteroid outline | `Asteroid.generateShape` uses its seed, radius, and session-locked vertex count/jaggedness | The seeded polygon independently, including disk-fallback shapes |
+| Jagged fracture cut | Owner mixes asteroid seed with impact angle/offset for `buildFracturePolyline` | Explicit packed child vertices, not a replayed cut |
+| Fragment separation direction | Owner uses the impact/seed mix plus a distinct salt in `separationAngleOffset` | Authored child velocity/spin, not a replayed impulse |
+| Final-life ship edges | Hash of normalized ship object ID and `gameOverAt`, sampled in server time | The same cosmetic decomposition without additional geometry traffic |
+
+The local session stream is reseeded on adoption; its draw position is not
+replicated. Fracture children still receive fresh `Math.random()` shape seeds
+which are then replicated. The current fracture mix uses
+`((asteroid.seed || 0) * 0x100000000) >>> 0`, so integer wave seeds contribute zero
+to that term.
+These are limits on whole-run reproduction from a session seed, not a reason
+to rerun another owner's decisions or change the existing wire format.
+Sources: [inline RNG/shape/spawn/terminal helpers](AstervoidsWeb/wwwroot/index.html)
+and [fracture RNG helpers](AstervoidsWeb/wwwroot/js/asteroid-fracture.js).
+
+### Waves, score and shared lives
+
+The GameState owner coordinates progression. Current defaults start with three
+lives and one asteroid; each wave adds an asteroid and increases its speed
+multiplier, with a cap and a simulation-tick delay between empty fields and the
+next wave. Exact tuning belongs to game configuration. Asteroid score depends
+on size.
+
+Multiplayer wave spawning uses bounded groups of at most four concurrent create
+calls. Random generation/invocation order, cancellation checks, ownership, and
+stale-create cleanup stay game-owned. Solo spawning is sequential. Concurrency
+reduces serialized round trips, not message count or backend operation ordering.
+
+`calculateGameState` is a pure calculation over explicit inputs, not a mutation
+of them. `syncGameState` owns validation, serialization, side effects, and
+publication. Its persisted ledgers include processed hits/scores, counted
+participants, personal score/number/tag histories, and score-life awards so a
+new owner does not repeat effects. Persistence here means the lifetime of the
+process-local session, not storage in the durable identity service.
+
+Every additional unique participant earns one entry life once; it is not based
+on concurrent ship count. Ships publish a stable `participantId`, and ships
+without one are skipped rather than attributed to a changing member ID.
+`peakShipCount` is a high-water count of participants already paid.
+Shared score awards are applied before damage; participant entry lives are
+applied after damage, only while lives remain. The entry-life ledger caps at
+255 identities. Personal history registration is separate and is not capped
+or evicted to satisfy that limit or a standings display limit.
+
+Ledger/calculation caches compare actual inputs, including score/hit events
+that do not advance object versions. Private ledger snapshots detect in-place
+mutation. Session, ownership, and recovery transitions invalidate caches.
+Cached publication still queues against confirmed ObjectSync state, never an
+optimistic local write. Packed counter IDs and values must be valid before
+serialization.
+
+### Personal score history and departure
+
+In capable sessions, GameState carries `participantScores`, `participantNumbers`,
+and `participantTags`, keyed by normalized participant GUID. The **GameState
+owner**, not necessarily the `Server` member, registers every observed ship
+participant at zero, including fatal entrants and terminal/departure inputs.
+New IDs within a calculation are GUID-sorted before receiving successive positive
+ordinals; existing ordinals never change. The first valid tag is retained across
+departures and ownership migration.
+
+The same positive `Ship.score - processedScores[shipId]` delta updates team score
+and that participant's historical total. Duplicate/lower counters do not count;
+retired ship baselines remain. A recreated ship starts its counter at zero, while
+its participant retains the session total. Multiple browser bindings of the same
+durable identity aggregate independent ship counters into one participant and
+one entry-life award. Pure spectators acquire no history until publishing a ship.
+
+`syncLocalShipScore` queues only unconfirmed counter changes through ObjectSync.
+Visible, hidden, and terminal maintenance retry them independently of movement;
+confirmed scores add no steady-state pose traffic. Voluntary leave lets atomic
+member departure remove ships rather than pre-deleting calculation inputs.
+Explicit ship deletion also supplies the deleted record to the same calculator.
+This preserves accepted records, not a guarantee of delivery for never-confirmed
+client writes.
+
+Score-history readers validate GUIDs, unsigned integer ranges, duplicate entries,
+and matching score/number participant sets. Missing, partial, or malformed history
+is visibly unavailable; a sum different from the persisted team total is not
+presented as complete attribution. Tag validation/cache failure is separate:
+unavailable names become `Unknown` without hiding otherwise valid scores.
+Caches inspect private snapshots, including same-version/in-place mutations.
+
+### HUD and final standings
+
+Multiplayer shows `Your Score: value : player tag` above
+`Team Score: value : session name`. The playing personal value projects the
+persisted participant total plus positive unprocessed ship counters; it is not
+another accumulator. Tags come from the membership-pinned public identity and
+replicated history, not current rank, member position, or per-frame HTTP lookup.
+Older score-capable sessions without tag slots retain `Player N`/`Spectator`
+labels. Named spectators keep their tag but have no personal score.
+
+Final standings replace the multiplayer playing HUD. They use persisted history,
+including departed and zero-score participants, sorted by score descending,
+ordinal ascending, then normalized GUID lexical order. Show only the highest
+`floor(maxMembers * 1.5)` rows; the viewer's own persisted total remains above
+the team total even when their row is outside that limit. Pure spectators show
+`Your Score: --`; unavailable history does not invent zero scores.
+
+Capacity comes from a matching session advertisement and survives same-session
+reentry. If absent, one lookup per entry uses the already joined hub's
+`getActiveSessions`; unknown capacity defers rows, not the full team total or a
+known personal total. Older GameState owners are not guaranteed to maintain new
+histories; consumers show unavailable data rather than fabricate it.
+
+HUD and native HTML/CSS overlays fit the creator-aspect gameplay viewport, not
+letterbox margins or the surrounding browser window. Narrow HUDs move Wave/Lives
+to a second row, session names ellipsize, and bounded final results wrap/scroll.
+Only the results region opts into native keyboard/touch scrolling. Layout is
+change-gated and responds to viewport resize without changing Canvas/world
+geometry. Solo scoring and `Final Score` remain unchanged; its HUD adds the
+active player tag.
+
+### Damage, respawn and predicted death hold
+
+A surviving hit resets the ship to center with zero velocity and simulation-tick
+invulnerability. For a predicted-fatal hit, the owner locally reruns the same
+pure life calculation with the new `hitCount`, including unprocessed hits and
+pending extra-life awards, without an extra round trip.
+
+The hold clears controls and rotation but **preserves translation velocity**.
+`Ship.update` continues friction, movement, and wrapping. The visible wreck
+cannot collide again while awaiting the authority's verdict. Parking an instance
+that still advertises velocity would make replicas extrapolate motion the owner
+never performed.
+
+Survival is confirmed only when the authority records that hit in `processedHits`
+while lives remain; positive lives before processing are not proof. A surviving
+verdict releases the hold into a normal reset, not a coasting respawn. Because
+hit notifications are transient, a missing verdict times out after three seconds
+rather than leaving the player shipless.
+
+The hold is local, not a replicated flag. Peers replay authored motion, not the
+prediction behind it. Solo play reads local lives directly and leaves the final
+wreck where it died.
+
+### Deterministic terminal convergence
 
 ```mermaid
 flowchart TB
-    subgraph "CreateObject (Response-First)"
-        direction TB
-        C1["Caller invokes CreateObject"]
-        C2["Wait for server response<br/>(server assigns Id, Version=1)"]
-        C3["Register object in local Map<br/>from response"]
-        C4["Broadcast: OthersInGroup<br/>(sender excluded)"]
-        C5["If isStillNeeded callback returns false:<br/>auto-delete server object"]
-        C1 --> C2 --> C3
-        C2 --> C4
-        C3 --> C5
-    end
-
-    subgraph "DeleteObject (Local-First)"
-        direction TB
-        D1["Remove from local Map immediately<br/>(before server call)"]
-        D2["Remove from pendingUpdates"]
-        D3["Invoke server DeleteObject"]
-        D4["Server verifies ownership<br/>(rejects if not owner)"]
-        D5["Broadcast: OthersInGroup<br/>(sender excluded)"]
-        D1 --> D2 --> D3 --> D4 --> D5
-    end
-
-    subgraph "ReplaceObject (Response-First)"
-        direction TB
-        R1["Invoke server ReplaceObject"]
-        R2["Server creates children,<br/>deletes parent"]
-        R3["Broadcast: OthersInGroup<br/>Response: children + sequence + validAt"]
-        R4["Sender applies response through<br/>the shared replacement handler"]
-        R1 --> R2 --> R3 --> R4
-    end
+    Authority["GameState fixes the terminal epoch and deadline"]
+    Owners["Each owner persists a canonical target on its objects"]
+    Retry["Retry unconfirmed target fields"]
+    Members["Existing members settle from their displayed poses"]
+    Joiners["Terminal joiners wait for targets and create no ship"]
+    Rest["Converge to the same authored pose"]
+    Authority --> Owners
+    Owners --> Retry --> Owners
+    Owners --> Members --> Rest
+    Owners --> Joiners --> Rest
 ```
 
-## Durable State and Object Events
+When shared lives first reach zero, the GameState owner fixes immutable
+`gameOverAt` and `terminalAt`; the default convergence window is 750 ms.
+Each object owner projects its authoritative pose through half the remaining
+ballistic travel, the stopping distance of a smooth zero-end-velocity stop.
+It persists `terminalEpoch`, `terminalX`, `terminalY`, and applicable
+`terminalAngle` on that object's ordinary record.
 
-Object records are the recovery contract: joins and reconciliation receive their
-latest authoritative state. Object events are transient notifications, not an
-event log; they are not replayed to a late joiner or recovered as occurrences from
-a snapshot. Sequence-gap recovery can restore records, but cannot reconstruct an
-event that left no durable state.
+Existing members start from the exact preceding rendered transform, normally
+preserving position, velocity, and acceleration through a minimum-jerk quintic
+trajectory. Targets retry until confirmed, with or without delta encoding.
+New terminal viewers create no ship; target-less snapshot or late-create
+replicas stay hidden until target-bearing data arrives.
 
-Gameplay that must survive a reconnect or late join must therefore serialize the
-necessary state through its game adapter. Use events for notifications where a
-missed occurrence is acceptable, or pair them with a durable record that permits
-recovery. New replicated fields require an explicit schema/default strategy and
-JavaScript/C# compatibility coverage; a new event is not a shortcut around that
-review. Generic transport and server layers remain opaque to the game's fields.
+Terminal fields remain opaque below the game adapter. Known object types use a
+superset schema that can encode live and terminal fields. Gameplay physics and
+collisions stop, but create/replace/delete, migration, reconciliation, hidden-tab
+work, and target publication keep running.
 
-## Delta Encoding & Deferred Confirmation
+The pose deadline does not freeze scores. Late/in-flight ship awards accepted by
+the existing calculator update team and personal totals/standings while
+`gameOverAt`, `terminalAt`, and `terminalShipId` remain fixed. There is no separate
+score deadline or second terminal authority.
 
-```mermaid
-sequenceDiagram
-    participant OS as ObjectSync
-    participant SC as SessionClient
-    participant SRV as Server
+Member-scoped objects still disappear on departure. Session-scoped objects keep
+accepted targets through migration. If an owner must author a target before its
+local instance is adopted, it derives a bounded target from the canonical
+record's `validAt`, not a new join-time-dependent pose.
 
-    Note over OS: computeDelta(): compare current data vs the object's lastSentData<br/>Uses shallow reference comparison (===)<br/>Nested objects must be spread into new refs
+Wrapping chooses a reachable, topologically equivalent target. A complete
+toroidal winding is retained only if incoming motion can cover it in the window;
+gratuitous winding falls back to the nearest target, bounds presentation velocity,
+and clears acceleration. Coincident or opposite-direction targets can reduce
+velocity to zero. Late targets may extend that member's local settle window.
+Exact eventual pose and continuous position outrank pretending every member
+stopped at an already-past common time.
 
-    OS->>OS: delta = computeDelta(objectId, data)<br/>lastSentData NOT updated yet
+Buffered sessions retain their authoritative-snapshot settling path and do not
+wait for canonical terminal targets. A final unsent owner pose can therefore
+differ from the last stored snapshot; this is not the deterministic exact-target
+guarantee.
 
-    OS->>SC: updateObjects(deltas, senderSeq, sendIntervalMs)
-    SC->>SRV: Invoke UpdateObjects(deltas, ...)
+### Terminal ship visuals
 
-    alt Server accepts batch
-        SRV-->>SC: Response {versions: {id→ver}, ...}
-        SC-->>OS: confirmSentDeltas(sentDeltas, versions)
-        OS->>OS: Update lastSentData only for<br/>confirmed objects
-    else Network error / null response
-        Note over OS: sentDeltas NOT confirmed<br/>→ all changed fields re-sent next flush
-    end
+Pose convergence and cosmetic cleanup are separate. After both rest passes have
+reapplied authoritative data, the render pass clears latched thrust visuals and
+ends invulnerability blinking with the ship visible. It does not change the
+invulnerability revision, which is a wire transition key.
 
-    Note over OS: Full sync forced every 6000 frames<br/>(FULL_SYNC_INTERVAL) — bypasses delta,<br/>sends complete object state
+Only the multiplayer ship whose processed damage exhausts shared lives separates
+into three triangle edges. The GameState owner records immutable `terminalShipId`
+at the first positive-to-zero transition, after score-life awards and in the
+existing hit-processing order. A predicted death hold does not select that ship.
 
-    Note over OS: Field name compression (FIELD_MAP) is applied<br/>after delta computation — wire payloads use short<br/>keys (e.g. velocityX→vx) while game logic uses<br/>readable names. expandData() reverses on receive.
-```
+The effect is render-only: offsets are seeded by ship ID and `gameOverAt`,
+sampled in server time through `terminalAt`, and follow the ship's moving origin.
+Rigid edges rotate about their midpoints and decay to exact rest. Late viewers
+sample the settled shape rather than replaying it. Collision vertices, pose, and
+replication are unchanged. Solo and old terminal records without the ID retain
+an intact triangle.
 
-## Type Index (ObjectSync)
+`SHIP_TERMINAL_SEPARATION` and `SHIP_TERMINAL_ROTATION` are session-configured
+limits. Zero disables a component, negative values are treated as zero, and
+members adopt creator values rather than diverging through local URL overrides.
 
-```mermaid
-flowchart TB
-    subgraph "Type Index (Map<string, Set<objectId>>)"
-        direction TB
-        IDX["typeIndex: Map<br/>e.g. 'ship' → {id1, id2}<br/>'asteroid' → {id3, id4, id5}<br/>'gameState' → {id6}"]
-    end
+## Backend state and concurrency
 
-    subgraph "Index Maintenance"
-        ADD["addToTypeIndex(obj)<br/>On: createObject, handleRemoteObjectCreated"]
-        REM["removeFromTypeIndex(obj)<br/>On: deleteObject, handleRemoteObjectDeleted"]
-        UPD["updateTypeIndex(obj, oldType, newType)<br/>On: updateObject, handleRemoteObjectsUpdated<br/>(only when data.type changes)"]
-    end
+This section describes process-local gameplay authority. The independent durable
+identity transaction model is defined in [Durable player identity](#durable-player-identity).
 
-    subgraph "Efficient Queries"
-        QT["getObjectsByType(type) → O(n) for n = matching<br/>vs O(N) scanning all objects"]
-        QS["getObjectByType(type) → O(1) singleton lookup<br/>e.g. GameState"]
-    end
+Sources: [SessionService](AstervoidsWeb/Services/SessionService.cs),
+[ObjectService](AstervoidsWeb/Services/ObjectService.cs),
+[Session](AstervoidsWeb/Models/Session.cs),
+[operation coordinator](AstervoidsWeb/Services/SessionOperationCoordinator.cs),
+[cleanup service](AstervoidsWeb/Services/SessionCleanupService.cs).
 
-    ADD --> IDX
-    REM --> IDX
-    UPD --> IDX
-    IDX --> QT
-    IDX --> QS
-```
+### Records and lookup boundaries
 
-## SignalR Reconnection & Reconciliation
+| Record | Important state |
+| --- | --- |
+| Session | Identity/name, metadata, lifecycle, version, creation/empty times, members, objects, handle indexes |
+| Member | Identity, connection, role, join time, session, event sequence, private reconnect proof |
+| SessionObject | GUID/handle, immutable creator, mutable owner, scope, generic data, version, timestamps including `ValidAt` |
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant SR as SignalR
-    participant HUB as SessionHub
-
-    Note over C,SR: Connection lost (network interruption)
-
-    SR->>SR: withAutomaticReconnect<br/>Linear 1s interval<br/>Max 10 attempts (10s window)
-
-    SR->>C: onreconnecting(error) → freeze gameplay,<br/>show #reconnecting-overlay
-
-    alt Reconnection succeeds (transport restored)
-        SR->>C: onreconnected(connectionId)
-        C->>C: onSessionStateUncertain("reconnected", epoch)<br/>ObjectSync subscriber starts reconciliation
-        C->>HUB: GetSessionState()
-        C->>C: onConnected fires (transport ready;<br/>snapshot still pending)
-
-        alt Server still has the member
-            HUB-->>C: Full snapshot + memberSequences
-            C->>C: Sync local objects:<br/>• Add missing<br/>• Update stale<br/>• Remove ghosts<br/>• Reset sequences<br/>onReconciliationComplete fires
-        else Server already processed disconnect
-            HUB-->>C: null
-            C->>C: onReconciliationFailed → re-freeze<br/>and call attemptAutoRejoin (full path below)
-        end
-    else Max retries exceeded (or mobile auto-rejoin)
-        SR->>C: onclose(error)
-        C->>C: attemptAutoRejoin(sessionId, oldMemberId)<br/>Guards: rejoinInProgress, leavingSession.<br/>If document.hidden: defer (save pendingRejoinSessionId/MemberId,<br/>resume on visibilitychange).<br/>ObjectSync.suspendReconciliation() while rejoining.
-        loop Up to 5 attempts (delay 0.5s, then 2s × n)
-            C->>C: connectToSessionHub(force=true) —<br/>await stale.stop() with timeout, clear currentSession/<br/>currentMember, then build new connection.
-            C->>HUB: JoinSession(sessionId, evictMemberId=oldMemberId)
-            Note over HUB: If old member still present (server hadn't<br/>processed disconnect yet — up to ClientTimeoutSeconds),<br/>it is evicted atomically and OnMemberLeft is broadcast<br/>to remaining members BEFORE the new member is added.
-            HUB-->>C: Rejoin response (new memberId, members[], objects[])
-        end
-        C->>C: resetMultiplayerState() BEFORE handleSessionJoined<br/>loads snapshot (avoids ObjectSync.clear wiping it).<br/>game.connectionLost cleared, ObjectSync.resumeReconciliation().
-    end
-
-    Note over C: Stale connection guard: setupEventHandlers()<br/>captures thisConnection reference.<br/>Old connection's onclose/on* events<br/>are silently ignored if connection<br/>has been replaced by connect().
-    Note over C: Reconciliation safety: ObjectSync.pendingDeletes Set<br/>prevents triggerReconciliation from resurrecting<br/>locally-deleted objects whose server delete is in flight.
-```
-
-## SessionService: Thread Safety
-
-```mermaid
-flowchart TB
-    subgraph "Serialization Strategy"
-        direction TB
-        LOCK["_sessionLock (object)<br/>Serializes CreateSession & JoinSession<br/>Prevents TOCTOU races on:<br/>• connection-already-in-session check<br/>• max sessions count check<br/>• concurrent join + capacity check"]
-        SYNC["session.SyncRoot (object, per-session)<br/>Serializes ALL session-local mutations:<br/>• member add/remove<br/>• server promotion (deterministic — no race)<br/>• object create/update/delete/replace<br/>• ownership migration<br/>• lifecycle transitions<br/>• LastMemberLeftAt updates"]
-        CONC["ConcurrentDictionary (4 instances)<br/>_sessions, _connectionToMember,<br/>_memberToSession, session.Members<br/>Thread-safe individual operations"]
-    end
-
-    subgraph "Lock ordering"
-        ORDER["Acquisition order is always:<br/>_sessionLock → session.SyncRoot<br/>(prevents deadlocks across cross-session ops)"]
-    end
-
-    LOCK --> CONC
-    SYNC --> CONC
-```
-
-## Hub: Ownership Enforcement
-
-Ownership and session lifecycle are validated **inside the service layer** under
-`Session.SyncRoot`, atomically with the mutation. Hub-layer pre-checks remain
-only as fast early-return / logging — they are not relied on for correctness.
+Indexes resolve connection ID to member ID to session ID. Individual concurrent
+dictionary operations do not make multi-record lifecycle transitions atomic.
+Expected lifecycle failure uses typed results or the operation's documented
+nullable result, not exceptions for normal branching.
 
 `GetSession` and `GetSessionByConnectionId` return detached, lock-consistent
-snapshots, including independent member/object records, handle indexes, metadata,
-and supported mutable payload containers. Locking or modifying such a snapshot
-does not synchronize with or mutate live authority.
+snapshots, including independent members, objects, indexes, metadata, and
+supported mutable payload containers. Locking or mutating such a copy does not
+synchronize with live authority.
 
-Hot infrastructure instead uses the explicit `GetSessionForSynchronization`
-lookup, without cloning an entire session per object update. Its live result
-requires the existing lock ordering and in-lock lifecycle/authorization checks.
-Combined member/session lookups, cleanup enumeration, and lifecycle result
-records likewise remain documented live infrastructure references, not immutable
-public data. This boundary hardening does not replace the session locks or turn
-the whole service model into an immutable API.
+Hot infrastructure instead uses `GetSessionForSynchronization` and the
+documented live lookup/result paths. These require the established lock ordering
+and in-lock authorization/lifecycle checks. Do not clone a whole session on
+each hot object update or treat every service result as immutable.
+See [ISessionService](AstervoidsWeb/Services/ISessionService.cs).
 
-Create/replace scope strings accept `Member` or `Session`, case-insensitively;
-omission retains each RPC's existing default. Only a null/omitted owner defaults
-to the caller. Explicit malformed, empty, unknown, or departed owners reject
-normally rather than silently changing ownership. Services revalidate membership
-under the session lock. Replacements validate every child's scope and explicit
-owner before creating children, allocating their handles, or deleting the parent;
-invalid input leaves the original state intact. A valid empty replacement list
-remains an intentional deletion.
+### Two complementary synchronization layers
 
 ```mermaid
 flowchart TB
-    subgraph "ObjectService (authoritative — under SyncRoot)"
-        OS_SINGLE["UpdateObject: requires current caller ID<br/>and checks object ownership"]
-        OS_UPD["UpdateObjects: filters batch to objects<br/>where OwnerMemberId == ownerMemberId"]
-        OS_DEL["DeleteObject(sessionId, objectId, ownerMemberId):<br/>verifies ownership before TryRemove"]
-        OS_REP["ReplaceObject(sessionId, deleteId,<br/>ownerMemberId, replacements[]):<br/>verifies ownership of delete target<br/>before atomic delete + create"]
-    end
-
-    subgraph "SessionHub (early-return + logging)"
-        HUB_UPD["UpdateObjects: passes caller.Id as ownerMemberId<br/>to ObjectService"]
-        HUB_DEL["DeleteObject: optional pre-check + warning if not owner;<br/>passes caller.Id to ObjectService"]
-        HUB_REP["ReplaceObject: optional pre-check;<br/>passes caller.Id to ObjectService"]
-    end
-
-    HUB_UPD --> OS_UPD
-    HUB_DEL --> OS_DEL
-    HUB_REP --> OS_REP
+    Entry["Hub mutation, snapshot or cleanup operation"]
+    Gate["Async per-session operation gate"]
+    Mutation["Short service critical section on Session.SyncRoot"]
+    Publish["Await group changes and ordered fan-out"]
+    Release["Release operation lease"]
+    Index["Create and join also take the global index lock"]
+    Entry --> Gate --> Mutation --> Publish --> Release
+    Index -.->|"Global lock before session lock"| Mutation
 ```
 
-## Wire Format & Server Monitoring
+The shared `SessionOperationCoordinator` uses per-session `SemaphoreSlim` leases
+to preserve commit/group/broadcast order across awaits. It is a production DI
+singleton shared by hubs and cleanup; fixtures share the same coordinator through
+`TestServiceFactory`. A private fallback coordinator would not coordinate them.
+Stateless clock `Ping` does not take this operation gate.
 
-```mermaid
-flowchart TB
-    subgraph "SignalR transport (binary MessagePack)"
-        direction TB
-        MP["AddMessagePackProtocol with CompositeResolver:<br/>• BinaryGuidResolver (16-byte binary GUIDs)<br/>• annotated positional DTOs<br/>• ContractlessStandardResolver for outer response records<br/>• MessagePackSecurity.UntrustedData"]
-        DTO["Hot object DTOs are integer-key arrays:<br/>ObjectInfo · updates · requests · replacements · events.<br/>Updates address objects by session-scoped handle.<br/>SyncPayload is [schemaId, dataBytes]."]
-        JSGUID["SessionClient normalizes compact arrays to named JS objects,<br/>resolves handles back to GUIDs, transforms binary GUIDs to strings,<br/>then unwraps SyncPayload.<br/>Game/ObjectSync code keeps an ergonomic object contract."]
-    end
+Synchronous service locks protect data:
 
-    subgraph "REST API (camelCase JSON)"
-        REST["ConfigureHttpJsonOptions →<br/>JsonNamingPolicy.CamelCase.<br/>Used by GET /api/srvmon."]
-    end
+- `_sessionLock` serializes create/join index and capacity decisions.
+- `Session.SyncRoot` protects membership, promotion, objects, ownership,
+  lifecycle, and empty-time transitions.
+- When both locks are needed, ordering is global then session.
+- No synchronous monitor is held across an asynchronous hub/group operation.
 
-    subgraph "ServerMetricsService (singleton, IDisposable)"
-        SMS_SAMPLE["Background CPU sampling every 2s.<br/>Tracks: connectedCount, peakConnections,<br/>totalHubInvocations, per-member TX/RX bytes,<br/>reconciliations, reconnects."]
-        SMS_EST["SessionHub.EstimatePayloadBytes() uses<br/>a static MessagePackSerializerOptions<br/>matching Program.cs to compute byte counts<br/>per OnHubInvocation / OnBroadcastToMembers call."]
-        SMS_API["GET /api/srvmon → snapshot record (camelCase JSON).<br/>/srvmon/index.html polls every 2s and renders<br/>TX Rate / RX Rate / CPU / connection counts."]
-    end
+Ownership and lifecycle are checked **inside ObjectService under the same lock
+as mutation**. Hub pre-checks are early-return/logging optimizations, not the
+authorization boundary. Data merges are copy-on-write, and snapshot construction
+detaches mutable containers.
 
-    MP --> DTO --> JSGUID
-    SMS_SAMPLE --> SMS_API
-    SMS_EST --> SMS_API
-    REST --> SMS_API
-```
+### Publication, join and mutation invariants
 
-## Networking: Compact Wire Protocol
+Create parses/registers schemas before publishing the session through
+SessionService. Failed creation clears registration. Join adds the connection
+to its group before taking the snapshot so live broadcasts cannot fall into a
+snapshot/subscription gap; version ordering handles overlap. Group or entry
+publication failure rolls membership back.
 
-Hub frames are additionally compressed in transit by WebSocket
-`permessage-deflate` (RFC 7692), enabled for the `/sessionHub` path only by
-`UseWebSocketCompression` in `Program.cs`. Context takeover is left enabled on
-both directions — the shared compression window across messages is what makes
-the saving possible, because individual hot-path frames are small enough that
-compressing them in isolation recovers only a fraction of it. Server window bits
-are 12, which costs nothing measurable: a sweep over production-encoded frames is
-flat from 11 through 15 bits, because gameplay state drifts continuously and the
-dominant match is against the previous frame rather than anything far back. The
-~112 KiB less deflate state per connection that 12 holds is therefore free, and it
-is charged per connection because takeover retains that state for the connection's
-lifetime. `AstervoidsWeb/websocket-deflate-window.test.mjs` holds both claims. See
-the `WebSocketCompressionMiddleware` remarks for the measured figures. Two
-consequences matter:
+Scope strings accept `Member` or `Session` case-insensitively; omission retains
+each operation's documented default. Only a null/omitted owner defaults to the
+caller. Explicit malformed, empty, unknown, or departed owners reject rather
+than silently changing ownership.
 
-- It is purely a transport-layer concern. No DTO, schema, or client code is
-  aware of it, and a peer or proxy that does not offer the extension simply
-  negotiates it away.
-- `UseWebSocketCompression` installs `UseWebSockets` inside its own path
-  branch, and must keep doing so. Kestrel exposes only `IHttpUpgradeFeature`;
-  the `IHttpWebSocketFeature` the decorator wraps is created by
-  `UseWebSockets`, and the copy `MapHub` runs lives in the endpoint's
-  sub-pipeline, which executes *after* all outer middleware. Without the
-  branch-local call there is nothing to decorate and compression is silently
-  never negotiated. `TestServer` supplies that feature on its own, so only the
-  real-Kestrel handshake tests in `WebSocketCompressionTests.cs` can detect
-  the regression.
-- `ServerMetricsService` TX/RX byte counters remain **pre-compression**
-  estimates of the MessagePack payload, so `/api/srvmon` numbers are unchanged
-  by it and stay comparable with the `WireSizeBenchTests.cs` budgets.
+Replace validates every child's scope and owner before allocating handles,
+creating children, or deleting the parent. Invalid input leaves the original
+state intact. Accepted patches assign increasing object versions; handles are
+never reused within a session.
 
-The hot-path object payload (`ObjectInfo.Data`, `ObjectUpdateInfo.Data`,
-`ObjectUpdateRequest.Data`) does not flow as a `Dictionary<string, object?>`
-on the wire. It is wrapped in the positional
-`SyncPayload(byte SchemaId, byte[] Data)` array `[schemaId, dataBytes]`, so
-encoding can be selected per object without changing the game-facing data
-contract.
+### Departure and lifetime
 
-The surrounding hot DTOs also use integer MessagePack keys:
+`LeaveSession` and stale-member eviction atomically remove the member, promote
+if necessary, and process objects in one service critical section.
 
-| DTO | Wire shape |
+| Case | Result |
 | --- | --- |
-| `ObjectInfo` | `[id, creatorId, ownerId, scope, syncPayload, version, handle]` |
-| `ObjectUpdateInfo` | `[handle, syncPayload, version]` |
-| `ObjectUpdateRequest` | `[handle, syncPayload]` |
-| `ObjectReplacedEvent` | `[deletedObjectId, createdObjects]` |
-| `ObjectEventInfo` | `[objectId, eventKind, payloadBytes]` |
-| create/update/delete responses | `[result, memberSequence, timestamp?]` |
+| Departing member had `Server` role | Promote oldest remaining member, with GUID tie-break |
+| Departing member owned a member-scoped object | Delete it and its handle mapping |
+| Departing member owned a session-scoped object | Distribute ownership among remaining members by default |
+| No member remains | Preserve orphan session-scoped records during empty grace |
+| First member joins an empty retained session | Assign `Server` role and adopt orphan objects |
 
-### Session-scoped object handles
+Ships and bullets are member-scoped; asteroids and GameState are session-scoped.
+Creator identity does not change on migration. Migrated versions increase but
+`validAt` is preserved. The hub relays authoritative deleted IDs, migration
+versions, and optional promotion in `OnMemberLeft`.
 
-The two hot legs — the `UpdateObjects` request and the `OnObjectsUpdated`
-broadcast — address objects by a **session-scoped integer handle** instead of
-the 18-byte binary GUID. The handle costs 1–3 bytes, so a compact asteroid
-delta drops from ~31 B to ~16 B on both legs; with the GUID repeated in the
-request and again in the broadcast, it was the single largest remaining field
-on the uplink.
+The configured limits in [appsettings.json](AstervoidsWeb/appsettings.json)
+currently allow six active sessions and four members per session, with 60 seconds
+of empty grace and a 20-minute absolute lifetime. Empty retained sessions are not
+a persistence service. Cleanup scans every ten seconds, acquires the same
+operation gate, rechecks conditions under the session lock, destroys expired
+state, and removes schemas/groups while notifying clients.
 
-- `Session.AllocateObjectHandle()` hands out `1, 2, 3, …` per session. Handles
-  are **never reused**, so `0` is an unambiguous "no handle" sentinel and an
-  in-flight update addressed to a dead handle can only fail to resolve — it can
-  never land on a different object.
-- `Session` keeps a `handle → Guid` index next to the object map. Every add and
-  remove goes through `AddObject` / `RemoveObject` so the two cannot drift.
-- The handle is **published, not negotiated**: it rides on every `ObjectInfo`
-  alongside the GUID, so create responses, `OnObjectCreated`, replacement
-  children, the join response and every reconciliation snapshot teach it. There
-  is no mapping message, and a reconnect resync needs no special handling.
-- Everything outside those two legs keeps the GUID — `DeleteObject`,
-  `ReplaceObject`, `BroadcastObjectEvent`, `MemberLeftInfo.deletedObjectIds`
-  and the `validAts` / `memberSequences` pair arrays are all cold paths where
-  the extra bytes do not repeat per frame.
+Session schemas survive the empty grace period with retained objects; they are
+not simply discarded whenever the last member leaves. Lifecycle progresses
+through active, destroying, and destroyed states. Runtime restart discards the
+entire process-local store regardless of those configured lifetimes.
 
-`session-client.js` owns the translation, so `ObjectSync` and game code keep
-speaking GUIDs:
+## Wire protocol
 
-- It learns `handle ↔ id` from every decoded `ObjectInfo` and forgets the
-  mapping on delete, replacement of the parent, and member departure. A session
-  transition clears the whole map, since handles mean nothing outside the
-  session that allocated them.
-- On send it maps `objectId → handle`, dropping any update whose object it has
-  never been told about (the ack is then folded against the array that actually
-  went on the wire, not the caller's request array).
-- On receive it resolves `handle → objectId`. An update for a handle it has not
-  learned yet is **parked** (newest per handle, bounded) and replayed once a
-  live create teaches the handle; a snapshot that teaches the handle discards
-  the parked entry instead, because the snapshot is already newer. This
-  replaces the old "create a provisional object from an update for an unknown
-  id" fallback, which a handle cannot express.
+The authoritative definitions are
+[HubDtos](AstervoidsWeb/Hubs/HubDtos.cs),
+[SyncPayload codec](AstervoidsWeb/Hubs/SyncPayloadCodec.cs),
+[PositionalSchemaCodec](AstervoidsWeb/Hubs/PositionalSchemaCodec.cs),
+[client codec](AstervoidsWeb/wwwroot/js/schema-codec.js), and
+[game schemas](AstervoidsWeb/wwwroot/js/game-wire-schemas.js).
+Consult those definitions for exact method signatures and field order before
+changing a contract.
 
-`UpdateObjectsResponse.Versions` is **positional**, not keyed: entry `i` is the
-version assigned to wire element `i`, or `0` when that element was not
-applied (unknown handle, or owned by another member). `SessionObject.Version`
-starts at 1 and only increments, so `0` is an unambiguous rejection sentinel.
-The object id is omitted because the caller already knows which id it sent at
-each index, which takes a three-object acknowledgement from 72 B to 15 B.
+### DTO boundaries
 
-The alignment holds because `ObjectService.UpdateObjects` returns an
-order-preserving *subsequence* of the requested updates, so the hub matches the
-two lists with a single forward walk on the handle. A batch that repeats an
-object applies each occurrence separately, and each occurrence is acknowledged
-at its own request index; `session-client.js` keeps the highest version when
-folding such a batch back to `{objectId: version}`.
+| Surface | MessagePack shape |
+| --- | --- |
+| Full object | `[id, creatorMemberId, ownerMemberId, scope, payload, version, handle]` |
+| Update request entry | `[handle, payload]` |
+| Update broadcast entry | `[handle, payload, version]` |
+| Update acknowledgement | `[versions[], memberSequence, serverTimestamp]` |
+| Payload | `[schemaId, dataBytes]` |
+| Replacement event | `[deletedObjectId, createdObjects]` |
+| Create/replace response | `[objectInfo-or-createdObjects, memberSequence, validAt]` |
+| Object event | `[objectId, eventKind, payloadBytes]` |
 
-The same forward walk pairs each accepted occurrence's assigned version with
-that occurrence's original `SyncPayload` bytes for broadcast. Payloads must not
-be cached only by handle: two disjoint patches to one object need two distinct
-broadcast patches, not the last patch repeated twice. Unknown/unowned requests
-remain zero acknowledgements and do not shift the accepted payloads.
+The hot `UpdateObjects` arguments are updates, sender sequence, advertised send
+interval, and optional `clientValidAt`. Broadcast metadata includes sender/member
+sequences, sender member ID, server UTC, advertised interval, and one batch
+`validAt`. **Local `clientTimestamp` used to measure RTT is not an echoed wire
+argument.**
 
-`session-client.js` converts these arrays to named objects immediately at every
-invoke, live-event, snapshot, replacement, and reconciliation boundary.
+Session responses use named fields. Join/snapshot `validAts` and snapshot
+`memberSequences` are GUID/long pair arrays on the wire, normalized for client
+consumers. Entry installs schemas before payload decoding; shared full-object
+decoding resolves scope/identities consistently across responses, broadcasts,
+join, and recovery paths.
 
-### Schema registry (game-agnostic)
+Typed GUIDs use 16-byte binary values. SessionClient translates compact transport
+shapes to named JS objects, including a versions map for ObjectSync. That
+game-facing map must not be confused with the positional wire acknowledgement.
+Serialization uses the configured MessagePack resolvers and untrusted-data
+security setting; HTTP APIs separately use camelCase JSON.
 
-`object-sync.js` exposes a 3-call surface that the game uses to opt in:
+### Handles and positional acknowledgement
 
-1. `SchemaCodec.register(id, fields)` — declare a positional schema.
-2. `ObjectSync.setSchemaIdSelector((data, kind, ctx) => id)` — given a
-   payload + its kind (`'create' | 'update' | 'replace'`) + context
-   (`{objectId, object}` for updates, where `data.type` may be absent),
-   return the byte schema ID or `0` for the generic MessagePack-map path.
-3. Pass `schemas: [...]` into `SessionClient.createSession({...})` so
-   late joiners receive the same registry via `metadata.schemas`.
+`Session.AllocateObjectHandle` assigns increasing session-local integers.
+Zero is a missing/rejected sentinel; handles are never reused, so a late update
+for a deleted handle cannot mutate a different object. All add/remove paths keep
+the GUID map and handle index consistent.
 
-The C# counterpart `SyncSchemaRegistry` (per-`SessionId` map) parses
-`metadata.schemas` at session create and clears it on the last leave.
+Every full ObjectInfo publishes the mapping: create, replacement, join, and
+resync need no separate negotiation. SessionClient learns and forgets mappings
+at these boundaries and clears them on transition. Hot updates use handles;
+cold operations such as delete, replace, events, departure, and snapshots retain
+GUID identities.
 
-Schema IDs must be unique within one registration. Duplicate IDs reject the
-entire set during metadata parsing or direct registration; they do not silently
-replace an earlier descriptor. A failed replacement leaves the previously
-registered set usable. Changing a field layout therefore requires explicit
-compatibility review rather than relying on registration order.
+An outbound update without a known handle cannot go on the wire. A received
+unknown-handle update is parked, newest-per-handle and bounded, until a live
+create teaches it. A teaching snapshot discards the parked entry because its
+state is already authoritative.
 
-While create/join/rejoin is pending, `SessionClient` retains session-scoped
-membership and object broadcasts as raw arguments in the existing transition
-queue. The response's `metadata.schemas` is installed before any queued object
-payload is decoded. A join snapshot is decoded first to learn its handles,
-then seeded through ordinary object registration with no sender sequence.
-Queued hub handlers and callbacks replay together in received order, so an
-ownership migration sees its snapshot record before a newer delta advances
-the version. The final session callback retains `ObjectSync`'s version-aware
-snapshot merge: newer live records and owners survive, missing snapshot fields
-are backfilled, and deletion tombstones prevent resurrection. Expiration and
-session-list signals are not delayed.
+`versions[i]` acknowledges **wire request occurrence i**; zero means unapplied.
+ObjectService returns an order-preserving accepted subsequence, and the hub
+aligns it to the request using a forward walk. Repeated occurrences of one object
+are applied and acknowledged separately. SessionClient keeps the highest version
+when folding them into its game-facing map.
 
-The queue belongs only to that connection/session epoch and entry RPC: failed,
-rejected, cancelled, reset, expired, or superseded entry discards it rather than
-decoding it with another session's registry. Replay stops if a callback changes
-the epoch. Missing schema metadata clears the positional registry and preserves
-the schema-zero MessagePack-map path, not the previous/startup layout. Invalid
-queued positional payloads reject entry through the existing logged error and
-`onError` path, invalidating any seeds and replayed state along with the raw
-tail; they are not silently treated as successful joins.
+The same occurrence alignment selects original encoded deltas for broadcast.
+Do not cache payloads only by handle: two disjoint patches to one object must
+not become two copies of the last patch. Unknown/unowned requests remain zero
+acknowledgements and do not shift later accepted payloads.
 
-### Wire shape (SchemaId >= 1)
+### Schema registration and encoding
 
-```
-SyncPayload.Data = <bitmask: ceil(N/8) bytes>
-                  + <slot_i ...>   (only present slots, in declaration order)
-```
+The game registers positional schemas, supplies ObjectSync's schema selector, and
+publishes definitions in session metadata. The server's
+[SyncSchemaRegistry](AstervoidsWeb/Hubs/SyncSchemaRegistry.cs) is session-scoped.
+Create/join/rejoin install the returned registry before decoding snapshots or
+queued live payloads, following [entry ordering](#entry-and-recovery).
+Missing schema metadata clears positional registrations and retains schema 0,
+not the previous session/startup layout. Duplicate IDs reject registration
+rather than silently overwriting an earlier descriptor.
 
-A leading bit-presence mask preserves delta encoding: omitted slots are
-absent from both the bitmask and the body, and the receiver merges over
-prior state (matching the existing `Object.assign` semantics in JS and
-`ObjectService.ApplyUpdate` dict-merge in C#).
+Schema 0 is a generic MessagePack-map extension path. It preserves supported
+nested maps, arrays, nulls, bytes, and unknown fields. Current Astervoids object
+types select schemas 1 through 4:
 
-### Type tags
-
-| Tag             | Bytes | Range                | Notes                          |
-| --------------- | ----- | -------------------- | ------------------------------ |
-| `f64`           | 8     | IEEE-754             | Lossless                       |
-| `f32`           | 4     | IEEE-754             | ~7 decimal digits              |
-| `u8/u16/u32`    | 1/2/4 | unsigned LE          |                                |
-| `i8/i16/i32`    | 1/2/4 | signed LE            |                                |
-| `bool`          | 1     | 0/1                  |                                |
-| `str`           | 2+N   | 2-byte LE len + UTF8 | max 65535 bytes                |
-| `guid`          | 16    | binary               | Matches `BinaryGuidResolver`   |
-| `bytes`         | 4+N   | 4-byte LE len + raw  |                                |
-| `nullable-str`  | 1+…   | flag + (str)         |                                |
-| `nullable-guid` | 1+…   | flag + (guid)        |                                |
-| `q16`           | 2     | [0, 1]                | resolution ≈ 1.5e-5; clamps    |
-| `q16w`          | 2     | [-0.5, 1.5]           | wrap-extended coordinates      |
-| `q16s`          | 2     | [-1, 1]              | resolution ≈ 3.0e-5; clamps    |
-| `q16_2pi`       | 2     | [0, 2π)              | ~0.0055°; wraps negatives      |
-| `q8`            | 1     | [0, 1]                | resolution ≈ 4e-3; clamps      |
-
-`q16_2pi` normalizes via `((v % 2π) + 2π) % 2π` before quantizing so
-boundary inputs (e.g. -0.0001 vs +0.0001) round to angularly-close
-codes rather than opposite ends of the range.
-
-Both codecs use half-away-from-zero rounding (JS `Math.round`,
-C# `MidpointRounding.AwayFromZero`) to keep cross-wire bytes identical
-on midpoint inputs.
-
-### Durable Player Identity
-
-`player-identity.js` owns identity HTTP access and origin-local browser storage;
-inline picker code owns consent, naming and clipboard UI. Identity storage is
-separate from process-local sessions and **contains no gameplay scores**.
-
-An identity is a backend-generated public GUID plus an immutable, case-preserved
-`[A-Za-z0-9_-]{1,8}` tag. Tags are not globally unique. A 256-bit random base64url
-invitation identifies a pending player until its first successful naming, then
-remains that identity's recovery/access capability. Self invitations reproduce
-that same token. Link possession authorizes assuming the identity; confirmation
-does not add a second authentication factor. There is no automatic expiry in v1.
-
-Each browser environment is a top-level origin and profile/storage context.
-A 256-bit bearer credential lives in `localStorage`, initialized and used under
-Web Locks, and is sent only as `X-Astervoids-Browser` to the configured identity
-API. Private/blocked storage does not silently fall back to a per-tab credential.
-One binding row maps its credential hash to zero or one identity. Identities may
-have any number of separate browser bindings, without a growing binding array.
-Clearing browser storage or using another origin requires recovery with the link.
-Storage notifications and foreground resolution stop old-identity gameplay on
-rebind; membership and pending rejoin state are invalidated before new play.
-This also cancels picker joins whose session snapshot has not arrived.
-Refresh notifications coalesce while another request is pending, rather than
-being discarded; a failed verification requires Retry or explicit guest play.
-
-The API authority is the application's own origin for a regional host, or the
-first region in the deployed bootstrap manifest for a static apex. Arbitrary
-URL parameters cannot select it. HTTP requests use no cookies, reject redirects,
-disable caching, and send no referrer. Invitation links use the current site's
-origin and `#invite=...`; the fragment is scrubbed before normal startup.
-Successful acceptance and ignored invitations replace the address with `/`.
-No custom hostname, browser credential or invite token enters game data,
-SignalR URLs, public logs or committed configuration.
-
-Identity POST requests retain strict `Origin` validation. Azure terminates TLS
-before the container's HTTP hop, so Bicep explicitly configures default and
-bound custom HTTPS app origins through `Region__AdditionalAllowedOrigins`.
-This supplements existing apex/peer origins without trusting arbitrary forwarded
-headers or allowing wildcard hosts.
-
-All endpoints are JSON POST requests under `/api/identity`: `resolve`, `root`,
-`invites`, `invites/accept`, and `invites/self`. Responses contain public
-`{ id, tag }` identities, binding ETags/revisions, and (where needed) invite state
-and an invite ETag. Mutation request IDs give retries idempotent receipts.
-Consent captures the expected browser identity/ETag and invite ETag; concurrent
-claims or rebindings conflict, re-resolve, and require a new decision. An uncertain
-network outcome retains the exact pending request, rather than minting another
-identity or treating cancellation as rollback. Binding swaps and first naming
-are atomic. Superseded receipts cannot restore a discarded binding.
-
-`Identity:PromptOnRoot=true` prompts unbound root visitors. When false, root
-visitors stay anonymous; explicit naming is still available from the invite UI.
-Known bindings activate silently, same-identity invite visits silently return
-to root, and different-identity invitations offer Accept/Ignore. Tags in fresh
-multiplayer sessions use the same public identity as solo play; the hub still
-relays opaque client-authoritative game data. This is not an anti-cheat or
-server-authenticated scoring system.
-
-Development persists a locked, atomically replaced file; corrupt storage is
-unavailable, never silently reset. Production uses `Azure.Data.Tables` with
-`DefaultAzureCredential`, a single shared production account/Table endpoint,
-and table-scoped managed-identity roles. Previews use separate retained accounts.
-The runtime does not provision the table or fall back after an Azure error.
-Rows share one transaction partition: identity `I:`, invite-hash index `V:`,
-browser-hash binding `B:`, and request receipt `O:`. Identity rows retain the
-original invite capability for self recovery; private friend-creation receipts
-also retain their response for exact retries. Endpoints enforce size/type,
-origin and rate limits and uncompressed `no-store` responses. See `CICD_SETUP.md`
-for IAM, retention, region routing and rollout limitations.
-
-### Production schemas
-
-Registered in `index.html` `WIREOPT_SCHEMAS`:
-
-| SchemaId | Type | Fields (positional, all optional per payload) |
+| Schema | Type | State family |
 | --- | --- | --- |
-| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id/tag |
-| 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
-| 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id; packed personal-score, participant-number and participant-tag ledgers |
+| 1 | Ship | Pose/motion, controls, score/hits, invulnerability timing/revision, participant identity/tag, terminal target |
+| 2 | Asteroid | Pose/motion, radius/seed, optional packed fracture vertices, terminal target |
+| 3 | Bullet | Pose/motion/lifetime, ownership/color, optional pending-hit claim, terminal target |
+| 4 | GameState | Round/lives/score, wave state, packed hit/score/entry-life and personal-score/number/tag ledgers, terminal anchors and final-life ship |
 
-GameState keeps its original slots 0–15 unchanged, then appends optional `bytes`
-fields `participantScores` at slot 16, `participantNumbers` at slot 17, and
-`participantTags` at slot 18. Ship appends `participantTag: str` at slot 27,
-after `participantId: guid` at slot 26, retaining its four-byte mask.
-GameState's current nineteen-slot layout uses a three-byte presence mask. The session
-creator publishes the layout through `metadata.schemas`; older sixteen-slot
-registries retain their two-byte mask on updates and join snapshots.
+Each known type has **one superset schema** across live modes, create, update,
+replace, and terminal publication. The backend retains the object's creation
+schema for later re-encoding; an update-only field absent from that schema
+would disappear from recovery snapshots.
 
-Every known gameplay type uses exactly one superset schema for create, update,
-replace, terminal writes, and snapshot re-encoding. Adaptive-delay and
-deterministic ships therefore share schema 1: the presence mask omits replay or
-terminal slots when a mode does not produce them. This prevents a later update
-from introducing fields that the object's retained creation schema cannot
-encode.
+GameState preserves original slots 0-15 and appends optional `bytes` fields:
+`participantScores` at 16, `participantNumbers` at 17, and `participantTags` at 18.
+Ship appends `participantTag: str` at slot 27 after `participantId: guid` at 26;
+its presence mask remains four bytes. The nineteen-slot GameState mask is three
+bytes, but a creator's older sixteen-slot registry retains its two-byte mask on
+both updates and snapshots. Joining a session never silently upgrades its layout.
+Game capability checks inspect the advertised slots, not just a local build's
+field list. Ship tags are created once, not sent on every pose update.
 
-`thrustInput` is `f32` because the configured analog range extends past 1.
-Ship velocity and asteroid velocity/spin also use `f32`: their supported caps
-can exceed the unit interval, and setting a cap to zero permits larger values.
-Unit-range brake and turn magnitudes remain `q8`. Asteroid owners apply their
-linear/angular limits before create, replacement, and update capture, and
-asteroid update deltas include velocity and spin whenever those values change.
-
-Schema 0 remains reserved as the generic extension/fallback path. Its body is a
-MessagePack map and can preserve nested maps, arrays, nulls, binary values, and
-unknown fields. No current Astervoids gameplay object selects it, but JS and C#
-cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
-
-### Nested compact data
-
-- **Asteroid vertices:** seeded polygons are reproducible and transmit no
-  vertices; `ASTEROID_VERTICES` and `ASTEROID_JAGGEDNESS` are locked in session
-  metadata so every client regenerates identical geometry. Explicit fracture
-  geometry uses four bytes per vertex: q16 wrapped angle followed by q16
-  normalized distance.
-- **GameState ledgers:** processed hit/score maps, the counted-participant map,
-  personal scores, and participant numbers are sorted by normalized GUID and
-  encoded as fixed 20-byte entries (16-byte binary GUID + little-endian uint32).
-  Personal scores validate as nonnegative integers; participant numbers as
-  positive integers. Both maps must describe the same participants. Duplicate
-  GUIDs, invalid entries, and malformed byte lengths are rejected and reported
-  through the existing validation/recovery path, never reset to an empty history.
-  `ObjectSync` compares byte arrays by content so repacking an unchanged map
-  does not defeat delta suppression or confirmation tracking. Decode/pack caches
-  retain private snapshots to detect same-version and in-place mutations.
-- **Participant tags:** a GUID-sorted map uses a 16-byte mixed-endian GUID,
-  a one-byte ASCII length, then 1-8 tag bytes per entry. Duplicate/invalid GUIDs,
-  invalid tags and truncated entries are rejected. Tags do not accompany
-  high-frequency ship poses. The historical tag cache is independent of score
-  validation, so unavailable names cannot erase accepted score totals.
-- **Object events:** payload maps are field-aliased, MessagePack-encoded once by
-  the sender, and relayed by the hub as opaque `byte[]`. The receiver decodes
-  and expands aliases before calling the game handler.
-
-### Wire-size measurements (locked into `WireSizeBenchTests.cs`)
-
-| Payload | Current compact size |
-| --- | ---: |
-| ship create body (including countdown timing) | 64 B |
-| seeded asteroid create body | 40 B |
-| bullet create body | 37 B |
-| fresh GameState create body (five empty ledgers) | 65 B |
-| asteroid x/y/angle update DTO | 29–35 B |
-| ballistic bullet update DTO | 29–35 B |
-| pending-hit bullet update DTO | 50–60 B |
-| full replay-capable ship update DTO (including countdown timing) | 65–75 B |
-| three-asteroid update batch | 90–105 B |
-| seven-object mixed steady-state batch | 248–268 B |
-| three-version update acknowledgement | 15 B |
-| aliased ship-state object event | 35–45 B |
-
-The full ship fixture grows by 13 B for explicit countdown timing; unchanged
-countdowns no longer trigger per-step ship publication. Replacement response
-fixtures additionally cover SignalR MessagePack invocation/completion framing:
-the sender receives one completion, with 11 B of authoritative metadata, instead
-of a completion plus duplicate child broadcast. Neither budget includes
-WebSocket, TLS or IP overhead.
-
-The eighteen-slot GameState fixture without the three optional participant maps
-is 53 B; adding empty personal-score/number maps makes it 61 B, and the fresh
-production producer also includes the empty counted-participant map for 65 B.
-Each historical participant adds 40 B across the two new packed maps. A score-only
-Ship update body is 8 B (four-byte Ship mask plus the existing uint32 counter);
-it is sent only while that counter is unconfirmed, not on every motion update.
-
-### Hazards verified by tests
-
-- Delta encoding survives positional packing: the mask preserves partial
-  updates for every production schema.
-- Byte-valued fields use content equality for delta and confirmation checks.
-- Joiner schema race: `joinSessionCore` calls
-  `SyncPayload.replaceSchemas(metadata.schemas)` before unwrapping
-  `response.objects`; `ObjectSync` reapplies the same contract defensively when
-  it receives the completed session callback.
-- Angle wrap at 0/2π: `q16_2pi roundtrip: angle near 0 vs
-  near 2π wrap correctly`.
-- Extrapolation drift: receiver uses `pos = snapshot.x + dt *
-  snapshot.vx` (non-integrating). 3600-frame simulation asserts max
-  render error stays within `quantum + lag × velocity_quantum`.
-- `validAt` continuity is preserved: existing `validAt-axis`,
-  `spawn-extrapolation`, and `clock-offset` suites stay green at every
-  phase.
-- JS/C# golden fixtures pin every field type, production schema layout,
-  schema-0 structured values, compact DTO shape, and representative byte
-  budgets.
-
-## Networking: Regional Deployment
-
-Astervoids can deploy to one or many Azure regions simultaneously. Every
-visitor sees every active session in every region; sessions live in
-exactly one region (no replication) and the client routes its Create/Join
-SignalR connection to the correct region's hub.
-
-### Architectural choices
-
-- **Independent regions, client-side merge.** Each region runs its own
-  in-memory `SessionService`; the client polls `GET /api/sessions` on
-  every region in parallel and merges the results. No central registry,
-  no cross-region writes — keeps the existing per-process state model
-  unchanged.
-- **One process owns a joined session.** The replication runtime consumes
-  canonical records without assuming where they are stored, but current server
-  ordering and authority remain process-local. Future distributed sessions
-  require a shared ordered session/object store and fan-out below this client
-  boundary; client extraction alone does not provide them.
-- **Apex entrypoint via Static Web App.** First-time visitors land on the
-  static shell via apex CNAME → Static Web App. After the client downloads
-  `region-service.js` it takes over: pings every region and pins to its
-  measured-best region for API/SignalR traffic.
-- **Spectator SignalR connections (picker only).** While the start
-  screen is visible, the client opens one read-only SignalR connection
-  per region. Each region's hub still broadcasts `OnSessionsChanged` to
-  every connected client, so cross-region changes surface within
-  ~1 inter-region RTT (typically 50–200 ms). Connections close on
-  Join/Create/Solo and on `document.hidden` — backgrounded tabs must
-  NOT keep regions warm or scale-to-zero is defeated.
-- **Scale-to-zero everywhere.** Container Apps `minReplicas: 0` +
-  `cooldownPeriod: 60s` returns regions to zero ~1 min after the last
-  connection closes. In the static-apex path there is no Traffic Manager
-  probe loop hitting regional APIs, so idle regions are not kept warm by
-  DNS routing infrastructure.
-
-### Latency budget
-
-| Event | Single region (today) | Multi-region (this design) | Mechanism |
-|---|---|---|---|
-| Picker open, regions warm | ~1 RTT to origin | ~1 RTT to slowest region | parallel `/api/sessions` fan-out + parallel WS negotiate |
-| Picker open, regions cold | n/a | up to 15 s budget per region; `🔥 Warming up…` shown until first real sample | client-side cold-start detection (samples >1500 ms suppressed from EMA) |
-| Change in **same** region as visitor | ~1 LAN RTT (push) | ~1 LAN RTT (push) | unchanged `OnSessionsChanged` push |
-| Change in **other** region | n/a | ~1 inter-region RTT | spectator hub in that region pushes `OnSessionsChanged` |
-| Spectator WebSocket dropped | n/a | ≤30 s worst case, `↻` badge sooner | belt-and-suspenders REST 30 s repoll |
-| Ping column updates | n/a | first value ≤1 RTT after load; settled (`confidence === 1`) ~50 s later | RegionService bursts + EMA(α=0.3) + per-cell re-render |
-
-### Module layout
-
-```mermaid
-graph TB
-    BR["Browser"]
-    subgraph Client modules
-        RS["RegionService<br/>region-service.js<br/>Discovers regions · Progressive RTT bursts<br/>EMA · Cold-start handling · bestRegion hysteresis"]
-        SP["SpectatorClient<br/>spectator-client.js<br/>N read-only SignalR connections<br/>OnSessionsChanged → per-region refetch"]
-        SC["SessionClient<br/>session-client.js<br/>Single join connection · region-aware hub URL"]
-        MR["MultiRegionSessions<br/>(inline in index.html)<br/>Parallel /api/sessions fetch · Merge · Coalesce"]
-        UI["Session picker UI<br/>Region+Ping columns · 'Your region' banner<br/>'Create in <region>' button · Native <select>"]
-    end
-    subgraph Per-region server
-        API["GET /api/ping<br/>GET /api/regions<br/>GET /api/sessions"]
-        HUB["/sessionHub<br/>(CORS-enabled for cross-region)"]
-    end
-    SA["Azure Static Web App<br/>(apex CNAME · no redirect shell)"]
-
-    BR -->|"apex DNS + static shell"| SA
-    SA -->|"client RTT probing + region choice"| API
-    RS -->|"GET /api/regions, /api/ping × N"| API
-    MR -->|"GET /api/sessions × N"| API
-    SP -->|"WS × N (picker only)"| HUB
-    SC -->|"WS × 1 (joined region)"| HUB
-    SP -->|"sessionsChanged(regionId)"| MR
-    MR --> UI
-    RS --> UI
+```text
+schema payload = presence mask of ceil(fieldCount / 8) bytes
+               + present field slots in declaration order
 ```
 
-### Cold-start handling
+Presence bits preserve partial updates. Omitted slots merge over prior state,
+not zero it. Schemas have a bounded field count; changing slot order, type, or
+null semantics requires JS/C# compatibility review.
 
-CAE scaling to zero means a visitor opening the picker after an idle
-period hits cold containers on the first ping. `RegionService` handles
-this honestly:
+| Type family | Representation |
+| --- | --- |
+| `f64`, `f32` | IEEE-754 little-endian |
+| Signed/unsigned 8/16/32-bit integers | Fixed width, little-endian where applicable |
+| `bool` | One byte |
+| `str` | uint16 byte length, then UTF-8 |
+| `guid` | 16 bytes in the shared GUID ordering |
+| `bytes` | uint32 length, then raw bytes |
+| Nullable string/GUID | Presence flag, then value when present |
+| `q16`, `q8` | Quantized unit interval |
+| `q16w` | Quantized wrap-extended position interval `[-0.5, 1.5]` |
+| `q16s` | Quantized signed unit interval |
+| `q16_2pi` | Quantized wrapped angle |
 
-1. First-ever ping per region uses 15 s timeout (vs 5 s for warm pings).
-2. If the first valid sample is > 1500 ms it's treated as container
-   start-up (emits `coldStart` event, **suppressed** from the EMA).
-3. State stays `'warming'` (`🔥 Warming up…` shown in the cell) until a
-   real sub-1500 ms sample lands. `bestRegion()` never picks a warming
-   region.
-4. Once a real sample arrives, state → `'measuring'` → `'settled'`.
+Wrap-extended position encoding prevents offscreen wrap margins from being
+clamped to the visible edge. Terminal positions/angles use full-precision
+fields. Ship thrust and ship/asteroid velocities use ranges capable of expressing
+their configured limits rather than assuming every quantity lies in `[0, 1]`.
 
-### Picker assessment lifecycle
+Do not infer universal byte equality from language rounding names: JavaScript
+`Math.round` and C# `MidpointRounding.AwayFromZero` differ at negative signed
+halfway inputs. The existing signed quantizers use those respective operations.
+Exact midpoint behavior needs explicit compatibility coverage, not the blanket
+claim that both languages round every input identically.
 
-Regional RTT bursts run only while the session picker is visible, including
-single-region deployments. Entering solo or multiplayer gameplay stops timers,
-aborts active probes, and invalidates stale continuations. Returning to the
-picker starts fresh bursts while retaining the manifest and prior measurements.
-Hidden tabs suspend picker polling/spectators and regional assessment; delayed
-bootstrap completion cannot restart them during gameplay. The joined session's
-clock synchronization remains independent and active.
+### Packed game data and compatibility evidence
 
-Session-list notifications from the active connection refresh only its region,
-just like spectator notifications. Explicit refreshes and fallback polling still
-cover all regions.
+[AstervoidsWireCodec](AstervoidsWeb/wwwroot/js/astervoids-wire-codec.js) owns
+game-specific nested packing:
 
-After confidence is full, wholly successful stable RTT bursts progressively
-double their five-second interval up to 60 seconds. Stability allows the greater
-of 10 ms or 20% deviation from the previous EMA. Failures or meaningful changes
-restore the base interval; returning to visibility, going online or a supported
-network-connection change triggers prompt reassessment.
+- Seeded asteroids can regenerate their initial polygon from the seed and
+  session-locked geometry settings. Explicit fracture geometry uses four bytes
+  per polar vertex: wrapped angle plus normalized distance.
+- Counter ledgers sort entries by GUID and encode 16-byte identity plus
+  little-endian uint32. Personal-score/number maps normalize GUIDs and validate
+  nonnegative scores, positive ordinals, matching participants, and duplicate
+  entries before use. These histories are distinct from the entry-life ledger.
+- Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
+  ASCII length, and 1-8 tag bytes. Invalid/duplicate entries or truncated bytes
+  reject; tag failure must not erase valid score history.
+- Event payload maps are aliased and MessagePack-encoded once by the sender.
+  The hub relays opaque bytes; the receiver expands aliases before dispatch.
 
-Session-list refreshes are single-flight per region. Hints received during a
-request coalesce into one pending follow-up rather than aborting useful work;
-explicit callers await that follow-up. Teardown still aborts requests and
-invalidates old generations so delayed responses cannot repopulate the picker.
+Keep cross-wire fixtures for every scalar type, production schema, mixed batch,
+schema-0 structure, and compact DTO. Include boundary/wrap inputs and preserve
+positional field order. Quantization-drift checks sample from anchors rather
+than accumulating prediction error.
 
-### Configuration
+Exact byte budgets live in
+[WireSizeBenchTests](AstervoidsWeb.Tests/WireSizeBenchTests.cs), not a duplicated
+size table here. Distinguish payload/SignalR framing, compressed WebSocket bytes,
+and TLS/IP overhead when interpreting them.
 
-- **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
-  Manifest in `appsettings.json` under `Region:Regions`. CORS permits the
-  configured region hosts, `Region:ApexHostname`, and exact origins in
-  `Region:AdditionalAllowedOrigins`. Bicep supplies each app's default and bound
-  custom HTTPS origins, plus the default Static Web App origin where applicable.
-  This supports deployed self-origin identity requests after TLS termination
-  and public-URL regional HTTP/SignalR traffic without publishing private hostnames.
-  Only when no origins are configured does the local-development permissive
-  fallback apply; deployed origins do not use wildcard host matching.
-- **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
-  single-region; a non-empty validated array plus custom-domain and BYO
-  certificate inputs = multi-region). Primary region (index 0) owns the
-  shared ACR + DNS zone.
-- **CI**: `REGIONS_JSON` env var in `.github/workflows/azure-deploy.yml`
-  (empty by default). Set it to a validated JSON array, with the required
-  custom-domain and BYO certificate inputs, to enable multi-region prod.
+**Polygon-fracture geometry remains explicit.** Late join, reconciliation, and
+ownership migration recover a child from its replicated record, without the
+deleted parent or the owner's RNG cursor. Seed-recipe compression was evaluated
+but not adopted: at existing geometry defaults, the small compressed-traffic
+saving did not justify another geometry format and its compatibility cost.
+No event-seed recipe payload is supported or being introduced.
 
-  ### Deployment permutation contract
+## Infrastructure and deployment
 
-  The deployment paths are expected to remain reproducible from IaC inputs:
-
-  - **`main` + empty `REGIONS_JSON`** → production single-region (greenfield-capable).
-  - **`main` + valid non-empty `REGIONS_JSON` + custom domain + BYO cert** →
-    production multi-region static-apex path (greenfield-capable).
-  - **Incomplete multi-region input** → CI fails before Azure mutation; direct
-    Bicep/azd calls use the safe single-region path and emit
-    `DEPLOYMENT_WARNING`.
-  - **non-`main` + shared infra** → branch preview deploys from scratch against shared production infra.
-  - **non-`main` + standalone** → isolated env in its own resource group.
-
-  Cleanup automation must only remove branch-ephemeral resources and never delete
-  production resources by name-pattern collision.
-
-  ### BYO wildcard cert for regional hostnames
-
-Azure Container Apps' free managed certificates have a hard requirement:
-the custom-domain CNAME must point **directly** at the container app's
-generated FQDN. That makes them awkward for this deployment's per-region
-custom hostnames, where we use a shared wildcard cert across regions and
-branches. (Reference:
-[Microsoft docs](https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates)).
-
-For multi-region production, the apex now points at a Static Web App, while
-gameplay APIs/SignalR still target per-region ACA hostnames. We use a BYO
-wildcard cert in Key Vault and bind it on every region's container app (and
-on branch container apps too, by reusing the same cert).
-
-The recommended automation is [keyvault-acmebot](https://github.com/shibayan/keyvault-acmebot)
-— an open-source Azure Function App that auto-issues and rotates Let's
-Encrypt certs into Key Vault. Total cost: <$1/mo for hobby traffic. One
-wildcard cert covers all per-region / per-branch ACA subdomains, while the
-apex hostname is bound on the Static Web App entrypoint.
-
-#### Setup, permissions, and rotation
-
-The one-time ACMEbot setup, the bicep-managed vs. externally managed
-permission paths, and the cert-rotation cadence are operational procedures
-rather than architectural contracts. They live in
-[CICD_SETUP.md → BYO wildcard certificate (ACMEbot) runbook](CICD_SETUP.md#byo-wildcard-certificate-acmebot-runbook).
-
-The contract this document pins down is narrower:
-
-- CI sources `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, and
-  `CERT_READER_IDENTITY_ID` from repository secrets, never repository variables.
-  Certificate metadata can reveal the private hostname by correlation and must
-  not appear in public outputs. Legacy variables remain only for older workflow
-  refs until the runbook's migration is complete.
-- Multi-region production **requires** `CUSTOM_DOMAIN_NAME`,
-  `CUSTOM_SUBDOMAIN`, and the `CERT_KEY_VAULT_SECRET_URL` /
-  `CERT_KEY_VAULT_CERT_NAME` pair; incomplete input is rejected before any
-  Azure resource is created.
-- Bicep provisions one
-  `Microsoft.App/managedEnvironments/certificates` per region's CAE from the
-  Key Vault secret URL, and binds `<subdomain>.<domain>` on each region's
-  container app with `bindingType: SniEnabled`.
-- The same wildcard cert covers branch hostnames, so branch deploys skip
-  DigiCert managed-cert provisioning entirely.
-
-### Key files
-
-- `AstervoidsWeb/Configuration/RegionSettings.cs` — manifest binding.
-- `AstervoidsWeb/Program.cs` — `/api/ping`, `/api/regions`,
-  `/api/sessions` + `RegionalApi` CORS policy.
-- `AstervoidsWeb/wwwroot/js/region-service.js` — progressive RTT.
-- `AstervoidsWeb/wwwroot/js/spectator-client.js` — multi-region SignalR.
-- `AstervoidsWeb/wwwroot/index.html` (Section 10) — picker + inline
-  `MultiRegionSessions` module + lifecycle wiring.
-- `infra/main.bicep` — `regions` loop, BYO cert plumbing.
-- `infra/core/host/static-web-app.bicep` — static apex entrypoint for
-  multi-region production.
-- `infra/core/host/container-apps.bicep` — CAE + optional BYO cert resource
-  from Key Vault.
-- `infra/core/host/container-app.bicep` — container app + optional
-  `customDomains[bindingType: SniEnabled, certificateId]` binding to the
-  CAE's BYO cert.
-
-### Tests
-
-- `RegionEndpointsTests.cs` — `/api/ping` shape + Cache-Control,
-  `/api/regions` manifest + camelCase, `/api/sessions` regionId stamp,
-  CORS allow-list + reject untrusted origin.
-- `SessionServiceTests.cs` — default `RegionId = "local"`, configured
-  manifest stamps every emitted `SessionInfo`.
-- `PingBudgetTests.cs` — mean handler time < 5 ms over 200 iterations;
-  response body shape pinned to `{ now }`.
-- `AstervoidsWeb/region-service.test.mjs` — warm-up discard, cold-start
-  gating, EMA convergence, confidence monotonicity, `bestRegion`
-  hysteresis.
-- `AstervoidsWeb/spectator-client.test.mjs` — open/close per region,
-  exclude-by-hostname, push dispatch, connection-state transitions,
-  error tolerance.
-- `AstervoidsWeb/picker-freshness.test.mjs` — bootstrap merge,
-  per-region failure isolation, 250 ms push coalescing,
-  visibility-driven `stop()`, cold-region non-blocking render.
-
-## Static Asset Delivery
-
-Startup hashes every `wwwroot` file and serves the hash as the `ETag`, with
-`Cache-Control: no-cache` so browsers revalidate on each launch. The hash is
-re-applied in `StaticFileOptions.OnPrepareResponse`, because the static-file
-middleware would otherwise stamp its own last-modified/length validator — which
-changes on every container build even for byte-identical files, forcing a full
-re-download after each deploy.
-
-Text assets are additionally cached as maximum-quality Brotli encodings
-(`StaticAssetCompressionCache`). Quality 11 is roughly 28% smaller than the
-quality-1 encoding the response-compression middleware produces on the request
-path, but far too slow to run per request, so the cache is warmed on a
-background task **after** the host is listening. This preserves the
-deliberate ordering in `Program.cs` that lets regional endpoints answer
-cold-start RTT probes immediately. Until an entry is ready, requests fall
-through to the ordinary response-compression path, so the cache is never a
-correctness dependency.
-
-Both representations share the content-hash validator, so `Vary:
-Accept-Encoding` accompanies the Brotli response. Range requests bypass the
-cache and are served from the identity representation.
-
-Set `StaticAssets:Precompress` to `false` to skip the warm-up entirely, trading
-bandwidth for ~213 KiB of resident memory and the startup CPU burst. Test hosts
-default it off (`AstervoidsWebFactory`): the suite starts many hosts, and
-paying ~1.4 s of Brotli quality-11 CPU per host perturbs the wall-clock budget
-asserted by `PingBudgetTests`.
-
-## Project Structure
-
-```
-astervoids/
-├── ARCHITECTURE.md              # This document
-├── README.md                    # Project overview and setup
-├── CICD_SETUP.md               # CI/CD pipeline documentation
-├── DEV_NOTES.md                # Developer notes
-├── astervoids.sln              # .NET solution file
-├── azure.yaml                  # Azure Developer CLI config
-├── index.html                  # Root redirect page
-│
-├── AstervoidsWeb/              # Main web application
-│   ├── AstervoidsWeb.csproj    # .NET 10.0 Web SDK project
-│   ├── *.test.mjs              # Node behavior, policy, runtime, cadence, continuity,
-│   │                           # codec, and source-order contract tests
-│   ├── test-support/
-│   │   └── inline-game.mjs     # Production inline declarations with injected dependencies
-│   ├── Program.cs              # App startup, DI, middleware, SignalR mapping,
-│   │                           # MessagePack protocol, /api/srvmon endpoint
-│   ├── Dockerfile              # Multi-stage Docker build (SDK → aspnet runtime)
-│   ├── docker-compose.yml      # Local Docker orchestration
-│   ├── appsettings.json        # Configuration (Session section)
-│   ├── manifest.json           # PWA manifest
-│   │
-│   ├── Configuration/
-│   │   └── SessionSettings.cs  # MaxSessions, MaxMembersPerSession,
-│   │                           # DistributeOrphanedObjects, EmptyTimeoutSeconds,
-│   │                           # AbsoluteTimeoutMinutes, ClientTimeoutSeconds,
-│   │                           # KeepAliveSeconds
-│   │
-│   ├── Formatters/
-│   │   └── BinaryGuidFormatter.cs      # MessagePack binary GUID encoding:
-│   │                                   # BinaryGuidFormatter, NullableGuidFormatter,
-│   │                                   # BinaryGuidResolver
-│   │
-│   ├── Models/
-│   │   ├── Session.cs                  # Session entity (Members, Objects, SyncRoot,
-│   │   │                               # LifecycleState, Metadata, LastMemberLeftAt)
-│   │   ├── Member.cs                   # Member entity (Role, EventSequence)
-│   │   ├── SessionObject.cs            # Synced object (Scope, Version, Data dictionary)
-│   │   ├── MemberRole.cs               # Enum: Server, Client
-│   │   ├── ObjectScope.cs              # Enum: Member, Session
-│   │   └── SessionLifecycleState.cs    # Enum: Active, Destroying, Destroyed
-│   │
-│   ├── Services/
-│   │   ├── ISessionService.cs          # Interface + result records (Create/Join/Leave/
-│   │   │                               # ActiveSessions/EvictionInfo/ForceDestroy)
-│   │   ├── SessionService.cs           # In-memory session management. Atomic LeaveSession,
-│   │   │                               # EvictMemberInternal, AdoptOrphanedObjects,
-│   │   │                               # HandleObjectDeparture (private helper).
-│   │   ├── ISessionNameGenerator.cs    # Pluggable session naming
-│   │   ├── FruitNameGenerator.cs       # Default 50-fruit naming with collision counter
-│   │   ├── IObjectService.cs           # Interface + ObjectUpdate / ObjectMigration /
-│   │   │                               # ReplacementObjectSpec / MemberDepartureResult
-│   │   ├── ObjectService.cs            # Object CRUD + ReplaceObject; ownership and
-│   │   │                               # lifecycle enforced atomically under Session.SyncRoot
-│   │   ├── SessionCleanupService.cs    # Background service: expires empty / long-lived sessions
-│   │   ├── ServerMetricsService.cs     # Singleton; CPU/memory/GC/connections/per-member
-│   │   │                               # TX/RX/reconciliation/reconnect; powers /api/srvmon
-│   │   └── StaticAssetCompressionCache.cs  # Maximum-quality Brotli encodings of text assets,
-│   │                                   # warmed in the background after startup
-│   │
-│   ├── Hubs/
-│   │   ├── SessionHub.cs       # SignalR hub: game-agnostic session/object API.
-│   │   │                       # Includes MessagePack payload-size estimation for metrics.
-│   │   ├── HubDtos.cs          # [MessagePackObject] request/response DTOs (camelCase keys)
-│   │   └── WebSocketCompressionMiddleware.cs  # Negotiates permessage-deflate on /sessionHub
-│   │
-│   └── wwwroot/
-│       ├── index.html          # Single-file game: HTML5 Canvas + CSS + JS runtime
-│       ├── session-test.html   # Session management test harness
-│       ├── manifest.json       # PWA web app manifest
-│       ├── debug/
-│       │   └── index.html      # Real-time client network metrics (BroadcastChannel)
-│       ├── srvmon/
-│       │   └── index.html      # Server monitoring page; polls /api/srvmon every 2s
-│       └── js/
-│           ├── debug-log.js                       # Shared _log/_warn/_error helpers gated on ASTERVOIDS_DEBUG.
-│           │                                      # Must load before every other script that logs.
-│           ├── session-client.js                  # SignalR lifecycle, hub RPC wrappers, stale-connection
-│           │                                      # guard(), GUID normalization, object handle translation.
-│           │                                      # See: Client Architecture.
-│           ├── object-sync.js                     # Object registry, type index, delta encoding, batched flush,
-│           │                                      # per-member sequencing, reconciliation, and schema dispatch.
-│           │                                      # See: Client Architecture.
-│           ├── replication-clock.js               # Injected server-clock estimator and validAt conversion
-│           ├── replication-presentation.js        # Adaptive delay, interpolation, and dead-reckoning policies
-│           ├── replication-send-policy.js         # Ballistic/ship send eligibility and immediate-edge decisions
-│           ├── replication-runtime.js             # Pull-driven replica lifecycle, versions, joins, and ownership
-│           ├── schema-codec.js                     # Positional presence-mask codec and schema registry
-│           ├── sync-payload.js                     # Schema-id/binary-body envelope adapter
-│           ├── msgpack-codec.js                    # Generic schema-0 and object-event map codec
-│           ├── astervoids-wire-codec.js            # Packed asteroid vertices and GameState ledgers
-│           ├── guid-utils.js                      # bytesToGuid · transformBinaryGuids (binary GUID → string)
-│           ├── signalr.min.js                     # SignalR client library (local copy)
-│           └── signalr-protocol-msgpack.min.js    # MessagePack protocol for SignalR client
-│
-├── AstervoidsWeb.Tests/        # xUnit test project (backend/unit/integration tests)
-│   ├── AstervoidsWeb.Tests.csproj   # Test dependencies: xUnit, FluentAssertions, Moq
-│   ├── TestBase.cs                  # Shared helpers: CreateTestSession / CreateTestSessionWithClient
-│   ├── SessionServiceTests.cs       # Session create/join/leave/naming
-│   ├── ObjectServiceTests.cs        # Object CRUD/versioning/replace
-│   ├── ServerPromotionTests.cs      # Server promotion, eviction, orphan adoption
-│   ├── ConcurrencyTests.cs          # Concurrency / thread-safety tests
-│   ├── BinaryGuidFormatterTests.cs  # MessagePack binary GUID round-trip tests
-│   ├── ReplaceAfterRejoinTest.cs    # Regression: replace right after a rejoin/eviction
-│   └── SessionHubTests.cs           # SessionHub unit tests
-│
-├── infra/                      # Azure infrastructure (Bicep IaC)
-│   ├── main.bicep              # Four deployment forms: prod single, prod multi, branch shared-infra, standalone
-│   ├── main.parameters.json    # Environment parameters
-│   ├── enable-custom-domain.ps1 # Custom domain setup script
-│   ├── CUSTOM_DOMAIN_SETUP.md  # Custom domain documentation
-│   └── core/
-│       ├── host/
-│       │   ├── container-apps.bicep  # Container Apps Environment + ACR
-│       │   ├── container-app.bicep   # Individual Container App module
-│       │   └── static-web-app.bicep  # Static apex hosting (multi-region prod)
-│       ├── security/
-│       │   ├── acmebot-permissions.bicep # id-acme-cert-reader + DNS role for ACMEbot
-│       │   └── kv-cert-user-role.bicep   # KV Certificate User role assignment on ACMEbot KV
-│       ├── network/
-│       │   └── traffic-manager.bicep      # Legacy/optional Traffic Manager module (not in static-apex path)
-│       └── dns/
-│           ├── dns-zone.bicep        # Azure DNS zone
-│           └── dns-records.bicep     # CNAME + TXT verification records
-│
-└── .github/
-    ├── copilot-instructions.md     # AI coding assistant instructions
-    ├── agents/
-    │   └── race-condition-reviewer.agent.md  # Race condition review agent
-    ├── scripts/
-    │   └── sanitize-branch-name.sh # Branch name sanitization for deployments
-    └── workflows/
-        ├── azure-deploy.yml            # CI/CD: build, test, provision, deploy
-        ├── cleanup-orphans.yml         # Cleanup orphaned branch deployments
-        └── check-easy-auth-secret.yml  # ACMEbot Easy Auth secret expiry monitor
-```
-
-## Infrastructure & Deployment
+[`infra/main.bicep`](infra/main.bicep) is the topology source of truth for every
+path. This diagram shows configured multi-region production, not proof that a
+particular environment currently has these resources:
 
 ```mermaid
 flowchart TB
-    subgraph "Deployment Forms (IaC Matrix)"
-        direction TB
-        PROD1["Production single-region<br/>environmentName = 'production'<br/>REGIONS_JSON empty<br/>rg-production + single CAE/app path"]
-        PRODN["Production multi-region<br/>environmentName = 'production'<br/>Validated REGIONS_JSON + custom domain + BYO cert<br/>static apex + per-region CAE/apps"]
-        BRANCH["Branch (CI/CD preview)<br/>useSharedInfra = true<br/>Shares production RG/ACR/primary CAE<br/>Creates one Container App per branch"]
-        STANDALONE["Standalone (local azd)<br/>Creates own resource group: rg-{env}<br/>Own ACR + CAE + Container App"]
+    Browser["Browser (direct regional HTTP and SignalR)"]
+    Static["Static Web App entrypoint"]
+    Registry["Shared primary ACR (same app image)"]
+    Certificate["Key Vault certificate and reader identity"]
+    IdentityTable[("Shared environment identity table (no sessions or scores)")]
+    subgraph RegionA["Primary region"]
+        AppA["CAE and Container App"]
+        StateA[("Process-local sessions")]
+        LogsA["Log Analytics"]
+        AppA --> StateA
+        AppA --> LogsA
     end
-
-    subgraph "CI/CD Pipeline (azure-deploy.yml)"
-        direction TB
-        TRIGGER["Trigger:<br/>push any branch<br/>PR to main (build/test only)<br/>workflow_dispatch"]
-        BUILD["Build & Test"]
-        DOCKER["Container build + push"]
-        DEPLOY["Deploy path selected by branch + REGIONS_JSON"]
-        CLEANUP["cleanup-orphans.yml:<br/>Daily/manual removal of<br/>orphaned branch resources"]
+    subgraph RegionB["Each additional region"]
+        AppB["CAE and Container App"]
+        StateB[("Independent sessions")]
+        LogsB["Log Analytics"]
+        AppB --> StateB
+        AppB --> LogsB
     end
-
-    subgraph "Runtime"
-        direction TB
-        CA["Azure Container App<br/>Port 8080, 0-1 replicas<br/>.NET 10.0 runtime"]
-        WS["WebSocket: /sessionHub<br/>SignalR with auto-reconnect"]
-        COMP["Response Compression:<br/>Brotli + Gzip (EnableForHttps=true)"]
-    end
-
-    TRIGGER --> BUILD --> DOCKER --> DEPLOY
-    DEPLOY --> PROD1
-    DEPLOY --> PRODN
-    DEPLOY --> BRANCH
+    Browser -->|"Static assets and regional bootstrap"| Static
+    Browser <--> AppA
+    Browser <--> AppB
+    Registry --> AppA
+    Registry --> AppB
+    Certificate -.-> AppA
+    Certificate -.-> AppB
+    AppA <-->|"App managed identity"| IdentityTable
+    AppB <-->|"App managed identity"| IdentityTable
 ```
 
-## Game Configuration (CONFIG)
+The Static Web App serves copied `wwwroot` content and generated regional
+bootstrap configuration. It does not proxy gameplay HTTP or WebSockets.
+The browser stays on the entry URL and talks directly to its selected region.
+The identity client on the static entrypoint instead uses the first configured
+region; every regional identity API accesses the same production Table endpoint.
+The repository's Traffic Manager module is not invoked by the current
+`main.bicep` path.
 
-Shared gameplay defaults and debug-control metadata are defined in
-[`wwwroot/js/game-config.js`](AstervoidsWeb/wwwroot/js/game-config.js). Runtime-only
-settings stay beside their owning systems in the `CONFIG` object in
-[`index.html`](AstervoidsWeb/wwwroot/index.html). These production sources are
-also imported by the JavaScript tests so physics and UI defaults cannot drift.
+### Deployment forms
 
-Object types: `ship`, `asteroid`, `bullet`, `gameState`. Ship colors: Green, Cyan, Magenta, Yellow (up to 4 players).
+| Form | Topology and state |
+| --- | --- |
+| Production, empty region manifest | One production CAE/app, same-origin frontend/APIs, durable production identity store |
+| Production, valid multi-region configuration | Static entrypoint, independent CAE/app/logs per region, shared primary registry and the same production identity store |
+| Branch preview with shared infrastructure | Separate single-region app/memory and retained identity account, reusing production RG/ACR/primary CAE and DNS, never production identity data |
+| Standalone azd environment | Separate resource group, registry, CAE/app, and environment identity account |
+| Local development | Same application boundaries through `dotnet watch`; development file identity store, with explicit configuration needed outside Development |
 
-## Debug & Test Pages
+Each app uses a single active revision and zero-to-one replicas, with HTTPS
+ingress to port 8080. This avoids pretending multiple independent in-memory
+replicas share a session; it does not make session state durable. Current
+deployment defaults include 1 vCPU/2 GiB, a 60-second scale-down cooldown,
+30-second termination grace, and per-CAE Log Analytics retention of 30 days.
+Source: [container app](infra/core/host/container-app.bicep) and
+[environment](infra/core/host/container-apps.bicep).
 
-| Page | Path | Purpose |
-|------|------|---------|
-| **Debug** | `/debug/index.html` | Real-time client network metrics display using BroadcastChannel. Shows per-member BUF, RTT, jitter, send rate, reconciliation count. Auto-connects to the game page's metrics broadcast. |
-| **Server Monitor** | `/srvmon/index.html` | Server-side monitoring page. Polls `GET /api/srvmon` every 2 seconds and renders CPU / memory / GC / connection counts and per-member TX/RX byte rates derived from poll deltas. |
-| **Session Test** | `/session-test.html` | Interactive test harness for session management. Tests create/join/leave sessions, object CRUD, and SignalR events. Uses local `signalr.min.js` and `signalr-protocol-msgpack.min.js`. |
+Configured CORS permits exact region/apex/additional origins, including the
+default Static Web App origin supplied by Bicep. Because Azure terminates HTTPS
+before the container's HTTP hop, Bicep also declares each app's default and bound
+custom HTTPS origins in `Region__AdditionalAllowedOrigins`. Identity POST
+validation does not trust arbitrary forwarded headers or wildcard hosts.
+Only the unconfigured regional API policy has a permissive local-development
+fallback, not identity CORS. Picker sockets and active connections can keep
+regions warm; no Traffic Manager probe loop is required.
+
+### Identity infrastructure and retention
+
+[Identity storage](infra/core/storage/player-identity.bicep) provisions one
+StorageV2 `Standard_LRS` account/Table per deployment environment, keyed by
+subscription, resource group, and environment name, not app revision or region.
+It lives in the resource group's home location. Production topologies share the
+same account; previews and standalone environments have their own stores.
+
+Each app has its own system-assigned managed identity and an exact-table
+[Storage Table Data Contributor grant](infra/core/security/player-identity-role.bicep).
+The certificate-reader identity is not reused. Shared-key authorization is
+disabled; apps use Entra-authenticated HTTPS to the public storage endpoint.
+No private endpoint, cross-region storage failover, or game-state backplane is
+provisioned.
+
+Provisioning orders table, app/principal, then role assignment. Startup probes
+must not wait for Table permission propagation. Bicep forces `Identity__Provider`
+to `AzureTable` and supplies the endpoint/table; caller `Identity__*` overrides
+are filtered. `IDENTITY_PROMPT_ON_ROOT` controls onboarding only, never storage.
+
+Storage survives ordinary deploys, app restarts, scale-to-zero, and orphan preview
+cleanup. Retention is manual: there is no automatic TTL, backup schedule, or
+deletion lock. LRS is not cross-region disaster recovery, and deleting an
+environment's table/account or resource group can invalidate bindings/invites.
+See [identity deployment and retirement](CICD_SETUP.md#durable-player-identity)
+for readiness, cost, scope verification, and deliberate retirement procedures.
+
+### BYO wildcard cert for regional hostnames
+
+Multi-region requires a validated nonempty manifest, complete custom-domain
+configuration, and the BYO certificate inputs. CI rejects incomplete combinations
+before Azure mutation. Direct Bicep/azd requests retain the safe single-region
+path and emit a deployment warning.
+
+Regional CAE certificate resources read an existing Key Vault wildcard
+certificate using a reader identity. Apps bind that certificate to their
+configured regional hostnames. Branches can reuse the production certificate;
+single-region/branch paths also support managed-certificate configurations.
+Managed certificates require a direct hostname-to-app CNAME.
+
+Optional ACMEbot permission wiring targets an existing Function App/vault
+installation; it does not provision a new certificate automation service.
+Setup, role assignments, and rotation belong to the
+[BYO certificate runbook](CICD_SETUP.md#byo-wildcard-certificate-acmebot-runbook).
+
+Custom domain/subdomain values and derived hostnames are private. Logs being
+masked does not make step summaries, PR comments, environment URLs, names, or
+workflow outputs safe. Public evidence uses only default Azure hostnames;
+committed examples use placeholders, never real domains or app/client IDs.
+CI reads `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, and
+`CERT_READER_IDENTITY_ID` from repository **secrets**, not variables; those
+certificate details can also reveal a private hostname by correlation.
+
+### Delivery and cleanup
+
+```mermaid
+flowchart TB
+    Trigger["Push, PR or manual trigger"]
+    Gates["Build and layered checks"]
+    Deploy{"Push or manual deploy?"}
+    Azure["OIDC login and IaC path selection"]
+    Apps["Build and publish app image"]
+    Entry["Publish static entrypoint when multi-region"]
+    Preview["Branch preview browser smoke"]
+    Trigger --> Gates --> Deploy
+    Deploy -->|"Yes"| Azure --> Apps
+    Apps --> Entry
+    Apps -->|"Branch"| Preview
+```
+
+The canonical [workflow](.github/workflows/azure-deploy.yml) validates .NET/xUnit,
+Node behavior, local real-browser playability, workflow/Squad helpers, and
+Bicep. PRs validate; push/manual runs can deploy. Single-region production uses
+azd, while multi-region/branch paths use shared deployment helpers for provision,
+build/push, and rollout. Static entry publication is a separate output of the
+multi-region path.
+
+The [Dockerfile](AstervoidsWeb/Dockerfile) builds with the .NET Alpine SDK and
+ships the ASP.NET Alpine runtime. Federated Azure authentication avoids putting
+credentials in the repository.
+
+Branch preview browser smoke against a default Azure URL is different evidence
+from local playability. A successful rollout or unvisited URL does not prove a
+playable preview.
+
+[Orphan cleanup](.github/workflows/cleanup-orphans.yml) removes branch-ephemeral
+apps and related DNS/certificate resources on its scheduled/manual path.
+Production and regional resources must be protected from branch-name collisions.
+Previews cannot use the reserved `production`/`production-*` environment namespace.
+Identity accounts/tables and their player data are deliberately not purged.
+Operational procedures and deployment commands remain in CICD_SETUP rather
+than being repeated here.
+
+## Diagnostics and static delivery
+
+### Three observability surfaces
+
+| Surface | Data path and purpose |
+| --- | --- |
+| `/debug` | Same-origin BroadcastChannel between browser tabs, local timing/network/game diagnostics and config controls |
+| `/srvmon` | Polls the selected region's `/api/srvmon` for process/session/connection metrics |
+| Azure host logs | Console/application logs through each CAE to Log Analytics |
+
+Browser diagnostics compute/publish detailed snapshots only while a listener's
+heartbeat is present, separately from HUD rendering. URL/localStorage defaults
+and debug edits remain subject to shared session configuration.
+BroadcastChannel diagnostics are not gameplay telemetry sent to the backend.
+
+[ServerMetricsService](AstervoidsWeb/Services/ServerMetricsService.cs) reports
+CPU, memory, GC, thread pool, connections, invocations, sessions/members/objects,
+reconciliation/reconnect counts, and byte estimates. The hot UpdateObjects path
+uses arithmetic [WireSizeEstimator](AstervoidsWeb/Hubs/WireSizeEstimator.cs);
+serialize-to-measure `EstimatePayloadBytes` remains for cold operations.
+These are pre-compression payload estimates, not packet captures.
+
+[`session-test.html`](AstervoidsWeb/wwwroot/session-test.html) is a separate
+interactive session/object harness using the local SignalR libraries. New logs
+must not expose object payloads, member identity, or session metadata without
+reviewing privacy implications.
+
+### HTTP assets and WebSocket compression are different
+
+On ACA, startup content hashing supplies stable ETags for `wwwroot` files.
+`Cache-Control: no-cache` means conditional revalidation, not prohibition on
+storing assets. `OnPrepareResponse` reapplies the hash so container-build file
+timestamps do not force unchanged content to download again.
+
+Text assets have a background-warmed Brotli quality-11 cache after the host starts
+listening. Until an entry is ready, ordinary Brotli/Gzip response compression
+serves the request. The cache is not a correctness dependency; early regional
+ping responses must not wait for expensive precompression.
+
+Compressed and uncompressed static representations share the hash validator, with
+`Vary: Accept-Encoding`. Range requests bypass the precompressed cache.
+`StaticAssets:Precompress` can disable warm-up; test hosts normally do so to
+avoid perturbing endpoint timing budgets.
+
+WebSocket `permessage-deflate` is separately optional for `/sessionHub`.
+The current server uses a 12-bit window with context takeover; unsupported or
+stripped negotiation leaves the protocol working uncompressed.
+[WebSocketCompressionMiddleware](AstervoidsWeb/Hubs/WebSocketCompressionMiddleware.cs)
+must install `UseWebSockets` inside its branch before decorating the upgrade
+feature. Real Kestrel handshake coverage is necessary because TestServer supplies
+features that can conceal middleware-ordering regressions.
+Identity HTTP responses are a separate sensitive surface: they bypass response
+compression entirely, including errors, and use `Cache-Control: no-store`.
+
+## Change map and regression evidence
+
+Use this map to find the owning layer, then exercise the production boundary
+instead of copying implementation into a parallel test model.
+
+| Change | Primary source | Relevant evidence |
+| --- | --- | --- |
+| Game adapters, entry, rules | [Inline runtime](AstervoidsWeb/wwwroot/index.html) | [Inline production loader](AstervoidsWeb/test-support/inline-game.mjs), [replication order](AstervoidsWeb/replication-order.test.mjs) |
+| Replica lifecycle/ownership | [ReplicationRuntime](AstervoidsWeb/wwwroot/js/replication-runtime.js) | [Runtime contracts](AstervoidsWeb/replication-runtime.test.mjs), [reference indexing](AstervoidsWeb/replication-index.test.mjs) |
+| Entry schemas and participant pinning | [SessionClient](AstervoidsWeb/wwwroot/js/session-client.js) | [Raw replay, snapshot seeding, stale epochs and mixed schemas](AstervoidsWeb/session-client-join-schema.test.mjs) |
+| Identity, invitations and browser binding | [PlayerIdentity](AstervoidsWeb/wwwroot/js/player-identity.js), [identity backend](AstervoidsWeb/Identity) | [Client behavior](AstervoidsWeb/player-identity.test.mjs), [service transactions](AstervoidsWeb.Tests/PlayerIdentityServiceTests.cs), [file persistence](AstervoidsWeb.Tests/FileIdentityStoreTests.cs), [HTTP isolation](AstervoidsWeb.Tests/IdentityEndpointsTests.cs), [browser flows](browser-smoke/identity.spec.mjs) |
+| Personal scores, departure and standings | [Inline runtime](AstervoidsWeb/wwwroot/index.html), [packed ledgers](AstervoidsWeb/wwwroot/js/astervoids-wire-codec.js) | [Personal score contracts](AstervoidsWeb/personal-score.test.mjs), [life calculation](AstervoidsWeb/game-state-calculation.test.mjs), [browser playability](browser-smoke/playability.spec.mjs) |
+| Send scheduling and prediction | [ObjectSync](AstervoidsWeb/wwwroot/js/object-sync.js), [policies](AstervoidsWeb/wwwroot/js/replication-send-policy.js) | [Advertised cadence](AstervoidsWeb/send-interval-advertisement.test.mjs), [heartbeat grid](AstervoidsWeb/heartbeat-grid.test.mjs), [deterministic simulation](AstervoidsWeb/deterministic-sim.test.mjs) |
+| Schema or transport boundary | [Game schemas](AstervoidsWeb/wwwroot/js/game-wire-schemas.js), [Hub DTOs](AstervoidsWeb/Hubs/HubDtos.cs) | [Cross-language codec](AstervoidsWeb/schema-codec-cross.test.mjs), [production schemas](AstervoidsWeb/production-wire-schemas.test.mjs), [GUID boundary](AstervoidsWeb/session-client-guid-boundary.test.mjs) |
+| Death/terminal behavior | [Game runtime](AstervoidsWeb/wwwroot/index.html), [presentation](AstervoidsWeb/wwwroot/js/replication-presentation.js) | [Death hold](AstervoidsWeb/ship-death-hold.test.mjs), [terminal convergence](AstervoidsWeb/terminal-convergence.test.mjs), [terminal visuals](AstervoidsWeb/ship-gameover-visuals.test.mjs) |
+| Regional discovery | [RegionService](AstervoidsWeb/wwwroot/js/region-service.js), [MultiRegionSessions](AstervoidsWeb/wwwroot/js/multi-region-sessions.js) | [Regional behavior](AstervoidsWeb/region-service.test.mjs), [picker freshness](AstervoidsWeb/picker-freshness.test.mjs), [spectators](AstervoidsWeb/spectator-client.test.mjs) |
+| Backend lifecycle, ordering, endpoints | [Services](AstervoidsWeb/Services), [SessionHub](AstervoidsWeb/Hubs/SessionHub.cs) | [C# suites](AstervoidsWeb.Tests), including shared-coordinator fixtures, snapshots, codecs, and concurrency |
+| Hosting and rollout | [Main Bicep](infra/main.bicep), [deployment helpers](.github/scripts/deployment-helpers.sh) | Bicep compilation, [workflow helpers](.github/scripts/workflow-helpers.test.sh) including [compiled identity wiring](.github/scripts/identity-infrastructure.test.mjs), real preview evidence |
+
+For inline declarations, `test-support/inline-game.mjs` loads selected production
+functions/classes with explicit dependencies without starting DOM or transport
+loops. Keep expected results independent. Normalize CRLF before source-marker
+or ordering assertions; never weaken a contract to accommodate a checkout.
+
+Preserve coverage of late replies, stale epochs, equal/metadata-only versions,
+delete resurrection, ownership handoffs, repeated-handle acknowledgements,
+clock conversion, timing clamps, and visibility changes. UI entry, simulation,
+and cleanup ordering are behavior, not formatting.
+
+Wire changes need both language stacks and golden fixtures. Performance
+operation/allocation assertions and wire budgets are not substitutes for real
+device, cellular/network, frame-time, or GC measurements. Local browser smoke,
+deployment success, and visited branch-preview playability remain distinct.
+
+## Maintaining this document
+
+- Keep this Markdown file as the maintained architecture source. Overview
+  diagrams summarize relationships; detailed contracts have one authoritative
+  home below them. Do not append a second independently maintained atlas.
+- Prefer source-file/symbol links and executable fixtures over duplicated API
+  catalogs, directory inventories, every tunable default, or historical byte
+  measurements. Commit-pinned evidence is appropriate for a historical claim,
+  not an automatic assertion about current behavior.
+- When behavior changes, update the affected contract and its overview together.
+  Keep deployed topology conditional, proposed extensions clearly marked, and
+  public examples free of private deployment values.
+- Use conventional Mermaid flowcharts, state diagrams, and short sequences.
+  Quote complex flowchart labels. Avoid literal semicolons in sequence message
+  or note text: Mermaid treats them as statement separators. Prefer a comma,
+  period, or separate note.
+- After diagram edits, render every block with a Mermaid-capable preview and
+  inspect the document through its final section. Balanced Markdown fences
+  alone do not prove that embedded diagrams parse. Keep navigation and
+  cross-document anchors working, especially the certificate runbook link.
