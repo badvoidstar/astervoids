@@ -16,7 +16,9 @@ names that identity; later visits to the same link recover it after confirmation
 Both buttons copy the link and show a readiness message; denied clipboard access
 offers the same selectable link and a Copy retry, without generating another invite.
 Controller, fullscreen, and invitation controls stack in portrait and sit beside
-the main actions in landscape, including short phone viewports.
+the main actions in landscape, including short phone viewports. All main-menu
+buttons match Solo Play's compact dimensions, including the full-width multiplayer
+lobby actions.
 
 **Treat a self link like a password:** anyone possessing an accepted invite can
 use that identity. Confirmation is protection against accidental switches, not

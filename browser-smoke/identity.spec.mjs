@@ -196,16 +196,20 @@ test('clipboard rejection offers the same selectable link and responsive menu gr
         const boxes = await player.page.evaluate(() => {
             const left = document.getElementById('menu-play').getBoundingClientRect();
             const right = document.getElementById('menu-utilities').getBoundingClientRect();
+            const solo = document.getElementById('btn-solo').getBoundingClientRect();
             return {
                 sideBySide: right.left >= left.right,
                 stacked: right.top >= left.bottom,
                 nativeText: getComputedStyle(document.getElementById('start-screen-content')).transform === 'none',
-                targets: [...document.querySelectorAll('#menu-utilities button')]
-                    .every(button => button.getBoundingClientRect().height >= 44),
+                matchesSolo: [...document.querySelectorAll('#menu-utilities button')]
+                    .every(button => {
+                        const box = button.getBoundingClientRect();
+                        return Math.abs(box.width - solo.width) < 0.05 && box.height === solo.height;
+                    }),
                 fits: right.right <= innerWidth && left.left >= 0,
             };
         });
-        expect(boxes.nativeText && boxes.targets && boxes.fits).toBe(true);
+        expect(boxes.nativeText && boxes.matchesSolo && boxes.fits).toBe(true);
         expect(viewport.width > viewport.height ? boxes.sideBySide : boxes.stacked).toBe(true);
     }
 });

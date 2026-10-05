@@ -20,11 +20,23 @@ test('main-screen content uses native layout without scaling text or shrinking i
 
 test('portrait menu utilities stack and landscape uses a native two-column layout', () => {
     assert.match(source, /#menu-columns \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
-    assert.match(source, /@media \(orientation: landscape\) \{/);
-    assert.match(source, /#menu-utilities \.picker-btn \{[\s\S]*?min-height: 44px;/);
+    assert.match(source,
+        /@media \(orientation: landscape\) \{[\s\S]*?#menu-columns \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/);
     for (const id of ['btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend']) {
         assert.match(source, new RegExp(`<button id="${id}"`));
     }
+});
+
+test('every main-menu button shares Solo Play sizing without split-width lobby actions', () => {
+    const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
+    assert.ok(buttonStyle);
+    assert.match(buttonStyle, /width: 100%;/);
+    assert.match(buttonStyle, /height: 32px;/);
+    assert.match(buttonStyle, /font-size: 11px;/);
+    assert.match(buttonStyle, /line-height: 12px;/);
+    assert.match(buttonStyle, /padding-inline: min\(18px, 2vw\);/);
+    assert.match(buttonStyle, /transition-property: background-color, border-color, color, opacity;/);
+    assert.match(source, /#picker-buttons \.button-row \{[^}]*flex-direction: column;/);
 });
 
 test('main-screen vertical spacing is compressed without reducing font sizes', () => {

@@ -200,6 +200,56 @@ test('page boots and solo play responds to keyboard input', async ({ players }) 
     }
 });
 
+test('main-menu buttons match Solo Play in portrait, landscape and multiplayer lobbies', async ({ players }) => {
+    const { page } = await players.open();
+    async function expectMatchingButtons(inSession) {
+        const ids = [
+            'btn-leave-create', ...(inSession ? ['btn-start-enter'] : []), 'btn-solo',
+            'btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend',
+        ];
+        for (const viewport of [
+            { width: 1280, height: 900 }, { width: 900, height: 550 },
+            { width: 568, height: 320 }, { width: 400, height: 300 },
+            { width: 360, height: 800 }, { width: 320, height: 568 },
+        ]) {
+            await page.setViewportSize(viewport);
+            const buttons = await page.locator('#menu-columns .picker-btn:visible').evaluateAll(elements =>
+                elements.map(button => {
+                    const box = button.getBoundingClientRect();
+                    const style = getComputedStyle(button);
+                    return {
+                        id: button.id, width: box.width, height: box.height,
+                        fontSize: style.fontSize, nativeText: style.transform === 'none',
+                        fits: box.left >= 0 && box.right <= innerWidth
+                            && button.scrollWidth <= button.clientWidth
+                            && button.scrollHeight <= button.clientHeight,
+                    };
+                }));
+            expect(buttons.map(button => button.id)).toEqual(ids);
+            const solo = buttons.find(button => button.id === 'btn-solo');
+            for (const button of buttons) {
+                const label = `${button.id} at ${viewport.width}x${viewport.height}`;
+                expect(button.width, `${label} matches Solo Play width`).toBeCloseTo(solo.width, 1);
+                expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
+                expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
+                expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
+            }
+            expect(solo.height, 'Solo Play retains its compact reference height').toBe(32);
+        }
+    }
+
+    await expectMatchingButtons(false);
+    await page.locator('#btn-control-mode').click();
+    const sessionId = await create(page);
+    players.ownSession(sessionId);
+    try {
+        await expectMatchingButtons(true);
+    } finally {
+        await page.locator('#btn-leave-create').click();
+        await expect.poll(() => page.evaluate(() => SessionClient.isInSession())).toBe(false);
+    }
+});
+
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
     const host = await players.open();
     const guest = await players.open();
