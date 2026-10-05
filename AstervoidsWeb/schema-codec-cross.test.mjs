@@ -34,6 +34,7 @@ const SHIP_SCHEMA_FIELDS = [
     ['terminalY', 'f64'], ['terminalAngle', 'f64'],
     ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
     ['participantId', 'guid'],
+    ['participantTag', 'str'],
 ];
 const ASTEROID_SCHEMA_FIELDS = [
     ['type', 'str'],
@@ -60,7 +61,21 @@ const GAME_STATE_SCHEMA_FIELDS = [
     ['peakShipCount', 'u8'], ['gameOverAt', 'f64'], ['terminalAt', 'f64'],
     ['scoreLifeAwardCount', 'u32'], ['countedParticipants', 'bytes'],
     ['terminalShipId', 'guid'], ['participantScores', 'bytes'], ['participantNumbers', 'bytes'],
+    ['participantTags', 'bytes'],
 ];
+
+test('cross-wire: durable participant identity and tags retain sparse positional masks', () => {
+    const ship = SchemaCodec.normalizeSchema(1, SHIP_SCHEMA_FIELDS);
+    const gameState = SchemaCodec.normalizeSchema(4, GAME_STATE_SCHEMA_FIELDS);
+    const identity = { participantId: '00112233-4455-6677-8899-aabbccddeeff', participantTag: 'Pilot_1' };
+    const shipBytes = hexToBytes('0000000c33221100554477668899aabbccddeeff070050696c6f745f31');
+    assert.deepEqual(SchemaCodec.decode(ship, shipBytes), identity);
+    assert.deepEqual(SchemaCodec.encode(ship, identity), shipBytes);
+    const tags = hexToBytes('33221100554477668899aabbccddeeff0750696c6f745f31');
+    const stateBytes = hexToBytes('0000041800000033221100554477668899aabbccddeeff0750696c6f745f31');
+    assert.deepEqual(SchemaCodec.decode(gameState, stateBytes), { participantTags: tags });
+    assert.deepEqual(SchemaCodec.encode(gameState, { participantTags: tags }), stateBytes);
+});
 
 test('cross-wire fixtures match every production positional field', () => {
     for (const [id, fields] of [

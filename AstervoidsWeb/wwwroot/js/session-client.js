@@ -14,6 +14,8 @@ const SessionClient = (function() {
     let currentMember = null;
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
     let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
+    let participantIdentityResolver = null;
+    let currentParticipantIdentity = null;
     // sessionId -> participantId. A rejoin, and a plain re-join of the same
     // session, mint a brand new member id server-side, so a member id cannot
     // identify "the same human" across a reconnect. This keeps the id this
@@ -118,6 +120,7 @@ const SessionClient = (function() {
         pendingSessionTransition = { kind, epoch, targetSessionId, events: [] };
         currentSession = null;
         currentMember = null;
+        currentParticipantIdentity = null;
         clearObjectHandles();
         if (clearLastSession) {
             lastSessionId = null;
@@ -138,6 +141,7 @@ const SessionClient = (function() {
         pendingSessionTransition = null;
         currentSession = null;
         currentMember = null;
+        currentParticipantIdentity = null;
         clearObjectHandles();
         if (clearLastSession) {
             lastSessionId = null;
@@ -525,6 +529,12 @@ const SessionClient = (function() {
         currentSession = session;
         currentMember = member;
         reconnectIdentity = identity;
+        const participant = participantIdentityResolver?.(session) ?? null;
+        if (participant !== null && !GuidUtils.isGuid(participant.id)) {
+            throw new TypeError('Participant identity requires a valid GUID');
+        }
+        currentParticipantIdentity = participant
+            ? Object.freeze({ id: participant.id.toLowerCase(), tag: participant.tag }) : null;
         // Re-entering a session (auto-rejoin after a drop, Leave then Join again,
         // a page reload, or a visit to another session and back) keeps the id this
         // client first entered *that* session with; a session never seen before
@@ -1486,8 +1496,14 @@ const SessionClient = (function() {
      */
     function getParticipantId() {
         return currentSession
-            ? participantIdentities.get(currentSession.id) ?? null
+            ? currentParticipantIdentity?.id ?? participantIdentities.get(currentSession.id) ?? null
             : null;
+    }
+
+    function setParticipantIdentityResolver(resolver) {
+        if (typeof resolver !== 'function') throw new TypeError('Participant identity resolver must be a function');
+        if (currentSession || pendingSessionTransition) throw new Error('Cannot change identity resolution during membership');
+        participantIdentityResolver = resolver;
     }
 
     /**
@@ -1540,6 +1556,8 @@ const SessionClient = (function() {
         getLastSessionId,
         getReconnectHubHostname,
         getParticipantId,
+        getParticipantIdentity: () => currentSession ? currentParticipantIdentity : null,
+        setParticipantIdentityResolver,
         clearSessionState,
         getCurrentHubHostname,
         getSessionEpoch,

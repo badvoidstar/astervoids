@@ -240,6 +240,69 @@ test('origin guard rejects another page that lacks response interception', async
     });
 });
 
+test('origin guard allows explicitly guarded tabs while blocking redirects in each', async ({ browser }) => {
+    await withOrigins(browser, async ({ page, baseURL, health, destinationRequests }) => {
+        const other = await page.context().newPage();
+        const otherHealth = { offOrigin: 0, redirects: 0, requestFailures: 0 };
+        await installOriginGuard(other, baseURL, otherHealth);
+        for (const tab of [page, other]) {
+            await tab.goto(baseURL);
+            const rejected = await tab.evaluate(async () => {
+                try { await fetch('/redirect'); return false; }
+                catch { return true; }
+            });
+            expect(rejected).toBe(true);
+        }
+        expect(destinationRequests()).toBe(0);
+        expect(health).toEqual({ offOrigin: 1, redirects: 1, requestFailures: 0 });
+        expect(otherHealth).toEqual(health);
+    });
+});
+
+test('origin guard handles client cancellation of a paused live response without a false network failure', async ({ browser }) => {
+    await withOrigins(browser, async ({ page, baseURL }) => {
+        const context = page.context();
+        const other = await context.newPage();
+        const health = { offOrigin: 0, redirects: 0, requestFailures: 0 };
+        let finishInterception;
+        const interception = new Promise(resolve => { finishInterception = resolve; });
+        const newSession = context.newCDPSession.bind(context);
+        context.newCDPSession = async target => {
+            const session = await newSession(target);
+            if (target === other) {
+                const requests = new Set();
+                const send = session.send.bind(session);
+                session.on('Fetch.requestPaused', event => {
+                    if (new URL(event.request.url).pathname === '/echo') requests.add(event.requestId);
+                });
+                session.send = async (method, parameters) => {
+                    if (method === 'Fetch.continueRequest' && requests.delete(parameters.requestId)) {
+                        await other.evaluate(() => window.stopGuardedFetch());
+                        try { return await send(method, parameters); }
+                        finally { finishInterception(); }
+                    }
+                    return send(method, parameters);
+                };
+            }
+            return session;
+        };
+        await installOriginGuard(other, baseURL, health);
+        await other.goto(baseURL);
+        const result = await other.evaluate(async () => {
+            const controller = new AbortController();
+            window.stopGuardedFetch = () => controller.abort();
+            try {
+                await fetch('/echo', { method: 'POST', signal: controller.signal });
+                return 'unexpected success';
+            } catch (error) { return error.name; }
+        });
+        expect(result).toBe('AbortError');
+        await interception;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(health).toEqual({ offOrigin: 0, redirects: 0, requestFailures: 0 });
+    });
+});
+
 test('origin guard prevents worker requests from bypassing redirect interception', async ({ browser }) => {
     await withOrigins(browser, async ({ page, baseURL, destinationRequests }) => {
         await page.goto(baseURL);

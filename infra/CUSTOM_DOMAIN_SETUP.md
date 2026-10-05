@@ -11,7 +11,7 @@ Custom-domain behavior now depends on deployment form and certificate mode:
    - Regional gameplay endpoints use per-region hostnames (`<subdomain>-<region>.<domain>`).
    - If custom domain is enabled, this path is expected to run with **BYO wildcard cert**.
 3. **Branch previews (non-`main`)**
-   - Reuse production shared infra/CAE and bind branch hostnames with the shared wildcard cert when BYO vars are set.
+   - Reuse production shared infra/CAE and bind branch hostnames with the shared wildcard cert when BYO secrets are set.
 
 ## Required Secrets and Variables
 
@@ -23,13 +23,18 @@ Custom-domain behavior now depends on deployment form and certificate mode:
 | `CUSTOM_DOMAIN_NAME` | Root domain (example: `example.com`) |
 | `CUSTOM_SUBDOMAIN` | Base subdomain (example: `app`) |
 
-### Optional BYO cert variables (recommended for multi-region and branch previews)
+### Optional BYO cert secrets (recommended for multi-region and branch previews)
 
-| Variable | Purpose |
+| Secret | Purpose |
 |---|---|
 | `CERT_KEY_VAULT_SECRET_URL` | Versionless KV secret URL for wildcard cert |
 | `CERT_KEY_VAULT_CERT_NAME` | Certificate resource name used on CAE(s) |
 | `CERT_READER_IDENTITY_ID` | Cert-reader user-assigned identity resource ID (required for branch BYO bootstrap) |
+
+Certificate metadata can reveal the private hostname by correlation. Store these
+values as repository secrets, not variables. For existing deployments, follow
+[the migration runbook](../CICD_SETUP.md#migrating-existing-certificate-variables);
+retain legacy variables until all active workflow refs have migrated.
 
 ## ACMEbot Relationship
 
@@ -69,17 +74,17 @@ Until delegation is complete and propagated, custom-domain verification/certific
 
 ### BYO cert path
 
-When BYO vars are set, bicep creates/uses `Microsoft.App/managedEnvironments/certificates` on each relevant CAE and binds hostnames with `bindingType: SniEnabled`.
+When BYO secrets are set, bicep creates/uses `Microsoft.App/managedEnvironments/certificates` on each relevant CAE and binds hostnames with `bindingType: SniEnabled`.
 
 - Production single-region: binds `<subdomain>.<domain>`.
 - Production multi-region: binds `<subdomain>-<region>.<domain>` on each regional app; apex is served by Static Web App.
 - Branch previews: workflow bootstraps cert resource on shared CAE (if needed), then bicep binds `<subdomain>-<branch>.<domain>`.
 
-The legacy "Configure Custom Domain" managed-cert step is skipped when BYO vars are provided.
+The legacy "Configure Custom Domain" managed-cert step is skipped when BYO secrets are provided.
 
 ### Managed-cert path (legacy)
 
-If BYO vars are not set, workflow falls back to `az containerapp env certificate create` + hostname bind in the single-region flow. This mode is not the intended path for multi-region custom-domain rollouts.
+If BYO secrets are not set, workflow falls back to `az containerapp env certificate create` + hostname bind in the single-region flow. This mode is not the intended path for multi-region custom-domain rollouts.
 
 ## DNS Expectations
 

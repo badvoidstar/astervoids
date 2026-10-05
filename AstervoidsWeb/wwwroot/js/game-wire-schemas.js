@@ -21,6 +21,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalAngle', 'f64'],
             ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
             ['participantId', 'guid'],
+            ['participantTag', 'str'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],
@@ -68,6 +69,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalShipId', 'guid'],
             ['participantScores', 'bytes'],
             ['participantNumbers', 'bytes'],
+            ['participantTags', 'bytes'],
         ]},
     ];
 

@@ -24,6 +24,9 @@ param customSubdomain string = ''
 @description('Use shared production infrastructure (for CI/CD branch deployments). When false, creates standalone infra.')
 param useSharedInfra bool = false
 
+@description('Prompt for player onboarding on the root URL. Applied to every app in this environment; durable Azure Table identity storage remains enabled when false.')
+param identityPromptOnRoot bool = true
+
 @description('''
 Multi-region production deployment manifest. Each entry creates its own
 Container Apps Environment + Container App in `rg-production`, plus stamps
@@ -175,6 +178,24 @@ var tags = {
   'azd-env-name': environmentName
 }
 
+// Durable identity belongs to a deployment environment, not an app revision,
+// CAE, or gameplay region. Both production topologies resolve the same account;
+// a branch in rg-production still has its own independent account and table.
+var identityStorageAccountName = 'stid${uniqueString(subscription().subscriptionId, isStandalone ? standaloneResourceGroupName : sharedResourceGroupName, environmentName)}'
+module identityStorage 'core/storage/player-identity.bicep' = {
+  name: 'identity-storage-${uniqueString(environmentName)}'
+  scope: resourceGroup(isStandalone ? standaloneResourceGroupName : sharedResourceGroupName)
+  params: {
+    name: identityStorageAccountName
+    tags: union(tags, {
+      'astervoids-data': 'player-identity'
+      'astervoids-deployment-kind': isProduction ? 'production' : (isBranch ? 'branch' : 'standalone')
+      'astervoids-retention': 'manual'
+    })
+  }
+  dependsOn: [productionRg, standaloneRg]
+}
+
 // ============================================================================
 // PRODUCTION DEPLOYMENT PATH
 // ============================================================================
@@ -230,7 +251,7 @@ module acmebotKvCertUser 'core/security/kv-cert-user-role.bicep' = if (shouldMan
 // container-apps / container-app module that takes certReaderIdentityId.
 // Resolution order (first non-empty wins):
 //   1. Caller-supplied `certReaderIdentityId` param (e.g. from the
-//      workflow's CERT_READER_IDENTITY_ID GitHub variable) — preserves
+//      workflow's CERT_READER_IDENTITY_ID GitHub secret) — preserves
 //      backward compatibility for non-production deploys.
 //   2. The identity bicep just created via acmebotPermissions module when a
 //      production BYO cert explicitly takes the ACMEbot-managed path.
@@ -266,6 +287,9 @@ module webProduction 'core/host/container-app.bicep' = if (isProduction && !isMu
     tags: union(tags, { 'azd-service-name': 'web' })
     containerAppsEnvironmentName: containerAppsEnvironmentName
     containerRegistryName: containerRegistryName
+    identityStorageAccountName: identityStorage.outputs.accountName
+    identityTableName: identityStorage.outputs.tableName
+    identityPromptOnRoot: identityPromptOnRoot
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
@@ -360,6 +384,9 @@ module webRegional 'core/host/container-app.bicep' = [for (r, i) in (isMultiRegi
     tags: union(tags, { 'azd-service-name': 'web-${r.name}', 'astervoids-region': r.name })
     containerAppsEnvironmentName: 'cae-production-${r.name}'
     containerRegistryName: containerRegistryName
+    identityStorageAccountName: identityStorage.outputs.accountName
+    identityTableName: identityStorage.outputs.tableName
+    identityPromptOnRoot: identityPromptOnRoot
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
@@ -493,6 +520,9 @@ module webStandalone 'core/host/container-app.bicep' = if (isStandalone) {
     tags: union(tags, { 'azd-service-name': 'web' })
     containerAppsEnvironmentName: containerAppsEnvironmentName
     containerRegistryName: containerRegistryName
+    identityStorageAccountName: identityStorage.outputs.accountName
+    identityTableName: identityStorage.outputs.tableName
+    identityPromptOnRoot: identityPromptOnRoot
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
@@ -572,6 +602,9 @@ module webBranch 'core/host/container-app.bicep' = if (isBranch) {
     tags: union(tags, { 'azd-service-name': 'web-${environmentName}' })  // Unique tag per branch
     containerAppsEnvironmentName: containerAppsEnvironmentName
     containerRegistryName: containerRegistryName
+    identityStorageAccountName: identityStorage.outputs.accountName
+    identityTableName: identityStorage.outputs.tableName
+    identityPromptOnRoot: identityPromptOnRoot
     imageName: !empty(webImageTag) ? 'astervoids-web:${webImageTag}' : ''
     targetPort: 8080
     external: true
@@ -644,7 +677,7 @@ output DEPLOYMENT_WARNING string = deploymentWarning
 // string when BYO is not configured. Useful for the workflow to assert that
 // the identity it expects to use is the one bicep is wiring up, and for the
 // branch-deploy bootstrap step to discover the ID without needing the
-// CERT_READER_IDENTITY_ID GitHub variable.
+// CERT_READER_IDENTITY_ID GitHub secret.
 @description('Resource ID of the user-assigned managed identity used to pull the BYO cert from Key Vault. Empty when BYO is not configured.')
 output CERT_READER_IDENTITY_ID string = effectiveCertReaderIdentityId
 

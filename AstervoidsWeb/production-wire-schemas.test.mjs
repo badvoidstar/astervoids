@@ -67,7 +67,7 @@ test('ship transition slots append to the stable schema and preserve timing prec
     const schema = SchemaCodec.get(1);
     assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
         ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
-        ['participantId', 'guid']
+        ['participantId', 'guid'], ['participantTag', 'str']
     ]);
     const data = {
         invulnerable: 180, invulnerabilityRevision: 0xffffffff,
@@ -213,11 +213,12 @@ test('known terminal updates do not fall back to schema zero', () => {
 test('GameState appends personal history after the stable final-life ship slot', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(4);
-    assert.equal(schema.fields.length, 18);
+    assert.equal(schema.fields.length, 19);
     assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]), [
         ['terminalShipId', 'guid'],
         ['participantScores', 'bytes'],
         ['participantNumbers', 'bytes'],
+        ['participantTags', 'bytes'],
     ]);
     const terminal = {
         lives: 0, gameOverAt: 1000, terminalAt: 1750,
@@ -231,7 +232,7 @@ test('GameState appends personal history after the stable final-life ship slot',
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
     assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5,
-        'eighteen optional slots use a three-byte presence mask');
+        'nineteen optional slots retain the three-byte presence mask');
 });
 
 test('rare ship score updates reuse the existing uint32 slot and eight-byte body', () => {
@@ -257,7 +258,7 @@ test('personal history has sparse three-byte masks and packed zero-score entries
     assert.deepEqual(SchemaCodec.decode(schema, encoded), payload);
 });
 
-test('fresh GameState producer initializes all five empty ledgers with a sixty-five-byte body', async () => {
+test('fresh GameState producer initializes six empty ledgers with a sixty-nine-byte body', async () => {
     registerProductionSchemas();
     let created;
     const game = {
@@ -276,8 +277,9 @@ test('fresh GameState producer initializes all five empty ledgers with a sixty-f
     });
     await createSyncedGameState();
     const bytes = SchemaCodec.encode(SchemaCodec.get(4), created);
-    assert.equal(bytes.length, 65);
-    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 3]);
+    assert.equal(bytes.length, 69);
+    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 7]);
+    assert.deepEqual(WireCodec.unpackTagMap(created.participantTags), {});
     for (const field of ['processedHits', 'processedScores', 'countedParticipants',
         'participantScores', 'participantNumbers']) {
         assert.deepEqual(WireCodec.unpackCounterMap(created[field]), {});

@@ -216,7 +216,7 @@ The game continues to own orchestration in `wwwroot/index.html`:
   against `ObjectSync`'s confirmed baseline rather than treating a local write
   as an acknowledgement.
 - Personal score history is separate from the entry-life ledger. New sessions
-  persist `participantScores` and `participantNumbers` on GameState, keyed by
+  persist `participantScores`, `participantNumbers`, and `participantTags` on GameState, keyed by
   normalized `participantId` GUIDs. The GameState **owner**, not the Server
   role, registers every observed ship participant at zero, even on fatal and
   departure transitions. Unseen IDs in one calculation are GUID-sorted before
@@ -228,6 +228,11 @@ The game continues to own orchestration in `wwwroot/index.html`:
   `countedParticipants`, its 255-entry limit, score-life-before-damage order,
   and entry-life-after-damage order retain their existing meanings. Personal
   histories are not evicted to satisfy a presentation row limit.
+  Supported sessions pin the backend's public identity/tag before membership
+  snapshot callbacks. Ship creation carries the tag; pose updates do not.
+  The owner retains each first valid tag in the historical map, including after
+  departures and migration. Multiple browser bindings for one identity aggregate
+  their independent ship counters into one participant and one entry-life award.
 - Rare ship score changes are persisted through the existing Ship `score`
   slot with `ObjectSync.updateObject`, independently of the motion send gate.
   Unconfirmed counters retry at the existing visible/hidden and terminal
@@ -242,12 +247,14 @@ The game continues to own orchestration in `wwwroot/index.html`:
   too. A newly owning spectator adopts canonical GameState before publication;
   it acquires no personal
   history unless it has published a ship.
-- Multiplayer HUD shows `Your Score: value : Player N` above
-  `Team Score: value : session name`. The viewer's placeholder uses their
-  immutable participant ordinal, not their current score rank, ship or member
-  position. Spectators show `Spectator`; a new ship whose ordinal has not yet
-  been published shows `Player --`, and unavailable histories show `--`.
-  These names add no identity fields or network queries. The personal value
+- Multiplayer HUD shows `Your Score: value : player tag` above
+  `Team Score: value : session name`. The viewer's name is their membership-pinned
+  public tag, never a current score rank, ship or member position. Named spectators
+  retain that tag with no personal score. Historical names use replicated tag
+  metadata, not a public directory or per-frame backend queries. Missing or malformed
+  tag metadata yields `Unknown` without discarding otherwise valid score ledgers.
+  Sessions created with older schemas retain `Player N`/`Spectator` labels.
+  The personal value
   projects the persisted lifetime total plus positive, unprocessed counters
   for that participant; it is not a second accumulator. Long session names
   ellipsize. The creator-aspect gameplay viewport is the hard boundary for all
@@ -267,7 +274,7 @@ The game continues to own orchestration in `wwwroot/index.html`:
   Canvas/world coordinates, creator metadata and wave-announcement geometry
   remain unchanged. Standings use only
   persisted histories, including departed and zero-score players, and label
-  them `Player N` from the immutable ordinal (never a member ID or rank).
+  them with their retained tag (never a member ID or rank).
   Sort is score descending, ordinal ascending, then normalized GUID lexical
   order, independent of locale and live membership. Only the highest-scoring
   `floor(maxMembers * 1.5)` entries are displayed. Capacity comes from a
@@ -277,13 +284,13 @@ The game continues to own orchestration in `wwwroot/index.html`:
   visible but defers the personal rows. The results region alone enables native
   keyboard/touch scrolling; normal game controls and exits remain unchanged.
 - The creator's schema registry remains authoritative. Sixteen-slot GameState
-  sessions are not reinterpreted as eighteen-slot sessions. Missing, malformed,
+  sessions are not reinterpreted as eighteen- or nineteen-slot sessions. Missing, malformed,
   or incomplete personal history is visibly unavailable rather than reconstructed
   from currently live ships or the entry-life ledger. A personal-history sum
   that does not match the persisted team total is also unavailable, without
   inventing the missing attribution. A mixed-version old GameState owner is
-  **not** guaranteed to maintain the new histories. Solo `Score` / `Final Score`
-  behavior is unchanged.
+  **not** guaranteed to maintain the new histories. Solo score mechanics and
+  `Final Score` are unchanged; its HUD includes the active player tag.
 - A session ship that takes a hit its owner predicts to be fatal stops being
   controlled instead of respawning, so the final frames everyone sees are the
   collision that ended the game rather than a fresh ship at centre. The owner
@@ -2068,20 +2075,93 @@ Both codecs use half-away-from-zero rounding (JS `Math.round`,
 C# `MidpointRounding.AwayFromZero`) to keep cross-wire bytes identical
 on midpoint inputs.
 
+### Durable Player Identity
+
+`player-identity.js` owns identity HTTP access and origin-local browser storage;
+inline picker code owns consent, naming and clipboard UI. Identity storage is
+separate from process-local sessions and **contains no gameplay scores**.
+
+An identity is a backend-generated public GUID plus an immutable, case-preserved
+`[A-Za-z0-9_-]{1,8}` tag. Tags are not globally unique. A 256-bit random base64url
+invitation identifies a pending player until its first successful naming, then
+remains that identity's recovery/access capability. Self invitations reproduce
+that same token. Link possession authorizes assuming the identity; confirmation
+does not add a second authentication factor. There is no automatic expiry in v1.
+
+Each browser environment is a top-level origin and profile/storage context.
+A 256-bit bearer credential lives in `localStorage`, initialized and used under
+Web Locks, and is sent only as `X-Astervoids-Browser` to the configured identity
+API. Private/blocked storage does not silently fall back to a per-tab credential.
+One binding row maps its credential hash to zero or one identity. Identities may
+have any number of separate browser bindings, without a growing binding array.
+Clearing browser storage or using another origin requires recovery with the link.
+Storage notifications and foreground resolution stop old-identity gameplay on
+rebind; membership and pending rejoin state are invalidated before new play.
+This also cancels picker joins whose session snapshot has not arrived.
+Refresh notifications coalesce while another request is pending, rather than
+being discarded; a failed verification requires Retry or explicit guest play.
+
+The API authority is the application's own origin for a regional host, or the
+first region in the deployed bootstrap manifest for a static apex. Arbitrary
+URL parameters cannot select it. HTTP requests use no cookies, reject redirects,
+disable caching, and send no referrer. Invitation links use the current site's
+origin and `#invite=...`; the fragment is scrubbed before normal startup.
+Successful acceptance and ignored invitations replace the address with `/`.
+No custom hostname, browser credential or invite token enters game data,
+SignalR URLs, public logs or committed configuration.
+
+Identity POST requests retain strict `Origin` validation. Azure terminates TLS
+before the container's HTTP hop, so Bicep explicitly configures default and
+bound custom HTTPS app origins through `Region__AdditionalAllowedOrigins`.
+This supplements existing apex/peer origins without trusting arbitrary forwarded
+headers or allowing wildcard hosts.
+
+All endpoints are JSON POST requests under `/api/identity`: `resolve`, `root`,
+`invites`, `invites/accept`, and `invites/self`. Responses contain public
+`{ id, tag }` identities, binding ETags/revisions, and (where needed) invite state
+and an invite ETag. Mutation request IDs give retries idempotent receipts.
+Consent captures the expected browser identity/ETag and invite ETag; concurrent
+claims or rebindings conflict, re-resolve, and require a new decision. An uncertain
+network outcome retains the exact pending request, rather than minting another
+identity or treating cancellation as rollback. Binding swaps and first naming
+are atomic. Superseded receipts cannot restore a discarded binding.
+
+`Identity:PromptOnRoot=true` prompts unbound root visitors. When false, root
+visitors stay anonymous; explicit naming is still available from the invite UI.
+Known bindings activate silently, same-identity invite visits silently return
+to root, and different-identity invitations offer Accept/Ignore. Tags in fresh
+multiplayer sessions use the same public identity as solo play; the hub still
+relays opaque client-authoritative game data. This is not an anti-cheat or
+server-authenticated scoring system.
+
+Development persists a locked, atomically replaced file; corrupt storage is
+unavailable, never silently reset. Production uses `Azure.Data.Tables` with
+`DefaultAzureCredential`, a single shared production account/Table endpoint,
+and table-scoped managed-identity roles. Previews use separate retained accounts.
+The runtime does not provision the table or fall back after an Azure error.
+Rows share one transaction partition: identity `I:`, invite-hash index `V:`,
+browser-hash binding `B:`, and request receipt `O:`. Identity rows retain the
+original invite capability for self recovery; private friend-creation receipts
+also retain their response for exact retries. Endpoints enforce size/type,
+origin and rate limits and uncompressed `no-store` responses. See `CICD_SETUP.md`
+for IAM, retention, region routing and rollout limitations.
+
 ### Production schemas
 
 Registered in `index.html` `WIREOPT_SCHEMAS`:
 
 | SchemaId | Type | Fields (positional, all optional per payload) |
 | --- | --- | --- |
-| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id |
+| 1 | Ship | type; pose; velocity; rotation; thrust/invulnerability; identity; score/hit count; replay controls; terminal epoch/pose; invulnerability revision/capture time; participant id/tag |
 | 2 | Asteroid | type; pose; radius; velocity/rotation; seed; packed vertices; terminal epoch/pose |
 | 3 | Bullet | type; pose/velocity; lifetime; color/owner; optional pending-hit claim; terminal epoch/position |
-| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id; packed personal-score and participant-number ledgers |
+| 4 | GameState | type; start/wave/state/lives/score; speed/timer; packed hit and score ledgers; counted-participant high-water mark; game-over/terminal times; packed counted-participant ledger; final-life ship id; packed personal-score, participant-number and participant-tag ledgers |
 
 GameState keeps its original slots 0–15 unchanged, then appends optional `bytes`
-fields `participantScores` at slot 16 and `participantNumbers` at slot 17.
-Its current eighteen-slot layout uses a three-byte presence mask. The session
+fields `participantScores` at slot 16, `participantNumbers` at slot 17, and
+`participantTags` at slot 18. Ship appends `participantTag: str` at slot 27,
+after `participantId: guid` at slot 26, retaining its four-byte mask.
+GameState's current nineteen-slot layout uses a three-byte presence mask. The session
 creator publishes the layout through `metadata.schemas`; older sixteen-slot
 registries retain their two-byte mask on updates and join snapshots.
 
@@ -2121,6 +2201,11 @@ cross-wire, lifecycle, snapshot, and mixed-batch tests keep it operational.
   `ObjectSync` compares byte arrays by content so repacking an unchanged map
   does not defeat delta suppression or confirmation tracking. Decode/pack caches
   retain private snapshots to detect same-version and in-place mutations.
+- **Participant tags:** a GUID-sorted map uses a 16-byte mixed-endian GUID,
+  a one-byte ASCII length, then 1-8 tag bytes per entry. Duplicate/invalid GUIDs,
+  invalid tags and truncated entries are rejected. Tags do not accompany
+  high-frequency ship poses. The historical tag cache is independent of score
+  validation, so unavailable names cannot erase accepted score totals.
 - **Object events:** payload maps are field-aliased, MessagePack-encoded once by
   the sender, and relayed by the hub as opaque `byte[]`. The receiver decodes
   and expands aliases before calling the game handler.
@@ -2297,9 +2382,10 @@ invalidates old generations so delayed responses cannot repopulate the picker.
 - **Server**: `Region__Id` + `Region__DisplayName` env vars (per region).
   Manifest in `appsettings.json` under `Region:Regions`. CORS permits the
   configured region hosts, `Region:ApexHostname`, and exact origins in
-  `Region:AdditionalAllowedOrigins`. Bicep supplies the default Static Web App
-  origin in that additional list so the public deployment URL can reach
-  regional HTTP and SignalR endpoints without publishing private hostnames.
+  `Region:AdditionalAllowedOrigins`. Bicep supplies each app's default and bound
+  custom HTTPS origins, plus the default Static Web App origin where applicable.
+  This supports deployed self-origin identity requests after TLS termination
+  and public-URL regional HTTP/SignalR traffic without publishing private hostnames.
   Only when no origins are configured does the local-development permissive
   fallback apply; deployed origins do not use wildcard host matching.
 - **Infra**: `infra/main.bicep` `regions` array param (empty = legacy
@@ -2355,6 +2441,11 @@ rather than architectural contracts. They live in
 
 The contract this document pins down is narrower:
 
+- CI sources `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, and
+  `CERT_READER_IDENTITY_ID` from repository secrets, never repository variables.
+  Certificate metadata can reveal the private hostname by correlation and must
+  not appear in public outputs. Legacy variables remain only for older workflow
+  refs until the runbook's migration is complete.
 - Multi-region production **requires** `CUSTOM_DOMAIN_NAME`,
   `CUSTOM_SUBDOMAIN`, and the `CERT_KEY_VAULT_SECRET_URL` /
   `CERT_KEY_VAULT_CERT_NAME` pair; incomplete input is rejected before any

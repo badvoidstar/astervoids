@@ -1,3 +1,5 @@
+const guardedPages = new WeakSet();
+
 export async function installOriginGuard(page, baseURL, health) {
     const context = page.context();
     const session = await context.newCDPSession(page);
@@ -15,7 +17,9 @@ export async function installOriginGuard(page, baseURL, health) {
                 }
                 await session.send('Fetch.continueRequest', { requestId });
             }
-        } catch {
+        } catch (error) {
+            // Navigation or AbortController can remove a paused request before continuation.
+            if (error.message?.includes('Invalid InterceptionId')) return;
             if (!context.isClosed() && !page.isClosed()) health.requestFailures++;
             await session.send('Fetch.failRequest', {
                 requestId: event.requestId, errorReason: 'Aborted',
@@ -26,6 +30,7 @@ export async function installOriginGuard(page, baseURL, health) {
     // interception must already be enabled when Chromium creates the request.
     // Native response bodies (including streams) and WebSockets stay intact.
     await session.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Response' }] });
+    guardedPages.add(page);
 
     await context.route('**/*', async route => {
         try {
@@ -35,9 +40,9 @@ export async function installOriginGuard(page, baseURL, health) {
                 await route.abort('blockedbyclient');
                 return;
             }
-            // Each smoke context owns exactly one guarded page. Popups and
-            // frameless worker requests must not bypass response interception.
-            if (route.request().frame().page() !== page) {
+            // Only explicitly guarded tabs may share a browser binding.
+            // Unguarded popups and frameless workers still cannot bypass interception.
+            if (!guardedPages.has(route.request().frame().page())) {
                 health.requestFailures++;
                 await route.abort('blockedbyclient');
                 return;

@@ -8,10 +8,13 @@ export function rankedPersonalResults(participants, maxMembers) {
         .sort((left, right) => right.score - left.score || left.number - right.number
             || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
         .slice(0, Math.floor(maxMembers * 1.5))
-        .map(({ number, score }) => ({ number, score }));
+        .map(({ number, score, tag }) => tag ? ({ tag, score }) : ({ number, score }));
 }
 
 export function personalRows(text) {
+    const tagged = [...text.matchAll(/^[ \t]*\d+[ \t]+([A-Za-z0-9_-]{1,8})[ \t]+(\d[\d,]*)[ \t]*$/gm)]
+        .map(match => ({ tag: match[1], score: Number(match[2].replaceAll(',', '')) }));
+    if (tagged.length) return tagged;
     return [...text.matchAll(rowPattern)]
         .map(match => ({
             number: Number(match[1]),
@@ -116,16 +119,19 @@ export function personalScoreGeometry() {
     const session = document.getElementById('session-indicator');
     const sessionStyle = session ? getComputedStyle(session) : null;
     const playerText = visibleText('player-indicator');
-    const terminalText = visibleText('gameover-overlay');
-    const rows = [...terminalText.text.matchAll(
-        /\bPlayer ([1-9]\d*)(?:\s+\([Yy]ou\))?(?:\s*[:|\u2014]\s*|\s+)(\d{1,3}(?:,\d{3})+|\d+)(?![\d,])\b/g,
-    )].map(match => ({
-        number: Number(match[1]),
-        score: Number(match[2].replaceAll(',', '')),
-        box: textBox(terminalText, match.index, match[0].length),
-        label: textBox(terminalText, match.index, `Player ${match[1]}`.length),
-        value: textBox(terminalText, match.index + match[0].lastIndexOf(match[2]), match[2].length),
-    }));
+    const glyphs = element => {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        return { ...rectangle(range.getBoundingClientRect()), fontSize: parseFloat(getComputedStyle(element).fontSize) };
+    };
+    const rows = [...document.querySelectorAll('#gameover-results tbody tr')].map(row => {
+        const cells = row.querySelectorAll('td');
+        return {
+            tag: cells[1].textContent,
+            score: Number(cells[2].textContent.replaceAll(',', '')),
+            box: glyphs(row), label: glyphs(cells[1]), value: glyphs(cells[2]),
+        };
+    });
     const restart = document.getElementById('touch-restart');
     const restartBox = restart?.getBoundingClientRect();
     const restartTarget = restartBox?.width && restartBox.height

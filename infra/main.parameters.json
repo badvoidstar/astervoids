@@ -17,6 +17,9 @@
     "useSharedInfra": {
       "value": "${USE_SHARED_INFRA=false}"
     },
+    "identityPromptOnRoot": {
+      "value": "${IDENTITY_PROMPT_ON_ROOT=true}"
+    },
     "certKeyVaultSecretUrl": {
       "value": "${CERT_KEY_VAULT_SECRET_URL=}"
     },

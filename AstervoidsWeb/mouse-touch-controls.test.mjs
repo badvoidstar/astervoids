@@ -122,7 +122,8 @@ test('picker labels multiplayer creation consistently', () => {
         html,
         /id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer<\/button>/);
     assert.match(html, /Create Multiplayer in \$\{regionName\}/);
-    assert.match(html, /: 'Create Multiplayer'/);
+    assert.match(html, /btnLeaveCreate\.textContent = 'Create Multiplayer';/);
+    assert.match(html, /regionLabel\.textContent = ` in \$\{regionName\}`;/);
 });
 
 test('right touch and mouse use held firing without an analog anchor', () => {

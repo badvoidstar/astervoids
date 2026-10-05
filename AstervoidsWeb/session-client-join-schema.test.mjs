@@ -9,7 +9,10 @@ import {
 const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 const WireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
-const { SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
+const { SCHEMAS: CURRENT_SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
+const SCHEMAS = CURRENT_SCHEMAS.map(schema => schema.id === 4
+    ? { ...schema, fields: schema.fields.slice(0, 18) }
+    : schema.id === 1 ? { ...schema, fields: schema.fields.slice(0, 27) } : schema);
 const LEGACY_SCHEMAS = Object.freeze(SCHEMAS.map(schema => schema.id === 4
     ? Object.freeze({ id: 4, fields: Object.freeze(schema.fields.slice(0, 16)) })
     : schema));
@@ -135,6 +138,37 @@ function emitUpdate(loaded, packet, sequence = 2) {
     loaded.emit('OnObjectsUpdated', [packet], GuidUtils.guidToBytes(REMOTE_ID),
         sequence - 1, sequence, 101, 50, 91);
 }
+
+test('durable public identity is pinned before snapshot callbacks and changes only between memberships', async t => {
+    const loaded = await subject(t, CURRENT_SCHEMAS);
+    let identity = { id: REMOTE_ID, tag: 'Pilot_1' };
+    loaded.client.setParticipantIdentityResolver(session =>
+        session.metadata.schemas.find(schema => schema.id === 4)?.fields[18]?.[0] === 'participantTags'
+            ? identity : null);
+    loaded.replies.set('JoinSession', () => joinResponse({
+        schemas: CURRENT_SCHEMAS,
+        objects: [objectPacket({ type: 'gameState', participantTags: WireCodec.packTagMap({}) }, {
+            schemas: CURRENT_SCHEMAS,
+        })],
+    }));
+    const snapshots = [];
+    loaded.client.on('onObjectCreated', () => snapshots.push(loaded.client.getParticipantIdentity()));
+    await loaded.client.joinSession(SESSION_ID);
+    assert.deepEqual(snapshots, [identity]);
+    assert.equal(loaded.client.getParticipantId(), REMOTE_ID);
+    identity = { id: NEXT_OWNER_ID, tag: 'Nova-2' };
+    assert.equal(loaded.client.getParticipantId(), REMOTE_ID, 'an in-flight game never reads a new browser identity');
+    assert.throws(() => loaded.client.setParticipantIdentityResolver(() => identity), /during membership/);
+    await loaded.client.leaveSession();
+    await loaded.client.joinSession(SESSION_ID);
+    assert.equal(loaded.client.getParticipantId(), NEXT_OWNER_ID);
+    assert.deepEqual(loaded.client.getParticipantIdentity(), identity);
+    await loaded.client.leaveSession();
+    loaded.replies.set('JoinSession', () => joinResponse({ schemas: SCHEMAS }));
+    await loaded.client.joinSession(SESSION_ID);
+    assert.equal(loaded.client.getParticipantId(), MEMBER_ID, 'legacy creator schemas retain their original session participant');
+    assert.equal(loaded.client.getParticipantIdentity(), null);
+});
 
 for (const slots of [16, 18]) {
     test(`${slots}-slot defaults retain live score 30/version 2 with a 16-slot creator`, async t => {

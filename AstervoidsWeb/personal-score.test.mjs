@@ -9,6 +9,9 @@ const require = createRequire(import.meta.url);
 const GuidUtils = require('./wwwroot/js/guid-utils.js');
 const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 const { SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
+const SCORE_ONLY_SCHEMAS = SCHEMAS.map(schema => schema.id === 4
+    ? { ...schema, fields: schema.fields.slice(0, 18) }
+    : schema.id === 1 ? { ...schema, fields: schema.fields.slice(0, 27) } : schema);
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const id = number => `${number.toString(16).padStart(8, '0')}-1111-2222-3333-aabbccddeeff`;
 const participantA = id(1);
@@ -22,16 +25,16 @@ const ship = (shipId, participantId, score = 0, hitCount = 0) => ({
     data: { type: 'ship', participantId, score, hitCount },
 });
 const { calculateGameState } = loadInlineGameFunctions(['calculateGameState'], {
-    GuidUtils, countExtraLivesForScore,
+    GuidUtils, AstervoidsWireCodec, countExtraLivesForScore,
 });
 
 function calculate({
     persisted = { lives: 3, groupScore: 0 },
     processedScores = {}, processedHits = {}, countedParticipants = {},
-    participantScores = {}, participantNumbers = {}, ships = [],
+    participantScores = {}, participantNumbers = {}, participantTags, ships = [],
 } = {}) {
     return calculateGameState(persisted, {
-        processedScores, processedHits, countedParticipants, participantScores, participantNumbers,
+        processedScores, processedHits, countedParticipants, participantScores, participantNumbers, participantTags,
     }, ships, {
         lives: 3, state: 'playing', observedScoreLifeAwardCount: null,
     }, 1000);
@@ -45,6 +48,7 @@ function continueFrom(previous, ships) {
         countedParticipants: previous.countedParticipants,
         participantScores: previous.participantScores,
         participantNumbers: previous.participantNumbers,
+        participantTags: previous.participantTags,
         ships,
     });
 }
@@ -680,7 +684,10 @@ test('session reset retires the local ship without pre-deleting the durable depa
     assert.equal(game.ship, soloShip, 'solo menu keeps its existing ship presentation');
 });
 
-function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false, participantId = participantA } = {}) {
+function scoreUiHarness({
+    data, maxMembers = 3, ships = [], legacy = false, participantId = participantA,
+    tagged = false, participantTag,
+} = {}) {
     const writes = [];
     const identity = { participantId, epoch: 1 };
     function element(tag = 'div') {
@@ -740,9 +747,10 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false, part
         isLobbySpectating: () => false,
         SessionClient: {
             getSessionEpoch: () => identity.epoch, getParticipantId: () => identity.participantId,
+            getParticipantIdentity: () => participantTag ? { id: identity.participantId, tag: participantTag } : null,
             getCurrentSession: () => ({ metadata: { schemas: legacy
                 ? SCHEMAS.map(schema => schema.id === 4 ? { ...schema, fields: schema.fields.slice(0, 16) } : schema)
-                : SCHEMAS } }),
+                : tagged ? SCHEMAS : SCORE_ONLY_SCHEMAS } }),
         },
         ObjectSync: {
             getObjectByType: type => type === 'gameState' ? record : null,
@@ -754,6 +762,7 @@ function scoreUiHarness({ data, maxMembers = 3, ships = [], legacy = false, part
             createElement: element,
         },
         _error: (...args) => errors.push(args),
+        _warn: (...args) => errors.push(args),
     });
     return { ...functions, ...elements, record, game, ships, writes, errors, counts, identity };
 }
@@ -763,6 +772,58 @@ function standingsRows(container) {
     return table?.children.find(element => element.tag === 'tbody').children
         .map(row => row.children.map(cell => cell.textContent)) ?? [];
 }
+
+test('durable tags replace placeholders without changing ordinal ranking, totals, or solo identity', () => {
+    const h = scoreUiHarness({ tagged: true, participantTag: 'Pilot_1' });
+    h.record.data.participantTags = AstervoidsWireCodec.packTagMap({
+        [participantA]: 'Pilot_1', [participantB]: 'Nova-2',
+    });
+    h.updateHUD();
+    h.updateGameplayOverlays();
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot_1');
+    assert.equal(h.yourScoreDisplay.textContent, '100');
+    assert.deepEqual(standingsRows(h.gameoverResultsEl).map(row => row[1]), ['Pilot_1', 'Nova-2']);
+    const history = h.getSessionScoreView().history;
+    for (let frame = 0; frame < 120; frame++) h.updateHUD();
+    assert.equal(h.getSessionScoreView().history, history);
+    h.game.mode = 'solo';
+    h.game.playerIdentity = { id: participantA, tag: 'Pilot_1' };
+    h.updateHUD();
+    assert.equal(h.scoreDisplay.textContent, 'Score: 999 : Pilot_1');
+});
+
+test('missing or malformed tag metadata shows Unknown without hiding valid scores', () => {
+    const h = scoreUiHarness({ tagged: true });
+    h.record.data.participantTags = new Uint8Array([1, 2]);
+    h.updateHUD();
+    h.updateGameplayOverlays();
+    assert.equal(h.yourScoreDisplay.textContent, '100');
+    assert.equal(h.teamScoreDisplay.textContent, '120');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Unknown');
+    assert.deepEqual(standingsRows(h.gameoverResultsEl).map(row => row[1]), ['Unknown', 'Unknown']);
+    const errors = h.errors.length;
+    for (let frame = 0; frame < 120; frame++) h.updateGameplayOverlays();
+    assert.equal(h.errors.length, errors, 'unchanged malformed metadata is reported once, not each frame');
+    h.record.data.participantTags = AstervoidsWireCodec.packTagMap({ [participantA]: 'Pilot_1' });
+    h.updateGameplayOverlays();
+    assert.equal(standingsRows(h.gameoverResultsEl)[0][1], 'Pilot_1', 'a tag-only update invalidates rendered rows');
+});
+
+test('one durable identity across browsers aggregates ships, retains its tag, and receives one entry life', () => {
+    const first = calculate({
+        participantTags: {},
+        ships: [
+            { ...ship(shipA, participantA, 20), data: { ...ship(shipA, participantA, 20).data, participantTag: 'Pilot_1' } },
+            { ...ship(shipB, participantA, 30), data: { ...ship(shipB, participantA, 30).data, participantTag: 'Pilot_1' } },
+        ],
+    });
+    assert.deepEqual(first.participantScores, { [participantA]: 50 });
+    assert.deepEqual(first.participantTags, { [participantA]: 'Pilot_1' });
+    assert.equal(first.lives, 3);
+    const departed = continueFrom(first, []);
+    assert.deepEqual(departed.participantTags, first.participantTags);
+    assert.deepEqual(departed.participantScores, first.participantScores);
+});
 
 test('canonical scalar replacements reuse personal history decodes and standings without frame map allocations', () => {
     const h = scoreUiHarness();

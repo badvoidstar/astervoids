@@ -54,9 +54,11 @@ env:
   # production requires the BYO URL/name pair and is rejected before Azure
   # resources are created when it is absent.
   #
-  # Set via repo variables (Settings → Secrets and variables → Actions → Variables):
-  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://my-kv.vault.azure.net/secrets/wildcard-your-domain-com
-  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-your-domain-com (stable name for the CAE cert resource)
+  # Set via repo secrets (Settings → Secrets and variables → Actions → Secrets):
+  # Certificate metadata can reveal the private hostname by correlation.
+  # Variables are not log-masked; keep these values out of public outputs too.
+  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://example.vault.azure.net/secrets/wildcard-example-com
+  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-example-com (stable name for the CAE cert resource)
   #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
   #                                 'Key Vault Certificate User' role on the KV holding the cert.
   #                                 OPTIONAL in production when bicep's manageAcmebotPermissions=true
@@ -64,12 +66,15 @@ env:
   #                                 output for the CAE cert binding). STILL REQUIRED for branch deploys
   #                                 (the bootstrap step needs the ID to attach the identity to the
   #                                 shared CAE before creating the cert resource).
-  CERT_KEY_VAULT_SECRET_URL: ${{ vars.CERT_KEY_VAULT_SECRET_URL }}
-  CERT_KEY_VAULT_CERT_NAME: ${{ vars.CERT_KEY_VAULT_CERT_NAME }}
-  CERT_READER_IDENTITY_ID: ${{ vars.CERT_READER_IDENTITY_ID }}
+  CERT_KEY_VAULT_SECRET_URL: ${{ secrets.CERT_KEY_VAULT_SECRET_URL }}
+  CERT_KEY_VAULT_CERT_NAME: ${{ secrets.CERT_KEY_VAULT_CERT_NAME }}
+  CERT_READER_IDENTITY_ID: ${{ secrets.CERT_READER_IDENTITY_ID }}
   # Optional. Defaults to true when unset, but is consulted only by a
   # production BYO deployment that omits CERT_READER_IDENTITY_ID.
   MANAGE_ACMEBOT_PERMISSIONS: ${{ vars.MANAGE_ACMEBOT_PERMISSIONS }}
+  # Optional boolean, defaults to true. Controls root onboarding only;
+  # every deployed app always uses its environment's durable identity table.
+  IDENTITY_PROMPT_ON_ROOT: ${{ vars.IDENTITY_PROMPT_ON_ROOT }}
 
 jobs:
   build:
@@ -167,6 +172,8 @@ jobs:
             echo "is_production=true" >> $GITHUB_OUTPUT
             echo "env_name=production" >> $GITHUB_OUTPUT
           else
+            source .github/scripts/deployment-helpers.sh
+            validate_preview_environment_name "$SANITIZED"
             echo "is_production=false" >> $GITHUB_OUTPUT
             echo "env_name=$SANITIZED" >> $GITHUB_OUTPUT
           fi
@@ -214,6 +221,7 @@ jobs:
           # Register Microsoft.App provider (required for Container Apps)
           az provider register -n Microsoft.App --wait || true
           az provider register -n Microsoft.OperationalInsights --wait || true
+          az provider register -n Microsoft.Storage --wait
 
       - name: Authenticate azd with federated credentials
         run: |
@@ -255,6 +263,7 @@ jobs:
             [certKeyVaultCertName]="$CERT_KEY_VAULT_CERT_NAME"
             [certReaderIdentityId]="$CERT_READER_IDENTITY_ID"
             [manageAcmebotPermissions]="${MANAGE_ACMEBOT_PERMISSIONS:-true}"
+            [identityPromptOnRoot]="${IDENTITY_PROMPT_ON_ROOT:-true}"
           )
           validate_deployment_settings PRECHECK_SETTINGS || exit 1
 
@@ -288,6 +297,7 @@ jobs:
           # Pass through region matrix so non-production shared-infra deploys
           # can resolve the primary shared CAE deterministically.
           azd env set REGIONS_JSON "${REGIONS_JSON:-[]}"
+          azd env set IDENTITY_PROMPT_ON_ROOT "${IDENTITY_PROMPT_ON_ROOT:-true}"
 
           # For branch deployments, set resource group to production's resource group
           # This tells azd deploy where to find the container app
@@ -453,7 +463,7 @@ jobs:
 
       - name: Configure Custom Domain (if enabled)
         id: managed_domain
-        # Runs ONLY for single-region production WITHOUT BYO cert vars.
+        # Runs ONLY for single-region production WITHOUT BYO cert secrets.
         # All other cases are handled in-band by bicep + the bootstrap step:
         #   - Single-region production WITH BYO    → bicep binds via SNI.
         #   - Multi-region production              → bicep + static-apex publish

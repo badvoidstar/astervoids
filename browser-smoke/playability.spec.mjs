@@ -1,5 +1,6 @@
 import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
+import { provisionPlayer } from './identity-helpers.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
@@ -20,6 +21,8 @@ const test = base.extend({
                 });
                 context.setDefaultTimeout(15_000);
                 context.setDefaultNavigationTimeout(30_000);
+                const tag = `Pilot${opened.length + 1}`;
+                await provisionPlayer(context, tag);
                 const page = await context.newPage();
                 const health = {
                     uncaught: 0, consoleErrors: 0, hubFrames: 0,
@@ -43,7 +46,9 @@ const test = base.extend({
                 await expect(page.locator('#game')).toBeVisible();
                 await expect(page.locator('#start-screen')).toBeVisible();
                 await expect(page.locator('#btn-solo')).toBeEnabled();
-                return { page, health };
+                await expect(page.locator('#identity-dialog')).not.toBeVisible();
+                await expect(page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
+                return { page, health, tag };
             },
             async close(player) {
                 const entry = opened.find(({ page }) => page === player.page);
@@ -195,6 +200,271 @@ test('page boots and solo play responds to keyboard input', async ({ players }) 
     }
 });
 
+test('main-menu buttons share size and brightness with compact spacing in portrait, landscape and lobbies', async ({ players }) => {
+    const { page } = await players.open();
+    async function expectMatchingButtons(inSession) {
+        const ids = [
+            'btn-leave-create', ...(inSession ? ['btn-start-enter'] : []), 'btn-solo',
+            'btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend',
+        ];
+        for (const viewport of [
+            { width: 1280, height: 900 }, { width: 900, height: 550 },
+            { width: 568, height: 320 }, { width: 400, height: 300 },
+            { width: 360, height: 800 }, { width: 320, height: 568 },
+        ]) {
+            await page.setViewportSize(viewport);
+            const buttons = await page.evaluate(() => {
+                const elements = [...document.querySelectorAll('#menu-columns .picker-btn')]
+                    .filter(button => button.getClientRects().length > 0);
+                return elements.map(button => {
+                    const box = button.getBoundingClientRect();
+                    const style = getComputedStyle(button);
+                    return {
+                        id: button.id, width: box.width, height: box.height,
+                        disabled: button.disabled,
+                        fontSize: style.fontSize, nativeText: style.transform === 'none',
+                        fits: box.left >= 0 && box.right <= innerWidth
+                            && button.scrollWidth <= button.clientWidth
+                            && button.scrollHeight <= button.clientHeight,
+                    };
+                });
+            });
+            expect(buttons.map(button => button.id)).toEqual(ids);
+            const solo = buttons.find(button => button.id === 'btn-solo');
+            for (const button of buttons) {
+                const label = `${button.id} at ${viewport.width}x${viewport.height}`;
+                const paired = inSession && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                expect(button.width, `${label} ${paired ? 'shares the Create row' : 'matches Solo Play width'}`)
+                    .toBeCloseTo(paired ? (solo.width - 7.2) / 2 : solo.width, 1);
+                expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
+                expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
+                expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
+                if (!button.disabled) {
+                    await expect(page.locator(`#${button.id}`), `${label} has a full-bright label`)
+                        .toHaveCSS('color', 'rgb(255, 255, 255)');
+                    await expect(page.locator(`#${button.id}`), `${label} is not dimmed`)
+                        .toHaveCSS('opacity', '1');
+                }
+            }
+            expect(solo.height, 'Solo Play retains its compact reference height').toBe(32);
+            const spacing = await page.evaluate(() => {
+                const box = selector => document.querySelector(selector).getBoundingClientRect();
+                const banner = box('#region-banner');
+                const statusNext = banner.height ? banner : box('#menu-columns');
+                const utilityButtons = [...document.querySelectorAll('#menu-utilities .picker-btn')]
+                    .filter(button => button.getBoundingClientRect().height);
+                const utilities = utilityButtons.map(button => button.getBoundingClientRect());
+                return {
+                    title: box('#identity-status').top - box('#start-screen h1').bottom,
+                    identity: box('#picker-status').top - box('#identity-status').bottom,
+                    status: statusNext.top - box('#picker-status').bottom,
+                    sessions: box('#picker-buttons').top - box('#session-list').bottom,
+                    solo: box('#btn-solo').top - box('#picker-buttons .button-row').bottom,
+                    utilities: utilities.slice(1).map((rect, index) => ({
+                        gap: rect.top - utilities[index].bottom,
+                        sharedGroup: utilityButtons[index].parentElement === utilityButtons[index + 1].parentElement,
+                    })),
+                    groups: innerWidth > innerHeight
+                        ? box('#menu-utilities').left - box('#menu-play').right
+                        : utilities[0].top - box('#btn-solo').bottom,
+                    actionRowHeight: box('#picker-buttons .button-row').height,
+                    actionRowWidth: box('#picker-buttons .button-row').width,
+                    lobbyGap: box('#btn-start-enter').left - box('#btn-leave-create').right,
+                    lobbyOffset: box('#btn-start-enter').top - box('#btn-leave-create').top,
+                    lobbySpan: box('#btn-start-enter').right - box('#btn-leave-create').left,
+                    topAlignment: utilities[0].top - box('#session-list').top,
+                    bottomAlignment: utilities.at(-1).bottom - box('#btn-solo').bottom,
+                    inviteAlignment: box('#btn-invite-self').top
+                        - box(box('#btn-start-enter').height ? '#btn-start-enter' : '#btn-leave-create').top,
+                };
+            });
+            const landscape = viewport.width > viewport.height;
+            const titleMargin = Math.min(27, Math.max(14, Math.min(viewport.width, viewport.height) * 0.027));
+            for (const [name, previous] of [
+                ['title', titleMargin], ['identity', 10], ['status', 14],
+                ['solo', 14],
+            ]) {
+                expect(spacing[name], `${name} gap is 20% smaller`).toBeCloseTo(previous * 0.8, 1);
+            }
+            if (landscape) {
+                expect(spacing.sessions, 'Extra space aligns the play actions at the bottom')
+                    .toBeGreaterThanOrEqual(18 * 0.8 - 0.05);
+                for (const name of ['topAlignment', 'bottomAlignment', 'inviteAlignment']) {
+                    expect(spacing[name], name).toBeCloseTo(0, 1);
+                }
+            } else {
+                expect(spacing.sessions, 'Portrait session gap stays compact').toBeCloseTo(18 * 0.8, 1);
+            }
+            for (const { gap, sharedGroup } of spacing.utilities) {
+                if (landscape && !sharedGroup) {
+                    expect(gap, 'Extra space separates device and invitation groups').toBeGreaterThanOrEqual(11.2 - 0.05);
+                } else {
+                    expect(gap, 'Gaps within utility groups stay compact').toBeCloseTo(14 * 0.8, 1);
+                }
+            }
+            expect(spacing.groups, 'Only vertical spacing between groups is reduced')
+                .toBeCloseTo(viewport.width > viewport.height ? 12 : 19 * 0.8, 1);
+            expect(spacing.actionRowHeight, 'Create and the lobby pair occupy one 32px row').toBe(32);
+            expect(spacing.actionRowWidth, 'The action row retains the full Create width').toBeCloseTo(solo.width, 1);
+            if (inSession) {
+                expect(spacing.lobbyGap, 'Leave and Start/Enter have a compact horizontal gap').toBeCloseTo(7.2, 1);
+                expect(spacing.lobbyOffset, 'Leave and Start/Enter sit side by side').toBeCloseTo(0, 1);
+                expect(spacing.lobbySpan, 'The pair fills the former Create footprint').toBeCloseTo(solo.width, 1);
+            }
+        }
+    }
+
+    await expectMatchingButtons(false);
+    await page.locator('#btn-control-mode').click();
+    const sessionId = await create(page);
+    players.ownSession(sessionId);
+    try {
+        await expectMatchingButtons(true);
+    } finally {
+        await page.locator('#btn-leave-create').click();
+        await expect.poll(() => page.evaluate(() => SessionClient.isInSession())).toBe(false);
+    }
+    await expectMatchingButtons(false);
+});
+
+test('landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states', async ({ players }) => {
+    const { page } = await players.open();
+    await expect(page.locator('#btn-leave-create')).toBeEnabled();
+    await page.locator('#btn-control-mode').click();
+    for (const viewport of [
+        { width: 1280, height: 900 }, { width: 900, height: 550 },
+        { width: 568, height: 320 }, { width: 400, height: 300 },
+    ]) {
+        await page.setViewportSize(viewport);
+        const cases = await page.evaluate(() => {
+            const saved = { ...sessionPicker };
+            const container = document.getElementById('game-container');
+            const originalClass = container.className;
+            const invites = ['btn-invite-self', 'btn-invite-friend'].map(id => document.getElementById(id));
+            const disabledInvites = invites.map(button => button.disabled);
+            const region = saved.regions.find(candidate => candidate.id === getCreateRegionId());
+            if (!region) throw new Error('Menu layout coverage requires an assessed create region');
+            const box = id => document.getElementById(id).getBoundingClientRect();
+            const cases = [];
+            // Project display states through production renderers in one browser turn,
+            // then restore the live picker before any transport callbacks can run.
+            try {
+                for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen'])
+                for (const multiRegion of [false, true])
+                for (const sessionCount of [0, 6])
+                for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
+                for (const unavailable of [false, true]) {
+                    container.className = `${originalClass} ${mode}`;
+                    Object.assign(sessionPicker, {
+                        regions: multiRegion ? [
+                            { ...region, displayName: 'Northwestern Europe' },
+                            { id: 'layout-secondary', displayName: 'Secondary Region' },
+                        ] : [region],
+                        selectedCreateRegion: region.id,
+                        sessions: Array.from({ length: sessionCount }, (_, index) => ({
+                            id: `layout-${index}`, name: `Layout ${index + 1}`,
+                            regionId: region.id, memberCount: index + 1, maxMembers: 6,
+                        })),
+                        currentSessionId: role === 'outside' ? null : 'layout-0',
+                        isServer: role === 'host',
+                        gameStarted: role === 'running-member',
+                        canCreate: !unavailable,
+                        connected: !unavailable,
+                    });
+                    for (const button of invites) button.disabled = unavailable;
+                    renderCreateRegionSelector();
+                    renderSessionList();
+                    updatePickerButtons();
+                    const buttons = [...document.querySelectorAll('#menu-columns .picker-btn')]
+                        .filter(button => button.getBoundingClientRect().height);
+                    const solo = box('btn-solo');
+                    cases.push({
+                        mode, multiRegion, sessionCount, role, unavailable,
+                        top: box('btn-control-mode').top - box('session-list').top,
+                        bottom: box('btn-invite-friend').bottom - solo.bottom,
+                        invite: box('btn-invite-self').top
+                            - box(role === 'outside' ? 'btn-leave-create' : 'btn-start-enter').top,
+                        columnGap: box('menu-utilities').left - box('menu-play').right,
+                        fullscreenVisible: box('btn-fullscreen').height > 0,
+                        regionVisible: box('create-region-row').height > 0,
+                        startVisible: box('btn-start-enter').height > 0,
+                        startDisabled: sessionPicker.btnStartEnter.disabled,
+                        actionRowHeight: sessionPicker.btnLeaveCreate.parentElement.getBoundingClientRect().height,
+                        lobbyGap: box('btn-start-enter').left - box('btn-leave-create').right,
+                        lobbyOffset: box('btn-start-enter').top - box('btn-leave-create').top,
+                        lobbyWidthError: box('btn-start-enter').right - box('btn-leave-create').left - solo.width,
+                        destination: sessionPicker.btnLeaveCreate.getAttribute('aria-label'),
+                        createText: sessionPicker.btnLeaveCreate.textContent,
+                        clipped: buttons.filter(button => {
+                            const rect = button.getBoundingClientRect();
+                            const paired = role !== 'outside'
+                                && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                            const expectedWidth = paired ? (solo.width - 7.2) / 2 : solo.width;
+                            return Math.abs(rect.width - expectedWidth) > 0.05 || rect.height !== 32
+                                || rect.left < 0 || rect.right > innerWidth
+                                || button.scrollWidth > button.clientWidth
+                                || button.scrollHeight > button.clientHeight
+                                || getComputedStyle(button).transform !== 'none';
+                        }).map(button => button.id),
+                    });
+                }
+            } finally {
+                const btnLeaveCreate = sessionPicker.btnLeaveCreate;
+                Object.assign(sessionPicker, saved, { btnLeaveCreate });
+                container.className = originalClass;
+                invites.forEach((button, index) => { button.disabled = disabledInvites[index]; });
+                renderCreateRegionSelector();
+                renderSessionList();
+                updatePickerButtons();
+            }
+            return cases;
+        });
+        expect(cases).toHaveLength(128);
+        for (const state of cases) {
+            const label = `${viewport.width}x${viewport.height} ${state.mode || 'windowed'}`
+                + ` regions=${state.multiRegion ? 2 : 1} sessions=${state.sessionCount}`
+                + ` ${state.role} unavailable=${state.unavailable}`;
+            for (const edge of ['top', 'bottom', 'invite']) {
+                expect(state[edge], `${label} ${edge} alignment`).toBeCloseTo(0, 1);
+            }
+            expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
+            expect(state.fullscreenVisible, label).toBe(state.mode === '');
+            expect(state.regionVisible, label).toBe(state.multiRegion);
+            expect(state.startVisible, label).toBe(state.role !== 'outside');
+            expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
+            if (state.role !== 'outside') {
+                expect(state.lobbyGap, `${label} has a horizontal action gap`).toBeCloseTo(7.2, 1);
+                expect(state.lobbyOffset, `${label} has side-by-side actions`).toBeCloseTo(0, 1);
+                expect(state.lobbyWidthError, `${label} actions fill the Create width`).toBeCloseTo(0, 1);
+                expect(state.startDisabled, label).toBe(state.role === 'waiting-member');
+                expect(state.destination, `${label} Leave has no stale create label`).toBeNull();
+            } else if (state.multiRegion && !state.unavailable) {
+                expect(state.destination, `${label} full destination remains accessible`)
+                    .toBe('Create Multiplayer in Northwestern Europe');
+                expect(state.createText, label).toBe(state.destination);
+            }
+            expect(state.clipped, `${label} buttons retain their dimensions without clipping`).toEqual([]);
+        }
+    }
+    await page.setViewportSize({ width: 900, height: 550 });
+    await page.locator('#btn-fullscreen').click();
+    try {
+        await expect(page.locator('#btn-fullscreen')).toBeHidden();
+        const offsets = await page.evaluate(() => {
+            const box = id => document.getElementById(id).getBoundingClientRect();
+            return [
+                box('btn-control-mode').top - box('session-list').top,
+                box('btn-invite-self').top - box('btn-leave-create').top,
+                box('btn-invite-friend').bottom - box('btn-solo').bottom,
+            ];
+        });
+        for (const offset of offsets) expect(offset, 'Live fullscreen transition keeps alignment').toBeCloseTo(0, 1);
+    } finally {
+        await page.evaluate(() => toggleFullscreen());
+    }
+    await expect(page.locator('#btn-fullscreen')).toBeVisible();
+});
+
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
     const host = await players.open();
     const guest = await players.open();
@@ -243,16 +513,18 @@ async function personalState(page) {
         if (!record) return null;
         const data = record.data;
         const available = data.participantScores instanceof Uint8Array
-            && data.participantNumbers instanceof Uint8Array;
+            && data.participantNumbers instanceof Uint8Array && data.participantTags instanceof Uint8Array;
         const confirmation = available ? {
             groupScore: data.groupScore,
             participantScores: data.participantScores,
             participantNumbers: data.participantNumbers,
+            participantTags: data.participantTags,
         } : null;
         return {
             available,
             scores: available ? AstervoidsWireCodec.unpackCounterMap(data.participantScores) : null,
             numbers: available ? AstervoidsWireCodec.unpackCounterMap(data.participantNumbers) : null,
+            tags: available ? AstervoidsWireCodec.unpackTagMap(data.participantTags) : null,
             counted: AstervoidsWireCodec.unpackCounterMap(data.countedParticipants),
             groupScore: data.groupScore,
             lives: data.lives,
@@ -273,6 +545,7 @@ function expectedPersonalState(participants) {
         available: true,
         scores: Object.fromEntries(participants.map(({ id, score }) => [id, score])),
         numbers: Object.fromEntries(participants.map(({ id, number }) => [id, number])),
+        tags: Object.fromEntries(participants.map(({ id, tag }) => [id, tag])),
         counted: Object.fromEntries(participants.map(({ id }) => [id, 1])),
         groupScore: participants.reduce((sum, { score }) => sum + score, 0),
         ownerConfirmed: true,
@@ -363,16 +636,16 @@ function personalLayoutEvidence(stage, geometry) {
     })}`);
 }
 
-async function containedPersonalHud(page, yourScore, teamScore, playerNumber) {
+async function containedPersonalHud(page, yourScore, teamScore, playerTag) {
     const longName = 'A remarkably long multiplayer session name';
     await page.evaluate(name => {
         game.sessionInfo.name = name;
         updateHUD();
     }, longName);
     await expect(page.locator('#session-indicator')).toHaveText(longName);
-    await expect(page.locator('#player-indicator')).toHaveText(`Player ${playerNumber}`);
+    await expect(page.locator('#player-indicator')).toHaveText(playerTag);
     const rows = page.locator('#multiplayer-scores .score-row');
-    await expect(rows.nth(0)).toHaveText(new RegExp(`^\\s*Your Score:\\s*${yourScore}\\s*:\\s*Player ${playerNumber}\\s*$`));
+    await expect(rows.nth(0)).toHaveText(new RegExp(`^\\s*Your Score:\\s*${yourScore}\\s*:\\s*${playerTag}\\s*$`));
     await expect(rows.nth(1)).toHaveText(new RegExp(`^\\s*Team Score:\\s*${teamScore}\\s*:\\s*${longName}\\s*$`));
     await expect.poll(async () => personalHudScores(await page.locator('#hud').innerText()),
         { message: 'The capitalized individual and team HUD counters display the accepted totals' })
@@ -407,7 +680,7 @@ async function containedPersonalHud(page, yourScore, teamScore, playerNumber) {
             .toBeLessThanOrEqual(geometry.session.left + 1);
         expect(geometry.player.bottom, 'The player and session names stay on separate score rows')
             .toBeLessThanOrEqual(geometry.session.top + 1);
-        boxInRegion(geometry.playerText, geometry.player, 'The complete placeholder player name remains readable');
+        boxInRegion(geometry.playerText, geometry.player, 'The complete durable player tag remains readable');
         expect(Math.max(geometry.your.top, geometry.player.top), 'The player name shares the personal-score line')
             .toBeLessThan(Math.min(geometry.your.bottom, geometry.player.bottom));
         expect(Math.max(geometry.team.top, geometry.session.top), 'The session name shares the team-score line')
@@ -440,7 +713,7 @@ async function readablePersonalResults(page, expected, requireScroll = false) {
     await results.evaluate(element => { element.scrollTop = 0; });
     let geometry = await page.evaluate(personalScoreGeometry);
     personalLayoutEvidence('results at first row', geometry);
-    expect(geometry.rows.map(({ number, score }) => ({ number, score }))).toEqual(expected);
+    expect(geometry.rows.map(({ tag, score }) => ({ tag, score }))).toEqual(expected);
     for (const box of [geometry.overlay, geometry.title, geometry.personalTotal, geometry.total,
         geometry.prompt, geometry.results]) {
         boxInRegion(box, geometry.gameView, 'Final title, personal and team totals, prompt and results stay in the creator view');
@@ -568,11 +841,11 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             hostShip = await shipId(host.page);
             participants.push({
                 id: await host.page.evaluate(() => SessionClient.getParticipantId()),
-                number: 1, score: 0,
+                number: 1, score: 0, tag: host.tag,
             });
             await personalConvergence([host.page, guest.page], participants);
-            await expect(host.page.locator('#player-indicator')).toHaveText('Player 1');
-            await expect(guest.page.locator('#player-indicator')).toHaveText('Spectator');
+            await expect(host.page.locator('#player-indicator')).toHaveText(host.tag);
+            await expect(guest.page.locator('#player-indicator')).toHaveText(guest.tag);
             await expect(guest.page.locator('#your-score')).toHaveText('--');
             await guest.page.locator('#btn-start-enter').click();
             await playing(guest.page);
@@ -584,7 +857,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             guestShip = await shipId(guest.page);
             participants.push({
                 id: await guest.page.evaluate(() => SessionClient.getParticipantId()),
-                number: 2, score: 0,
+                number: 2, score: 0, tag: guest.tag,
             });
             const config = await host.page.evaluate(() => ({
                 threshold: CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, lives: CONFIG.MULTIPLAYER_LIVES,
@@ -592,7 +865,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             scoreThreshold = config.threshold;
             startingLives = config.lives;
             await personalConvergence([host.page, guest.page], participants);
-            await expect(guest.page.locator('#player-indicator')).toHaveText('Player 2');
+            await expect(guest.page.locator('#player-indicator')).toHaveText(guest.tag);
             await expect(guest.page.locator('#your-score')).toHaveText('0');
             await guest.page.evaluate(() => enableTouchControls());
         });
@@ -621,6 +894,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
                 const participant = {
                     id: await visitor.page.evaluate(() => SessionClient.getParticipantId()),
                     number: participants.length + 1,
+                    tag: visitor.tag,
                     score: 0,
                 };
                 participants.push(participant);
@@ -661,7 +935,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             guestShip = rejoinedShip;
             await personalConvergence([host.page, guest.page], participants);
             await containedPersonalHud(guest.page, participants[1].score,
-                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].number);
+                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].tag);
         });
 
         await test.step('exclude a pure watcher and continue score updates after the original authority departs', async () => {
@@ -671,7 +945,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             await expect.poll(() => watcher.page.evaluate(() => game.ship == null),
                 { message: 'A joined lobby watcher has no player ship' }).toBe(true);
             await personalConvergence([host.page, guest.page, watcher.page], participants);
-            await expect(watcher.page.locator('#player-indicator')).toHaveText('Spectator');
+            await expect(watcher.page.locator('#player-indicator')).toHaveText(watcher.tag);
             const watchingParticipant = await watcher.page.evaluate(() => SessionClient.getParticipantId());
             expect(participants.some(({ id }) => id === watchingParticipant),
                 'A pure spectator is not a historical scoring participant').toBe(false);
@@ -696,7 +970,7 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             expect(await guest.page.evaluate(() => game.sessionInfo.metadata.aspectRatio),
                 'Resizing a guest never rewrites creator viewport metadata').toBe(creatorAspect);
             await containedPersonalHud(guest.page, participants[1].score,
-                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].number);
+                participants.reduce((sum, participant) => sum + participant.score, 0), participants[1].tag);
         });
 
         let terminal;
@@ -731,11 +1005,11 @@ for (const { mode, layout } of ['deterministic', 'buffered']
             const expected = rankedPersonalResults(participants, maxMembers);
             const teamScore = participants.reduce((sum, participant) => sum + participant.score, 0);
             expect(expected).toHaveLength(Math.floor(maxMembers * 1.5));
-            expect(expected[0].number, 'A continued positive delta changes rank without changing the player label')
-                .toBe(2);
+            expect(expected[0].tag, 'A continued positive delta changes rank without changing the player tag')
+                .toBe(participants[1].tag);
             expect(expected.some(({ score }) => score === 0), 'Departed zero-score players occupy eligible rows')
                 .toBe(true);
-            expect(expected.some(({ number }) => number === participants.length),
+            expect(expected.some(({ tag }) => tag === participants.at(-1).tag),
                 'The last historical arrival is included because top-K keeps the highest scorers').toBe(true);
             await personalResults(guest.page, expected, teamScore, participants[1].score);
             await personalResults(watcher.page, expected, teamScore);
@@ -780,14 +1054,14 @@ for (const { mode, layout } of ['deterministic', 'buffered']
     });
 }
 
-test('personal scores leave solo score and game-over controls unchanged', async ({ players }) => {
+test('player tags preserve solo scoring and game-over controls', async ({ players }) => {
     const { page } = await players.open({
         path: '/?cfg.INVULNERABILITY_TIME=60000',
         viewport: { width: 360, height: 800 }, hasTouch: true, isMobile: true,
     });
     await page.locator('#btn-solo').tap();
     await playing(page);
-    await expect(page.locator('#score')).toHaveText('Score: 0');
+    await expect(page.locator('#score')).toHaveText('Score: 0 : Pilot1');
     await expect(page.locator('#session-indicator')).toBeHidden();
     await page.evaluate(() => {
         game.score = 654321;
@@ -795,7 +1069,7 @@ test('personal scores leave solo score and game-over controls unchanged', async 
         updateHUD();
         enableTouchControls();
     });
-    await expect(page.locator('#score')).toHaveText('Score: 654321');
+    await expect(page.locator('#score')).toHaveText('Score: 654321 : Pilot1');
     expect(personalHudScores(await page.locator('#hud').innerText())).toEqual({ your: null, team: null });
     await page.evaluate(() => handleShipHit(game.ship));
     await expect(page.locator('#gameover-overlay')).toBeVisible();

@@ -20,6 +20,15 @@ assert_equal() {
   [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
 }
 
+WORKFLOW_SOURCE=$(tr -d '\r' < "$SCRIPT_DIR/../workflows/azure-deploy.yml")
+for certificate_input in CERT_KEY_VAULT_SECRET_URL CERT_KEY_VAULT_CERT_NAME CERT_READER_IDENTITY_ID; do
+  grep -Fxq "  $certificate_input: "'${{ secrets.'"$certificate_input"' }}' <<< "$WORKFLOW_SOURCE" \
+    || fail "workflow must source $certificate_input only from a repository secret"
+  if grep -Fq "vars.$certificate_input" <<< "$WORKFLOW_SOURCE"; then
+    fail "workflow must not read the unmasked $certificate_input repository variable"
+  fi
+done
+
 is_protected_deployment_suffix production "" || fail "production must be protected"
 is_protected_deployment_suffix production-westus "" || fail "regional production must be protected"
 is_protected_deployment_suffix feature-a "feature-a feature-b" || fail "active suffix must be protected"
@@ -101,13 +110,15 @@ CALL_LOG="$TEST_DIR/calls.jsonl"
 # the one-way static-apex -> regional-app dependency without contacting Azure.
 az bicep build --file infra/main.bicep --outfile "$TEST_DIR/main.compiled.json"
 jq -e \
-  --arg origin_count "[length(parameters('additionalAllowedOrigins'))]" \
-  --arg origin_name "[format('Region__AdditionalAllowedOrigins__{0}', copyIndex('additionalOriginEnv'))]" \
-  --arg origin_value "[parameters('additionalAllowedOrigins')[copyIndex('additionalOriginEnv')]]" \
+  --arg origin_count "[length(variables('configuredAdditionalOrigins'))]" \
+  --arg origin_name "[format('Region__AdditionalAllowedOrigins__{0}', add(copyIndex('additionalOriginEnv'), 1))]" \
+  --arg origin_value "[variables('configuredAdditionalOrigins')[copyIndex('additionalOriginEnv')]]" \
+  --arg merged_origins_prefix "[union(parameters('additionalAllowedOrigins')," \
   '
   [.resources[] | select(.copy.name == "webRegional")][0] as $regional |
   [.resources[] | select(.name == "static-apex")][0] as $static |
   $regional.properties.template as $module |
+  [$module.resources[] | select(.type == "Microsoft.App/containerApps")][0].properties.template.containers[0].env as $runtime_env |
   $regional.properties.parameters.additionalAllowedOrigins as $origins |
   [$module.variables.copy[] | select(.name == "additionalOriginEnv")][0] as $env |
   ($module.parameters.additionalAllowedOrigins.type == "array") and
@@ -115,13 +126,16 @@ jq -e \
   ($origins | contains("staticApexEnabled") and contains("https://{0}") and
     contains("static-apex") and contains(".outputs.defaultHostname.value") and
     endswith("createArray()))]") and (contains("*") | not)) and
+  ($module.variables.configuredAdditionalOrigins | startswith($merged_origins_prefix)) and
   ($env.count == $origin_count) and
   ($env.input.name == $origin_name) and
   ($env.input.value == $origin_value) and
-  ($module.variables.effectiveEnv | contains("additionalOriginEnv") and
-    contains("apexEnv") and contains("manifestEnv")) and
-  any($module.resources[]; .type == "Microsoft.App/containerApps" and
-    .properties.template.containers[0].env == "[variables('\''effectiveEnv'\'')]") and
+  ($runtime_env | startswith("[concat(") and
+    contains("Region__AdditionalAllowedOrigins__0") and
+    contains("Microsoft.App/managedEnvironments") and contains(".defaultDomain") and
+    contains("variables('\''additionalOriginEnv'\'')") and
+    contains("variables('\''apexEnv'\'')") and
+    contains("variables('\''manifestEnv'\'')")) and
   ($regional.properties.parameters.apexHostname | contains("fullCustomDomain")) and
   ($regional.properties.parameters.regionsManifest.value | contains("regionsManifest")) and
   any($regional.dependsOn[]; contains("static-apex")) and
@@ -149,8 +163,21 @@ jq -e '
   (.outputs.DEPLOYMENT_WARNING.type == "string")
   ' "$TEST_DIR/main.compiled.json" >/dev/null || fail "compiled deployment safety wiring is incorrect"
 
+ASTERVOIDS_INFRA_TEMPLATE="$TEST_DIR/main.compiled.json" \
+  node --test .github/scripts/identity-infrastructure.test.mjs
+
 jq -e '.parameters.manageAcmebotPermissions.value == "${MANAGE_ACMEBOT_PERMISSIONS=true}"' \
   infra/main.parameters.json >/dev/null || fail "azd parameter mapping for MANAGE_ACMEBOT_PERMISSIONS is missing"
+jq -e '.parameters.identityPromptOnRoot.value == "${IDENTITY_PROMPT_ON_ROOT=true}"' \
+  infra/main.parameters.json >/dev/null || fail "azd parameter mapping for IDENTITY_PROMPT_ON_ROOT is missing"
+grep -Fq 'IDENTITY_PROMPT_ON_ROOT: ${{ vars.IDENTITY_PROMPT_ON_ROOT }}' .github/workflows/azure-deploy.yml \
+  || fail "workflow must source the root-onboarding switch from a repository variable"
+grep -Fq '[identityPromptOnRoot]="${IDENTITY_PROMPT_ON_ROOT:-true}"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must pre-validate the root-onboarding switch"
+grep -Fq 'validate_preview_environment_name "$SANITIZED"' .github/workflows/azure-deploy.yml \
+  || fail "workflow must reject previews that collide with production resources"
+grep -Fq 'az provider register -n Microsoft.Storage --wait' .github/workflows/azure-deploy.yml \
+  || fail "workflow must register the storage resource provider"
 grep -Fq 'primary_region_location "$REGIONS_JSON"' .github/workflows/azure-deploy.yml \
   || fail "workflow must derive the regional deployment location from REGIONS_JSON"
 grep -Fq 'CUSTOM_DOMAIN_NAME: ${{ secrets.CUSTOM_DOMAIN_NAME }}' .github/workflows/azure-deploy.yml \
@@ -307,6 +334,7 @@ reset_deployment() {
     CERT_KEY_VAULT_CERT_NAME: "wildcard-example-com",
     CERT_READER_IDENTITY_ID: "",
     MANAGE_ACMEBOT_PERMISSIONS: "true",
+    IDENTITY_PROMPT_ON_ROOT: "true",
     DOMAIN_VERIFICATION_ID: "seeded-verification",
     WEB_URI: "https://primary.azurecontainerapps.io",
     CONTAINER_APP_NAME: "ca-web-production",
@@ -352,6 +380,38 @@ expect_failure() {
   "$@" >/dev/null 2>&1 || actual=$?
   assert_equal "$actual" "$expected"
 }
+
+identity_setup=$(sed -n '/^          azd env set IDENTITY_PROMPT_ON_ROOT /{
+  s/^          //
+  p
+}' "$SCRIPT_DIR/../workflows/azure-deploy.yml")
+test -n "$identity_setup" || fail "workflow identity setup not found"
+for prompt in '' true false; do
+  reset_deployment
+  MOCK_AZD_VALUES=$(jq '.IDENTITY_PROMPT_ON_ROOT = "old-value"' <<< "$MOCK_AZD_VALUES")
+  IDENTITY_PROMPT_ON_ROOT="$prompt"
+  source /dev/stdin <<< "$identity_setup"
+  load_deployment_settings deployment
+  assert_equal "${deployment[identityPromptOnRoot]}" "${prompt:-true}"
+  assert_calls 1 azd env set IDENTITY_PROMPT_ON_ROOT
+done
+unset IDENTITY_PROMPT_ON_ROOT
+
+for invalid in TRUE False yes 1; do
+  reset_deployment
+  MOCK_AZD_VALUES=$(jq --arg value "$invalid" '.IDENTITY_PROMPT_ON_ROOT = $value' <<< "$MOCK_AZD_VALUES")
+  expect_failure 2 load_deployment_settings deployment
+  assert_calls 0 az
+done
+for reserved in production production-north; do
+  reset_deployment
+  branch_settings
+  deployment[environmentName]="$reserved"
+  expect_failure 2 validate_preview_environment_name "$reserved"
+  expect_failure 2 validate_deployment_settings deployment
+  assert_calls 0 az
+done
+validate_preview_environment_name feature-production
 
 # Execute the actual workflow certificate setup, including its conditionals.
 certificate_setup=$(sed -n '/^          # BYO TLS cert (optional)/,/^      - name: Bootstrap BYO cert/{
@@ -449,6 +509,7 @@ assert_calls 2 az containerapp update
 assert_call_argument environmentName=production az deployment sub create
 assert_call_argument location=northeurope az deployment sub create
 assert_call_argument useSharedInfra=false az deployment sub create
+assert_call_argument identityPromptOnRoot=true az deployment sub create
 assert_call_argument "regions=$REGIONS" az deployment sub create
 assert_call_argument certReaderIdentityId= az deployment sub create
 assert_call_argument manageAcmebotPermissions=true az deployment sub create
@@ -463,6 +524,8 @@ for key in WEB_URI CONTAINER_APP_NAME CONTAINER_APPS_ENVIRONMENT RESOURCE_GROUP 
   assert_equal "$(azd_env_value "$key")" "${outputs[$key]}"
 done
 cmp AstervoidsWeb/wwwroot/index.html "$TEST_DIR/static/index.html" || fail "static shell not copied"
+diff -r AstervoidsWeb/wwwroot/js "$TEST_DIR/static/js" >/dev/null \
+  || fail "static payload must copy every JS module, including player identity"
 BOOTSTRAP=$(sed 's/^window.ASTERVOIDS_REGION_BOOTSTRAP = //; s/;$//' "$TEST_DIR/static/region-bootstrap.js")
 assert_equal "$(jq -c '.regions' <<< "$BOOTSTRAP")" "${outputs[STATIC_APEX_REGION_MANIFEST]}"
 assert_equal "$(jq '.regionId, .displayName' <<< "$BOOTSTRAP")" $'null\nnull'
@@ -599,6 +662,7 @@ done
 
 reset_deployment
 branch_settings
+deployment[identityPromptOnRoot]=false
 APP_STATE=after-bicep
 ARM_OUTPUTS=$(jq '.weB_URI.value="https://preview.azurecontainerapps.io" |
   .containeR_APP_NAME.value="ca-web-feature-login" |
@@ -612,6 +676,7 @@ assert_calls 2 az containerapp show
 assert_call_argument fallback-feature-login-123 az deployment sub create
 assert_call_argument environmentName=feature-login az deployment sub create
 assert_call_argument useSharedInfra=true az deployment sub create
+assert_call_argument identityPromptOnRoot=false az deployment sub create
 assert_call_argument location=northeurope az deployment sub create
 assert_call_argument customSubdomain=app-feature-login az deployment sub create
 assert_call_argument certReaderIdentityId=example-identity az deployment sub create
