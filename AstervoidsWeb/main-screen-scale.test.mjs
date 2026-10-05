@@ -39,7 +39,7 @@ test('landscape aligns the play and utility groups without reserving hidden butt
     assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
 });
 
-test('every main-menu button shares Solo Play sizing without split-width lobby actions', () => {
+test('main-menu buttons keep Solo Play height while lobby actions share one row', () => {
     const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
     assert.ok(buttonStyle);
     assert.match(buttonStyle, /width: 100%;/);
@@ -48,7 +48,14 @@ test('every main-menu button shares Solo Play sizing without split-width lobby a
     assert.match(buttonStyle, /line-height: 12px;/);
     assert.match(buttonStyle, /padding-inline: min\(18px, 2vw\);/);
     assert.match(buttonStyle, /transition-property: background-color, border-color, color, opacity;/);
-    assert.match(source, /#picker-buttons \.button-row \{[^}]*flex-direction: column;/);
+    const rowStyle = source.match(/#picker-buttons \.button-row \{([^}]+)\}/)?.[1];
+    assert.ok(rowStyle);
+    assert.match(rowStyle, /flex-direction: row;/);
+    assert.match(rowStyle, /gap: 7\.2px;/);
+    const rowButtonStyle = source.match(/#picker-buttons \.button-row \.picker-btn \{([^}]+)\}/)?.[1];
+    assert.ok(rowButtonStyle);
+    assert.match(rowButtonStyle, /flex: 1;/);
+    assert.match(rowButtonStyle, /min-width: 0;/);
     assert.match(source, /#menu-columns \.picker-btn\.regional-create \{[^}]*padding-block: 2px;/);
     assert.match(source, /#menu-columns \.create-region-label \{[^}]*display: block;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/);
 });
@@ -84,7 +91,6 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         ['.region-select-row', 'gap', 5],
         ['.region-select-row', 'margin-bottom', 7],
         ['#picker-buttons', 'gap', 7],
-        ['#picker-buttons .button-row', 'gap', 9],
     ]) {
         const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const propertyPattern = new RegExp(`${property}: ([\\d.]+)px;`);

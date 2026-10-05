@@ -852,8 +852,13 @@
 
         #picker-buttons .button-row {
             display: flex;
-            flex-direction: column;
+            flex-direction: row;
             gap: 7.2px;
+        }
+
+        #picker-buttons .button-row .picker-btn {
+            flex: 1;
+            min-width: 0;
         }
 
         /* Mobile touch controls */

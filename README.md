@@ -16,10 +16,11 @@ names that identity; later visits to the same link recover it after confirmation
 Both buttons copy the link and show a readiness message; denied clipboard access
 offers the same selectable link and a Copy retry, without generating another invite.
 Controller, fullscreen, and invitation controls stack in portrait and sit beside
-the main actions in landscape, including short phone viewports. All main-menu
-buttons match Solo Play's compact dimensions, including the full-width multiplayer
-lobby actions. Enabled labels use bright white text, with compact vertical spacing
-and distinct disabled-button indicators.
+the main actions in landscape, including short phone viewports. Main-menu buttons
+use Solo Play's compact height and native typography. Create Multiplayer spans
+its column; in a session, Leave and Start/Enter split that same row so the actions
+take no extra vertical space. Enabled labels use bright white text, with compact
+vertical spacing and distinct disabled-button indicators.
 Landscape columns share top and bottom edges: device controls sit at the top,
 and the invitation pair aligns with the bottom play actions. Optional controls
 collapse naturally without reserved empty button slots. Regional create buttons

@@ -213,8 +213,10 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             { width: 360, height: 800 }, { width: 320, height: 568 },
         ]) {
             await page.setViewportSize(viewport);
-            const buttons = await page.locator('#menu-columns .picker-btn:visible').evaluateAll(elements =>
-                elements.map(button => {
+            const buttons = await page.evaluate(() => {
+                const elements = [...document.querySelectorAll('#menu-columns .picker-btn')]
+                    .filter(button => button.getClientRects().length > 0);
+                return elements.map(button => {
                     const box = button.getBoundingClientRect();
                     const style = getComputedStyle(button);
                     return {
@@ -225,12 +227,15 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                             && button.scrollWidth <= button.clientWidth
                             && button.scrollHeight <= button.clientHeight,
                     };
-                }));
+                });
+            });
             expect(buttons.map(button => button.id)).toEqual(ids);
             const solo = buttons.find(button => button.id === 'btn-solo');
             for (const button of buttons) {
                 const label = `${button.id} at ${viewport.width}x${viewport.height}`;
-                expect(button.width, `${label} matches Solo Play width`).toBeCloseTo(solo.width, 1);
+                const paired = inSession && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                expect(button.width, `${label} ${paired ? 'shares the Create row' : 'matches Solo Play width'}`)
+                    .toBeCloseTo(paired ? (solo.width - 7.2) / 2 : solo.width, 1);
                 expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
                 expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
                 expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
@@ -262,8 +267,11 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     groups: innerWidth > innerHeight
                         ? box('#menu-utilities').left - box('#menu-play').right
                         : utilities[0].top - box('#btn-solo').bottom,
-                    lobby: box('#btn-start-enter').height
-                        ? box('#btn-start-enter').top - box('#btn-leave-create').bottom : null,
+                    actionRowHeight: box('#picker-buttons .button-row').height,
+                    actionRowWidth: box('#picker-buttons .button-row').width,
+                    lobbyGap: box('#btn-start-enter').left - box('#btn-leave-create').right,
+                    lobbyOffset: box('#btn-start-enter').top - box('#btn-leave-create').top,
+                    lobbySpan: box('#btn-start-enter').right - box('#btn-leave-create').left,
                     topAlignment: utilities[0].top - box('#session-list').top,
                     bottomAlignment: utilities.at(-1).bottom - box('#btn-solo').bottom,
                     inviteAlignment: box('#btn-invite-self').top
@@ -296,7 +304,13 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             }
             expect(spacing.groups, 'Only vertical spacing between groups is reduced')
                 .toBeCloseTo(viewport.width > viewport.height ? 12 : 19 * 0.8, 1);
-            if (inSession) expect(spacing.lobby, 'Lobby action gap is 20% smaller').toBeCloseTo(9 * 0.8, 1);
+            expect(spacing.actionRowHeight, 'Create and the lobby pair occupy one 32px row').toBe(32);
+            expect(spacing.actionRowWidth, 'The action row retains the full Create width').toBeCloseTo(solo.width, 1);
+            if (inSession) {
+                expect(spacing.lobbyGap, 'Leave and Start/Enter have a compact horizontal gap').toBeCloseTo(7.2, 1);
+                expect(spacing.lobbyOffset, 'Leave and Start/Enter sit side by side').toBeCloseTo(0, 1);
+                expect(spacing.lobbySpan, 'The pair fills the former Create footprint').toBeCloseTo(solo.width, 1);
+            }
         }
     }
 
@@ -310,6 +324,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
         await page.locator('#btn-leave-create').click();
         await expect.poll(() => page.evaluate(() => SessionClient.isInSession())).toBe(false);
     }
+    await expectMatchingButtons(false);
 });
 
 test('landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states', async ({ players }) => {
@@ -374,11 +389,18 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                         regionVisible: box('create-region-row').height > 0,
                         startVisible: box('btn-start-enter').height > 0,
                         startDisabled: sessionPicker.btnStartEnter.disabled,
+                        actionRowHeight: sessionPicker.btnLeaveCreate.parentElement.getBoundingClientRect().height,
+                        lobbyGap: box('btn-start-enter').left - box('btn-leave-create').right,
+                        lobbyOffset: box('btn-start-enter').top - box('btn-leave-create').top,
+                        lobbyWidthError: box('btn-start-enter').right - box('btn-leave-create').left - solo.width,
                         destination: sessionPicker.btnLeaveCreate.getAttribute('aria-label'),
                         createText: sessionPicker.btnLeaveCreate.textContent,
                         clipped: buttons.filter(button => {
                             const rect = button.getBoundingClientRect();
-                            return Math.abs(rect.width - solo.width) > 0.05 || rect.height !== 32
+                            const paired = role !== 'outside'
+                                && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                            const expectedWidth = paired ? (solo.width - 7.2) / 2 : solo.width;
+                            return Math.abs(rect.width - expectedWidth) > 0.05 || rect.height !== 32
                                 || rect.left < 0 || rect.right > innerWidth
                                 || button.scrollWidth > button.clientWidth
                                 || button.scrollHeight > button.clientHeight
@@ -409,7 +431,11 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             expect(state.fullscreenVisible, label).toBe(state.mode === '');
             expect(state.regionVisible, label).toBe(state.multiRegion);
             expect(state.startVisible, label).toBe(state.role !== 'outside');
+            expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
             if (state.role !== 'outside') {
+                expect(state.lobbyGap, `${label} has a horizontal action gap`).toBeCloseTo(7.2, 1);
+                expect(state.lobbyOffset, `${label} has side-by-side actions`).toBeCloseTo(0, 1);
+                expect(state.lobbyWidthError, `${label} actions fill the Create width`).toBeCloseTo(0, 1);
                 expect(state.startDisabled, label).toBe(state.role === 'waiting-member');
                 expect(state.destination, `${label} Leave has no stale create label`).toBeNull();
             } else if (state.multiRegion && !state.unavailable) {
