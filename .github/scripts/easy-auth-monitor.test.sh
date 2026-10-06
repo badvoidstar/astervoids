@@ -39,6 +39,11 @@ az() {
       ;;
     empty) return 0 ;;
     denied)
+      echo "Insufficient privileges to complete the operation." >&2
+      echo "private-auth-error-sentinel" >&2
+      return 1
+      ;;
+    failed)
       echo "private-auth-error-sentinel" >&2
       return 1
       ;;
@@ -50,11 +55,15 @@ export EASYAUTH_APP_ID=private-app-id-sentinel GITHUB_OUTPUT=/dev/null
 OUTPUT=$(MOCK_MODE=success bash -c "$COMPUTE")
 grep -Eq 'Days until expiration: (89|90)$' <<< "$OUTPUT" \
   || fail "monitor must continue selecting the latest credential"
-for mode in empty denied; do
+for mode in empty denied failed; do
   if OUTPUT=$(MOCK_MODE="$mode" bash -c "$COMPUTE" 2>&1); then
     fail "$mode metadata lookup must fail, not pass as a successful check"
   fi
   grep -Fq '::error::' <<< "$OUTPUT" || fail "$mode lookup must report failure"
+  if [ "$mode" = denied ]; then
+    grep -Fq 'Microsoft Graph denied credential metadata access.' <<< "$OUTPUT" \
+      || fail "Graph permission denial must have a safe actionable diagnosis"
+  fi
   if grep -Eq 'private-app-id-sentinel|private-auth-error-sentinel' <<< "$OUTPUT"; then
     fail "$mode lookup must not leak identifiers or raw Azure errors"
   fi
