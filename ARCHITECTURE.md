@@ -933,10 +933,14 @@ its participant retains the session total. Multiple browser bindings of the same
 durable identity aggregate independent ship counters into one participant and
 one entry-life award. Pure spectators acquire no history until publishing a ship.
 
-`syncLocalShipScore` queues only unconfirmed counter changes through ObjectSync.
-Visible, hidden, and terminal maintenance retry them independently of movement;
-confirmed scores add no steady-state pose traffic. Voluntary leave lets atomic
-member departure remove ships rather than pre-deleting calculation inputs.
+`syncLocalShipScore` checks confirmation of the score counter alone. An
+unconfirmed score queues the ship's current `toUpdateData()` motion snapshot
+alongside the counter: every data-bearing version re-anchors replica presentation,
+so a score-only patch would timestamp the previous pose as fresh and disrupt motion.
+Visible, hidden, and terminal maintenance retry with the latest pose independently
+of the motion send gate; confirmed scores add no steady-state pose traffic.
+Voluntary leave lets atomic member departure remove ships rather than
+pre-deleting calculation inputs.
 Explicit ship deletion also supplies the deleted record to the same calculator.
 This preserves accepted records, not a guarantee of delivery for never-confirmed
 client writes.

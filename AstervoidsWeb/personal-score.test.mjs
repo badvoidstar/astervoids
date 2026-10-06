@@ -402,7 +402,10 @@ function counterHarness({ deltaEncoding = true } = {}) {
     const events = [];
     const controls = { accept: true };
     const game = {
-        ship: { score: 0, hitCount: 0, syncObjectId: shipA, toUpdateData: () => ({ x: 0.5 }) },
+        ship: {
+            x: 0.5, score: 0, hitCount: 0, syncObjectId: shipA,
+            toUpdateData() { return { x: this.x }; },
+        },
         multiplayer: { myShipObjectId: shipA },
     };
     const SessionClient = {
@@ -447,15 +450,16 @@ function counterHarness({ deltaEncoding = true } = {}) {
 }
 
 for (const deltaEncoding of [true, false]) {
-    test(`rare score changes persist through ObjectSync, not motion packets (delta=${deltaEncoding})`, async () => {
+    test(`rare score changes persist with fresh motion outside the motion gate (delta=${deltaEncoding})`, async () => {
         const h = counterHarness({ deltaEncoding });
         h.game.ship.score = 30;
         h.emitShipStateChanged();
         await h.ObjectSync.flushUpdates();
-        assert.deepEqual(h.requests.map(batch => batch.map(update => update.data)), [[{ score: 30 }]]);
+        assert.deepEqual(h.requests.map(batch => batch.map(update => update.data)), [[{ x: 0.5, score: 30 }]]);
         assert.equal(h.events.length, 1, 'transient feedback remains available');
         assert.equal(h.ObjectSync.getObject(shipA).data.score, 30);
         for (let frame = 0; frame < 120; frame++) {
+            h.game.ship.x += 0.001;
             h.syncLocalShip();
             await h.ObjectSync.flushUpdates();
         }
@@ -474,12 +478,16 @@ test('rejected score writes retry outside the motion gate until confirmed, inclu
     h.game.ship.score = 40;
     h.emitShipStateChanged();
     await h.ObjectSync.flushUpdates();
+    h.game.ship.x = 0.55;
     h.syncLocalShip();
     await h.ObjectSync.flushUpdates();
     h.controls.accept = true;
+    h.game.ship.x = 0.6;
     h.syncLocalShipScore();
     await h.ObjectSync.flushUpdates();
-    assert.deepEqual(h.requests.map(batch => batch[0].data), [{ score: 40 }, { score: 40 }, { score: 40 }]);
+    assert.deepEqual(h.requests.map(batch => batch[0].data), [
+        { x: 0.5, score: 40 }, { x: 0.55, score: 40 }, { x: 0.6, score: 40 }
+    ], 'each unconfirmed score retry captures the current pose');
     h.syncLocalShipScore();
     await h.ObjectSync.flushUpdates();
     assert.equal(h.requests.length, 3);
