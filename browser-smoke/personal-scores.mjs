@@ -12,7 +12,7 @@ export function rankedPersonalResults(participants, maxMembers) {
 }
 
 export function personalRows(text) {
-    const tagged = [...text.matchAll(/^[ \t]*\d+[ \t]+([A-Za-z0-9_-]{1,8})[ \t]+(\d[\d,]*)[ \t]*$/gm)]
+    const tagged = [...text.matchAll(/^[ \t]*\d+[ \t]+([A-Za-z0-9_-]{1,10})[ \t]+(\d[\d,]*)[ \t]*$/gm)]
         .map(match => ({ tag: match[1], score: Number(match[2].replaceAll(',', '')) }));
     if (tagged.length) return tagged;
     return [...text.matchAll(rowPattern)]

@@ -7,7 +7,7 @@ const PlayerIdentity = (function () {
     const CHANGE_KEY = 'astervoids.identity-change';
     const LOCK_NAME = 'astervoids.identity';
     const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-    const TAG_PATTERN = /^[A-Za-z0-9_-]{1,8}$/;
+    const TAG_PATTERN = /^[A-Za-z0-9_-]{1,10}$/;
     const GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     class IdentityError extends Error {

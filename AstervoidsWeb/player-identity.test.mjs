@@ -5,7 +5,7 @@ import { webcrypto } from 'node:crypto';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
-const { createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY } =
+const { createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY, TAG_PATTERN } =
     require('./wwwroot/js/player-identity.js');
 const Wire = require('./wwwroot/js/astervoids-wire-codec.js');
 const first = { id: '00112233-4455-6677-8899-aabbccddeeff', tag: 'Pilot_1' };
@@ -52,6 +52,47 @@ function subject(options = {}) {
     });
     return { client, requests, replies, values, storage, locks };
 }
+
+test('identity and replicated tags accept up to ten ASCII characters without changing the character set', () => {
+    for (const tag of ['A', 'A_b-1234', 'A_b-12345', 'A_b-123456']) {
+        assert.equal(TAG_PATTERN.test(tag), true, tag);
+        assert.equal(Wire.isParticipantTag(tag), true, tag);
+    }
+    for (const tag of ['', '12345678901', 'bad tag', '<img>', '\u00e9']) {
+        assert.equal(TAG_PATTERN.test(tag), false, tag);
+        assert.equal(Wire.isParticipantTag(tag), false, tag);
+    }
+});
+
+for (const tag of ['A_b-12345', 'A_b-123456']) {
+    test(`${tag.length}-character identities survive creation, binding resolution and invite decoding`, async () => {
+        const h = subject();
+        const identity = { ...first, tag };
+        const named = { ...binding, identity };
+        const invite = { ...active, tag };
+        h.replies.push(resolved(), { binding: named }, resolved(named, invite));
+        await h.client.resolve();
+        await h.client.create(tag);
+        assert.deepEqual(h.client.current(), identity);
+        assert.equal(h.requests[1].body.tag, tag);
+        const view = await h.client.resolve(token);
+        assert.deepEqual(view.binding.identity, identity);
+        assert.equal(view.invite.tag, tag);
+    });
+}
+
+test('binding and active-invite responses reject eleven-character tags', async () => {
+    const tag = '12345678901';
+    for (const reply of [
+        resolved({ ...binding, identity: { ...first, tag } }, active),
+        resolved(empty, { ...active, tag }),
+    ]) {
+        const h = subject();
+        h.replies.push(reply);
+        await assert.rejects(h.client.resolve(token), { code: 'identity_unavailable' });
+        assert.equal(h.client.current(), null);
+    }
+});
 
 test('invites are captured once and scrubbed before any request, including malformed links', () => {
     for (const hash of [`#invite=${token}`, '#invite=bad', `#invite=${token}&invite=${token}`]) {
@@ -804,7 +845,7 @@ test('tag maps are GUID sorted, bounded ASCII, strict, and retain zero-score his
     assert.equal(packed.length, 17 * 2 + first.tag.length + second.tag.length);
     assert.deepEqual(Wire.packTagMap({ [first.id]: first.tag, [second.id]: second.tag }), packed);
     for (const value of [
-        { bad: 'Valid' }, { [first.id]: '' }, { [first.id]: '123456789' },
+        { bad: 'Valid' }, { [first.id]: '' }, { [first.id]: '12345678901' },
         { [first.id]: '<img>' }, { [first.id]: 'a b' }, { [first.id]: '\u00e9' },
         { [first.id]: first.tag, [first.id.toUpperCase()]: 'Other' },
     ]) assert.throws(() => Wire.packTagMap(value));
@@ -812,4 +853,18 @@ test('tag maps are GUID sorted, bounded ASCII, strict, and retain zero-score his
     const doubled = new Uint8Array(packed.length * 2);
     doubled.set(packed); doubled.set(packed, packed.length);
     assert.throws(() => Wire.unpackTagMap(doubled));
+});
+
+test('tag maps round-trip nine and ten bytes but reject a complete eleven-byte entry', () => {
+    for (const tag of ['A_b-12345', 'A_b-123456']) {
+        const packed = Wire.packTagMap({ [first.id]: tag });
+        assert.equal(packed.length, 17 + tag.length);
+        assert.equal(packed[16], tag.length);
+        assert.deepEqual(Wire.unpackTagMap(packed), { [first.id]: tag });
+    }
+    const oversized = new Uint8Array(17 + 11);
+    oversized.set(Wire.packTagMap({ [first.id]: 'A' }).subarray(0, 16));
+    oversized[16] = 11;
+    oversized.fill('A'.charCodeAt(0), 17);
+    assert.throws(() => Wire.unpackTagMap(oversized), /invalid/);
 });

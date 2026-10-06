@@ -4,7 +4,7 @@ A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
 ## Player identities and invitations
 
-Choose a permanent 1-8 character player tag (letters, numbers, `_` or `-`).
+Choose a permanent 1-10 character player tag (letters, numbers, `_` or `-`).
 The backend retains the identity independently of games, including solo play.
 Tags need not be unique. Each browser profile and site origin has at most one
 active identity; clearing its site storage removes that local access, not the

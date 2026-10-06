@@ -372,7 +372,7 @@ or GameState record.
 
 | Value | Meaning and lifetime |
 | --- | --- |
-| Public identity | Backend-generated GUID and immutable, case-preserved `[A-Za-z0-9_-]{1,8}` tag; tags are not globally unique |
+| Public identity | Backend-generated GUID and immutable, case-preserved `[A-Za-z0-9_-]{1,10}` tag; tags are not globally unique |
 | Browser credential | Random 256-bit bearer capability in `localStorage`, scoped to one top-level origin and browser profile/storage context |
 | Browser binding | One credential-hash row pointing to zero or one public identity, with an ETag and monotonic revision |
 | Invitation | Random 256-bit base64url capability; identifies a pending player until first naming, then remains that identity's access/recovery link |
@@ -1401,7 +1401,7 @@ game-specific nested packing:
   nonnegative scores, positive ordinals, matching participants, and duplicate
   entries before use. These histories are distinct from the entry-life ledger.
 - Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
-  ASCII length, and 1-8 tag bytes. Invalid/duplicate entries or truncated bytes
+  ASCII length, and 1-10 tag bytes. Invalid/duplicate entries or truncated bytes
   reject; tag failure must not erase valid score history.
 - Game ledger readers require packed bytes, not older dictionary-shaped wire
   fields. Decoded calculation maps are still ordinary objects. Duplicate packed

@@ -70,8 +70,11 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         }
     }
 
-    [Fact]
-    public async Task ResolveRootInviteClaimAndSelfHaveExactShapesAndPrivateResponses()
+    [Theory]
+    [InlineData("Pilot_1", "Friend")]
+    [InlineData("A_b-123456", "Friend_123")]
+    public async Task ResolveRootInviteClaimAndSelfHaveExactShapesAndPrivateResponses(
+        string rootTag, string friendTag)
     {
         using var client = _factory.CreateClient();
         var browser = IdentitySecrets.NewToken();
@@ -85,7 +88,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         Assert.Equal(JsonValueKind.Null, binding.GetProperty("identity").ValueKind);
         Assert.Equal(0, binding.GetProperty("revision").GetInt64());
 
-        var rootRequest = new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = "Pilot_1" };
+        var rootRequest = new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = rootTag };
         using var rootResponse = await Send(client, "/root", browser, rootRequest);
         var root = await Body(rootResponse, 201);
         Assert.Single(root.EnumerateObject());
@@ -93,7 +96,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         var identity = named.GetProperty("identity");
         Assert.Equal(new[] { "id", "tag" }, Names(identity));
         Assert.NotEqual(Guid.Empty, identity.GetProperty("id").GetGuid());
-        Assert.Equal("Pilot_1", identity.GetProperty("tag").GetString());
+        Assert.Equal(rootTag, identity.GetProperty("tag").GetString());
         using var rootRetry = await Send(client, "/root", browser, rootRequest);
         Assert.Equal(root.GetRawText(), (await Body(rootRetry, 201)).GetRawText());
 
@@ -114,9 +117,10 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         {
             requestId = Guid.NewGuid(), inviteToken = token,
             expectedInviteEtag = invitation.GetProperty("etag").GetString(),
-            expectedBinding = Expected(friend.GetProperty("binding")), tag = "Friend"
+            expectedBinding = Expected(friend.GetProperty("binding")), tag = friendTag
         });
         var accepted = (await Body(acceptedResponse, 200)).GetProperty("binding");
+        Assert.Equal(friendTag, accepted.GetProperty("identity").GetProperty("tag").GetString());
         using var selfResponse = await Send(client, "/invites/self", friendBrowser,
             new { expectedBinding = Expected(accepted) });
         Assert.Equal(token, (await Body(selfResponse, 200)).GetProperty("inviteToken").GetString());
@@ -186,7 +190,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
 
     [Theory]
     [InlineData("")]
-    [InlineData("123456789")]
+    [InlineData("12345678901")]
     [InlineData("P ilot")]
     [InlineData("é")]
     [InlineData(null)]

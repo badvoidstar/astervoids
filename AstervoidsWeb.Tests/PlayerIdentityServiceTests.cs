@@ -31,9 +31,13 @@ public class PlayerIdentityServiceTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task PromptDisabled_StaysAnonymous_UntilExplicitRootNaming(bool azure)
+    [InlineData(false, "A_b-1234")]
+    [InlineData(true, "A_b-1234")]
+    [InlineData(false, "A_b-12345")]
+    [InlineData(true, "A_b-12345")]
+    [InlineData(false, "A_b-123456")]
+    [InlineData(true, "A_b-123456")]
+    public async Task PromptDisabled_StaysAnonymous_UntilExplicitRootNaming(bool azure, string tag)
     {
         using var state = new IdentityTestState(azure);
         var browser = IdentitySecrets.NewToken();
@@ -42,9 +46,10 @@ public class PlayerIdentityServiceTests
         Assert.False(resolved.PromptOnRoot);
         Assert.Null(resolved.Binding.Identity);
 
-        var (binding, _) = await Root(service, browser, "A_b-1234");
-        Assert.Equal("A_b-1234", binding.Identity!.Tag);
+        var (binding, _) = await Root(service, browser, tag);
+        Assert.Equal(tag, binding.Identity!.Tag);
         Assert.Equal(1, binding.Revision);
+        Assert.Equal(binding, (await Resolve(state.Restart(), browser)).Binding);
     }
 
     [Theory]
@@ -287,7 +292,7 @@ public class PlayerIdentityServiceTests
 
     [Theory]
     [InlineData("")]
-    [InlineData("123456789")]
+    [InlineData("12345678901")]
     [InlineData(" bad")]
     [InlineData("Bad Tag")]
     [InlineData("é")]
@@ -339,6 +344,7 @@ public class PlayerIdentityServiceTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData("invalid!")]
+    [InlineData("12345678901")]
     public async Task PendingInviteRequiresValidTag_AndRetainsPendingStateOnFailure(string? tag)
     {
         using var state = new IdentityTestState();
@@ -352,6 +358,30 @@ public class PlayerIdentityServiceTests
         Error(await service.AcceptInviteAsync(browser,
             new(Guid.NewGuid(), token, before.Invite!.Etag, Expect(before.Binding), tag)), "invalid_tag", 400);
         Assert.Equal(before, await Resolve(service, browser, token));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PendingInviteAcceptsTenCharacterTag_AndPersistsAfterRestart(bool azure)
+    {
+        using var state = new IdentityTestState(azure);
+        var service = state.Service();
+        var creator = IdentitySecrets.NewToken();
+        await Root(service, creator);
+        var token = Read<InviteTokenReply>(
+            await service.CreateInviteAsync(creator, new(Guid.NewGuid())), 201).InviteToken;
+        var browser = IdentitySecrets.NewToken();
+        var before = await Resolve(service, browser, token);
+        const string tag = "A_b-123456";
+        var accepted = Read<BindingReply>(await service.AcceptInviteAsync(browser,
+            new(Guid.NewGuid(), token, before.Invite!.Etag, Expect(before.Binding), tag))).Binding;
+
+        Assert.Equal(tag, accepted.Identity!.Tag);
+        var restored = await Resolve(state.Restart(), browser, token);
+        Assert.Equal(accepted, restored.Binding);
+        Assert.Equal(tag, restored.Invite!.Tag);
+        Assert.Equal("active", restored.Invite.State);
     }
 
     [Fact]

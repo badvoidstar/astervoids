@@ -90,7 +90,7 @@ internal static class IdentitySecrets
     }
 
     public static bool IsTag(string? tag) =>
-        tag is { Length: >= 1 and <= 8 } && tag.All(IsTagCharacter);
+        tag is { Length: >= 1 and <= 10 } && tag.All(IsTagCharacter);
 
     public static bool IsHash(string? value) =>
         value is { Length: 64 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');

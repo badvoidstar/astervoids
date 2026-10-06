@@ -57,6 +57,13 @@ test('durable tag rows preserve ranking and do not parse titles as players', () 
     ], 3), [{ tag: 'Nova-2', score: 123456 }, { tag: 'Pilot_1', score: 0 }]);
 });
 
+test('personal result reader retains ten-character tags and rejects over-limit rows', () => {
+    assert.deepEqual(personalRows('1\tA_b-123456\t12\n2\tFriend_123\t0'), [
+        { tag: 'A_b-123456', score: 12 }, { tag: 'Friend_123', score: 0 },
+    ]);
+    assert.deepEqual(personalRows('1\tA_b-1234567\t12'), []);
+});
+
 test('personal score reader distinguishes capitalized individual and shared HUD and final labels', () => {
     assert.deepEqual(personalHudScores('Your Score\n123456\nTeam Score\n316,932\nWave: 1\nLives: 5'), {
         your: 123456, team: 316932,
