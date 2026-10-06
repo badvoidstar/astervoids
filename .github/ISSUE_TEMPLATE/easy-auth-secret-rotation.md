@@ -20,6 +20,13 @@ This issue is auto-opened by `.github/workflows/check-easy-auth-secret.yml`
 when the secret has <= 30 days to live (or via manual dispatch). Close the
 issue once you've rotated.
 
+Monitor setup and permission-denied troubleshooting are documented in
+[CICD_SETUP.md → Graph admin-consent portal runbook](https://github.com/badvoidstar/astervoids/blob/main/CICD_SETUP.md#graph-admin-consent-portal-runbook).
+`EASYAUTH_APP_ID` is a repository **secret**, not a variable. Its target
+registration is different from the deployment OIDC app that needs the Graph
+**Application** permission and tenant admin consent. Enabling that read-only
+monitor does not rotate credentials; rotation below is a separate operation.
+
 ## How to rotate
 
 ```bash

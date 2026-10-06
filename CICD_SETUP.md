@@ -60,16 +60,11 @@ az role assignment create \
 
 **Contributor alone is not sufficient.** Every app deployment now creates a
 system-assigned managed identity and a table-scoped **Storage Table Data
-Contributor** assignment. The deploying principal also needs
-`Microsoft.Authorization/roleAssignments/write` at the identity table's scope
-or an ancestor. Have an administrator grant appropriately scoped/conditioned
-**Role Based Access Control Administrator** permissions in addition to
-Contributor. Cover `rg-production` for production and shared-infrastructure
-previews, and each standalone resource group; creating those scopes from
-scratch requires an administrator-approved subscription-level arrangement.
-Constrain delegation to the required role and service principals where
-possible rather than granting unrestricted Owner. The optional ACMEbot path
-has its own existing DNS/Key Vault role-assignment requirements.
+Contributor** assignment. Retain Contributor for resource provisioning and
+follow the [identity-storage RBAC portal runbook](#identity-storage-rbac-portal-runbook)
+for constrained role-assignment management. The optional ACMEbot path has
+separate DNS/Key Vault delegation requirements; neither Azure permission
+grants Microsoft Graph access.
 
 The workflow also registers `Microsoft.Storage`. Subscription policy must
 allow StorageV2 accounts, Entra-authenticated Table access, and managed
@@ -118,6 +113,190 @@ No separate Static Web Apps deployment token secret is required. The workflow fe
 5. `CUSTOM_SUBDOMAIN` - Subdomain for the app (e.g., `app`)
 
 If the custom domain secrets are configured, the workflow will automatically set up HTTPS. See [Custom Domain Setup](infra/CUSTOM_DOMAIN_SETUP.md) for detailed instructions on DNS configuration.
+
+**Optional for the Easy Auth expiration monitor:**
+
+| Input | GitHub configuration | Purpose |
+|---|---|---|
+| `EASYAUTH_APP_ID` | Repository **secret** | Existing ACMEbot Easy Auth registration's Application (client) ID; not the deployment registration |
+| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | Existing repository **secrets** | Deployment OIDC identity reused by the monitor in the `production` environment |
+| `force_open` | Manual workflow-dispatch input, default `false` | Test-only override of the issue threshold; not a repository variable or secret |
+
+There is no repository variable required to enable the monitor. Keep app IDs
+private; do not migrate `EASYAUTH_APP_ID` to a variable. Configuration alone
+does not authorize Graph reads: follow the
+[Graph admin-consent portal runbook](#graph-admin-consent-portal-runbook).
+
+## Deployment permission runbooks
+
+These are **independent** permission planes for the existing deployment
+identity. Neither creates player credentials or a deployment client secret,
+and neither replaces the other:
+
+| Operation | Permission plane | Required grant |
+|---|---|---|
+| Read Easy Auth credential expiration metadata | Tenant Microsoft Graph | `Application.Read.All` **Application** permission with tenant admin consent |
+| Provision app-to-table access for durable identity | Azure Resource Manager (ARM) | Contributor plus constrained role-assignment management at the table scope or an ancestor |
+
+### Identify the deployment application privately
+
+1. Open [Microsoft Entra admin center](https://entra.microsoft.com) in the
+   deployment tenant. Current navigation is **Entra ID → App registrations →
+   All applications**; some portal versions label this **Identity →
+   Applications → App registrations**.
+2. Use existing private provisioning records to locate the registration
+   corresponding to `AZURE_CLIENT_ID` from setup steps 1–6. The example name
+   `GitHub-Astervoids-Deploy` is **not** proof of the actual registration.
+   Compare **Overview → Application (client) ID** privately with the recorded
+   deployment client ID; do not select by display name alone.
+3. Under **Certificates & secrets → Federated credentials**, verify the existing
+   GitHub federation: issuer `https://token.actions.githubusercontent.com`,
+   audience `api://AzureADTokenExchange`, and production subject
+   `repo:badvoidstar/astervoids:environment:production`. Substitute your
+   owner/repository for a clone. Existing successful workload-federation
+   sign-in records can help identify the app if its name is unknown.
+4. GitHub can show secret **names**, not retrieve their saved values. If the
+   client ID was not retained, use private Azure provisioning/sign-in records
+   and the registration's federation details to establish the identity; do
+   not replace the secret or guess an app. Keep actual IDs, tenant details,
+   domains, and screenshots containing them out of commits and public output.
+
+The deployment app is the **caller**. The ACMEbot authentication registration
+corresponding to `EASYAUTH_APP_ID` is the **read target**. Do not add the monitor's
+Graph permission to the Easy Auth target instead.
+
+### Graph admin-consent portal runbook
+
+Use an authorized **Privileged Role Administrator** or **Global Administrator**
+in the deployment tenant (activate the approved role through PIM if applicable).
+Application Administrator and Cloud Application Administrator can manage
+requested permissions, but their normal consent authority explicitly excludes
+**Microsoft Graph application permissions**. A purpose-built custom consent
+role is usable only if the tenant administrator has approved the required
+authority; an Azure subscription role does not confer it.
+
+1. Open the **verified deployment app registration** identified above.
+2. Select **Manage → API permissions → Add a permission → Microsoft Graph**.
+3. Select **Application permissions**, not **Delegated permissions**: the
+   unattended OIDC workflow has no signed-in user. Search for and expand
+   **Application**, select **Application.Read.All**, then **Add permissions**.
+   If already present as an Application permission, do not add a duplicate.
+4. Review **all** requested permissions before consenting. This read grant
+   allows application/service-principal metadata reads across the tenant,
+   **not just the Easy Auth target**. Approve that scope consciously; do not
+   substitute directory-write permissions or subscription Owner. Credential
+   expiration metadata is readable, not existing secret values.
+5. Select **Grant admin consent for &lt;tenant&gt;**, confirm the dialog, then
+   refresh. Verify the Microsoft Graph `Application.Read.All` row has **Type:
+   Application** and **Status: Granted for &lt;tenant&gt;**. Adding the row without
+   the Granted status is not sufficient. If the button is unavailable, have the
+   authorized Entra administrator perform consent; do not elevate the deployer.
+6. Allow permission propagation, then run **Check Easy Auth secret expiration**
+   in GitHub **Actions → Run workflow**, selecting the latest PR branch while
+   the workflow fix is unmerged (currently `fix/easy-auth-expiry-monitor`).
+   Leave `force_open` **false** and satisfy existing `production` environment
+   approvals. Alternatively, from the repository:
+
+   ```powershell
+   gh workflow run check-easy-auth-secret.yml --repo badvoidstar/astervoids --ref fix/easy-auth-expiry-monitor -f force_open=false
+   ```
+
+7. Inspect the run's steps without publishing raw identifiers or errors.
+   **Log in to Azure** and **Compute days until secret expires** must actually
+   run and succeed; the latter reports an expiration and days remaining.
+   A green unset-configuration no-op is **not** proof of access. More than
+   30 days remaining normally means no issue; at or below 30 days an issue is
+   created unless an `easy-auth-rotation` issue is already open.
+
+The successful OIDC login followed by Graph denial in
+[run 37406956101](https://github.com/badvoidstar/astervoids/actions/runs/37406956101)
+demonstrated this independent missing authorization, not a failed Azure login.
+No grant or successful expiration read is implied by this documentation.
+After [PR #187](https://github.com/badvoidstar/astervoids/pull/187) merges, the
+weekly schedule uses the updated workflow on the default branch; before merge,
+rerunning the old default-branch version may still use its old configuration.
+No new credential, secret rotation, or Easy Auth reconfiguration is needed
+to fix this Graph read denial. Rotation remains a separate maintenance task.
+
+### Identity-storage RBAC portal runbook
+
+The durable-identity provisioning work in
+[PR #184](https://github.com/badvoidstar/astervoids/pull/184) requires the
+deployment **service principal** to create table-scoped role assignments.
+Contributor excludes `Microsoft.Authorization/roleAssignments/write`.
+An authorized Azure administrator must configure delegation; the deployer
+must not self-grant it.
+
+1. In [Azure portal](https://portal.azure.com), select the correct subscription,
+   then **Resource groups → rg-production → Access control (IAM)**.
+   This scope covers production and shared-infrastructure preview identity
+   accounts/tables, including resources created later beneath that group.
+2. Select **Add → Add role assignment → Privileged administrator roles →
+   Role Based Access Control Administrator**. The administrator performing
+   this step must already have role-assignment authority at this scope.
+3. On **Members**, choose **User, group, or service principal → Select members**.
+   Select the deployment application's **service principal**, privately
+   verifying its application ID against the registration above. Do not select
+   the Easy Auth app, an operator account, or a Container App managed identity.
+4. On **Conditions**, select **Allow user to only assign selected roles to
+   selected principals (fewer privileges) → Select roles and principals**.
+   Choose **Constrain roles and principal types → Configure**:
+   - **Roles:** only **Storage Table Data Contributor**.
+   - **Principal types:** only **Service principals** (`ServicePrincipal`).
+   - Save the condition. Do not restrict this to a list of today's principal
+     IDs: new/recreated Container Apps get new system-assigned principals.
+     This role/type constraint allows those future app identities within the
+     resource-group scope; it is not an app-name-specific allowlist.
+5. On **Review + assign**, review the member, scope, role, and saved condition,
+   then assign. Preserve the existing Contributor grant for resource
+   provisioning. If your portal only exposes **Constrain roles**, that template
+   alone does not restrict principal types: use the documented advanced editor
+   with Microsoft's **Constrain roles and principal types** example, or have
+   the administrator complete it in a supported portal. Do not fall back to
+   unrestricted delegation.
+6. Verify the effective/inherited grants and conditions under IAM. The
+   constrained role must permit both `roleAssignments/write` for Bicep
+   creation and `roleAssignments/delete` for removal of the same permitted
+   assignments when needed for lifecycle/cleanup. Use the portal template or
+   Microsoft's example rather than hand-writing a write-only condition:
+   creation checks **Request** attributes; deletion checks **Resource**
+   attributes. Retain role-assignment read access for ARM inspection.
+   Other broader inherited grants can bypass these restrictions and need
+   administrator review, not an unapproved permission change.
+7. Allow propagation and rerun the normal deployment. Verify privately that
+   each app's **system-assigned** identity has Storage Table Data Contributor
+   on its exact `.../tableServices/default/tables/PlayerIdentity` table.
+   Bicep's [role module](infra/core/security/player-identity-role.bicep) uses a
+   deterministic assignment name incorporating the table, principal, and role;
+   do not create duplicate manual app grants as the fix.
+   Check identity onboarding after storage RBAC propagation, not only
+   `/api/ping`; see [Provisioning order and readiness](#provisioning-order-and-readiness).
+
+Repeat the equivalent scoped arrangement for standalone `rg-{env}` deployments.
+An RG-scoped grant cannot create the RG itself: greenfield creation and grants
+require an administrator-approved subscription-level provisioning/delegation
+plan or administrator-created groups. Do not grant subscription Owner merely
+to bypass this prerequisite.
+
+This delegation does **not itself grant table data access** to the deployment
+service principal. Assigning Storage Table Data Contributor directly to that
+principal is not the fix for an ARM role-assignment denial. Bicep grants the
+data role only to each app at table scope; players use the app API, not Azure
+credentials. Certificate Key Vault/DNS delegation for the optional managed
+ACMEbot path remains separate and is not covered by this storage-only condition.
+The Graph consent runbook above does not replace this Azure RBAC grant.
+
+### Microsoft permission references
+
+Portal labels can vary by rollout; these Microsoft instructions define the
+permissions and supported condition templates:
+
+- [Add requested app permissions](https://learn.microsoft.com/en-us/entra/identity-platform/howto-update-permissions)
+- [Tenant-wide admin consent and authorized Entra roles](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/grant-admin-consent)
+- [Graph application reads and least-privileged permissions](https://learn.microsoft.com/en-us/graph/api/application-get?view=graph-rest-1.0)
+- [Delegate Azure role assignments with portal conditions](https://learn.microsoft.com/en-us/azure/role-based-access-control/delegate-role-assignments-portal)
+- [Constrain roles and principal types: write/delete examples](https://learn.microsoft.com/en-us/azure/role-based-access-control/delegate-role-assignments-examples#example-constrain-roles-and-principal-types)
+- [Assign Azure Table data access and propagation](https://learn.microsoft.com/en-us/azure/storage/tables/assign-azure-role-data-access)
 
 ## Testing the Workflow
 
@@ -415,8 +594,10 @@ az containerapp show -g rg-production \
 - The deployment identity needs **User Access Administrator** or **Owner** at
   the relevant production and certificate-Key-Vault scopes when
   `MANAGE_ACMEBOT_PERMISSIONS=true`, because that path creates Azure role
-  assignments. The normal Contributor role is sufficient when using an
-  externally managed reader identity.
+  assignments, or equivalent administrator-approved constrained delegation.
+  An externally managed reader avoids these **certificate-specific** grants,
+  not the mandatory [identity-storage RBAC](#identity-storage-rbac-portal-runbook)
+  requirement. Contributor alone is still insufficient for app deployments.
 
 ### BYO wildcard certificate (ACMEbot) runbook
 
@@ -435,10 +616,13 @@ default). That explicit ACMEbot path provisions `id-acme-cert-reader` in
 `rg-production`, grants ACMEbot DNS Zone Contributor on the production DNS
 zone, and grants the cert reader Key Vault Certificate User on the ACMEbot KV.
 Production deployments without BYO certificate inputs do not reference
-ACMEbot resources. The deployment identity needs User Access Administrator or
-Owner at the production and certificate-Key-Vault scopes for this opt-in path,
-because it creates role assignments; use an externally managed reader identity
-instead when the normal Contributor role should remain sufficient.
+ACMEbot resources. This opt-in path needs role-assignment authority at the
+production and certificate-Key-Vault scopes (User Access Administrator/Owner
+or equivalent administrator-approved constrained delegation). Use an externally
+managed reader identity instead to avoid these certificate-specific requirements. The
+mandatory identity-storage role-assignment permission still applies. For the
+optional expiration monitor, see the
+[Graph admin-consent portal runbook](#graph-admin-consent-portal-runbook).
 
 ```bash
 # 1. [MANUAL, ONE-TIME] Deploy ACMEbot via its ARM template (use the README button):
@@ -486,8 +670,8 @@ instead when the normal Contributor role should remain sufficient.
 #      Do not store this ID in an unmasked repository variable or public output.
 #      The monitor uses the existing `production` environment OIDC federation.
 #      Its OIDC identity also needs separately granted Microsoft Graph
-#      application-read permission (e.g. Application.Read.All with admin
-#      consent); Azure Contributor alone does not grant this permission.
+#      Application.Read.All (Application type) with tenant admin consent.
+#      Follow the linked Graph portal runbook above; Azure RBAC is separate.
 
 # 2. [BICEP-MANAGED — provided here for disaster recovery only]
 #    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
@@ -690,6 +874,8 @@ the deployment entrypoint, and the container module filters caller-supplied
 `Identity__*` environment overrides.
 
 Each Container App has its own **SystemAssigned** managed identity.
+The deployer's separate role-assignment authority is configured through the
+[identity-storage RBAC portal runbook](#identity-storage-rbac-portal-runbook).
 `DefaultAzureCredential` uses that identity without storage keys, SAS tokens,
 or client secrets. Only **Storage Table Data Contributor** on the exact
 `.../tableServices/default/tables/PlayerIdentity` scope is assigned; no
@@ -812,7 +998,7 @@ locally when editing Squad setup files.
 Primary CI/CD customization points are configured in GitHub repository settings:
 
 - Variables: `REGIONS_JSON`, `MANAGE_ACMEBOT_PERMISSIONS`, `IDENTITY_PROMPT_ON_ROOT` (boolean text; defaults to `true`)
-- Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`
+- Secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `CUSTOM_DOMAIN_NAME`, `CUSTOM_SUBDOMAIN`, `CERT_KEY_VAULT_SECRET_URL`, `CERT_KEY_VAULT_CERT_NAME`, `CERT_READER_IDENTITY_ID`, `EASYAUTH_APP_ID` (optional expiration monitor; see [Step 6](#step-6-add-github-secrets))
 
 For existing certificate variables, follow
 [Migrating existing certificate variables](#migrating-existing-certificate-variables);
