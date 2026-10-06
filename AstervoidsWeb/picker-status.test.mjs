@@ -602,7 +602,7 @@ test('voluntary leave bookkeeping blocks rejoin synchronously without clearing p
     const { beginVoluntarySessionLeave, attemptAutoRejoin } = loadInlineGameFunctions([
         'clearPickerMembership', 'beginVoluntarySessionLeave', 'attemptAutoRejoin',
     ], {
-        sessionPicker, leavingSession: false, rejoinInProgress: false,
+        sessionPicker, leavingSession: false, rejoinInProgress: false, pendingRejoinSessionId: 's',
         isSessionMode: () => true,
         _log: (...args) => logs.push(args),
     });

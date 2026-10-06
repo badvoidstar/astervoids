@@ -11675,6 +11675,7 @@
     function beginVoluntarySessionLeave() {
         // Run before any await so disconnect handlers cannot rejoin this session.
         leavingSession = true;
+        pendingRejoinSessionId = null;
         // Leave paths retain ships for MemberLeft's migration and score calculation.
         clearPickerMembership();
     }
@@ -12040,9 +12041,8 @@
     // attemptAutoRejoin so a transport drop mid-leave can't trigger an auto-rejoin
     // back into the session the user is leaving (would create ghost membership).
     let leavingSession = false;
-    // Deferred rejoin: when attemptAutoRejoin is called while the tab is hidden
-    // (mobile background), network ops would fail. Save the info and let
-    // visibilitychange trigger the rejoin when the tab becomes visible.
+    // Retain recovery requests while hidden or verifying identity; a connected
+    // transport does not mean the requested session recovery can be discarded.
     let pendingRejoinSessionId = null;
 
     /**
@@ -12051,21 +12051,20 @@
      * @param {string} sessionId - The session ID to rejoin
      */
     async function attemptAutoRejoin(sessionId) {
-        if (rejoinInProgress || leavingSession || game.identityChanging || !isSessionMode()) {
+        if (rejoinInProgress || leavingSession || !isSessionMode()) {
             _log('[Rejoin] Skipped — rejoinInProgress:', rejoinInProgress,
                 'leavingSession:', leavingSession, 'isSessionMode:', isSessionMode());
             return;
         }
 
-        // Mobile browsers throttle/block network while backgrounded. Attempting
-        // to reconnect now would exhaust all retries before the user even sees
-        // the tab. Defer until the tab becomes visible.
-        if (document.hidden) {
+        // Resume only after the tab is visible and its browser binding is verified.
+        if (document.hidden || game.identityChanging) {
             pendingRejoinSessionId = sessionId;
-            _log('[Rejoin] Deferred — tab hidden. Session:', sessionId);
+            _log('[Rejoin] Deferred until foreground and identity are ready');
             return;
         }
 
+        pendingRejoinSessionId = null;
         _log('[Rejoin] Starting. Session:', sessionId,
             'game.state:', game.state, 'game.mode:', game.mode);
         rejoinInProgress = true;
@@ -12955,7 +12954,6 @@
         if (identityLeave) return identityLeave;
         cancelPickerOperations();
         startGameOperation = null;
-        pendingRejoinSessionId = null;
         beginVoluntarySessionLeave();
         releaseIdentityInput();
         // Disconnect invalidates membership/queued operations synchronously,
@@ -13144,9 +13142,13 @@
         identityRefreshRequested = false;
         identityRefresh = PlayerIdentity.resolve().then(async () => {
             await identityLeave;
+            if (identityRefreshRequested) return;
             game.identityChanging = false;
-            const sessionId = SessionClient.getLastSessionId();
-            if (sessionId && isSessionMode() && !SessionClient.isConnected()) void attemptAutoRejoin(sessionId);
+            const sessionId = pendingRejoinSessionId || SessionClient.getLastSessionId();
+            if (sessionId && isSessionMode()
+                && (pendingRejoinSessionId || !SessionClient.isConnected() || !SessionClient.isInSession())) {
+                void attemptAutoRejoin(sessionId);
+            }
         }).catch(async error => {
             // Do not publish under an identity whose current binding is unknown.
             const cleanup = leaveIdentityGame();

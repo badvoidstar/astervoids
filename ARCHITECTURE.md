@@ -340,6 +340,13 @@ stop waits, and resumes reconciliation on completion. Hidden tabs defer full
 rejoin until visible. A long background interval can force rejoin even if a
 connection appeared healthy.
 
+Recovery requests also defer during browser identity verification. They remain
+pending even when the transport is connected, and resume once the latest queued
+identity refresh succeeds and the tab is visible. A connected transport without
+membership also requires rejoin. Starting recovery consumes the pending request;
+voluntary leave, changed identity, or failed verification discards it rather than
+resurrecting an abandoned session.
+
 Rejoin can assign a new member ID and recreate member-scoped objects. A resolved
 public player identity is pinned before snapshot callbacks and remains fixed
 for that membership. Guests use the bounded per-tab, per-session participant
@@ -410,6 +417,7 @@ separately enforce compare-and-swap transactions.
 
 Foreground/focus and storage notifications re-resolve bindings. Requests
 coalesce without losing a refresh received while another action is pending.
+Queued refreshes keep recovery paused until the newest verification completes.
 During verification/rebinding, `game.identityChanging` pauses foreground and
 hidden gameplay. A changed or unverifiable identity cancels pending picker
 entry/rejoin, invalidates membership, releases controls/audio, and returns to
