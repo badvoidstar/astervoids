@@ -4126,8 +4126,8 @@
          * and shrinks the rare full-sync payloads (FULL_SYNC_INTERVAL).
          *
          * Counters do not ride every motion update. Rare score changes persist
-         * through syncLocalShipScore; events still deliver prompt score/hit
-         * feedback. hitCount remains event-only.
+         * with a current motion snapshot through syncLocalShipScore; events
+         * still deliver prompt score/hit feedback. hitCount remains event-only.
          * Replay controls are emitted only in deterministic sessions.
          */
         toUpdateData() {
@@ -5527,7 +5527,12 @@
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
         const payload = { score: game.ship.score || 0 };
         if (!ObjectSync.isDataConfirmed(game.multiplayer.myShipObjectId, payload)) {
-            ObjectSync.updateObject(game.multiplayer.myShipObjectId, payload, immediate);
+            // Every data version re-anchors replica motion; never timestamp an
+            // old pose as current just because its score changed.
+            ObjectSync.updateObject(game.multiplayer.myShipObjectId, {
+                ...game.ship.toUpdateData(),
+                ...payload
+            }, immediate);
         }
     }
 
