@@ -35,6 +35,7 @@ function harness() {
     });
     const dependencies = {
         ...functions, game, OBJECT_TYPES, ReplicationRuntime,
+        AstervoidsWireCodec: require('./wwwroot/js/astervoids-wire-codec.js'),
         Asteroid: { fromSyncData: entity },
         Bullet: { fromSyncData: entity },
         ObjectSync: { getObject: id => records.get(id) },
@@ -90,6 +91,23 @@ test('reconciliation indexes existing references once instead of scanning for ev
         assert.deepEqual([...collection], originalOrder);
         for (const instance of collection) {
             assert.equal(h.getKinematicInstance(type, instance.syncObjectId, context), instance);
+        }
+    }
+});
+
+test('malformed and old unpacked asteroid geometry never becomes an invented replica or owned shape', () => {
+    for (const owner of ['remote', 'local']) {
+        for (const vertices of [[{ angle: 0, distance: 0.1 }], new Uint8Array(3), {}]) {
+            const h = harness();
+            const record = h.record('geometry', OBJECT_TYPES.ASTEROID, owner);
+            record.data.vertices = vertices;
+            h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
+            assert.deepEqual(h.game.astervoids, []);
+            record.data.vertices = require('./wwwroot/js/astervoids-wire-codec.js')
+                .packAsteroidVertices([{ angle: 0, distance: 0.1 }]);
+            record.version++;
+            h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
+            assert.equal(h.game.astervoids.length, 1, 'current packed geometry repairs the record');
         }
     }
 });

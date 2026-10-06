@@ -66,11 +66,11 @@ within that same view; the surrounding letterbox margins are not extra UI space.
 
 Personal totals survive ship recreation, same-tab rejoin, and GameState ownership
 migration within that session. They follow the existing team accounting, including
-accepted late awards after game over. Older sessions or detected inconsistent
-histories show personal results as unavailable; missing advertised capacity defers
-the rows, never the team total. Old game owners in mixed-version sessions
-cannot guarantee personal history or new names. Sessions created with older
-schemas retain their original `Player N` labels and session-local identities.
+accepted late awards after game over. Missing or inconsistent histories show
+personal results as unavailable; missing advertised capacity defers the rows,
+never the team total. The game requires its current session schemas and reports
+unsupported older contracts at entry; create a new session rather than joining
+with reduced score or identity features. Guest identities remain supported.
 Missing/malformed tag metadata shows `Unknown` without hiding valid scores.
 Solo retains its existing score mechanics and shows the active tag beside `Score`.
 

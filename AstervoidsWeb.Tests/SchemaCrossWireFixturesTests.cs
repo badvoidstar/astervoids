@@ -243,8 +243,6 @@ public class SchemaCrossWireFixturesTests
             "03000000" + "00000000" +
             "33221100554477668899aabbccddeeff";
 
-        GameStateSchemaFixture.Legacy.Fields.Should().HaveCount(16);
-        GameStateSchemaFixture.Legacy.BitmaskBytes.Should().Be(2);
         GameStateSchemaFixture.Current.Fields.Should().HaveCount(19);
         GameStateSchemaFixture.Current.BitmaskBytes.Should().Be(3);
         GameStateSchemaFixture.Current.Fields[16].Should().Be(
@@ -252,8 +250,6 @@ public class SchemaCrossWireFixturesTests
         GameStateSchemaFixture.Current.Fields[17].Should().Be(
             new PositionalSchemaCodec.FieldSpec("participantNumbers", "bytes"));
 
-        Hex(PositionalSchemaCodec.Encode(GameStateSchemaFixture.Legacy, data))
-            .Should().Be("ffff" + body);
         var encoded = PositionalSchemaCodec.Encode(GameStateSchemaFixture.Current, data);
         Hex(encoded).Should().Be("ffff00" + body);
         var decoded = PositionalSchemaCodec.Decode(GameStateSchemaFixture.Current, encoded);
@@ -393,28 +389,21 @@ public class SchemaCrossWireFixturesTests
     }
 
     [Fact]
-    public void Fixture_GameState_CreatorSessionRegistryKeepsLegacyAndCurrentLayoutsSeparate()
+    public void Fixture_CustomSchemasRemainSessionScopedEvenWithTheSameSchemaId()
     {
-        const string legacyHex =
-            "1098" + "0000" + "0000000000408f40" + "0000000000589b40" +
-            "33221100554477668899aabbccddeeff";
         var registry = new SyncSchemaRegistry();
-        var legacySessionId = Guid.NewGuid();
-        var currentSessionId = Guid.NewGuid();
-        registry.SetSessionSchemas(legacySessionId, [GameStateSchemaFixture.Legacy]);
-        registry.SetSessionSchemas(currentSessionId, [GameStateSchemaFixture.Current]);
-
-        var decoded = SyncPayloadCodec.DecodeDict(
-            new SyncPayload(4, Convert.FromHexString(legacyHex)), legacySessionId, registry);
-        Convert.ToInt32(decoded["lives"]).Should().Be(0);
-        decoded["gameOverAt"].Should().Be(1000d);
-        decoded["terminalAt"].Should().Be(1750d);
-        decoded["terminalShipId"].Should().Be("00112233-4455-6677-8899-aabbccddeeff");
-        decoded.Should().NotContainKey("participantScores").And.NotContainKey("participantNumbers");
-        Hex(SyncPayloadCodec.EncodeDict(4, decoded, registry, legacySessionId).Data)
-            .Should().Be(legacyHex);
-        Hex(SyncPayloadCodec.EncodeDict(4, decoded, registry, currentSessionId).Data)
-            .Should().Be("109800" + legacyHex[4..]);
-        registry.GetSchema(legacySessionId, 4).Should().BeSameAs(GameStateSchemaFixture.Legacy);
+        var counterSession = Guid.NewGuid();
+        var labelSession = Guid.NewGuid();
+        registry.SetSessionSchemas(counterSession, [new(29, [new("value", "u32")])]);
+        registry.SetSessionSchemas(labelSession, [new(29, [new("label", "str")])]);
+        var counter = SyncPayloadCodec.EncodeDict(29,
+            new Dictionary<string, object?> { ["value"] = 30 }, registry, counterSession);
+        var label = SyncPayloadCodec.EncodeDict(29,
+            new Dictionary<string, object?> { ["label"] = "widget" }, registry, labelSession);
+        Hex(counter.Data).Should().Be("011e000000");
+        Hex(label.Data).Should().Be("010600776964676574");
+        Convert.ToUInt32(SyncPayloadCodec.DecodeDict(counter, counterSession, registry)["value"])
+            .Should().Be(30);
+        SyncPayloadCodec.DecodeDict(label, labelSession, registry)["label"].Should().Be("widget");
     }
 }

@@ -4535,14 +4535,7 @@
          * @returns {Asteroid} New asteroid instance
          */
         static fromSyncData(data) {
-            let vertices = null;
-            if (data.vertices !== undefined) {
-                try {
-                    vertices = AstervoidsWireCodec.unpackAsteroidVertices(data.vertices);
-                } catch (error) {
-                    _error('[Multiplayer] Ignoring malformed asteroid vertices:', error);
-                }
-            }
+            const vertices = AstervoidsWireCodec.unpackAsteroidVertices(data.vertices);
             const asteroid = new Asteroid(
                 data.x,
                 data.y,
@@ -5839,6 +5832,9 @@
         type: OBJECT_TYPES.ASTEROID,
         classify(record, facts) {
             if (shouldDeferTerminalBootstrap(record)) return 'ignore';
+            const vertices = record.data.vertices;
+            if (vertices != null && !AstervoidsWireCodec.hasAsteroidVertices(vertices)
+                && !(vertices instanceof Uint8Array && vertices.length === 0)) return 'ignore';
             if (record.ownerMemberId === facts.currentMemberId) return 'owned';
             return facts.ownerIsActive ? 'replica' : 'ignore';
         },
@@ -6472,15 +6468,11 @@
                 // window and is likewise immutable for this terminal epoch.
                 gameOverAt: null,
                 terminalAt: null,
-                scoreLifeAwardCount: 0
+                scoreLifeAwardCount: 0,
+                participantScores: AstervoidsWireCodec.packCounterMap({}),
+                participantNumbers: AstervoidsWireCodec.packCounterMap({}),
+                participantTags: AstervoidsWireCodec.packTagMap({})
             };
-            if (hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata)) {
-                gameStateData.participantScores = AstervoidsWireCodec.packCounterMap({});
-                gameStateData.participantNumbers = AstervoidsWireCodec.packCounterMap({});
-                if (hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true)) {
-                    gameStateData.participantTags = AstervoidsWireCodec.packTagMap({});
-                }
-            }
             
             const objectInfo = await ObjectSync.createObject(
                 gameStateData, 'Session', null,
@@ -6499,10 +6491,11 @@
         const processedScores = { ...ledgers.processedScores };
         const hasPersonalHistory = ledgers.participantScores != null
             && ledgers.participantNumbers != null;
+        // Local fatal-hit prediction needs only the shared ledgers. Publication
+        // requires complete personal history in syncGameState.
         const participantScores = hasPersonalHistory ? { ...ledgers.participantScores } : null;
         const participantNumbers = hasPersonalHistory ? { ...ledgers.participantNumbers } : null;
-        const participantTags = hasPersonalHistory && ledgers.participantTags != null
-            ? { ...ledgers.participantTags } : null;
+        const participantTags = hasPersonalHistory ? { ...ledgers.participantTags } : null;
         if (hasPersonalHistory) {
             const unseen = new Set();
             let lastNumber = 0;
@@ -6626,8 +6619,7 @@
         // id, so a dropped player who returns is not counted twice.
         const countedParticipants = { ...ledgers.countedParticipants };
         let countedParticipantCount = Object.keys(countedParticipants).length;
-        // max() also keeps a mark persisted by an older client (which counted
-        // ships) from re-paying seats that client already paid for.
+        // Prediction can receive partial ledgers; never lower the paid high-water mark.
         let peakShipCount = Math.max(persisted?.peakShipCount || 0, countedParticipantCount);
         if (lives > 0) {
             for (const ship of shipObjects) {
@@ -6709,17 +6701,16 @@
     function serializeGameState(next, terminal, packedLedgers = null) {
         const { processedHits, processedScores, countedParticipants,
             participantScores, participantNumbers, participantTags } = next;
+        if (participantScores == null || participantNumbers == null || participantTags == null) {
+            throw new Error('Cannot publish GameState without participant history');
+        }
         const ledgers = packedLedgers ?? {
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
             processedScores: AstervoidsWireCodec.packCounterMap(processedScores),
             countedParticipants: AstervoidsWireCodec.packCounterMap(countedParticipants),
-            ...(participantScores != null && participantNumbers != null ? {
-                participantScores: AstervoidsWireCodec.packCounterMap(participantScores),
-                participantNumbers: AstervoidsWireCodec.packCounterMap(participantNumbers)
-            } : {}),
-            ...(participantTags != null ? {
-                participantTags: AstervoidsWireCodec.packTagMap(participantTags)
-            } : {})
+            participantScores: AstervoidsWireCodec.packCounterMap(participantScores),
+            participantNumbers: AstervoidsWireCodec.packCounterMap(participantNumbers),
+            participantTags: AstervoidsWireCodec.packTagMap(participantTags)
         };
         return {
             type: OBJECT_TYPES.GAME_STATE,
@@ -6733,11 +6724,9 @@
             processedHits: ledgers.processedHits,
             processedScores: ledgers.processedScores,
             countedParticipants: ledgers.countedParticipants,
-            ...(ledgers.participantScores != null && ledgers.participantNumbers != null ? {
-                participantScores: ledgers.participantScores,
-                participantNumbers: ledgers.participantNumbers
-            } : {}),
-            ...(ledgers.participantTags != null ? { participantTags: ledgers.participantTags } : {}),
+            participantScores: ledgers.participantScores,
+            participantNumbers: ledgers.participantNumbers,
+            participantTags: ledgers.participantTags,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -6749,15 +6738,6 @@
     let malformedGameStateLedgerKey = null;
     let gameStateSyncCache = null;
     let gameStateScoreViewCache = null;
-
-    function hasParticipantScoreSchema(metadata, includeTags = false) {
-        const fields = metadata?.schemas?.find(schema => schema.id === 4)?.fields;
-        const shipFields = metadata?.schemas?.find(schema => schema.id === 1)?.fields;
-        return fields?.[16]?.[0] === 'participantScores' && fields[16][1] === 'bytes'
-            && fields?.[17]?.[0] === 'participantNumbers' && fields[17][1] === 'bytes'
-            && (!includeTags || (fields?.[18]?.[0] === 'participantTags' && fields[18][1] === 'bytes'
-                && shipFields?.[27]?.[0] === 'participantTag' && shipFields[27][1] === 'str'));
-    }
 
     function resetGameStateSyncCache() {
         gameStateSyncCache = null;
@@ -6838,7 +6818,7 @@
         };
     }
 
-    function readParticipantScoreHistory(data, previous = null, packed = null, tagged = false) {
+    function readParticipantScoreHistory(data, previous = null, packed = null) {
         if (data?.participantScores == null && data?.participantNumbers == null) return null;
         if (data?.participantScores == null || data?.participantNumbers == null) {
             throw new Error('Participant score history is incomplete');
@@ -6848,17 +6828,15 @@
         const numbers = readGameStateLedger(
             data.participantNumbers, previous?.numbers, packed?.numbers, 1);
         let tags;
-        if (tagged) {
-            try {
-                tags = readGameStateLedger(data.participantTags, previous?.tags, packed?.tags, 'tag');
-            } catch (error) {
-                _warn('[Multiplayer] Player tag metadata is unavailable');
-                tags = {
-                    counters: {},
-                    snapshot: data.participantTags instanceof Uint8Array
-                        ? new Uint8Array(data.participantTags) : { ...data.participantTags }
-                };
-            }
+        try {
+            tags = readGameStateLedger(data.participantTags, previous?.tags, packed?.tags, 'tag');
+        } catch (error) {
+            _warn('[Multiplayer] Player tag metadata is unavailable');
+            tags = {
+                counters: {},
+                snapshot: data.participantTags instanceof Uint8Array
+                    ? new Uint8Array(data.participantTags) : { ...data.participantTags }
+            };
         }
         if (scores === previous?.scores && numbers === previous?.numbers && tags === previous?.tags) return previous;
         const ids = Object.keys(scores.counters);
@@ -6866,7 +6844,7 @@
             || ids.some(id => !Object.hasOwn(numbers.counters, id))) {
             throw new Error('Participant score history has mismatched players');
         }
-        return { scores, numbers, ...(tagged ? { tags } : {}) };
+        return { scores, numbers, tags };
     }
 
     function projectParticipantScore(history, processedScores, ships, participantId, localShip = null) {
@@ -6895,7 +6873,7 @@
                 || (left < right ? -1 : left > right ? 1 : 0));
         return ids.slice(0, Math.floor(maxMembers * 1.5)).map((id, index) => ({
             participantId: id, rank: index + 1,
-            label: history.tags ? history.tags.counters[id] || 'Unknown' : `Player ${numbers[id]}`,
+            label: history.tags.counters[id] || 'Unknown',
             score: scores[id]
         }));
     }
@@ -6904,20 +6882,16 @@
         const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
         if (!record) return null;
         const epoch = SessionClient.getSessionEpoch();
-        const supported = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata);
-        const tagged = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true);
         if (!gameStateScoreViewCache || gameStateScoreViewCache.record !== record
-            || gameStateScoreViewCache.epoch !== epoch
-            || gameStateScoreViewCache.supported !== supported || gameStateScoreViewCache.tagged !== tagged) {
+            || gameStateScoreViewCache.epoch !== epoch) {
             gameStateScoreViewCache = {
-                record, epoch, supported, tagged, history: null, errorVersion: null
+                record, epoch, history: null, errorVersion: null
             };
         }
         const cache = gameStateScoreViewCache;
         cache.groupScore = record.data?.groupScore ?? game.score;
         try {
-            const history = supported ? readParticipantScoreHistory(
-                record.data, cache.decodedHistory, null, tagged) : null;
+            const history = readParticipantScoreHistory(record.data, cache.decodedHistory);
             if (history !== cache.decodedHistory) {
                 cache.decodedHistory = history;
                 cache.personalTotal = history
@@ -7012,9 +6986,12 @@
                 gsObj.data?.processedScores, cache.scores, cache.packedScores);
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, cache.packedCounted);
-            cache.history = hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata)
-                ? readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory,
-                    hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true)) : null;
+            if (gsObj.data?.peakShipCount != null
+                && gsObj.data.peakShipCount !== Object.keys(cache.counted.counters).length) {
+                throw new Error('Participant entry-life history is inconsistent');
+            }
+            cache.history = readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory);
+            if (!cache.history) throw new Error('Participant score history is missing');
         } catch (error) {
             reportMalformedGameStateLedgers(gsObj, error);
             return;
@@ -7032,9 +7009,9 @@
                         processedHits: cache.hits.counters,
                         processedScores: cache.scores.counters,
                         countedParticipants: cache.counted.counters,
-                        participantScores: cache.history?.scores.counters,
-                        participantNumbers: cache.history?.numbers.counters,
-                        participantTags: cache.history?.tags.counters
+                        participantScores: cache.history.scores.counters,
+                        participantNumbers: cache.history.numbers.counters,
+                        participantTags: cache.history.tags.counters
                     },
                     ships,
                     {
@@ -7071,16 +7048,13 @@
         const packedHits = packGameStateLedger(next.processedHits, cache.packedHits);
         const packedScores = packGameStateLedger(next.processedScores, cache.packedScores);
         const packedCounted = packGameStateLedger(next.countedParticipants, cache.packedCounted);
-        let packedHistory = null;
-        if (next.participantScores != null) {
-            const scores = packGameStateLedger(next.participantScores, cache.packedHistory?.scores);
-            const numbers = packGameStateLedger(next.participantNumbers, cache.packedHistory?.numbers);
-            const tags = next.participantTags != null ? packGameStateLedger(
-                next.participantTags, cache.packedHistory?.tags, AstervoidsWireCodec.packTagMap) : undefined;
-            packedHistory = scores === cache.packedHistory?.scores
-                && numbers === cache.packedHistory?.numbers && tags === cache.packedHistory?.tags
-                ? cache.packedHistory : { scores, numbers, ...(tags ? { tags } : {}) };
-        }
+        const scores = packGameStateLedger(next.participantScores, cache.packedHistory?.scores);
+        const numbers = packGameStateLedger(next.participantNumbers, cache.packedHistory?.numbers);
+        const tags = packGameStateLedger(
+            next.participantTags, cache.packedHistory?.tags, AstervoidsWireCodec.packTagMap);
+        const packedHistory = scores === cache.packedHistory?.scores
+            && numbers === cache.packedHistory?.numbers && tags === cache.packedHistory?.tags
+            ? cache.packedHistory : { scores, numbers, tags };
         const packedChanged = packedHits !== cache.packedHits || packedScores !== cache.packedScores
             || packedCounted !== cache.packedCounted
             || packedHistory?.scores !== cache.packedHistory?.scores
@@ -7098,11 +7072,9 @@
         const gameStateData = serializeGameState(next, terminal, {
             processedHits: packedHits.bytes, processedScores: packedScores.bytes,
             countedParticipants: packedCounted.bytes,
-            ...(packedHistory ? {
-                participantScores: packedHistory.scores.bytes,
-                participantNumbers: packedHistory.numbers.bytes,
-                ...(packedHistory.tags ? { participantTags: packedHistory.tags.bytes } : {})
-            } : {})
+            participantScores: packedHistory.scores.bytes,
+            participantNumbers: packedHistory.numbers.bytes,
+            participantTags: packedHistory.tags.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
             'peakShipCount', 'state', 'terminalShipId'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
@@ -7117,10 +7089,7 @@
             cache.scores = readGameStateLedger(gsObj.data?.processedScores, cache.scores, packedScores);
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, packedCounted);
-            if (cache.history) {
-                cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory,
-                    hasParticipantScoreSchema(SessionClient.getCurrentSession()?.metadata, true));
-            }
+            cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory);
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
             // the attempted payload (updateObject can fail).
@@ -8479,13 +8448,8 @@
                 view.history, view.processedScores.counters,
                 ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP),
                 participantId, game.ship) : null;
-            const playerNumber = view?.history && GuidUtils.isGuid(participantId)
-                ? view.history.numbers.counters[participantId.toLowerCase()] : null;
-            const playerName = view?.tagged
-                ? SessionClient.getParticipantIdentity?.()?.tag
-                    || view.history?.tags?.counters[participantId?.toLowerCase()] || 'Unknown'
-                : playerNumber ? `Player ${playerNumber}`
-                : view?.history ? personal === null ? 'Spectator' : 'Player --' : '--';
+            const playerName = SessionClient.getParticipantIdentity()?.tag
+                || view?.history?.tags.counters[participantId?.toLowerCase()] || 'Unknown';
             if (hudCache.playerName !== playerName || hudCache.sessionMode !== sessionMode) {
                 playerIndicatorDisplay.textContent = playerName;
                 hudCache.playerName = playerName;
@@ -13138,8 +13102,8 @@
         document.getElementById('invite-share-url').value = '';
     });
 
-    SessionClient.setParticipantIdentityResolver(session =>
-        hasParticipantScoreSchema(session.metadata, true) ? PlayerIdentity.current() : null);
+    SessionClient.setSessionMetadataValidator(AstervoidsWireSchemas.requireCurrentSchemas);
+    SessionClient.setParticipantIdentityResolver(() => PlayerIdentity.current());
     function handlePlayerIdentityChange(identity, previous) {
         document.getElementById('identity-status').textContent = identity
             ? `Playing as ${identity.tag}` : 'Playing as guest';

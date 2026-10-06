@@ -47,7 +47,8 @@ async function loadClient(guidUtils = GuidUtils) {
         ['CreateObject', () => null],
         ['ReplaceObject', () => [[], 9, 2000]],
         ['DeleteObject', () => [true, 8]],
-        ['BroadcastObjectEvent', () => true]
+        ['BroadcastObjectEvent', () => true],
+        ['LeaveSession', () => undefined]
     ]);
     const loaded = await loadSessionClient({
         guidUtils,
@@ -82,14 +83,14 @@ function assertBinaryGuid(actual, expected) {
 }
 
 for (const compact of [false, true]) {
-    for (const encoding of ['plain', 'legacy', 'positional']) {
-        test(`incoming ${compact ? 'compact' : 'keyed'} objects decode consistently with ${encoding} data`, async () => {
+    for (const encoding of ['plain', 'dictionary', 'positional']) {
+        test(`incoming ${compact ? 'compact' : 'keyed'} objects with ${encoding} data ${compact && encoding !== 'plain' ? 'decode consistently' : 'are rejected'}`, async () => {
             const { client, replies, handlers } = await loadClient();
             const fields = [['type', 'str'], ['x', 'f64']];
             const schema = SchemaCodec.normalizeSchema(29, fields);
             SchemaCodec.clear();
             const payload = data => encoding === 'plain' ? data
-                : encoding === 'legacy' ? [0, MsgpackCodec.encode(data)]
+                : encoding === 'dictionary' ? [0, MsgpackCodec.encode(data)]
                 : [29, SchemaCodec.encode(schema, data)];
             const data = { type: 'widget', x: 0.25 };
             const expected = id => ({
@@ -128,6 +129,14 @@ for (const compact of [false, true]) {
                 client.on(event, (...args) => notifications.set(event, args));
             }
 
+            if (!compact || encoding === 'plain') {
+                await assert.rejects(client.joinSession(SESSION_ID),
+                    compact ? /Unsupported SyncPayload wire contract/ : /Unsupported ObjectInfo wire contract/);
+                assert.equal(notifications.size, 0, 'unsupported data never becomes a valid object');
+                assert.equal(client.getCurrentSession(), null);
+                await client.disconnect();
+                return;
+            }
             const joined = await client.joinSession(SESSION_ID);
             assert.deepEqual(joined.session.objects, [expected(OBJECT_ID), expected(OTHER_ID)]);
             assert.equal(joined.session.members[0].role, 'Client');
@@ -275,7 +284,7 @@ test('ReplaceObject converts only the deleted typed Guid, preserving string owne
         GuidUtils.guidToBytes(OTHER_ID),
         GuidUtils.guidToBytes(MEMBER_ID),
         GuidUtils.guidToBytes(MEMBER_ID),
-        1, SyncPayload.wrap(data), 1
+        1, SyncPayload.wrap(data), 1, HANDLES[OTHER_ID]
     ]], 9, 1999]);
     const notifications = [];
     client.on('onObjectReplaced', (...args) => notifications.push(args));
@@ -294,6 +303,32 @@ test('ReplaceObject converts only the deleted typed Guid, preserving string owne
     assert.deepEqual(notifications[0], [
         { deletedObjectId: OBJECT_ID, createdObjects: result }, MEMBER_ID, 9, 1999
     ]);
+});
+
+test('old compact and keyed object contracts reject without creating records or acknowledgements', async () => {
+    const { client, replies, handlers } = await loadClient();
+    await client.createSession();
+    let created = 0;
+    client.on('onObjectCreated', () => created++);
+    assert.throws(() => handlers.get('OnObjectCreated')([
+        GuidUtils.guidToBytes(OBJECT_ID), GuidUtils.guidToBytes(MEMBER_ID),
+        GuidUtils.guidToBytes(MEMBER_ID), 1, [0, MsgpackCodec.encode({})], 1,
+    ], MEMBER_ID, 1, 1000), /Unsupported ObjectInfo wire contract/);
+    assert.equal(created, 0, 'pre-handle objects cannot become canonical state');
+    for (const [method, invoke] of [
+        ['CreateObject', () => client.createObject({})],
+        ['UpdateObjects', () => client.updateObjects([])],
+        ['ReplaceObject', () => client.replaceObject(OBJECT_ID, [])],
+        ['DeleteObject', () => client.deleteObject(OBJECT_ID)],
+    ]) {
+        replies.set(method, () => ({}));
+        await assert.rejects(invoke(), /Unsupported .* wire contract/);
+    }
+    for (const event of ['OnObjectReplaced', 'OnObjectEvent']) {
+        assert.throws(() => handlers.get(event)({}, MEMBER_ID, 1, 1000),
+            /Unsupported .* wire contract/);
+    }
+    await client.disconnect();
 });
 
 test('DeleteObject and BroadcastObjectEvent convert IDs while preserving opaque payload bytes', async () => {

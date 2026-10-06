@@ -14,7 +14,7 @@ namespace AstervoidsWeb.Hubs;
 /// encode/decode a positional payload but knows nothing about what the fields
 /// MEAN. The game-agnostic boundary is preserved.
 ///
-/// SchemaId 0 is reserved for the legacy MessagePack-encoded dict envelope and
+/// SchemaId 0 is reserved for the generic MessagePack dictionary envelope and
 /// is NOT stored here — that path goes through <see cref="SyncPayloadCodec"/>.
 /// </summary>
 public sealed class SyncSchemaRegistry
@@ -52,8 +52,8 @@ public sealed class SyncSchemaRegistry
 
     /// <summary>
     /// Returns the schema registered for <paramref name="schemaId"/> in
-    /// <paramref name="sessionId"/>, or null if not registered. The caller is
-    /// expected to fall back to legacy dict decoding (SchemaId=0) when null.
+    /// <paramref name="sessionId"/>, or null if not registered. The caller
+    /// must reject unregistered positional payloads when null.
     /// </summary>
     public PositionalSchemaCodec.Schema? GetSchema(Guid sessionId, byte schemaId)
     {
@@ -67,7 +67,7 @@ public sealed class SyncSchemaRegistry
     /// <summary>
     /// True iff at least one schema is registered for <paramref name="sessionId"/>.
     /// Used by the hub to short-circuit decode work when the session never
-    /// registered any schemas (still on the legacy dict path).
+    /// registered any positional schemas (dictionary-only transport).
     /// </summary>
     public bool HasAnySchemas(Guid sessionId)
         => _bySession.TryGetValue(sessionId, out var map) && !map.IsEmpty;

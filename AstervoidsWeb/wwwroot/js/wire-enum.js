@@ -2,12 +2,11 @@
  * Wire Enum Translation Module
  *
  * The server sends MemberRole and ObjectScope as 1-byte enum values (Phase 1 wire-opt)
- * instead of strings. JS game code historically compared these against 'Server'/'Client'
+ * instead of strings. Game-facing code uses 'Server'/'Client'
  * and 'Member'/'Session' string literals (e.g. `member.role === 'Server'`).
  *
  * This module funnels the byte → string translation through a single boundary so all
- * downstream code keeps working. Translation is idempotent (already-string values pass
- * through unchanged) so tests using string literals still work.
+ * downstream code keeps the readable representation.
  *
  * Order MUST match the server-side `MemberRole` and `ObjectScope` enum declarations:
  *   MemberRole:  Server=0, Client=1   (AstervoidsWeb/Models/MemberRole.cs)
@@ -22,20 +21,22 @@ const WireEnum = (function() {
 
     /**
      * Convert a wire MemberRole (0/1) to its string form ('Server'/'Client').
-     * Pass-through for strings (idempotent) and null/undefined.
+     * Null/undefined represent absent optional metadata.
      */
     function roleFromWire(v) {
         if (typeof v === 'number') return MEMBER_ROLE_NAMES[v] ?? null;
-        return v;
+        if (v == null) return v;
+        throw new TypeError('Unsupported MemberRole wire contract: expected a numeric enum');
     }
 
     /**
      * Convert a wire ObjectScope (0/1) to its string form ('Member'/'Session').
-     * Pass-through for strings (idempotent) and null/undefined.
+     * Null/undefined represent absent optional metadata.
      */
     function scopeFromWire(v) {
         if (typeof v === 'number') return OBJECT_SCOPE_NAMES[v] ?? null;
-        return v;
+        if (v == null) return v;
+        throw new TypeError('Unsupported ObjectScope wire contract: expected a numeric enum');
     }
 
     /**
@@ -57,11 +58,7 @@ const WireEnum = (function() {
     /**
      * Convert a GuidLongPair[] (each entry deserialized as a 2-element array
      * [guidString, long] after GuidUtils.transformBinaryGuids) into a
-     * string-keyed object { [guidString]: long } so legacy game code that
-     * indexes by id keeps working.
-     *
-     * Idempotent: if the value is already a plain object (e.g. from a
-     * legacy server or test fixture), returns it as-is.
+     * string-keyed object { [guidString]: long } for game-facing consumers.
      */
     function pairsToObject(pairs) {
         if (pairs == null) return {};
@@ -75,7 +72,7 @@ const WireEnum = (function() {
             }
             return out;
         }
-        return pairs;
+        throw new TypeError('Unsupported GUID-pair wire contract: expected positional pairs');
     }
 
     return {

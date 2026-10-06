@@ -9,13 +9,10 @@ import {
 const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 const WireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
-const { SCHEMAS: CURRENT_SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
-const SCHEMAS = CURRENT_SCHEMAS.map(schema => schema.id === 4
-    ? { ...schema, fields: schema.fields.slice(0, 18) }
+const { SCHEMAS, requireCurrentSchemas } = require('./wwwroot/js/game-wire-schemas.js');
+const oldSchemas = slots => SCHEMAS.map(schema => schema.id === 4
+    ? { ...schema, fields: schema.fields.slice(0, slots) }
     : schema.id === 1 ? { ...schema, fields: schema.fields.slice(0, 27) } : schema);
-const LEGACY_SCHEMAS = Object.freeze(SCHEMAS.map(schema => schema.id === 4
-    ? Object.freeze({ id: 4, fields: Object.freeze(schema.fields.slice(0, 16)) })
-    : schema));
 
 const SESSION_ID = '00112233-4455-6677-8899-aabbccddeeff';
 const NEXT_SESSION_ID = '10112233-4455-6677-8899-aabbccddeeff';
@@ -37,7 +34,7 @@ function deferred() {
     return { promise, resolve, reject };
 }
 
-function payload(data, schemas = LEGACY_SCHEMAS, schemaId = 4) {
+function payload(data, schemas = SCHEMAS, schemaId = 4) {
     if (schemaId === 0) return [0, MsgpackCodec.encode(data)];
     const definition = schemas.find(schema => schema.id === schemaId);
     const schema = SchemaCodec.normalizeSchema(definition.id, definition.fields);
@@ -46,7 +43,7 @@ function payload(data, schemas = LEGACY_SCHEMAS, schemaId = 4) {
 
 function objectPacket(data, {
     id = OBJECT_ID, handle = HANDLE, version = 1, owner = REMOTE_ID,
-    schemas = LEGACY_SCHEMAS, schemaId = 4, compact = true,
+    schemas = SCHEMAS, schemaId = 4, compact = true,
 } = {}) {
     const fields = [
         GuidUtils.guidToBytes(id), GuidUtils.guidToBytes(owner),
@@ -59,14 +56,14 @@ function objectPacket(data, {
 }
 
 function updatePacket(data, {
-    handle = HANDLE, version = 2, schemas = LEGACY_SCHEMAS, schemaId = 4, compact = true,
+    handle = HANDLE, version = 2, schemas = SCHEMAS, schemaId = 4, compact = true,
 } = {}) {
     const dataPayload = payload(data, schemas, schemaId);
     return compact ? [handle, dataPayload, version] : { handle, data: dataPayload, version };
 }
 
 function joinResponse({
-    sessionId = SESSION_ID, schemas = LEGACY_SCHEMAS, metadata = { schemas },
+    sessionId = SESSION_ID, schemas = SCHEMAS, metadata = { schemas },
     objects = [], validAts = [], role = 1,
 } = {}) {
     return {
@@ -83,7 +80,7 @@ function joinResponse({
     };
 }
 
-async function subject(t, defaults = SCHEMAS) {
+async function subject(t, defaults = SCHEMAS, gameContract = true) {
     const replies = new Map([
         ['LeaveSession', () => undefined],
         ['UpdateObjects', () => [[], 1, 200]],
@@ -94,6 +91,7 @@ async function subject(t, defaults = SCHEMAS) {
             return replies.get(method)(...args);
         },
     });
+    if (gameContract) loaded.client.setSessionMetadataValidator(requireCurrentSchemas);
     SchemaCodec.replaceAll(defaults);
     const sync = loadClassicModule('object-sync.js', 'ObjectSync', {
         SessionClient: loaded.client,
@@ -140,15 +138,12 @@ function emitUpdate(loaded, packet, sequence = 2) {
 }
 
 test('durable public identity is pinned before snapshot callbacks and changes only between memberships', async t => {
-    const loaded = await subject(t, CURRENT_SCHEMAS);
+    const loaded = await subject(t);
     let identity = { id: REMOTE_ID, tag: 'Pilot_1' };
-    loaded.client.setParticipantIdentityResolver(session =>
-        session.metadata.schemas.find(schema => schema.id === 4)?.fields[18]?.[0] === 'participantTags'
-            ? identity : null);
+    loaded.client.setParticipantIdentityResolver(() => identity);
     loaded.replies.set('JoinSession', () => joinResponse({
-        schemas: CURRENT_SCHEMAS,
         objects: [objectPacket({ type: 'gameState', participantTags: WireCodec.packTagMap({}) }, {
-            schemas: CURRENT_SCHEMAS,
+            schemas: SCHEMAS,
         })],
     }));
     const snapshots = [];
@@ -164,46 +159,42 @@ test('durable public identity is pinned before snapshot callbacks and changes on
     assert.equal(loaded.client.getParticipantId(), NEXT_OWNER_ID);
     assert.deepEqual(loaded.client.getParticipantIdentity(), identity);
     await loaded.client.leaveSession();
-    loaded.replies.set('JoinSession', () => joinResponse({ schemas: SCHEMAS }));
+    identity = null;
     await loaded.client.joinSession(SESSION_ID);
-    assert.equal(loaded.client.getParticipantId(), MEMBER_ID, 'legacy creator schemas retain their original session participant');
+    assert.equal(loaded.client.getParticipantId(), MEMBER_ID, 'current guests retain their session participant');
     assert.equal(loaded.client.getParticipantIdentity(), null);
 });
 
 for (const slots of [16, 18]) {
-    test(`${slots}-slot defaults retain live score 30/version 2 with a 16-slot creator`, async t => {
-        const loaded = await subject(t, slots === 16 ? LEGACY_SCHEMAS : SCHEMAS);
-        const gate = holdInvoke(loaded);
-        const joining = loaded.client.joinSession(SESSION_ID);
-        await gate.invoked;
-        const create = objectPacket({ type: 'gameState', groupScore: 0 });
-        const update = updatePacket({ groupScore: 30 });
-        assert.equal(Buffer.from(update[1][1]).toString('hex'), '20001e000000');
-        const receiveErrors = [];
-        for (const receive of [
-            () => emitCreate(loaded, create),
-            () => emitUpdate(loaded, update),
-        ]) {
-            try {
-                receive();
-            } catch (error) {
-                receiveErrors.push(error.message);
+    for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
+        test(`${method} rejects the ${slots}-slot game contract before snapshot or queued live decoding`, async t => {
+            const loaded = await subject(t);
+            const schemas = oldSchemas(slots);
+            if (method === 'RejoinSession') {
+                loaded.replies.set('JoinSession', () => joinResponse());
+                await loaded.client.joinSession(SESSION_ID);
+                loaded.client.clearSessionState();
             }
-        }
-        gate.resolve(joinResponse());
-        assert.ok(await joining);
-        const replica = loaded.sync.getObject(OBJECT_ID);
-        assert.deepEqual(receiveErrors, [],
-            `valid packets must not decode against the startup registry (replica ${replica ? 'present' : 'absent'})`);
-        assert.equal(replica.data.groupScore, 30);
-        assert.equal(replica.version, 2);
-        assert.equal(replica.validAt, 91);
-        assert.equal(SchemaCodec.get(4).fields.length, 16);
-        assert.equal(SCHEMAS.find(schema => schema.id === 4).fields.length, 18);
-        assert.equal(LEGACY_SCHEMAS.find(schema => schema.id === 4).fields.length, 16);
-        assert.equal(Buffer.from(update[1][1]).toString('hex'), '20001e000000');
-        assert.deepEqual(loaded.errors, []);
-    });
+            const gate = holdInvoke(loaded, method);
+            const entering = method === 'CreateSession'
+                ? loaded.client.createSession({ schemas: SCHEMAS })
+                : loaded.client.joinSession(SESSION_ID);
+            await gate.invoked;
+            emitCreate(loaded, objectPacket({ type: 'gameState', groupScore: 0 }, { schemas }));
+            emitUpdate(loaded, updatePacket({ groupScore: 30 }, { schemas }));
+            gate.resolve(joinResponse({
+                schemas, objects: [objectPacket({ type: 'gameState', groupScore: 999 }, { schemas })],
+            }));
+            await assert.rejects(entering, /Unsupported Astervoids session schemas/);
+            assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
+            assert.equal(loaded.client.getCurrentSession(), null);
+            assert.equal(loaded.client.getParticipantId(), null);
+            assert.equal(SchemaCodec.get(4).fields.length, 19, 'never install the unsupported layout');
+            assert.equal(loaded.calls.at(-1).method, 'LeaveSession', 'rejected entry releases its allocated membership');
+            assert.equal(loaded.errors.length, 1);
+            assert.match(loaded.errors[0], /Unsupported Astervoids session schemas/);
+        });
+    }
 }
 
 test('deferred sparse updates replay in order and an older version cannot overwrite the newest patch', async t => {
@@ -246,7 +237,7 @@ test('packets arriving synchronously during replay stay behind packets already r
 });
 
 for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
-    test(`${method} preserves same-schema 18-slot personal history and live ordering`, async t => {
+    test(`${method} preserves current personal history and live ordering`, async t => {
         const loaded = await subject(t);
         if (method === 'RejoinSession') {
             loaded.replies.set('JoinSession', () => joinResponse({ schemas: SCHEMAS }));
@@ -264,6 +255,7 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         const personal = {
             participantScores: WireCodec.packCounterMap({ [REMOTE_ID]: 30 }),
             participantNumbers: WireCodec.packCounterMap({ [REMOTE_ID]: 1 }),
+            participantTags: WireCodec.packTagMap({ [REMOTE_ID]: 'Pilot_1' }),
         };
         emitCreate(loaded, objectPacket({
             type: 'gameState', groupScore: 0,
@@ -280,17 +272,18 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         assert.equal(replica.data.groupScore, 30);
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantScores), { [REMOTE_ID]: 30 });
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantNumbers), { [REMOTE_ID]: 1 });
-        assert.equal(SchemaCodec.get(4).fields.length, 18);
+        assert.deepEqual(WireCodec.unpackTagMap(replica.data.participantTags), { [REMOTE_ID]: 'Pilot_1' });
+        assert.equal(SchemaCodec.get(4).fields.length, 19);
         assert.deepEqual(loaded.errors, []);
     });
 }
 
-test('RejoinSession replaces reinstalled startup schemas before legacy live packets decode', async t => {
+test('RejoinSession replaces a stale local registry before current live packets decode', async t => {
     const loaded = await subject(t);
     loaded.replies.set('JoinSession', () => joinResponse());
     await loaded.client.joinSession(SESSION_ID);
     loaded.client.clearSessionState();
-    SchemaCodec.replaceAll(SCHEMAS);
+    SchemaCodec.replaceAll(oldSchemas(16));
     const gate = holdInvoke(loaded, 'RejoinSession');
     const joining = loaded.client.joinSession(SESSION_ID);
     await gate.invoked;
@@ -300,13 +293,14 @@ test('RejoinSession replaces reinstalled startup schemas before legacy live pack
     assert.ok(await joining);
     assert.equal(loaded.sync.getObject(OBJECT_ID).data.groupScore, 30);
     assert.equal(loaded.sync.getObject(OBJECT_ID).version, 2);
-    assert.equal(SchemaCodec.get(4).fields.length, 16);
+    assert.equal(SchemaCodec.get(4).fields.length, 19);
 });
 
 for (const compact of [false, true]) {
-    test(`pending ${compact ? 'compact' : 'keyed'} custom-schema updates retain handle parking and callback metadata`, async t => {
+    test(compact ? 'pending compact custom-schema updates retain handle parking and callback metadata'
+        : 'pending keyed custom-schema updates are rejected before store callbacks', async t => {
         const schemas = [{ id: 29, fields: [['type', 'str'], ['value', 'u32']] }];
-        const loaded = await subject(t);
+        const loaded = await subject(t, SCHEMAS, false);
         const gate = holdInvoke(loaded);
         const joining = loaded.client.joinSession(SESSION_ID);
         await gate.invoked;
@@ -319,6 +313,11 @@ for (const compact of [false, true]) {
         emitCreate(loaded, objectPacket({ type: 'counter', value: 0 }, { schemas, schemaId: 29, compact }));
         assert.deepEqual(order, []);
         gate.resolve(joinResponse({ schemas }));
+        if (!compact) {
+            await assert.rejects(joining, /Unsupported ObjectUpdateInfo wire contract/);
+            assert.deepEqual(order, [], 'keyed wire objects never reach the generic store');
+            return;
+        }
         assert.ok(await joining);
         assert.deepEqual(order, [['create', 0], ['update', 30]]);
         assert.deepEqual(batches, [[101, null, 50, REMOTE_ID]]);
@@ -371,10 +370,9 @@ test('the staged snapshot teaches handles before a newer live delta without a li
     assert.equal(replica.validAt, 91);
 });
 
-for (const slots of [16, 18]) {
     for (const migrationFirst of [true, false]) {
-        test(`${slots}-slot join preserves ownership when ${migrationFirst ? 'migration precedes' : 'update precedes'} a live delta without a live create`, async t => {
-            const schemas = slots === 16 ? LEGACY_SCHEMAS : SCHEMAS;
+        test(`current-schema join preserves ownership when ${migrationFirst ? 'migration precedes' : 'update precedes'} a live delta without a live create`, async t => {
+            const schemas = SCHEMAS;
             const loaded = await subject(t);
             const gate = holdInvoke(loaded);
             const joining = loaded.client.joinSession(SESSION_ID);
@@ -417,7 +415,6 @@ for (const slots of [16, 18]) {
             assert.deepEqual(loaded.errors, []);
         });
     }
-}
 
 test('snapshot seeds and received membership/object callbacks expose coherent entry state without reentrant overtaking', async t => {
     const loaded = await subject(t);
@@ -431,7 +428,7 @@ test('snapshot seeds and received membership/object callbacks expose coherent en
         assert.equal(loaded.client.getCurrentMember().id, MEMBER_ID);
         assert.equal(loaded.client.getLastSessionId(), SESSION_ID);
         assert.equal(loaded.client.getParticipantId(), MEMBER_ID);
-        assert.equal(SchemaCodec.get(4).fields.length, 16);
+        assert.equal(SchemaCodec.get(4).fields.length, 19);
     };
     loaded.sync.on('onObjectCreated', obj => {
         assertIdentity();
@@ -651,7 +648,7 @@ for (const failure of ['null response', 'invoke rejection', 'missing credential'
             gate.resolve(null);
             assert.equal(await joining, null);
         } else {
-            const rejected = assert.rejects(joining, /fixture rejection|missing reconnectToken|unknown type tag/);
+            const rejected = assert.rejects(joining, /fixture rejection|missing reconnectToken|Unsupported Astervoids session schemas/);
             if (failure === 'invoke rejection') {
                 gate.reject(new Error('fixture rejection'));
             } else {
@@ -671,7 +668,7 @@ for (const failure of ['null response', 'invoke rejection', 'missing credential'
             { id: CHILD_ID, handle: HANDLE, schemas: SCHEMAS }));
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 70);
-        assert.equal(SchemaCodec.get(4).fields.length, 18);
+        assert.equal(SchemaCodec.get(4).fields.length, 19);
     });
 }
 
@@ -743,7 +740,7 @@ for (const outcome of ['success', 'rejection']) {
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 80);
         assert.equal(loaded.sync.getObject(CHILD_ID).version, 2);
-        assert.equal(SchemaCodec.get(4).fields.length, 18);
+        assert.equal(SchemaCodec.get(4).fields.length, 19);
         assert.deepEqual(loaded.errors, []);
     });
 }
@@ -833,8 +830,8 @@ test('session-list signals stay immediate and another session expiration cannot 
 });
 
 for (const metadata of [undefined, null, {}, { schemas: null }, { schemas: [] }]) {
-    test(`absent positional metadata (${JSON.stringify(metadata)}) clears startup schemas and retains schema-zero fallback`, async t => {
-        const loaded = await subject(t);
+    test(`generic entry without positional metadata (${JSON.stringify(metadata)}) clears startup schemas and retains schema zero`, async t => {
+        const loaded = await subject(t, SCHEMAS, false);
         const gate = holdInvoke(loaded);
         const joining = loaded.client.joinSession(SESSION_ID);
         await gate.invoked;
@@ -877,7 +874,9 @@ for (const invalid of ['create', 'update', 'replacement', 'unregistered schema',
         }
         emitCreate(loaded, objectPacket({ type: 'gameState', groupScore: 100 },
             { id: CHILD_ID, handle: CHILD_HANDLE }), 3);
-        const rejected = assert.rejects(joining, /positional decode: truncated|not registered locally/);
+        const expected = invalid === 'missing schemas' ? /Unsupported Astervoids session schemas/
+            : /positional decode: truncated|not registered locally/;
+        const rejected = assert.rejects(joining, expected);
         const response = joinResponse();
         if (invalid === 'missing schemas') delete response.metadata;
         gate.resolve(response);
@@ -888,6 +887,77 @@ for (const invalid of ['create', 'update', 'replacement', 'unregistered schema',
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID), undefined);
         assert.equal(loaded.errors.length, 1);
-        assert.match(loaded.errors[0], /Failed to join session: .*truncated|Failed to join session: .*not registered locally/);
+        assert.match(loaded.errors[0], /Failed to join session:/);
+        assert.match(loaded.errors[0], expected);
     });
 }
+
+test('a rejected contract closes an ambiguous leave and still reports the unsupported session', async t => {
+    const loaded = await subject(t);
+    loaded.replies.set('JoinSession', () => joinResponse({ schemas: oldSchemas(16) }));
+    loaded.replies.set('LeaveSession', () => { throw new Error('fixture leave failure'); });
+    await assert.rejects(loaded.client.joinSession(SESSION_ID), /Unsupported Astervoids session schemas/);
+    assert.ok(!loaded.client.isConnected());
+    assert.equal(loaded.connection.state, 'Disconnected');
+    assert.equal(loaded.client.getCurrentSession(), null);
+    assert.equal(loaded.client.getLastSessionId(), null);
+    assert.equal(loaded.errors.length, 1);
+});
+
+test('unsupported entry cleanup finishes before a queued current-schema join', async t => {
+    const loaded = await subject(t);
+    loaded.replies.set('JoinSession', () => joinResponse({ schemas: oldSchemas(16) }));
+    const leave = holdInvoke(loaded, 'LeaveSession');
+    const rejected = assert.rejects(loaded.client.joinSession(SESSION_ID), /Unsupported Astervoids session schemas/);
+    await leave.invoked;
+    assert.equal(loaded.client.getCurrentSession(), null);
+    loaded.replies.set('JoinSession', () => joinResponse({ sessionId: NEXT_SESSION_ID }));
+    const joining = loaded.client.joinSession(NEXT_SESSION_ID);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(loaded.calls.map(call => call.method), ['JoinSession', 'LeaveSession']);
+    leave.resolve();
+    await rejected;
+    assert.equal((await joining).session.id, NEXT_SESSION_ID);
+    assert.equal(loaded.client.getLastSessionId(), NEXT_SESSION_ID);
+    assert.deepEqual(loaded.calls.map(call => call.method), ['JoinSession', 'LeaveSession', 'JoinSession']);
+    assert.equal(loaded.errors.length, 1);
+});
+
+for (const outcome of ['success', 'failure']) {
+    test(`obsolete unsupported-entry cleanup ${outcome} cannot close or clear a newer connection`, async t => {
+        const loaded = await subject(t);
+        loaded.replies.set('JoinSession', () => joinResponse({ schemas: oldSchemas(18) }));
+        const leave = holdInvoke(loaded, 'LeaveSession');
+        const rejectedEntry = loaded.client.joinSession(SESSION_ID);
+        await leave.invoked;
+        assert.equal(await loaded.client.connect(true), true);
+        loaded.replies.set('JoinSession', () => joinResponse({
+            sessionId: NEXT_SESSION_ID,
+            objects: [objectPacket({ type: 'gameState', groupScore: 20 })],
+        }));
+        await loaded.client.joinSession(NEXT_SESSION_ID);
+        if (outcome === 'success') leave.resolve();
+        else leave.reject(new Error('obsolete cleanup failed'));
+        assert.equal(await rejectedEntry, null);
+        assert.equal(loaded.client.isConnected(), true);
+        assert.equal(loaded.client.getCurrentSession().id, NEXT_SESSION_ID);
+        assert.equal(loaded.client.getLastSessionId(), NEXT_SESSION_ID);
+        assert.equal(loaded.sync.getObject(OBJECT_ID).data.groupScore, 20);
+        assert.deepEqual(loaded.errors, []);
+    });
+}
+
+test('metadata validation cannot change during entry or established membership', async t => {
+    const loaded = await subject(t);
+    const gate = holdInvoke(loaded);
+    const joining = loaded.client.joinSession(SESSION_ID);
+    await gate.invoked;
+    assert.throws(() => loaded.client.setSessionMetadataValidator(() => {}), /during membership or entry/);
+    gate.resolve(joinResponse());
+    await joining;
+    assert.throws(() => loaded.client.setSessionMetadataValidator(() => {}), /during membership or entry/);
+    await loaded.client.leaveSession();
+    assert.throws(() => loaded.client.setSessionMetadataValidator(null), /must be a function/);
+    loaded.client.setSessionMetadataValidator(requireCurrentSchemas);
+});

@@ -31,9 +31,9 @@ public static class SyncPayloadCodec
         AstervoidsMessagePack.Options;
 
     /// <summary>
-    /// Sentinel: identifies the "legacy MessagePack-encoded dict" payload format.
+    /// Identifies the generic MessagePack dictionary payload format.
     /// </summary>
-    public const byte LegacyDictSchemaId = 0;
+    public const byte DictionarySchemaId = 0;
 
     /// <summary>
     /// Wraps a server-internal data dict into the wire envelope. Returns a
@@ -46,11 +46,11 @@ public static class SyncPayloadCodec
         var bytes = MessagePackSerializer.Serialize(
             data ?? new Dictionary<string, object?>(0),
             DictOptions);
-        return new SyncPayload(LegacyDictSchemaId, bytes);
+        return new SyncPayload(DictionarySchemaId, bytes);
     }
 
     /// <summary>
-    /// Phase 4E overload: registry-aware re-encode used by
+    /// Registry-aware re-encode used by
     /// <c>SessionHub.ToObjectInfo</c> on every broadcast path
     /// (OnObjectCreated, OnObjectReplaced, JoinSession snapshot).
     ///
@@ -58,34 +58,34 @@ public static class SyncPayloadCodec
     /// <paramref name="sessionId"/>, emits the compact positional encoding so
     /// the server preserves the wire-size win across the receive→store→re-
     /// broadcast round-trip. Without this, every CreateObject reply and every
-    /// snapshot would collapse to legacy MessagePack even when the sender had
+    /// snapshot would collapse to dictionary MessagePack even when the sender had
     /// already paid the registration cost.
     ///
-    /// Falls back to legacy MessagePack when SchemaId=0, when the schema isn't
-    /// (or no longer is) registered, or when <paramref name="registry"/> is
-    /// null. Falling back never breaks decode — receivers route on the
-    /// envelope's SchemaId via <see cref="DecodeDict(SyncPayload, Guid, SyncSchemaRegistry)"/>.
+    /// SchemaId=0 selects the generic dictionary path. A positional schema must
+    /// remain registered; missing registrations are errors, never a wire-format
+    /// downgrade.
     /// </summary>
     public static SyncPayload EncodeDict(byte schemaId, Dictionary<string, object?>? data, SyncSchemaRegistry? registry, Guid sessionId)
     {
-        if (schemaId == LegacyDictSchemaId || registry is null)
+        if (schemaId == DictionarySchemaId)
             return EncodeDict(data);
-        var schema = registry.GetSchema(sessionId, schemaId);
+        var schema = registry?.GetSchema(sessionId, schemaId);
         if (schema is null)
-            return EncodeDict(data);
+            throw new InvalidOperationException(
+                $"No schema registered for SchemaId={schemaId}; cannot encode a positional payload.");
         var bytes = PositionalSchemaCodec.Encode(schema, data ?? new Dictionary<string, object?>(0));
         return new SyncPayload(schemaId, bytes);
     }
 
     /// <summary>
     /// Decodes a wire payload back to the server-internal data dict.
-    /// Phase 3 single-arg form: handles SchemaId=0 only and throws on others
+    /// Dictionary-only form: handles SchemaId=0 only and throws on others
     /// (caller forgot to pass a registry).
     /// </summary>
     public static Dictionary<string, object?> DecodeDict(SyncPayload payload)
     {
         if (payload is null) return new Dictionary<string, object?>(0);
-        if (payload.SchemaId != LegacyDictSchemaId)
+        if (payload.SchemaId != DictionarySchemaId)
         {
             throw new NotSupportedException(
                 $"SyncPayload SchemaId={payload.SchemaId} requires a SyncSchemaRegistry overload of DecodeDict. " +
@@ -96,12 +96,12 @@ public static class SyncPayloadCodec
             return new Dictionary<string, object?>(0);
         }
         return MessagePackSerializer.Deserialize<Dictionary<string, object?>>(payload.Data, DictOptions)
-               ?? new Dictionary<string, object?>(0);
+               ?? throw new InvalidOperationException("Schema 0 payload must contain a dictionary.");
     }
 
     /// <summary>
-    /// Phase 4 overload: decodes a wire payload using the per-session schema
-    /// registry. SchemaId=0 falls through to the legacy MessagePack path;
+    /// Decodes a wire payload using the per-session schema
+    /// registry. SchemaId=0 selects the generic MessagePack dictionary path;
     /// SchemaId&gt;=1 is decoded positionally via
     /// <see cref="PositionalSchemaCodec.Decode"/> using the schema registered
     /// for <paramref name="sessionId"/>.
@@ -112,7 +112,7 @@ public static class SyncPayloadCodec
     public static Dictionary<string, object?> DecodeDict(SyncPayload payload, Guid sessionId, SyncSchemaRegistry registry)
     {
         if (payload is null) return new Dictionary<string, object?>(0);
-        if (payload.SchemaId == LegacyDictSchemaId)
+        if (payload.SchemaId == DictionarySchemaId)
         {
             return DecodeDict(payload);
         }

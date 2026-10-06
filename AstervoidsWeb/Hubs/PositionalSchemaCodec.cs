@@ -64,7 +64,7 @@ public static class PositionalSchemaCodec
 
         public Schema(byte id, IReadOnlyList<FieldSpec> fields)
         {
-            if (id == 0) throw new ArgumentException("Schema id 0 is reserved for the legacy dict envelope.");
+            if (id == 0) throw new ArgumentException("Schema id 0 is reserved for the generic dictionary envelope.");
             if (fields == null || fields.Count == 0) throw new ArgumentException("Schema must have at least one field.");
             if (fields.Count > MaxFields) throw new ArgumentException($"Schema {id}: max {MaxFields} fields per schema; got {fields.Count}");
             var seen = new HashSet<string>();

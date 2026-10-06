@@ -31,10 +31,11 @@ test('asteroid vertices pack to four bytes each and round-trip within q16 tolera
         Math.max(...decoded.map(vertex => vertex.distance)));
 });
 
-test('asteroid vertex helpers retain legacy arrays and reject malformed bytes', () => {
+test('asteroid vertex readers reject old unpacked arrays and malformed bytes', () => {
     const vertices = [{ angle: 1, distance: 0.2 }];
-    assert.deepEqual(WireCodec.unpackAsteroidVertices(vertices), vertices);
-    assert.equal(WireCodec.hasAsteroidVertices(vertices), true);
+    assert.throws(() => WireCodec.unpackAsteroidVertices(vertices), /must be a Uint8Array/);
+    assert.throws(() => WireCodec.maxAsteroidVertexDistance(vertices), /must be a Uint8Array/);
+    assert.equal(WireCodec.hasAsteroidVertices(vertices), false);
     assert.equal(WireCodec.hasAsteroidVertices(new Uint8Array()), false);
     assert.equal(WireCodec.hasAsteroidVertices(new Uint8Array(5)), false);
     assert.throws(
@@ -75,4 +76,14 @@ test('counter-map codec rejects invalid ids, values, and byte lengths', () => {
     assert.throws(
         () => WireCodec.unpackCounterMap(new Uint8Array(19)),
         /invalid byte length/);
+});
+
+test('packed ledger readers reject old dictionary shapes and duplicate counter entries', () => {
+    const id = '00112233-4455-6677-8899-aabbccddeeff';
+    assert.throws(() => WireCodec.unpackCounterMap({ [id]: 3 }), /must be a Uint8Array/);
+    assert.throws(() => WireCodec.unpackTagMap({ [id]: 'Pilot_1' }), /must be a Uint8Array/);
+    const entry = WireCodec.packCounterMap({ [id]: 3 });
+    assert.throws(() => WireCodec.unpackCounterMap(new Uint8Array([...entry, ...entry])), /duplicate GUIDs/);
+    assert.deepEqual(WireCodec.unpackCounterMap(null), {}, 'absent partial state is not an old format');
+    assert.equal(WireCodec.unpackAsteroidVertices(null), null, 'seeded asteroids omit explicit geometry');
 });

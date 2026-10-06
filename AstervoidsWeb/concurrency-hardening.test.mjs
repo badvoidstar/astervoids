@@ -127,6 +127,7 @@ const WireEnum = {
 
 const SyncPayload = {
     wrap: value => value,
+    replaceSchemas: () => {},
     unwrapObjectData: () => {}
 };
 
@@ -184,7 +185,7 @@ function joinResponse(sessionId, objects = []) {
         sessionId,
         sessionName: sessionId,
         members: [],
-        objects,
+        objects: objects.map(wireObjectInfo),
         validAts: {},
         memberId: fixtureGuid(`member-${sessionId}`),
         role: 'Client',
@@ -216,6 +217,11 @@ function objectInfo(id, version, data, ownerMemberId = 'owner') {
         creatorMemberId: ownerMemberId,
         scope: 'Session'
     };
+}
+
+function wireObjectInfo(object) {
+    return [object.id, object.creatorMemberId, object.ownerMemberId,
+        object.scope, object.data, object.version, object.handle];
 }
 
 async function connectImmediately(client, connection) {
@@ -711,7 +717,7 @@ for (const reason of ['reconnected', 'leaveFailed']) {
                 objectInfo(id, 1, { type: 'counter', value: 1 })
             ])));
         connection.invokers.set('GetSessionState', () => Promise.resolve({
-            objects: [objectInfo(id, 2, { type: 'counter', value: 2 })],
+            objects: [wireObjectInfo(objectInfo(id, 2, { type: 'counter', value: 2 }))],
             validAts: {},
             memberSequences: {}
         }));
@@ -783,7 +789,7 @@ test('SessionClient installs session schemas before decoding a join snapshot', a
     const connection = new FakeConnection();
     connection.invokers.set('JoinSession', sessionId => Promise.resolve({
         ...joinResponse(sessionId, [
-            ['snapshot', 'owner', 'owner', 'Session', [7, new Uint8Array([0])], 1]
+            objectInfo('snapshot', 1, [7, new Uint8Array([0])])
         ]),
         metadata: {
             schemas: [{ id: 7, fields: [['type', 'str']] }]
@@ -863,7 +869,7 @@ test('join snapshot preserves object events delivered before JoinSession returns
     await drainMicrotasks();
     connection.emit(
         'OnObjectCreated',
-        objectInfo('live', 2, { type: 'ship', x: 2 }, 'live-owner'),
+        wireObjectInfo(objectInfo('live', 2, { type: 'ship', x: 2 }, 'live-owner')),
         'remote',
         1,
         100,
@@ -871,7 +877,7 @@ test('join snapshot preserves object events delivered before JoinSession returns
     );
     connection.emit(
         'OnObjectsUpdated',
-        [{ handle: handleFor('live'), version: 3, data: { x: 3 } }],
+        [[handleFor('live'), { x: 3 }, 3]],
         'remote',
         1,
         2,
@@ -1270,7 +1276,7 @@ test('replace response applies once, atomically, before resolving the public arr
     });
     const replacing = h.objectSync.replaceObject(h.parentId, children.map(child => child.data));
     assert.ok(h.objectSync.getObject(h.parentId), 'not speculative/local-first');
-    h.responseGate.resolve([children, 19, 1234]);
+    h.responseGate.resolve([children.map(wireObjectInfo), 19, 1234]);
     const result = await replacing;
     assert.ok(Array.isArray(result));
     assert.deepEqual(result, children);
@@ -1292,16 +1298,16 @@ test('delayed replacement cannot resurrect deleted children or rewind updates an
     h.objectSync.on('onObjectReplaced', (_, infos) => { anchored = infos.map(obj => obj.id); });
     const replacing = h.objectSync.replaceObject(h.parentId, children.map(child => child.data));
     h.connection.emit('OnObjectsUpdated',
-        [{ handle: handleFor('updated'), data: { value: 4 }, version: 4 }], 'other', 1, 1, 4000, 50, 3990);
+        [[handleFor('updated'), { value: 4 }, 4]], 'other', 1, 1, 4000, 50, 3990);
     h.connection.emit('OnObjectDeleted', 'deleted', 'other', 2, 4001);
     h.objectSync.handleMemberDeparture(['departed']);
     h.objectSync.handleOwnershipMigration([
         { objectId: 'migrated', newOwnerId: 'new-owner', newVersion: 2 }
     ]);
     h.connection.emit('OnObjectCreated',
-        objectInfo('snapshotted', 1, { type: 'counter', value: 1 }),
+        wireObjectInfo(objectInfo('snapshotted', 1, { type: 'counter', value: 1 })),
         'other', 3, 4002, 1200);
-    h.responseGate.resolve([children, 8, 1200]);
+    h.responseGate.resolve([children.map(wireObjectInfo), 8, 1200]);
     assert.equal((await replacing).length, 6, 'public result remains the server array');
     assert.equal(h.objectSync.getObject('deleted'), undefined);
     assert.equal(h.objectSync.getObject('departed'), undefined);
@@ -1331,7 +1337,7 @@ for (const reset of ['clear', 'session']) {
         const replacing = h.objectSync.replaceObject(h.parentId, [{ type: 'counter' }]);
         if (reset === 'clear') h.objectSync.clear();
         else h.client.clearSessionState();
-        h.responseGate.resolve([[objectInfo('old-child', 1, { type: 'counter' })], 10, 2000]);
+        h.responseGate.resolve([[wireObjectInfo(objectInfo('old-child', 1, { type: 'counter' }))], 10, 2000]);
         assert.equal(await replacing, null);
         assert.equal(h.objectSync.getObjectCount(), 0);
         assert.equal(notifications, 0);
@@ -1348,7 +1354,7 @@ test('replacement callbacks stop after a synchronous reset', async () => {
     h.objectSync.on('onObjectCreated', () => notifications.push('create'));
     h.objectSync.on('onObjectReplaced', () => notifications.push('replace'));
     const replacing = h.objectSync.replaceObject(h.parentId, [{ type: 'counter' }]);
-    h.responseGate.resolve([[objectInfo('child', 1, { type: 'counter' })], 10, 2000]);
+    h.responseGate.resolve([[wireObjectInfo(objectInfo('child', 1, { type: 'counter' }))], 10, 2000]);
     assert.equal(await replacing, null);
     assert.deepEqual(notifications, ['delete']);
     assert.equal(h.objectSync.getObjectCount(), 0);
@@ -1358,7 +1364,7 @@ test('a lost replacement response reconciles the committed children and removes 
     const h = await replacementHarness();
     const child = objectInfo('committed-child', 1, { type: 'counter', value: 2 });
     h.connection.invokers.set('GetSessionState', () => Promise.resolve({
-        members: [], objects: [child], validAts: [['committed-child', 1234]],
+        members: [], objects: [wireObjectInfo(child)], validAts: [['committed-child', 1234]],
         memberSequences: [[h.client.getCurrentMember().id, 10]]
     }));
     const reconciled = deferred();

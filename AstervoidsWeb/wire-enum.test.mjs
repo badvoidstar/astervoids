@@ -29,9 +29,9 @@ test('roleFromWire: byte 1 → Client', () => {
     assert.equal(WireEnum.roleFromWire(1), 'Client');
 });
 
-test('roleFromWire: passes through string (idempotent)', () => {
-    assert.equal(WireEnum.roleFromWire('Server'), 'Server');
-    assert.equal(WireEnum.roleFromWire('Client'), 'Client');
+test('roleFromWire: rejects the old string wire enum', () => {
+    assert.throws(() => WireEnum.roleFromWire('Server'), /Unsupported MemberRole wire contract/);
+    assert.throws(() => WireEnum.roleFromWire('Client'), /Unsupported MemberRole wire contract/);
 });
 
 test('roleFromWire: unknown byte → null', () => {
@@ -53,9 +53,9 @@ test('scopeFromWire: byte 1 → Session', () => {
     assert.equal(WireEnum.scopeFromWire(1), 'Session');
 });
 
-test('scopeFromWire: passes through string (idempotent)', () => {
-    assert.equal(WireEnum.scopeFromWire('Member'), 'Member');
-    assert.equal(WireEnum.scopeFromWire('Session'), 'Session');
+test('scopeFromWire: rejects the old string wire enum', () => {
+    assert.throws(() => WireEnum.scopeFromWire('Member'), /Unsupported ObjectScope wire contract/);
+    assert.throws(() => WireEnum.scopeFromWire('Session'), /Unsupported ObjectScope wire contract/);
 });
 
 test('scopeFromWire: unknown byte → null', () => {
@@ -101,9 +101,9 @@ test('pairsToObject: returns empty object for null/undefined', () => {
     assert.deepEqual(WireEnum.pairsToObject(undefined), {});
 });
 
-test('pairsToObject: passes through non-array (legacy/test fixture object)', () => {
+test('pairsToObject: rejects the old dictionary wire shape', () => {
     const legacy = { 'guid-a': 100, 'guid-b': 200 };
-    assert.equal(WireEnum.pairsToObject(legacy), legacy);
+    assert.throws(() => WireEnum.pairsToObject(legacy), /Unsupported GUID-pair wire contract/);
 });
 
 test('pairsToObject: skips malformed entries', () => {

@@ -52,12 +52,6 @@ const AstervoidsWireCodec = (function () {
 
     function unpackAsteroidVertices(value) {
         if (value == null) return null;
-        if (Array.isArray(value)) {
-            return value.map(vertex => ({
-                angle: vertex.angle,
-                distance: vertex.distance
-            }));
-        }
         if (!isByteArray(value)) {
             throw new TypeError('packed asteroid vertices must be a Uint8Array');
         }
@@ -77,22 +71,14 @@ const AstervoidsWireCodec = (function () {
     }
 
     function hasAsteroidVertices(value) {
-        return (Array.isArray(value) && value.length > 0)
-            || (isByteArray(value)
-                && value.length >= ASTEROID_VERTEX_BYTES
-                && value.length % ASTEROID_VERTEX_BYTES === 0);
+        return isByteArray(value)
+            && value.length >= ASTEROID_VERTEX_BYTES
+            && value.length % ASTEROID_VERTEX_BYTES === 0;
     }
 
     function maxAsteroidVertexDistance(value) {
-        if (Array.isArray(value)) {
-            let maximum = 0;
-            for (const vertex of value) {
-                const distance = Number(vertex?.distance) || 0;
-                if (distance > maximum) maximum = distance;
-            }
-            return maximum;
-        }
-        if (!isByteArray(value)) return 0;
+        if (value == null) return 0;
+        if (!isByteArray(value)) throw new TypeError('packed asteroid vertices must be a Uint8Array');
         if (value.length % ASTEROID_VERTEX_BYTES !== 0) {
             throw new Error('packed asteroid vertices have an invalid byte length');
         }
@@ -151,9 +137,6 @@ const AstervoidsWireCodec = (function () {
     function unpackCounterMap(value) {
         if (value == null) return {};
         if (!isByteArray(value)) {
-            if (typeof value === 'object' && !Array.isArray(value)) {
-                return { ...value };
-            }
             throw new TypeError('packed counter map must be a Uint8Array');
         }
         if (value.length % COUNTER_ENTRY_BYTES !== 0) {
@@ -162,7 +145,9 @@ const AstervoidsWireCodec = (function () {
         const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
         const counters = {};
         for (let offset = 0; offset < value.length; offset += COUNTER_ENTRY_BYTES) {
-            counters[guidBytesToString(value, offset)] = view.getUint32(offset + 16, true);
+            const id = guidBytesToString(value, offset);
+            if (Object.hasOwn(counters, id)) throw new Error('packed counter map contains duplicate GUIDs');
+            counters[id] = view.getUint32(offset + 16, true);
         }
         return counters;
     }
@@ -201,8 +186,7 @@ const AstervoidsWireCodec = (function () {
     function unpackTagMap(value) {
         if (value == null) return {};
         if (!isByteArray(value)) {
-            // Reuse the strict encoder to normalize dictionary-shaped local data.
-            return unpackTagMap(packTagMap(value));
+            throw new TypeError('packed participant tags must be a Uint8Array');
         }
         const tags = {};
         for (let offset = 0; offset < value.length;) {

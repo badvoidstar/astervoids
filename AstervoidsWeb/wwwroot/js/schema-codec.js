@@ -40,7 +40,7 @@
  * rounding. Decoders return float in the same range.
  *
  * Schemas are identified by a single byte SchemaId >= 1 (0 reserved for the
- * Phase 3 legacy dict envelope). Maximum 32 fields per schema (4-byte bitmask).
+ * generic dictionary envelope). Maximum 32 fields per schema (4-byte bitmask).
  *
  * Both peers MUST agree on the schema definition for a given SchemaId.
  * Coordination happens via session metadata (`metadata.schemas`) — see Phase
@@ -431,13 +431,14 @@ const SchemaCodec = (function () {
      * caller's array references into our normalized form.
      */
     function replaceAll(definitions) {
-        _schemas.clear();
-        if (!definitions) return;
-        for (const def of definitions) {
-            const id = def.id ?? def.Id;
-            const fields = def.fields ?? def.Fields;
-            register(id, fields);
+        const schemas = new Map();
+        for (const def of definitions || []) {
+            const schema = normalizeSchema(def.id, def.fields);
+            if (schemas.has(schema.id)) throw new Error('Schema IDs must be unique within a session');
+            schemas.set(schema.id, schema);
         }
+        _schemas.clear();
+        for (const [id, schema] of schemas) _schemas.set(id, schema);
     }
 
     function clear() { _schemas.clear(); }

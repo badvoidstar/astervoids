@@ -15,6 +15,7 @@ const SessionClient = (function() {
     let lastSessionId = null; // Track for auto-rejoin after unexpected disconnect
     let reconnectIdentity = null; // { sessionId, memberId, token }, never broadcast
     let participantIdentityResolver = null;
+    let sessionMetadataValidator = null;
     let currentParticipantIdentity = null;
     // sessionId -> participantId. A rejoin, and a plain re-join of the same
     // session, mint a brand new member id server-side, so a member id cannot
@@ -263,6 +264,34 @@ const SessionClient = (function() {
         }
     }
 
+    async function rejectSessionEntry(context, accepted, operation, error) {
+        if (!isSessionContextCurrent(context)) return null;
+        const incompleteEntry = accepted && pendingSessionTransition?.epoch === context.sessionEpoch;
+        if (incompleteEntry) {
+            const epoch = invalidateSession('entryFailed', true);
+            if (sessionEpoch !== epoch || !isConnectionContextCurrent(context)) return null;
+        } else {
+            failSessionEntry(context.sessionEpoch);
+        }
+        let rejectionContext = captureSessionContext();
+        if (incompleteEntry) {
+            try {
+                await context.connection.invoke('LeaveSession');
+            } catch {
+                if (!isSessionContextCurrent(rejectionContext)) return null;
+                // An accepted but unusable contract still allocated membership.
+                // Close an ambiguous leave rather than strand that member.
+                const closing = disconnect();
+                rejectionContext = captureSessionContext();
+                await closing;
+            }
+        }
+        if (!isSessionContextCurrent(rejectionContext)) return null;
+        _error(`[SessionClient] ${operation} session failed:`, error);
+        callbacks.onError?.(`Failed to ${operation.toLowerCase()} session: ${error.message}`);
+        throw error;
+    }
+
     function acceptsExpirationForSession(expiredSessionId) {
         if (currentSession?.id === expiredSessionId) return true;
         return pendingSessionTransition?.kind === 'join'
@@ -411,8 +440,15 @@ const SessionClient = (function() {
         return { id: objectId, data: update.data, version: update.version };
     }
 
+    function requireTuple(value, length, name) {
+        if (!Array.isArray(value) || value.length !== length) {
+            throw new TypeError(`Unsupported ${name} wire contract: expected ${length} positional fields`);
+        }
+    }
+
     function normalizeObjectInfo(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 7, 'ObjectInfo');
         return {
             id: value[0],
             creatorMemberId: value[1],
@@ -440,7 +476,8 @@ const SessionClient = (function() {
     }
 
     function normalizeObjectUpdateInfo(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 3, 'ObjectUpdateInfo');
         return {
             handle: value[0],
             data: value[1],
@@ -449,7 +486,8 @@ const SessionClient = (function() {
     }
 
     function normalizeObjectReplacedEvent(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 2, 'ObjectReplacedEvent');
         return {
             deletedObjectId: value[0],
             createdObjects: value[1]
@@ -457,7 +495,8 @@ const SessionClient = (function() {
     }
 
     function normalizeObjectEventInfo(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 3, 'ObjectEventInfo');
         return {
             objectId: value[0],
             eventKind: value[1],
@@ -466,7 +505,8 @@ const SessionClient = (function() {
     }
 
     function normalizeCreateObjectResponse(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 3, 'CreateObjectResponse');
         return {
             objectInfo: value[0],
             memberSequence: value[1],
@@ -483,11 +523,12 @@ const SessionClient = (function() {
         }
         if (handler) handler(event, senderMemberId, memberSequence, validAt);
         deliverParkedUpdates();
-        return event.createdObjects;
+        return event?.createdObjects;
     }
 
     function normalizeUpdateObjectsResponse(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 3, 'UpdateObjectsResponse');
         return {
             versions: value[0],
             memberSequence: value[1],
@@ -496,7 +537,8 @@ const SessionClient = (function() {
     }
 
     function normalizeDeleteObjectResponse(value) {
-        if (!Array.isArray(value)) return value;
+        if (value == null) return value;
+        requireTuple(value, 2, 'DeleteObjectResponse');
         return {
             success: value[0],
             memberSequence: value[1]
@@ -504,8 +546,7 @@ const SessionClient = (function() {
     }
 
     function replaceSessionSchemas(metadata) {
-        if (typeof SyncPayload === 'undefined'
-            || typeof SyncPayload.replaceSchemas !== 'function') return;
+        sessionMetadataValidator?.(metadata);
         const schemas = metadata?.schemas;
         SyncPayload.replaceSchemas(Array.isArray(schemas) ? schemas : []);
     }
@@ -1002,6 +1043,7 @@ const SessionClient = (function() {
             return null;
         }
 
+        let accepted = false;
         try {
             const rawResponse = await context.connection.invoke('CreateSession', metadata || null);
             if (!isSessionContextCurrent(context)) {
@@ -1012,6 +1054,7 @@ const SessionClient = (function() {
                 finishSessionTransition(thisSessionEpoch);
                 return null;
             }
+            accepted = true;
             replaceSessionSchemas(response.metadata);
 
             const createdMember = {
@@ -1031,15 +1074,7 @@ const SessionClient = (function() {
             return completeSessionEntry(
                 context, createdSession, createdMember, nextReconnectIdentity, 'onSessionCreated');
         } catch (err) {
-            if (!isSessionContextCurrent(context)) {
-                return null;
-            }
-            failSessionEntry(thisSessionEpoch);
-            _error('[SessionClient] Create session failed:', err);
-            if (callbacks.onError) {
-                callbacks.onError('Failed to create session: ' + err.message);
-            }
-            throw err;
+            return rejectSessionEntry(context, accepted, 'Create', err);
         }
     }
 
@@ -1063,6 +1098,7 @@ const SessionClient = (function() {
             return null;
         }
 
+        let accepted = false;
         try {
             _log('[SessionClient] JoinSession invoking:', sessionId, 'rejoin:', !!reconnecting);
             const rawResponse = reconnecting
@@ -1082,6 +1118,7 @@ const SessionClient = (function() {
                 finishSessionTransition(thisSessionEpoch);
                 return null;
             }
+            accepted = true;
 
             // The creator's registry must precede both snapshot and live decode.
             // Snapshot handles and object seeds must also precede replay.
@@ -1111,15 +1148,7 @@ const SessionClient = (function() {
             return completeSessionEntry(
                 context, joinedSession, joinedMember, nextReconnectIdentity, 'onSessionJoined');
         } catch (err) {
-            if (!isSessionContextCurrent(context)) {
-                return null;
-            }
-            failSessionEntry(thisSessionEpoch);
-            _error('[SessionClient] Join session failed:', err);
-            if (callbacks.onError) {
-                callbacks.onError('Failed to join session: ' + err.message);
-            }
-            throw err;
+            return rejectSessionEntry(context, accepted, 'Join', err);
         }
     }
 
@@ -1218,7 +1247,7 @@ const SessionClient = (function() {
      *   estimate of "now" at creation. Server clamps to ±2s of its own UtcNow
      *   before forwarding as the broadcast's validAt. Pass null to fall back to
      *   the server's hub-entry timestamp (slightly upload-biased).
-     * @param {number} [schemaId=0] Phase 4: positional schema id (0 = legacy MessagePack dict).
+     * @param {number} [schemaId=0] Positional schema id (0 = generic MessagePack dictionary).
      */
     async function createObject(data, scope = 'Member', ownerMemberId = null, clientValidAt = null, schemaId = 0) {
         const context = captureSessionContext();
@@ -1240,7 +1269,7 @@ const SessionClient = (function() {
     /**
      * Update multiple objects atomically.
      * @param {Array} updates Each entry: { objectId, data, schemaId? }. schemaId
-     *   defaults to 0 (legacy dict).
+     *   defaults to 0 (generic dictionary).
      * @param {number|null} [senderSequence=null]
      * @param {number|null} [senderSendIntervalMs=null]
      * @param {number|null} [clientValidAt=null] - Owner's NTP-aligned server-time
@@ -1346,7 +1375,7 @@ const SessionClient = (function() {
         const context = captureSessionContext();
         // Phase 3 envelope: each replacement is a raw game data dict; wrap before invoke.
         // Phase 4: schemaIds may be a parallel array of schemaId per replacement;
-        // omitted/null entries fall back to 0 (legacy MessagePack dict).
+        // omitted/null entries select 0 (generic MessagePack dictionary).
         const wrapped = Array.isArray(replacements)
             ? replacements.map((r, i) => SyncPayload.wrap(r, (schemaIds && schemaIds[i]) || 0))
             : replacements;
@@ -1355,13 +1384,12 @@ const SessionClient = (function() {
             throw staleOperationError();
         }
         if (!response) return null;
-        const [createdObjects, memberSequence, validAt] = Array.isArray(response)
-            ? response
-            : [response.createdObjects, response.memberSequence, response.validAt];
+        requireTuple(response, 3, 'ReplaceObjectResponse');
+        const [createdObjects, memberSequence, validAt] = response;
         // Preserve the public array return while delivering authoritative metadata
         // before resolving. ObjectSync supplies a handler scoped to its own epoch.
         return dispatchObjectReplacement(
-            { deletedObjectId: deleteObjectId, createdObjects },
+            [deleteObjectId, createdObjects],
             currentMember.id, memberSequence, validAt, onReplaced);
     }
 
@@ -1408,7 +1436,7 @@ const SessionClient = (function() {
             // Phase 1 wire-shape: SessionStateSnapshot now carries members with byte
             // role, objects with byte scope, and validAts/memberSequences as
             // GuidLongPair[] (deserialized as [guidString, long] arrays after
-            // GuidUtils.transformBinaryGuids). Translate to legacy shapes here so
+            // GuidUtils.transformBinaryGuids). Translate to game-facing shapes here so
             // game/object-sync code keeps using string roles/scopes and string-keyed
             // dicts for validAts/memberSequences.
             if (Array.isArray(snapshot.members)) {
@@ -1506,6 +1534,14 @@ const SessionClient = (function() {
         participantIdentityResolver = resolver;
     }
 
+    function setSessionMetadataValidator(validator) {
+        if (typeof validator !== 'function') throw new TypeError('Session metadata validator must be a function');
+        if (currentSession || pendingSessionTransition) {
+            throw new Error('Cannot change the session metadata validator during membership or entry');
+        }
+        sessionMetadataValidator = validator;
+    }
+
     /**
      * Clear stale session/member state without disconnecting.
      * Used when reconciliation fails after auto-reconnect: the transport is alive
@@ -1558,6 +1594,7 @@ const SessionClient = (function() {
         getParticipantId,
         getParticipantIdentity: () => currentSession ? currentParticipantIdentity : null,
         setParticipantIdentityResolver,
+        setSessionMetadataValidator,
         clearSessionState,
         getCurrentHubHostname,
         getSessionEpoch,

@@ -104,6 +104,17 @@ function polar(points) {
     return points.map(([x, y]) => ({ angle: Math.atan2(y, x), distance: Math.hypot(x, y) }));
 }
 
+test('asteroid reconstruction rejects malformed or old unpacked geometry instead of generating a substitute', () => {
+    const h = harness();
+    const data = { x: 0.5, y: 0.5, radius: 0.1, velocityX: 0, velocityY: 0, seed: 123 };
+    for (const vertices of [[{ angle: 0, distance: 0.1 }], new Uint8Array(3), {}]) {
+        assert.throws(() => h.Asteroid.fromSyncData({ ...data, vertices }),
+            /must be a Uint8Array|invalid byte length/);
+    }
+    assert.equal(h.Asteroid.fromSyncData(data).vertices.length, h.config.ASTEROID_VERTICES,
+        'omitted fracture geometry still reconstructs an ordinary seeded asteroid');
+});
+
 function rock(h, x = 0.5, y = 0.5, halfWidth = 0.01, halfHeight = halfWidth) {
     const asteroid = new h.Asteroid(x, y, halfWidth, 0, 0, 123, polar([
         [-halfWidth, -halfHeight], [halfWidth, -halfHeight],
