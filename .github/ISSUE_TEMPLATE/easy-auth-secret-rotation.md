@@ -17,7 +17,7 @@ the UI — though scheduled auto-renewals already triggered by ACMEbot
 inside the Function App keep working until their own auth path breaks.
 
 This issue is auto-opened by `.github/workflows/check-easy-auth-secret.yml`
-when the secret has < 30 days to live (or via manual dispatch). Close the
+when the secret has <= 30 days to live (or via manual dispatch). Close the
 issue once you've rotated.
 
 ## How to rotate
@@ -27,7 +27,11 @@ issue once you've rotated.
 az login
 
 # 2. Find the app reg's object ID (NOT the client/app ID).
-APP_CLIENT_ID=<value of vars.EASYAUTH_APP_ID, e.g. 00000000-0000-0000-0000-000000000000>
+# Read only the existing registration's client ID; never post it in this issue.
+APP_CLIENT_ID=$(az rest --method get \
+  --url "https://management.azure.com$(az functionapp show \
+    --resource-group sg-acmebot --name func-astervoids --query id -o tsv)/config/authsettingsV2?api-version=2022-03-01" \
+  --query properties.identityProviders.azureActiveDirectory.registration.clientId -o tsv)
 APP_OBJECT_ID=$(az ad app show --id "$APP_CLIENT_ID" --query id -o tsv)
 
 # 3. List existing credentials and note the keyId of the one about to expire.

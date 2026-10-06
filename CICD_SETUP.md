@@ -480,8 +480,14 @@ instead when the normal Contributor role should remain sufficient.
 #      scheduled workflow `.github/workflows/check-easy-auth-secret.yml`
 #      checks weekly and auto-opens a GitHub issue (with the rotation
 #      runbook from `.github/ISSUE_TEMPLATE/easy-auth-secret-rotation.md`)
-#      when < 30 days remain — set the repo variable `EASYAUTH_APP_ID` to
-#      the app reg's client ID to enable it.
+#      when <= 30 days remain — set the repository secret `EASYAUTH_APP_ID`
+#      to the existing Function App authentication registration's verified
+#      client ID to enable it (`gh secret set EASYAUTH_APP_ID`, private prompt).
+#      Do not store this ID in an unmasked repository variable or public output.
+#      The monitor uses the existing `production` environment OIDC federation.
+#      Its OIDC identity also needs separately granted Microsoft Graph
+#      application-read permission (e.g. Application.Read.All with admin
+#      consent); Azure Contributor alone does not grant this permission.
 
 # 2. [BICEP-MANAGED — provided here for disaster recovery only]
 #    DNS Zone Contributor on the production DNS zone for ACMEbot's identity,
