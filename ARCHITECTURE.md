@@ -418,6 +418,13 @@ separately enforce compare-and-swap transactions.
 Foreground/focus and storage notifications re-resolve bindings. Requests
 coalesce without losing a refresh received while another action is pending.
 Queued refreshes keep recovery paused until the newest verification completes.
+Create and Join clicks received during a binding refresh remain
+pending until its latest queued refresh completes. Entry rechecks verification
+after regional handoff and before applying the returned membership. Picker
+refreshes cannot re-enable entry controls or submit a duplicate while that
+operation is pending. Completing entry restores controls and reports failures
+without awaiting unrelated regional watcher startup. Cancellation releases busy
+controls before transport cleanup finishes and never replays the discarded click.
 During verification/rebinding, `game.identityChanging` pauses foreground and
 hidden gameplay. A changed or unverifiable identity cancels pending picker
 entry/rejoin, invalidates membership, releases controls/audio, and returns to

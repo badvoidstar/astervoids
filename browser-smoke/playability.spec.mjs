@@ -511,6 +511,43 @@ test('independent players create, join, play, leave and rejoin', async ({ player
     });
 });
 
+for (const touch of [false, true]) {
+    test(`Create retains a foreground ${touch ? 'tap' : 'click'} while real identity verification is pending`, async ({ players }) => {
+        const host = await players.open(touch
+            ? { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } } : {});
+        await expect(host.page.locator('#btn-leave-create')).toBeEnabled();
+        let releaseVerification;
+        const verification = new Promise(resolve => { releaseVerification = resolve; });
+        let verificationStarted;
+        const started = new Promise(resolve => { verificationStarted = resolve; });
+        const delayVerification = async route => {
+            verificationStarted();
+            await verification;
+            await route.fallback();
+        };
+        await host.page.route('**/api/identity/resolve', delayVerification);
+        try {
+            await host.page.evaluate(() => window.dispatchEvent(new Event('focus')));
+            await started;
+            expect(await host.page.evaluate(() => game.identityChanging)).toBe(true);
+            if (touch) await host.page.locator('#btn-leave-create').tap();
+            else await host.page.locator('#btn-leave-create').click();
+            await expect(host.page.locator('#btn-leave-create')).toBeDisabled();
+            expect(await host.page.evaluate(() => sessionPicker.currentSessionId)).toBeNull();
+            releaseVerification();
+            await sessionReady(host.page);
+            players.ownSession(await host.page.evaluate(() => SessionClient.getCurrentSession().id));
+            await expect(host.page.locator('#btn-start-enter')).toBeEnabled();
+            await host.page.locator('#btn-start-enter').click();
+            await playing(host.page);
+            expect(host.health.hubFrames, 'Create still uses the real hub connection').toBeGreaterThan(0);
+        } finally {
+            releaseVerification();
+            await host.page.unroute('**/api/identity/resolve', delayVerification);
+        }
+    });
+}
+
 test('foreground identity verification resumes a connected session instead of stranding recovery', async ({ players }) => {
     const host = await players.open();
     const guest = await players.open();

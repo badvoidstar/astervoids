@@ -10597,6 +10597,7 @@
         canCreate: false,
         connected: false,
         connectionState: 'connecting',
+        operationPending: false,
         // Regional state (Phase 1 region awareness). selectedCreateRegion is sticky
         // within a picker session — once the user explicitly chooses a region from
         // the dropdown, subsequent bestRegion() changes don't override it.
@@ -10620,11 +10621,35 @@
 
     function beginPickerOperation() {
         const generation = ++pickerOperationGeneration;
+        sessionPicker.operationPending = true;
         return () => generation === pickerOperationGeneration;
     }
 
     function cancelPickerOperations() {
         pickerOperationGeneration++;
+        sessionPicker.operationPending = false;
+        updatePickerButtons();
+    }
+
+    async function waitForPickerIdentity(isCurrentOperation) {
+        // A foreground refresh is not a rejected click. Its finally handler
+        // may start a newer verification, which must finish before entry too.
+        while (isCurrentOperation() && identityRefresh) {
+            setPickerStatus('Checking player identity...', 'connecting');
+            await identityRefresh;
+        }
+        return isCurrentOperation() && !game.identityChanging;
+    }
+
+    function finishPickerOperation(isCurrentOperation, errorMessage) {
+        if (!isCurrentOperation()) return;
+        sessionPicker.operationPending = false;
+        // Restoring controls and reporting entry errors must not wait for
+        // unrelated regions to finish restarting their picker connections.
+        void activateSessionPickerUpdates().catch(err => {
+            _warn('[Picker] Failed to resume updates after session entry:', err);
+        });
+        if (errorMessage) setPickerStatus(errorMessage, 'error');
     }
 
     // Update status message
@@ -10976,7 +11001,7 @@
         if (currentSessionId) {
             // In a session - show Leave
             btnLeaveCreate.textContent = 'Leave';
-            btnLeaveCreate.disabled = false;
+            btnLeaveCreate.disabled = sessionPicker.operationPending === true;
             btnLeaveCreate.className = 'picker-btn action leave';
             // Clone-replace to clear sticky :active/:hover pseudo-class from touch
             const fresh = btnLeaveCreate.cloneNode(true);
@@ -10989,7 +11014,7 @@
             const regionName = getCreateRegionDisplayName(createEligibility.regionId);
             const multiRegion = sessionPicker.regions.length > 1;
             btnLeaveCreate.textContent = 'Create Multiplayer';
-            btnLeaveCreate.disabled = !createEligibility.canCreateNow;
+            btnLeaveCreate.disabled = sessionPicker.operationPending === true || !createEligibility.canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
             if (regionName && multiRegion) {
                 const regionLabel = document.createElement('span');
@@ -11030,12 +11055,12 @@
                 // Server before game starts — offer to Start
                 btnStartEnter.textContent = 'Start';
                 btnStartEnter.className = 'picker-btn action';
-                btnStartEnter.disabled = false;
+                btnStartEnter.disabled = sessionPicker.operationPending === true;
             } else {
                 // Game already started (server promoted mid-game, or non-server) — offer to Enter
                 btnStartEnter.textContent = 'Enter';
                 btnStartEnter.className = 'picker-btn action';
-                btnStartEnter.disabled = !gameStarted; // Disable until server starts
+                btnStartEnter.disabled = sessionPicker.operationPending === true || !gameStarted;
             }
         } else {
             btnStartEnter.style.display = 'none';
@@ -11532,7 +11557,7 @@
     // region BEFORE invoking JoinSession, so the joined hub matches the
     // region that holds the session's authoritative state.
     async function handleSelectSession(sessionId) {
-        if (game.identityChanging) return;
+        if (sessionPicker.operationPending || identityLeave || (game.identityChanging && !identityRefresh)) return;
         if (sessionId === sessionPicker.currentSessionId) return; // Already in this session
         
         const session = sessionPicker.sessions.find(s => s.id === sessionId);
@@ -11540,9 +11565,11 @@
 
         const isCurrentOperation = beginPickerOperation();
         setPickerStatus('Joining...', 'connecting');
-        sessionPicker.btnLeaveCreate.disabled = true;
+        updatePickerButtons();
+        let errorMessage = null;
 
         try {
+            if (!await waitForPickerIdentity(isCurrentOperation)) return;
             // Leave current session if in one
             if (sessionPicker.currentSessionId) {
                 await SessionClient.leaveSession();
@@ -11560,12 +11587,13 @@
                 if (targetHostname) {
                     await connectToSessionHub(true, targetHostname, false);
                     if (!isCurrentOperation()) return;
-                    setPickerStatus('Joining...', 'connecting');
                 }
             }
 
+            if (!await waitForPickerIdentity(isCurrentOperation)) return;
+            setPickerStatus('Joining...', 'connecting');
             const result = await SessionClient.joinSession(sessionId);
-            if (!isCurrentOperation()) {
+            if (!isCurrentOperation() || (result && !await waitForPickerIdentity(isCurrentOperation))) {
                 if (result && isActiveSoloGame()) {
                     leaveSessionInBackground('Failed to leave session after starting solo play:');
                 }
@@ -11586,17 +11614,15 @@
                 
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
-                
-                await activateSessionPickerUpdates();
             } else {
-                await activateSessionPickerUpdates();
-                setPickerStatus('Could not join - session may be full', 'error');
+                errorMessage = 'Could not join - session may be full';
             }
         } catch (err) {
             if (!isCurrentOperation()) return;
             _error('Join session failed:', err);
-            await activateSessionPickerUpdates();
-            setPickerStatus('Failed to join session', 'error');
+            errorMessage = 'Failed to join session';
+        } finally {
+            finishPickerOperation(isCurrentOperation, errorMessage);
         }
     }
 
@@ -11688,7 +11714,7 @@
 
     // Handle create session - creates and enters lobby
     async function handleCreateSession() {
-        if (game.identityChanging) return;
+        if (sessionPicker.operationPending || identityLeave || (game.identityChanging && !identityRefresh)) return;
         const createEligibility = getCreateEligibility();
         if (!createEligibility.canCreateNow) {
             updatePickerButtons();
@@ -11702,9 +11728,11 @@
 
         const isCurrentOperation = beginPickerOperation();
         setPickerStatus('Creating...', 'connecting');
-        sessionPicker.btnLeaveCreate.disabled = true;
+        updatePickerButtons();
+        let errorMessage = null;
 
         try {
+            if (!await waitForPickerIdentity(isCurrentOperation)) return;
             // Leave current session if in one
             if (sessionPicker.currentSessionId) {
                 await SessionClient.leaveSession();
@@ -11723,10 +11751,11 @@
                 if (targetHostname) {
                     await connectToSessionHub(true, targetHostname, false);
                     if (!isCurrentOperation()) return;
-                    setPickerStatus('Creating...', 'connecting');
                 }
             }
 
+            if (!await waitForPickerIdentity(isCurrentOperation)) return;
+            setPickerStatus('Creating...', 'connecting');
             // Capture the current aspect ratio at the moment of session creation
             const currentAspectRatio = canvas.width / canvas.height;
             const result = await SessionClient.createSession({
@@ -11738,7 +11767,7 @@
                 schemas: WIREOPT_SCHEMAS,
                 seed: generateSessionSeed(),
             });
-            if (!isCurrentOperation()) {
+            if (!isCurrentOperation() || (result && !await waitForPickerIdentity(isCurrentOperation))) {
                 if (result && isActiveSoloGame()) {
                     leaveSessionInBackground('Failed to leave session after starting solo play:');
                 }
@@ -11757,17 +11786,15 @@
                 
                 // Recalculate viewport for session aspect ratio
                 resizeCanvas(true);
-                
-                await activateSessionPickerUpdates();
             } else {
-                await activateSessionPickerUpdates();
-                setPickerStatus('Could not create - max sessions reached', 'error');
+                errorMessage = 'Could not create - max sessions reached';
             }
         } catch (err) {
             if (!isCurrentOperation()) return;
             _error('Create session failed:', err);
-            await activateSessionPickerUpdates();
-            setPickerStatus('Failed to create session', 'error');
+            errorMessage = 'Failed to create session';
+        } finally {
+            finishPickerOperation(isCurrentOperation, errorMessage);
         }
     }
 
