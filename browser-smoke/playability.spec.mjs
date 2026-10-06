@@ -131,6 +131,8 @@ async function create(page) {
     await expect(page.locator('#btn-start-enter')).toBeVisible();
     await expect(page.locator('#btn-start-enter')).toHaveText('Start');
     await expect(page.locator('#btn-start-enter')).toBeEnabled();
+    await expect(page.locator('#create-region-row')).toBeHidden();
+    await expect(page.locator('#create-region-select')).toBeHidden();
     return page.evaluate(() => SessionClient.getCurrentSession().id);
 }
 
@@ -139,6 +141,8 @@ async function join(page, sessionId) {
     await expect.poll(() => page.evaluate(id => SessionClient.getCurrentSession()?.id === id, sessionId),
         { message: 'The selected session is joined through the picker' }).toBe(true);
     await sessionReady(page, sessionId);
+    await expect(page.locator('#create-region-row')).toBeHidden();
+    await expect(page.locator('#create-region-select')).toBeHidden();
 }
 
 async function membership(page, sessionId, count) {
@@ -429,7 +433,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             }
             expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
             expect(state.fullscreenVisible, label).toBe(state.mode === '');
-            expect(state.regionVisible, label).toBe(state.multiRegion);
+            expect(state.regionVisible, label).toBe(state.multiRegion && state.role === 'outside');
             expect(state.startVisible, label).toBe(state.role !== 'outside');
             expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
             if (state.role !== 'outside') {

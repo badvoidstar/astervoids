@@ -10900,21 +10900,29 @@
         banner.textContent = '';
     }
 
+    function updateCreateRegionSelectorVisibility() {
+        if (!isSessionPickerVisible()) return;
+        const row = sessionPicker.createRegionRowEl;
+        if (row) {
+            row.style.display = sessionPicker.currentSessionId || sessionPicker.regions.length <= 1
+                ? 'none' : '';
+        }
+    }
+
     function renderCreateRegionSelector() {
         if (!isSessionPickerVisible()) return;
         const sel = sessionPicker.createRegionSelectEl;
         const row = sessionPicker.createRegionRowEl;
         if (!sel || !row) return;
+        updateCreateRegionSelectorVisibility();
         const regions = sessionPicker.regions;
         // Hide the selector entirely when there's nothing to choose between
         // (single-region deployment / local dev). Phase 1 ships with N=1 so
         // the row is initially hidden — but its DOM exists so handleCreateSession
         // can read `selectedCreateRegion` without branching.
         if (regions.length <= 1) {
-            row.style.display = 'none';
             return;
         }
-        row.style.display = '';
         const readiness = getRegionalCreateReadiness();
         const bestId = (window.RegionService && window.RegionService.bestRegion()) || null;
         const desired = isCreateRegionAvailable(sessionPicker.selectedCreateRegion)
@@ -10989,6 +10997,7 @@
     function updatePickerButtons() {
         if (!isSessionPickerVisible()) return;
         const { btnLeaveCreate, btnStartEnter, currentSessionId, isServer, gameStarted, canCreate, connected } = sessionPicker;
+        updateCreateRegionSelectorVisibility();
         btnLeaveCreate.removeAttribute('aria-label');
         
         // Leave/Create button - context aware

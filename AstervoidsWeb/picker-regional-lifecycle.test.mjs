@@ -631,7 +631,8 @@ test('regional teardown does not block a rapid visible-picker restart', async t 
 test('picker rendering helpers do not touch hidden DOM during gameplay or backgrounding', () => {
     const names = [
         'setPickerStatus', 'renderSessionList', 'updatePingCellsForRegion', 'renderRegionBanner',
-        'renderCreateRegionSelector', 'updatePickerButtons', 'renderRegionDownBanner',
+        'updateCreateRegionSelectorVisibility', 'renderCreateRegionSelector',
+        'updatePickerButtons', 'renderRegionDownBanner',
     ];
     for (const documentHidden of [false, true]) {
         const functions = loadInlineGameFunctions(['isSessionPickerVisible', ...names], {
