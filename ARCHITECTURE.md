@@ -1378,7 +1378,9 @@ game-specific nested packing:
   session-locked geometry settings. Explicit fracture geometry uses four bytes
   per polar vertex: wrapped angle plus normalized distance. Old unpacked vertex
   arrays are rejected. Malformed explicit geometry is ignored by the game adapter,
-  not replaced with an invented seeded polygon.
+  not replaced with an invented seeded polygon. Rejection emits a payload-free
+  debug warning once per record/version; weak record keys do not retain discarded
+  records. Repaired geometry can be adopted normally, including same-version repairs.
 - Counter ledgers sort entries by GUID and encode 16-byte identity plus
   little-endian uint32. Personal-score/number maps normalize GUIDs and validate
   nonnegative scores, positive ordinals, matching participants, and duplicate

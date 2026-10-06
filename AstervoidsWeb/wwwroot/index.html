@@ -5828,13 +5828,21 @@
     // Asteroid descriptor: owned iff we are the ownerMemberId; a remote
     // asteroid is a replica only while its owner is still active (otherwise
     // ignored until the pending ownership migration lands).
+    const malformedAsteroidGeometryVersions = new WeakMap();
     const asteroidReplicationDescriptor = {
         type: OBJECT_TYPES.ASTEROID,
         classify(record, facts) {
             if (shouldDeferTerminalBootstrap(record)) return 'ignore';
             const vertices = record.data.vertices;
             if (vertices != null && !AstervoidsWireCodec.hasAsteroidVertices(vertices)
-                && !(vertices instanceof Uint8Array && vertices.length === 0)) return 'ignore';
+                && !(vertices instanceof Uint8Array && vertices.length === 0)) {
+                if (!malformedAsteroidGeometryVersions.has(record)
+                    || malformedAsteroidGeometryVersions.get(record) !== record.version) {
+                    malformedAsteroidGeometryVersions.set(record, record.version);
+                    _warn('[Multiplayer] Ignoring malformed asteroid geometry');
+                }
+                return 'ignore';
+            }
             if (record.ownerMemberId === facts.currentMemberId) return 'owned';
             return facts.ownerIsActive ? 'replica' : 'ignore';
         },

@@ -10,10 +10,11 @@ const ReplicationRuntime = require('./wwwroot/js/replication-runtime.js');
 const OBJECT_TYPES = { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' };
 const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 const descriptorsSource = source.slice(
-    source.indexOf('const asteroidReplicationDescriptor ='),
+    source.indexOf('const malformedAsteroidGeometryVersions ='),
     source.indexOf('function applyGameStateData('));
 
 function harness() {
+    const warnings = [];
     const game = {
         ship: {},
         astervoids: [],
@@ -35,6 +36,7 @@ function harness() {
     });
     const dependencies = {
         ...functions, game, OBJECT_TYPES, ReplicationRuntime,
+        _warn: (...args) => warnings.push(args),
         AstervoidsWireCodec: require('./wwwroot/js/astervoids-wire-codec.js'),
         Asteroid: { fromSyncData: entity },
         Bullet: { fromSyncData: entity },
@@ -63,7 +65,7 @@ function harness() {
     });
     runtime.beginSession({ epoch });
     return {
-        game, records, runtime, descriptors, ...functions,
+        game, records, runtime, descriptors, warnings, ...functions,
         setEpoch: value => { epoch = value; },
         record(id, type, ownerMemberId = 'remote') {
             const record = { id, type, ownerMemberId, version: 1,
@@ -103,11 +105,62 @@ test('malformed and old unpacked asteroid geometry never becomes an invented rep
             record.data.vertices = vertices;
             h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
             assert.deepEqual(h.game.astervoids, []);
+            assert.deepEqual(h.warnings, [['[Multiplayer] Ignoring malformed asteroid geometry']]);
+            for (let i = 0; i < 3; i++) {
+                h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
+            }
+            assert.deepEqual(h.game.astervoids, []);
+            assert.equal(h.warnings.length, 1, 'repeated reconciliation does not repeat the diagnostic');
             record.data.vertices = require('./wwwroot/js/astervoids-wire-codec.js')
                 .packAsteroidVertices([{ angle: 0, distance: 0.1 }]);
-            record.version++;
             h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
-            assert.equal(h.game.astervoids.length, 1, 'current packed geometry repairs the record');
+            assert.equal(h.game.astervoids.length, 1, 'a same-version repair is not blocked by diagnostic deduplication');
+            assert.equal(h.warnings.length, 1, 'repaired geometry does not warn');
+        }
+    }
+});
+
+test('malformed geometry diagnostics are payload-free and deduplicated per record and version', () => {
+    const h = harness();
+    const first = h.record('first-geometry', OBJECT_TYPES.ASTEROID);
+    first.data.vertices = new Uint8Array(3);
+    const second = h.record('second-geometry', OBJECT_TYPES.ASTEROID);
+    second.data.vertices = { detail: 'fixture payload must not be logged' };
+    const reconcile = () => h.runtime.reconcileType(
+        OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
+    reconcile();
+    reconcile();
+    assert.equal(h.warnings.length, 2, 'each record reports its own rejection');
+    first.version++;
+    reconcile();
+    reconcile();
+    assert.equal(h.warnings.length, 3, 'a new rejected version reports once');
+    const replacement = h.record(first.id, OBJECT_TYPES.ASTEROID);
+    replacement.version = first.version;
+    replacement.data.vertices = first.data.vertices;
+    reconcile();
+    reconcile();
+    assert.deepEqual(h.warnings, Array.from({ length: 4 }, () =>
+        ['[Multiplayer] Ignoring malformed asteroid geometry']),
+        'record replacement gets its own diagnostic without any identity, version, or payload arguments');
+    assert.deepEqual(h.game.astervoids, []);
+    replacement.data.vertices = require('./wwwroot/js/astervoids-wire-codec.js')
+        .packAsteroidVertices([{ angle: 0, distance: 0.1 }]);
+    replacement.version++;
+    reconcile();
+    assert.deepEqual(h.game.astervoids.map(asteroid => asteroid.syncObjectId), [replacement.id],
+        'a newer-version repair also recovers while the other malformed record remains ignored');
+    assert.equal(h.warnings.length, 4);
+});
+
+test('absent and empty seeded asteroid geometry does not produce a malformed-data warning', () => {
+    for (const owner of ['remote', 'local']) {
+        for (const vertices of [undefined, null, new Uint8Array(0)]) {
+            const h = harness();
+            h.record('seeded-geometry', OBJECT_TYPES.ASTEROID, owner).data.vertices = vertices;
+            h.runtime.reconcileType(OBJECT_TYPES.ASTEROID, h.buildReplicationContext(OBJECT_TYPES.ASTEROID));
+            assert.equal(h.game.astervoids.length, 1);
+            assert.deepEqual(h.warnings, []);
         }
     }
 });
