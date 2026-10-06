@@ -511,6 +511,85 @@ test('independent players create, join, play, leave and rejoin', async ({ player
     });
 });
 
+for (const touch of [false, true]) {
+    test(`Create retains a foreground ${touch ? 'tap' : 'click'} while real identity verification is pending`, async ({ players }) => {
+        const host = await players.open(touch
+            ? { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } } : {});
+        await expect(host.page.locator('#btn-leave-create')).toBeEnabled();
+        let releaseVerification;
+        const verification = new Promise(resolve => { releaseVerification = resolve; });
+        let verificationStarted;
+        const started = new Promise(resolve => { verificationStarted = resolve; });
+        const delayVerification = async route => {
+            verificationStarted();
+            await verification;
+            await route.fallback();
+        };
+        await host.page.route('**/api/identity/resolve', delayVerification);
+        try {
+            await host.page.evaluate(() => window.dispatchEvent(new Event('focus')));
+            await started;
+            expect(await host.page.evaluate(() => game.identityChanging)).toBe(true);
+            if (touch) await host.page.locator('#btn-leave-create').tap();
+            else await host.page.locator('#btn-leave-create').click();
+            await expect(host.page.locator('#btn-leave-create')).toBeDisabled();
+            expect(await host.page.evaluate(() => sessionPicker.currentSessionId)).toBeNull();
+            releaseVerification();
+            await sessionReady(host.page);
+            players.ownSession(await host.page.evaluate(() => SessionClient.getCurrentSession().id));
+            await expect(host.page.locator('#btn-start-enter')).toBeEnabled();
+            await host.page.locator('#btn-start-enter').click();
+            await playing(host.page);
+            expect(host.health.hubFrames, 'Create still uses the real hub connection').toBeGreaterThan(0);
+        } finally {
+            releaseVerification();
+            await host.page.unroute('**/api/identity/resolve', delayVerification);
+        }
+    });
+}
+
+test('foreground identity verification resumes a connected session instead of stranding recovery', async ({ players }) => {
+    const host = await players.open();
+    const guest = await players.open();
+    const sessionId = await create(host.page);
+    players.ownSession(sessionId);
+    await join(guest.page, sessionId);
+    await host.page.locator('#btn-start-enter').click();
+    await guest.page.locator('#btn-start-enter').click();
+    await Promise.all([playing(host.page), playing(guest.page)]);
+    const oldMember = await guest.page.evaluate(() => SessionClient.getCurrentMember().id);
+    const oldShip = await shipId(guest.page);
+
+    // Model a long background interval without dropping the real hub socket.
+    // Visibility capture starts the real identity request before game recovery.
+    const interrupted = await guest.page.evaluate(() => {
+        hiddenTimestamp = Date.now() - 6000;
+        document.dispatchEvent(new Event('visibilitychange'));
+        window.dispatchEvent(new Event('focus'));
+        return {
+            connected: SessionClient.isConnected(),
+            verifying: game.identityChanging,
+            frozen: game.connectionLost,
+        };
+    });
+    expect(interrupted).toEqual({ connected: true, verifying: true, frozen: true });
+    await expect.poll(() => guest.page.evaluate(previous => {
+        const member = SessionClient.getCurrentMember();
+        return !!member && member.id !== previous && !game.identityChanging
+            && !game.connectionLost && !rejoinInProgress;
+    }, oldMember), { message: 'Verified identity resumes deferred session entry despite a live transport' }).toBe(true);
+
+    await expect(guest.page.locator('#reconnecting-overlay')).toBeHidden();
+    await playing(guest.page);
+    await sessionReady(guest.page, sessionId);
+    await Promise.all([membership(host.page, sessionId, 2), membership(guest.page, sessionId, 2)]);
+    const recoveredShip = await shipId(guest.page);
+    expect(recoveredShip !== oldShip, 'Recovery creates a fresh network-backed ship').toBe(true);
+    await expect.poll(() => host.page.evaluate(id => !!ObjectSync.getObject(id), oldShip),
+        { message: 'The former member ship does not survive session recovery' }).toBe(false);
+    await replicatedThrust(guest.page, host.page, recoveredShip);
+});
+
 async function personalState(page) {
     return page.evaluate(() => {
         const record = ObjectSync.getObjectByType('gameState');

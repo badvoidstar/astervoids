@@ -255,7 +255,7 @@ test('binding refreshes coalesce but are never lost during another request or in
         'refreshBrowserIdentity', 'setIdentityBusy',
     ], {
         game, identityStarted: true, identityBusy: true, identityRefresh: null,
-        identityRefreshRequested: false, identityLeave: null,
+        identityRefreshRequested: false, identityLeave: null, pendingRejoinSessionId: null,
         PlayerIdentity: {
             hasPendingOperation: () => false,
             resolve: () => new Promise(resolve => { requests.push(resolve); }),
@@ -280,6 +280,494 @@ test('binding refreshes coalesce but are never lost during another request or in
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(requests.length, 2);
     assert.equal(game.identityChanging, false);
+});
+
+function pickerEntrySubject(options = {}) {
+    const requests = [];
+    const entries = [];
+    const notices = [];
+    let pickerRestarts = 0;
+    const game = { mode: 'solo', state: 'start', identityChanging: false };
+    const sessionPicker = {
+        currentSessionId: null, btnLeaveCreate: { disabled: false },
+        regions: options.regional ? [{ id: 'local' }, { id: 'peer' }] : [],
+        sessions: [{ id: 'new-session', regionId: 'local', memberCount: 1, maxMembers: 4 }],
+    };
+    const result = {
+        session: { id: 'new-session', name: 'New session', objects: [] },
+        member: { id: 'new-member', role: 'Server' },
+    };
+    const transport = { connected: true, member: false };
+    async function enter(kind) {
+        entries.push({ kind, verified: !game.identityChanging });
+        if (options.entry) await options.entry;
+        if (options.failure) throw new Error('Entry unavailable');
+        if (options.full) return null;
+        transport.member = true;
+        return result;
+    }
+    const functions = loadInlineGameFunctions([
+        'handleCreateSession', 'handleSelectSession', 'beginPickerOperation', 'cancelPickerOperations',
+        'waitForPickerIdentity', 'finishPickerOperation',
+        'refreshBrowserIdentity', 'handlePlayerIdentityChange', 'leaveIdentityGame',
+        'beginVoluntarySessionLeave', 'clearPickerMembership',
+    ], {
+        game, sessionPicker, pickerOperationGeneration: 0,
+        identityStarted: true, identityBusy: false, identityRefresh: null,
+        identityRefreshRequested: false, identityLeave: null, startGameOperation: null,
+        leavingSession: false, pendingRejoinSessionId: null,
+        PlayerIdentity: {
+            resolve: () => new Promise((resolve, reject) => requests.push({ resolve, reject })),
+            deactivate() {},
+        },
+        SessionClient: {
+            isConnected: () => transport.connected,
+            isInSession: () => transport.member,
+            getLastSessionId: () => transport.member ? result.session.id : null,
+            createSession: () => enter('create'),
+            joinSession: () => enter('join'),
+            async disconnect() {
+                transport.connected = transport.member = false;
+                if (options.disconnect) await options.disconnect;
+            },
+        },
+        isSessionMode: () => game.mode === 'session',
+        isActiveSoloGame: () => game.mode === 'solo' && game.state !== 'start',
+        getCreateEligibility: () => ({ canCreateNow: true }),
+        getCreateRegionHostname: () => 'https://local.example.com',
+        getRegionHostnameById: () => 'https://local.example.com',
+        teardownMultiRegionPicker: async () => {},
+        connectToSessionHub: () => options.connect ?? Promise.resolve(),
+        activateSessionPickerUpdates: async () => {
+            pickerRestarts++;
+            sessionPicker.btnLeaveCreate.disabled = false;
+            if (options.pickerUpdates) await options.pickerUpdates;
+        },
+        applySessionMembership: entry => {
+            game.mode = 'session';
+            sessionPicker.currentSessionId = entry.session.id;
+        },
+        updatePickerButtons() {
+            sessionPicker.btnLeaveCreate.disabled = sessionPicker.operationPending === true;
+        },
+        updateCurrentSessionStatus() {}, beginSessionSnapshot() {},
+        setPickerStatus: message => notices.push(message),
+        canvas: { width: 800, height: 600 }, CONFIG: {}, WIREOPT_SCHEMAS: [],
+        AstervoidsFracture: { getAspectSeverity: () => 1 },
+        getGameWidth: () => 800, getGameHeight: () => 600,
+        buildSessionConfigMetadata: () => ({}), generateSessionSeed: () => 1,
+        OBJECT_TYPES: { GAME_STATE: 'gameState' },
+        resizeCanvas() {}, releaseIdentityInput() {},
+        returnToStartScreen: async () => {
+            game.mode = 'solo';
+            game.state = 'start';
+            sessionPicker.btnLeaveCreate.disabled = false;
+        },
+        document: { getElementById: () => ({}) }, shareDialog: { close() {} },
+        identityNotice() {}, identityMessage: () => 'Identity unavailable',
+        showIdentityDialog: () => notices.push('identity-dialog'),
+        beginIdentityFlow() {}, activateIdentityMenu() {},
+        _error: message => notices.push(message),
+        _warn: message => notices.push(message),
+    });
+    return {
+        ...functions, requests, entries, notices, game, sessionPicker, transport,
+        getPickerRestarts: () => pickerRestarts,
+    };
+}
+
+for (const kind of ['create', 'join']) {
+    const startEntry = h => kind === 'create'
+        ? h.handleCreateSession() : h.handleSelectSession('new-session');
+
+    test(`${kind} retains a click during same-identity foreground verification`, async () => {
+        const h = pickerEntrySubject();
+        h.refreshBrowserIdentity();
+        const entering = startEntry(h);
+        await settleRecovery();
+        assert.deepEqual(h.entries, [], 'entry must not use an unverified identity');
+        assert.equal(h.sessionPicker.btnLeaveCreate.disabled, true);
+        h.requests[0].resolve();
+        await entering;
+        await settleRecovery();
+        assert.deepEqual(h.entries, [{ kind, verified: true }],
+            'the original click proceeds once verification completes');
+        assert.equal(h.sessionPicker.currentSessionId, 'new-session');
+        assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+    });
+
+    test(`${kind} waits for the newest queued identity verification and coalesces repeated clicks`, async () => {
+        const h = pickerEntrySubject();
+        h.refreshBrowserIdentity();
+        const firstEntry = startEntry(h);
+        const repeatedEntry = startEntry(h);
+        h.refreshBrowserIdentity();
+        h.requests[0].resolve();
+        await settleRecovery();
+        assert.equal(h.requests.length, 2);
+        assert.deepEqual(h.entries, []);
+        h.requests[1].resolve();
+        await Promise.all([firstEntry, repeatedEntry]);
+        await settleRecovery();
+        assert.deepEqual(h.entries, [{ kind, verified: true }]);
+    });
+
+    test(`${kind} rejects duplicate submissions while the server response is pending`, async () => {
+        let finishEntry;
+        const entry = new Promise(resolve => { finishEntry = resolve; });
+        const h = pickerEntrySubject({ entry });
+        const entering = startEntry(h);
+        await settleRecovery();
+        await startEntry(h);
+        assert.deepEqual(h.entries, [{ kind, verified: true }]);
+        assert.equal(h.sessionPicker.btnLeaveCreate.disabled, true);
+        finishEntry();
+        await entering;
+        assert.equal(h.sessionPicker.operationPending, false);
+    });
+
+    test(`${kind} cannot queue a click through unresolved identity consent`, async () => {
+        const h = pickerEntrySubject();
+        h.game.identityChanging = true;
+        await startEntry(h);
+        h.game.identityChanging = false;
+        await settleRecovery();
+        assert.deepEqual(h.entries, []);
+        assert.equal(h.getPickerRestarts(), 0);
+    });
+
+    test(`${kind} rechecks identity after a regional connection handoff`, async () => {
+        let finishConnect;
+        const connect = new Promise(resolve => { finishConnect = resolve; });
+        const h = pickerEntrySubject({ regional: true, connect });
+        const entering = startEntry(h);
+        await settleRecovery();
+        h.refreshBrowserIdentity();
+        finishConnect();
+        await settleRecovery();
+        assert.deepEqual(h.entries, [], 'a new focus refresh must pause the pending entry too');
+        h.requests[0].resolve();
+        await entering;
+        assert.deepEqual(h.entries, [{ kind, verified: true }]);
+    });
+
+    test(`${kind} does not publish lobby membership until in-flight verification finishes`, async () => {
+        let finishEntry;
+        const entry = new Promise(resolve => { finishEntry = resolve; });
+        const h = pickerEntrySubject({ entry });
+        const entering = startEntry(h);
+        await settleRecovery();
+        assert.deepEqual(h.entries, [{ kind, verified: true }]);
+        h.refreshBrowserIdentity();
+        finishEntry();
+        await settleRecovery();
+        assert.equal(h.sessionPicker.currentSessionId, null);
+        h.requests[0].resolve();
+        await entering;
+        assert.equal(h.sessionPicker.currentSessionId, 'new-session');
+    });
+
+    for (const interruption of ['binding change', 'verification failure', 'cancel']) {
+        test(`${kind} discards a verification-deferred click after ${interruption}`, async () => {
+            const h = pickerEntrySubject();
+            h.refreshBrowserIdentity();
+            const entering = startEntry(h);
+            if (interruption === 'binding change') {
+                h.handlePlayerIdentityChange(second, first);
+                h.requests[0].resolve();
+            } else if (interruption === 'verification failure') {
+                h.requests[0].reject(new Error('identity_unavailable'));
+            } else {
+                h.cancelPickerOperations();
+                h.requests[0].resolve();
+            }
+            await entering;
+            await settleRecovery();
+            assert.deepEqual(h.entries, [], 'discarded clicks cannot create membership under a different identity');
+            assert.equal(h.sessionPicker.currentSessionId, null);
+            assert.equal(h.sessionPicker.operationPending, false);
+            assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+            assert.equal(h.getPickerRestarts(), 0, 'a canceled operation cannot restart the picker');
+        });
+    }
+
+    test(`${kind} cannot let a canceled verification waiter finish a newer entry`, async () => {
+        const h = pickerEntrySubject();
+        h.refreshBrowserIdentity();
+        const oldEntry = startEntry(h);
+        h.cancelPickerOperations();
+        const newEntry = startEntry(h);
+        h.requests[0].resolve();
+        await Promise.all([oldEntry, newEntry]);
+        assert.deepEqual(h.entries, [{ kind, verified: true }]);
+        assert.equal(h.getPickerRestarts(), 1);
+        assert.equal(h.sessionPicker.currentSessionId, 'new-session');
+    });
+
+    test(`${kind} releases its disabled control immediately when identity failure cancels pending entry`, async () => {
+        let finishEntry, finishDisconnect;
+        const entry = new Promise(resolve => { finishEntry = resolve; });
+        const disconnect = new Promise(resolve => { finishDisconnect = resolve; });
+        const h = pickerEntrySubject({ entry, disconnect });
+        const entering = startEntry(h);
+        await settleRecovery();
+        assert.equal(h.sessionPicker.btnLeaveCreate.disabled, true);
+        h.refreshBrowserIdentity();
+        h.requests[0].reject(new Error('identity_unavailable'));
+        await settleRecovery();
+        try {
+            assert.equal(h.game.identityChanging, true, 'verification failure still prevents new entry');
+            assert.equal(h.sessionPicker.operationPending, false);
+            assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false,
+                'the canceled button must not wait for the dead connection to stop');
+            assert.equal(h.sessionPicker.currentSessionId, null);
+            await startEntry(h);
+            assert.equal(h.sessionPicker.operationPending, false,
+                'a failed verification awaiting cleanup is not a fresh verification to queue behind');
+            assert.equal(h.entries.length, 1);
+        } finally {
+            finishEntry();
+            finishDisconnect();
+            await entering;
+            await settleRecovery();
+        }
+        assert.ok(h.notices.includes('identity-dialog'));
+        assert.equal(h.getPickerRestarts(), 0);
+    });
+
+    test(`${kind} reports a rejected result without waiting for concurrent identity verification`, async () => {
+        let finishEntry;
+        const entry = new Promise(resolve => { finishEntry = resolve; });
+        const h = pickerEntrySubject({ full: true, entry });
+        let completed = false;
+        const entering = startEntry(h).then(() => { completed = true; });
+        await settleRecovery();
+        h.refreshBrowserIdentity();
+        finishEntry();
+        await settleRecovery();
+        try {
+            assert.equal(h.game.identityChanging, true);
+            assert.equal(completed, true, 'a rejection has no membership to verify before reporting it');
+            assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+            assert.match(h.notices.at(-1), new RegExp(`^Could not ${kind}`));
+        } finally {
+            h.requests[0].resolve();
+            await entering;
+            await settleRecovery();
+        }
+    });
+
+    for (const failure of ['full', 'failure']) {
+        test(`${kind} ${failure} restores controls and reports its result without waiting for regional updates`, async () => {
+            let finishUpdates;
+            const pickerUpdates = new Promise(resolve => { finishUpdates = resolve; });
+            const h = pickerEntrySubject({ regional: true, pickerUpdates, [failure]: true });
+            let completed = false;
+            const entering = startEntry(h).then(() => { completed = true; });
+            await settleRecovery();
+            try {
+                assert.equal(completed, true, 'a slow spectator restart cannot hold the entry result');
+                assert.equal(h.sessionPicker.operationPending, false);
+                assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+                assert.equal(h.sessionPicker.currentSessionId, null);
+                const expected = failure === 'failure'
+                    ? `Failed to ${kind} session`
+                    : kind === 'create'
+                        ? 'Could not create - max sessions reached'
+                        : 'Could not join - session may be full';
+                assert.equal(h.notices.at(-1), expected);
+            } finally {
+                finishUpdates();
+                await entering;
+            }
+        });
+    }
+}
+
+function recoverySubject() {
+    const events = [];
+    const requests = [];
+    const transport = { connected: true, member: true, lastSessionId: 'recovery-session' };
+    const game = {
+        mode: 'session', state: 'playing', ship: {}, multiplayer: {},
+        connectionLost: true, identityChanging: false, playerIdentity: first,
+    };
+    const sessionPicker = { currentSessionId: transport.lastSessionId, gameStarted: true };
+    const overlay = new Set(['visible']);
+    const document = { hidden: false, getElementById: () => ({}) };
+    const functions = loadInlineGameFunctions([
+        'refreshBrowserIdentity', 'attemptAutoRejoin', 'handleReconciliationFailed',
+        'leaveIdentityGame', 'beginVoluntarySessionLeave', 'clearPickerMembership',
+        'handlePlayerIdentityChange',
+    ], {
+        game, sessionPicker, document,
+        identityStarted: true, identityBusy: false, identityRefresh: null,
+        identityRefreshRequested: false, identityLeave: null, startGameOperation: null,
+        leavingSession: false, rejoinInProgress: false, pendingRejoinSessionId: null,
+        isSessionMode: () => game.mode === 'session',
+        OBJECT_TYPES: { GAME_STATE: 'gameState' },
+        setTimeout: action => action(),
+        PlayerIdentity: {
+            resolve: () => new Promise((resolve, reject) => { requests.push({ resolve, reject }); }),
+            deactivate: () => events.push('deactivate'),
+        },
+        SessionClient: {
+            isConnected: () => transport.connected,
+            isInSession: () => transport.member,
+            getLastSessionId: () => transport.lastSessionId,
+            clearSessionState() { transport.member = false; },
+            async disconnect() {
+                events.push('disconnect');
+                transport.connected = transport.member = false;
+                transport.lastSessionId = null;
+            },
+            async joinSession(id) {
+                assert.equal(game.identityChanging, false, 'rejoin waits for verified identity');
+                events.push(['join', id]);
+                transport.member = true;
+                return {
+                    session: { id, name: 'Recovery', objects: [{ data: { type: 'gameState' } }] },
+                    member: { id: 'restored-member' },
+                };
+            },
+        },
+        ObjectSync: {
+            suspendReconciliation: () => events.push('suspend'),
+            resumeReconciliation: () => events.push('resume'),
+            getObjectByType: () => ({ data: { state: 'playing' } }),
+        },
+        connectToSessionHub: async () => {
+            assert.equal(game.identityChanging, false, 'connection replacement waits for verified identity');
+            events.push('connect');
+            transport.connected = true;
+        },
+        resetMultiplayerState: () => events.push('reset'),
+        beginSessionSnapshot() {},
+        applySessionMembership: result => { sessionPicker.currentSessionId = result.session.id; },
+        startGameFromPicker: async () => { events.push('play'); game.state = 'playing'; },
+        applyGameStateData: data => { game.state = data.state; },
+        updatePickerButtons() {}, updateCurrentSessionStatus() {},
+        setPickerStatus() {}, setPickerConnectionState() {}, resizeCanvas() {},
+        activateSessionPickerUpdates: async () => {},
+        startScreen: { classList: { remove() {} } },
+        reconnectingOverlay: { classList: { add: name => overlay.add(name), remove: name => overlay.delete(name) } },
+        cancelPickerOperations() {}, releaseIdentityInput() {},
+        returnToStartScreen: async () => {
+            game.mode = 'solo';
+            game.state = 'start';
+            game.connectionLost = false;
+            overlay.delete('visible');
+        },
+        shareDialog: { close() {} },
+        identityNotice() {},
+        identityMessage: () => 'Identity unavailable',
+        showIdentityDialog: () => events.push('identity-dialog'),
+        beginIdentityFlow() {}, activateIdentityMenu() {},
+        _log() {}, _warn() {},
+        _error: (...args) => assert.fail(`Unexpected recovery error: ${args[0]}`),
+    });
+    return { ...functions, requests, events, transport, game, document, overlay };
+}
+
+const settleRecovery = () => new Promise(resolve => setImmediate(resolve));
+const joinedSessions = subject => subject.events.filter(event => Array.isArray(event));
+
+for (const reason of ['foreground recovery', 'failed session reconciliation']) {
+    test(`identity verification resumes ${reason} even while the transport is connected`, async () => {
+        const h = recoverySubject();
+        h.refreshBrowserIdentity();
+        if (reason === 'failed session reconciliation') h.handleReconciliationFailed();
+        else await h.attemptAutoRejoin(h.transport.lastSessionId);
+        assert.equal(h.transport.connected, true);
+        assert.deepEqual(h.events, [], 'identity verification must not start a replacement connection');
+        h.requests[0].resolve();
+        await settleRecovery();
+        assert.deepEqual(joinedSessions(h), [['join', 'recovery-session']]);
+        assert.equal(h.transport.member, true);
+        assert.equal(h.game.connectionLost, false);
+        assert.equal(h.overlay.has('visible'), false);
+        assert.equal(h.events.filter(event => event === 'resume').length, 1);
+    });
+}
+
+test('queued identity refreshes keep recovery paused until the newest verification completes', async () => {
+    const h = recoverySubject();
+    h.refreshBrowserIdentity();
+    await h.attemptAutoRejoin(h.transport.lastSessionId);
+    h.refreshBrowserIdentity();
+    h.requests[0].resolve();
+    await settleRecovery();
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.game.identityChanging, true);
+    assert.deepEqual(h.events, [], 'a superseded verification must not briefly start recovery');
+    h.requests[1].resolve();
+    await settleRecovery();
+    assert.deepEqual(joinedSessions(h), [['join', 'recovery-session']]);
+    assert.equal(h.game.connectionLost, false);
+});
+
+test('identity recovery stays deferred while hidden and runs only once on return', async () => {
+    const h = recoverySubject();
+    h.document.hidden = true;
+    h.refreshBrowserIdentity();
+    await h.attemptAutoRejoin(h.transport.lastSessionId);
+    h.requests[0].resolve();
+    await settleRecovery();
+    assert.deepEqual(h.events, []);
+    h.document.hidden = false;
+    h.refreshBrowserIdentity();
+    h.requests[1].resolve();
+    await settleRecovery();
+    assert.deepEqual(joinedSessions(h), [['join', 'recovery-session']]);
+    h.refreshBrowserIdentity();
+    h.requests[2].resolve();
+    await settleRecovery();
+    assert.deepEqual(joinedSessions(h), [['join', 'recovery-session']], 'the consumed request is not replayed');
+});
+
+test('changed and unverifiable bindings discard deferred recovery instead of rejoining the old session', async () => {
+    for (const change of ['changed', 'unavailable']) {
+        const h = recoverySubject();
+        h.refreshBrowserIdentity();
+        await h.attemptAutoRejoin(h.transport.lastSessionId);
+        if (change === 'changed') {
+            h.handlePlayerIdentityChange(second, first);
+            h.requests[0].resolve();
+        } else {
+            h.requests[0].reject(new Error('identity_unavailable'));
+        }
+        await settleRecovery();
+        assert.deepEqual(joinedSessions(h), []);
+        assert.equal(h.game.mode, 'solo');
+        assert.equal(h.game.connectionLost, false);
+        assert.equal(h.transport.member, false);
+        assert.ok(h.events.includes('disconnect'));
+        if (change === 'unavailable') assert.ok(h.events.includes('identity-dialog'));
+    }
+});
+
+test('voluntary leave cannot be undone by a deferred identity recovery', async () => {
+    const h = recoverySubject();
+    h.refreshBrowserIdentity();
+    await h.attemptAutoRejoin(h.transport.lastSessionId);
+    h.beginVoluntarySessionLeave();
+    h.game.mode = 'solo';
+    h.requests[0].resolve();
+    await settleRecovery();
+    assert.deepEqual(joinedSessions(h), []);
+    assert.ok(!h.events.includes('connect'));
+});
+
+test('identity refresh distinguishes a healthy membership from a connected socket without membership', async () => {
+    for (const state of ['healthy', 'disconnected', 'not-joined']) {
+        const h = recoverySubject();
+        h.transport.connected = state !== 'disconnected';
+        h.transport.member = state === 'healthy';
+        h.refreshBrowserIdentity();
+        h.requests[0].resolve();
+        await settleRecovery();
+        assert.deepEqual(joinedSessions(h), state === 'healthy' ? [] : [['join', 'recovery-session']], state);
+    }
 });
 
 test('self links reuse backend tokens and friend creation does not replace the current binding', async () => {

@@ -422,6 +422,24 @@ for (const regionCount of [0, 1]) {
     });
 }
 
+test('picker refreshes preserve the busy entry state until it finishes', () => {
+    const h = createRegionControlsHarness();
+    h.sessionPicker.operationPending = true;
+    h.updatePickerButtons();
+    h.renderCreateRegionSelector();
+    h.updatePickerButtons();
+    assert.equal(h.sessionPicker.btnLeaveCreate.disabled, true);
+
+    Object.assign(h.sessionPicker, { currentSessionId: 'joined-session', isServer: true });
+    h.updatePickerButtons();
+    assert.equal(h.sessionPicker.btnLeaveCreate.disabled, true);
+    assert.equal(h.sessionPicker.btnStartEnter.disabled, true);
+    h.sessionPicker.operationPending = false;
+    h.updatePickerButtons();
+    assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+    assert.equal(h.sessionPicker.btnStartEnter.disabled, false);
+});
+
 test('join and create reactivate live picker updates after membership succeeds', () => {
     const joinStart = html.indexOf('async function handleSelectSession(sessionId)');
     const createStart = html.indexOf('async function handleCreateSession()');
@@ -431,10 +449,13 @@ test('join and create reactivate live picker updates after membership succeeds',
     const joinSource = html.slice(joinStart, createStart);
     const createSource = html.slice(createStart, soloStart);
     const statusBeforeActivation =
-        /updateCurrentSessionStatus\(\);[\s\S]*?await activateSessionPickerUpdates\(\);/;
+        /updateCurrentSessionStatus\(\);[\s\S]*?finally \{\s*finishPickerOperation\(isCurrentOperation, errorMessage\);/;
 
     assert.match(joinSource, statusBeforeActivation);
     assert.match(createSource, statusBeforeActivation);
+    assert.match(extractFunctionSource('finishPickerOperation'),
+        /void activateSessionPickerUpdates\(\)\.catch\(/,
+        'picker startup failures are reported without keeping the entry operation pending');
 });
 
 test('create is guarded by regional readiness and avoids a global refresh during handoff', () => {
@@ -602,7 +623,7 @@ test('voluntary leave bookkeeping blocks rejoin synchronously without clearing p
     const { beginVoluntarySessionLeave, attemptAutoRejoin } = loadInlineGameFunctions([
         'clearPickerMembership', 'beginVoluntarySessionLeave', 'attemptAutoRejoin',
     ], {
-        sessionPicker, leavingSession: false, rejoinInProgress: false,
+        sessionPicker, leavingSession: false, rejoinInProgress: false, pendingRejoinSessionId: 's',
         isSessionMode: () => true,
         _log: (...args) => logs.push(args),
     });
@@ -718,8 +739,10 @@ test('leave and rejoin paths keep guards and reset-before-snapshot ordering expl
     }
     for (const name of ['handleSelectSession', 'handleCreateSession']) {
         const source = extractFunctionSource(name);
-        assert.match(source, /if \(!isCurrentOperation\(\)\) \{[\s\S]*?return;[\s\S]*?beginSessionSnapshot\(result\);/);
+        assert.match(source, /if \(!isCurrentOperation\(\) \|\| \(result && !await waitForPickerIdentity\(isCurrentOperation\)\)\) \{[\s\S]*?return;[\s\S]*?beginSessionSnapshot\(result\);/);
         assert.ok(source.indexOf('beginSessionSnapshot(result);')
             < source.indexOf('applySessionMembership(result);'));
     }
+    assert.match(extractFunctionSource('waitForPickerIdentity'),
+        /return isCurrentOperation\(\) && !game\.identityChanging;/);
 });
