@@ -322,6 +322,106 @@ test('regional create readiness waits for every assessment but accepts concluded
     }, 'all-unavailable regions must not leave an enabled Create target');
 });
 
+function createRegionControlsHarness(regionCount = 2) {
+    const handlers = [];
+    const select = {
+        style: {}, dataset: {}, options: [],
+        set innerHTML(_) { this.options = []; },
+        appendChild(option) { this.options.push(option); },
+        addEventListener: (_, handler) => handlers.push(handler),
+    };
+    const button = () => ({
+        style: {}, disabled: false, textContent: '',
+        removeAttribute() {}, replaceWith() {}, addEventListener() {},
+        cloneNode() {
+            return Object.assign(button(), {
+                textContent: this.textContent, disabled: this.disabled,
+                className: this.className, title: this.title,
+            });
+        },
+    });
+    const regions = [
+        { id: 'first', displayName: 'First region' },
+        { id: 'second', displayName: 'Second region' },
+    ].slice(0, regionCount);
+    const sessionPicker = {
+        regions, currentSessionId: null, isServer: false, gameStarted: false,
+        canCreate: true, connected: true, selectedCreateRegion: regions.at(-1)?.id ?? null,
+        userOverrodeCreateRegion: true,
+        createRegionRowEl: { style: { display: 'none' } },
+        createRegionSelectEl: select,
+        btnLeaveCreate: button(), btnStartEnter: button(),
+    };
+    const functions = loadInlineGameFunctions([
+        'updateCreateRegionSelectorVisibility', 'renderCreateRegionSelector',
+        'updatePickerButtons', 'clearPickerMembership',
+    ], {
+        sessionPicker, isSessionPickerVisible: () => true,
+        getRegionalCreateReadiness: () => ({ assessmentsComplete: true, hasAvailableRegion: true }),
+        isCreateRegionAvailable: id => regions.some(region => region.id === id),
+        getCreateEligibility: () => ({ canCreateNow: true, regionId: 'first' }),
+        getCreateRegionDisplayName: () => null,
+        pingForRegion: () => ({ state: 'settled', valueMs: 10 }),
+        window: { RegionService: { bestRegion: () => 'first' } },
+        document: { createElement: () => ({}) },
+        handleLeaveCreateButton() {},
+    });
+    return { ...functions, sessionPicker, select, handlers };
+}
+
+for (const role of [
+    { name: 'creator waiting to start', isServer: true, gameStarted: false, action: 'Start' },
+    { name: 'member waiting for start', isServer: false, gameStarted: false, action: 'Enter' },
+    { name: 'member waiting to enter', isServer: false, gameStarted: true, action: 'Enter' },
+    { name: 'promoted host waiting to enter', isServer: true, gameStarted: true, action: 'Enter' },
+]) {
+    test(`host region controls hide for ${role.name} and return after leaving`, () => {
+        const h = createRegionControlsHarness();
+        h.renderCreateRegionSelector();
+        assert.equal(h.sessionPicker.createRegionRowEl.style.display, '');
+        assert.equal(h.sessionPicker.selectedCreateRegion, 'second');
+
+        Object.assign(h.sessionPicker, role, { currentSessionId: 'joined-session' });
+        h.updatePickerButtons();
+        assert.equal(h.sessionPicker.createRegionRowEl.style.display, 'none',
+            'the membership/button transition must immediately hide the label and select');
+        assert.equal(h.sessionPicker.btnLeaveCreate.textContent, 'Leave');
+        assert.equal(h.sessionPicker.btnLeaveCreate.disabled, false);
+        assert.equal(h.sessionPicker.btnStartEnter.style.display, '');
+        assert.equal(h.sessionPicker.btnStartEnter.textContent, role.action);
+        assert.equal(h.sessionPicker.btnStartEnter.disabled, !role.isServer && !role.gameStarted);
+
+        h.renderCreateRegionSelector();
+        assert.equal(h.sessionPicker.createRegionRowEl.style.display, 'none',
+            'a later regional refresh cannot restore joined-session hosting controls');
+        h.sessionPicker.connected = false;
+        h.updatePickerButtons();
+        assert.equal(h.sessionPicker.createRegionRowEl.style.display, 'none',
+            'a reconnect retains membership even while the transport is unavailable');
+
+        h.clearPickerMembership();
+        h.sessionPicker.connected = true;
+        h.updatePickerButtons();
+        assert.equal(h.sessionPicker.createRegionRowEl.style.display, '');
+        assert.equal(h.sessionPicker.selectedCreateRegion, 'second', 'leaving preserves the chosen region');
+        assert.equal(h.select.options.find(option => option.selected)?.value, 'second');
+        assert.equal(h.handlers.length, 1, 'refreshing controls does not duplicate change handlers');
+        assert.equal(h.sessionPicker.btnStartEnter.style.display, 'none');
+    });
+}
+
+for (const regionCount of [0, 1]) {
+    test(`${regionCount} region(s) never show host region controls, including after leaving`, () => {
+        const h = createRegionControlsHarness(regionCount);
+        for (const sessionId of [null, 'joined-session', null]) {
+            h.sessionPicker.currentSessionId = sessionId;
+            h.updatePickerButtons();
+            h.renderCreateRegionSelector();
+            assert.equal(h.sessionPicker.createRegionRowEl.style.display, 'none');
+        }
+    });
+}
+
 test('join and create reactivate live picker updates after membership succeeds', () => {
     const joinStart = html.indexOf('async function handleSelectSession(sessionId)');
     const createStart = html.indexOf('async function handleCreateSession()');

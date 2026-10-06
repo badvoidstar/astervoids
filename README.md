@@ -25,7 +25,10 @@ Landscape columns share top and bottom edges: device controls sit at the top,
 and the invitation pair aligns with the bottom play actions. Optional controls
 collapse naturally without reserved empty button slots. Regional create buttons
 put the destination on a second line, ellipsized when necessary; the Host region
-selector and accessible button label retain the full name.
+selector and accessible button label retain the full name. The Host region label
+and picker are shown only before joining or creating a session in a multi-region
+deployment. While waiting to Start or Enter, only the applicable session actions
+remain; leaving restores the region picker and its valid selection.
 
 **Treat a self link like a password:** anyone possessing an accepted invite can
 use that identity. Confirmation is protection against accidental switches, not
