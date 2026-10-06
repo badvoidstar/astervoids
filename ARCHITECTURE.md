@@ -191,7 +191,7 @@ A runtime record includes identity, type/data, creator, owner, scope, version,
 ObjectSync's type index avoids scanning every object for each type query.
 `getObjectsByTypeSnapshot` transfers a membership array, not deep-cloned
 records. Runtime passes preserve callback-mutation safety and canonical record
-identity; optional legacy stores are snapshotted defensively.
+identity; generic stores that expose only an iterable are snapshotted defensively.
 
 ### Portability boundary
 
@@ -277,7 +277,14 @@ SessionClient serializes session transitions and fences asynchronous work with
 connection identity and session epochs. Create and join have distinct RPCs and
 snapshots. Membership and object broadcasts can overtake their response, so
 SessionClient queues raw arguments together until the response installs the
-creator's schema registry. Snapshot decoding first teaches GUID/handle mappings;
+creator's schema registry. Before installing it, SessionClient calls the
+game-injected synchronous metadata validator. Astervoids requires the exact
+current definitions of schemas 1–4; older, missing, reordered-field, or extended
+layouts fail through the entry error/`onError` path, not a reduced-feature game.
+An accepted but rejected entry releases its allocated membership with
+`LeaveSession`; an ambiguous cleanup closes that connection. Epoch guards prevent
+an obsolete rejection from clearing a newer entry.
+Snapshot decoding first teaches GUID/handle mappings;
 shared entry completion then installs member and public participant identity,
 seeds snapshot objects, and replays queued handlers and callbacks in receive order.
 
@@ -333,11 +340,12 @@ stop waits, and resumes reconciliation on completion. Hidden tabs defer full
 rejoin until visible. A long background interval can force rejoin even if a
 connection appeared healthy.
 
-Rejoin can assign a new member ID and recreate member-scoped objects. In
-identity-capable sessions, a resolved public player identity is pinned before
-snapshot callbacks and remains fixed for that membership. Guests and older
-schema sessions use the bounded per-tab, per-session participant mapping that
-survives reload/rejoin. Neither participant identity is the reconnect credential.
+Rejoin can assign a new member ID and recreate member-scoped objects. A resolved
+public player identity is pinned before snapshot callbacks and remains fixed
+for that membership. Guests use the bounded per-tab, per-session participant
+mapping that survives reload/rejoin. Guest mode is a current product option,
+not an older-schema fallback. Neither participant identity is the reconnect
+credential.
 
 Restore the role the client actually held, based on whether it owned a ship.
 A lobby spectator can read `playing` from GameState without being a player.
@@ -361,7 +369,7 @@ or GameState record.
 | Browser credential | Random 256-bit bearer capability in `localStorage`, scoped to one top-level origin and browser profile/storage context |
 | Browser binding | One credential-hash row pointing to zero or one public identity, with an ETag and monotonic revision |
 | Invitation | Random 256-bit base64url capability; identifies a pending player until first naming, then remains that identity's access/recovery link |
-| Session participant | Public identity pinned when the session schema supports it, otherwise the existing session-local fallback; not an authentication proof |
+| Session participant | Public identity pinned for the membership, or the session-local guest identity; not an authentication proof |
 
 An identity can have any number of independent browser bindings, not a growing
 binding array. Self invitations return the original capability. Possession of
@@ -918,7 +926,7 @@ serialization.
 
 ### Personal score history and departure
 
-In capable sessions, GameState carries `participantScores`, `participantNumbers`,
+GameState carries `participantScores`, `participantNumbers`,
 and `participantTags`, keyed by normalized participant GUID. The **GameState
 owner**, not necessarily the `Server` member, registers every observed ship
 participant at zero, including fatal entrants and terminal/departure inputs.
@@ -951,6 +959,11 @@ is visibly unavailable; a sum different from the persisted team total is not
 presented as complete attribution. Tag validation/cache failure is separate:
 unavailable names become `Unknown` without hiding otherwise valid scores.
 Caches inspect private snapshots, including same-version/in-place mutations.
+Fresh GameState creation initializes all six packed ledgers. The owner refuses
+publication and effects when score history is missing/incomplete or entry-life
+history disagrees with its paid count; it never silently publishes a team-only
+older contract. The pure calculator can still omit personal history for local
+fatal-hit prediction, which is not a publication path.
 
 ### HUD and final standings
 
@@ -959,8 +972,8 @@ Multiplayer shows `Your Score: value : player tag` above
 persisted participant total plus positive unprocessed ship counters; it is not
 another accumulator. Tags come from the membership-pinned public identity and
 replicated history, not current rank, member position, or per-frame HTTP lookup.
-Older score-capable sessions without tag slots retain `Player N`/`Spectator`
-labels. Named spectators keep their tag but have no personal score.
+Names never fall back to ordinal-based `Player N` labels. Named spectators keep
+their tag but have no personal score; unnamed participants show `Unknown`.
 
 Final standings replace the multiplayer playing HUD. They use persisted history,
 including departed and zero-score participants, sorted by score descending,
@@ -972,8 +985,8 @@ the team total even when their row is outside that limit. Pure spectators show
 Capacity comes from a matching session advertisement and survives same-session
 reentry. If absent, one lookup per entry uses the already joined hub's
 `getActiveSessions`; unknown capacity defers rows, not the full team total or a
-known personal total. Older GameState owners are not guaranteed to maintain new
-histories; consumers show unavailable data rather than fabricate it.
+known personal total. Consumers show unavailable data for inconsistent histories
+rather than fabricating missing attribution.
 
 HUD and native HTML/CSS overlays fit the creator-aspect gameplay viewport, not
 letterbox margins or the surrounding browser window. Narrow HUDs move Wave/Lives
@@ -1241,6 +1254,11 @@ join, and recovery paths.
 Typed GUIDs use 16-byte binary values. SessionClient translates compact transport
 shapes to named JS objects, including a versions map for ObjectSync. That
 game-facing map must not be confused with the positional wire acknowledgement.
+Wire object/response tuples require their current field counts; keyed pre-compact
+objects, pre-handle full objects, raw pre-envelope data dictionaries, string wire
+enums, and dictionary-shaped GUID-pair collections are not accepted. Named
+session responses and named game-facing objects remain the current API.
+Absent optional lifecycle metadata and sparse object data remain valid.
 Serialization uses the configured MessagePack resolvers and untrusted-data
 security setting; HTTP APIs separately use camelCase JSON.
 
@@ -1280,9 +1298,12 @@ publishes definitions in session metadata. The server's
 [SyncSchemaRegistry](AstervoidsWeb/Hubs/SyncSchemaRegistry.cs) is session-scoped.
 Create/join/rejoin install the returned registry before decoding snapshots or
 queued live payloads, following [entry ordering](#entry-and-recovery).
-Missing schema metadata clears positional registrations and retains schema 0,
-not the previous session/startup layout. Duplicate IDs reject registration
-rather than silently overwriting an earlier descriptor.
+For generic SessionClient consumers without the Astervoids validator, missing
+schema metadata clears positional registrations and retains schema 0, not the
+previous session/startup layout. Astervoids rejects that missing game contract.
+Registry replacement validates the entire lower-case `{ id, fields }` descriptor
+set before installing it; duplicate IDs and old `Id`/`Fields` aliases reject
+rather than silently overwriting or partially installing definitions.
 
 Schema 0 is a generic MessagePack-map extension path. It preserves supported
 nested maps, arrays, nulls, bytes, and unknown fields. Current Astervoids object
@@ -1299,15 +1320,20 @@ Each known type has **one superset schema** across live modes, create, update,
 replace, and terminal publication. The backend retains the object's creation
 schema for later re-encoding; an update-only field absent from that schema
 would disappear from recovery snapshots.
+Missing positional registrations now fail encoding rather than downgrading
+stored objects to schema 0. Empty positional writes likewise retain their
+selected schema. Schema 0 is selected explicitly (or by a generic caller's
+default), never to repair an unsupported positional contract.
 
-GameState preserves original slots 0-15 and appends optional `bytes` fields:
+GameState preserves slots 0-15 and has `bytes` fields:
 `participantScores` at 16, `participantNumbers` at 17, and `participantTags` at 18.
 Ship appends `participantTag: str` at slot 27 after `participantId: guid` at 26;
 its presence mask remains four bytes. The nineteen-slot GameState mask is three
-bytes, but a creator's older sixteen-slot registry retains its two-byte mask on
-both updates and snapshots. Joining a session never silently upgrades its layout.
-Game capability checks inspect the advertised slots, not just a local build's
-field list. Ship tags are created once, not sent on every pose update.
+bytes. The game validates every field name, type, position, and field count in
+all four advertised definitions, not just the score/tag slots. Sixteen- and
+eighteen-slot GameState generations and older Ship definitions are unsupported.
+Schema-list order and additional distinct generic schemas do not change the
+game contract. Ship tags are created once, not sent on every pose update.
 
 ```text
 schema payload = presence mask of ceil(fieldCount / 8) bytes
@@ -1350,7 +1376,11 @@ game-specific nested packing:
 
 - Seeded asteroids can regenerate their initial polygon from the seed and
   session-locked geometry settings. Explicit fracture geometry uses four bytes
-  per polar vertex: wrapped angle plus normalized distance.
+  per polar vertex: wrapped angle plus normalized distance. Old unpacked vertex
+  arrays are rejected. Malformed explicit geometry is ignored by the game adapter,
+  not replaced with an invented seeded polygon. Rejection emits a payload-free
+  debug warning once per record/version; weak record keys do not retain discarded
+  records. Repaired geometry can be adopted normally, including same-version repairs.
 - Counter ledgers sort entries by GUID and encode 16-byte identity plus
   little-endian uint32. Personal-score/number maps normalize GUIDs and validate
   nonnegative scores, positive ordinals, matching participants, and duplicate
@@ -1358,6 +1388,9 @@ game-specific nested packing:
 - Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
   ASCII length, and 1-8 tag bytes. Invalid/duplicate entries or truncated bytes
   reject; tag failure must not erase valid score history.
+- Game ledger readers require packed bytes, not older dictionary-shaped wire
+  fields. Decoded calculation maps are still ordinary objects. Duplicate packed
+  counter entries reject rather than overwrite one another.
 - Event payload maps are aliased and MessagePack-encoded once by the sender.
   The hub relays opaque bytes; the receiver expands aliases before dispatch.
 
@@ -1377,6 +1410,30 @@ deleted parent or the owner's RNG cursor. Seed-recipe compression was evaluated
 but not adopted: at existing geometry defaults, the small compressed-traffic
 saving did not justify another geometry format and its compatibility cost.
 No event-seed recipe payload is supported or being introduced.
+
+### Current-schema cleanup inventory
+
+Removed compatibility paths are the mixed-generation game capability gates,
+score-only/tagless creation and publication, ordinal name fallbacks, old unpacked
+game fields, pre-compact/pre-envelope DTO acceptance, descriptor casing aliases,
+and positional-to-dictionary downgrades. The current positional layouts and
+cross-language bytes are unchanged; no event, extra full snapshot, or render-loop
+send was added.
+
+Deliberately retained:
+
+- Schema-0 dictionaries, arbitrary session-defined positional schemas, and
+  pre-encoded current envelopes are reusable transport features. The backend
+  remains unaware of Astervoids fields and does not enforce game schema IDs.
+- Presence masks, missing terminal targets, partial lifecycle metadata,
+  nullable slots, malformed-data rejection, stale-epoch fences, snapshot
+  recovery, ownership migration, and confirmation/retry rules are current
+  correctness requirements, not legacy-client support.
+- Guest identity, both buffered and deterministic simulation, polygon fracture
+  and the selectable disk split, and same-origin single-region routing remain
+  supported even where older comments describe their origins as “legacy.”
+- The score-motion fix remains: an unconfirmed score queues the latest motion
+  snapshot, while confirmed scores add no steady-state pose traffic.
 
 ## Infrastructure and deployment
 

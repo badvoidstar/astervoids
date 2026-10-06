@@ -271,7 +271,7 @@ test('cross-wire: invulnerability transition and capture time have canonical byt
     assert.equal(Buffer.from(SchemaCodec.encode(schema, data)).toString('hex'), hex);
 });
 
-test('cross-wire: eighteen-slot GameState preserves terminal slots with a three-byte mask', () => {
+test('cross-wire: current GameState preserves terminal slots with a three-byte mask', () => {
     freshRegistry();
     const schema = SchemaCodec.register(4, GAME_STATE_SCHEMA_FIELDS);
     const data = {
@@ -297,14 +297,12 @@ test('cross-wire: personal score and number maps use optional slots sixteen and 
     assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5);
 });
 
-test('cross-wire: the creator sixteen-slot registry still decodes its original two-byte mask', () => {
+test('cross-wire: independent custom registries keep their own positional layouts', () => {
     freshRegistry();
-    const schema = SchemaCodec.register(4, GAME_STATE_SCHEMA_FIELDS.slice(0, 16));
-    const hex = '1098' + '0000' + '0000000000408f40' + '0000000000589b40'
-        + '33221100554477668899aabbccddeeff';
-    const decoded = SchemaCodec.decode(schema, hexToBytes(hex));
-    assert.equal(decoded.terminalShipId, '00112233-4455-6677-8899-aabbccddeeff');
-    assert.equal(decoded.lives, 0);
-    assert.equal('participantScores' in decoded, false);
-    assert.equal(Buffer.from(SchemaCodec.encode(schema, decoded)).toString('hex'), hex);
+    const counter = SchemaCodec.normalizeSchema(29, [['value', 'u32']]);
+    const label = SchemaCodec.normalizeSchema(29, [['label', 'str']]);
+    assert.deepEqual(SchemaCodec.decode(counter, hexToBytes('011e000000')), { value: 30 });
+    assert.deepEqual(SchemaCodec.decode(label, hexToBytes('010600776964676574')), { label: 'widget' });
+    assert.equal(Buffer.from(SchemaCodec.encode(counter, { value: 30 })).toString('hex'), '011e000000');
+    assert.equal(Buffer.from(SchemaCodec.encode(label, { label: 'widget' })).toString('hex'), '010600776964676574');
 });

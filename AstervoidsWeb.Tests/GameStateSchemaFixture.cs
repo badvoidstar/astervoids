@@ -27,9 +27,6 @@ internal static class GameStateSchemaFixture
         new("participantTags", "bytes"),
     ]);
 
-    internal static readonly PositionalSchemaCodec.Schema Legacy =
-        new(4, Current.Fields.Take(16).ToArray());
-
     internal const string ScoreEntries =
         "33221100554477668899aabbccddeeff00000000" +
         "443322116655887799aabbccddeeff0040e20100";

@@ -87,6 +87,21 @@ const AstervoidsWireSchemas = (function() {
         gameState: 4,
     });
 
+    function requireCurrentSchemas(metadata) {
+        const definitions = metadata?.schemas;
+        if (!Array.isArray(definitions)
+            || new Set(definitions.map(schema => schema?.id)).size !== definitions.length
+            || SCHEMAS.some(expected => {
+                const fields = definitions.find(schema => schema?.id === expected.id)?.fields;
+                return !Array.isArray(fields) || fields.length !== expected.fields.length
+                    || expected.fields.some(([name, type], index) =>
+                        !Array.isArray(fields[index]) || fields[index].length !== 2
+                        || fields[index][0] !== name || fields[index][1] !== type);
+            })) {
+            throw new Error('Unsupported Astervoids session schemas. Create a new session with the current game.');
+        }
+    }
+
     function selectSchemaId(data, kind, context) {
         let type = data?.type;
         if (kind === 'update') {
@@ -100,6 +115,7 @@ const AstervoidsWireSchemas = (function() {
     return Object.freeze({
         SCHEMAS,
         SCHEMA_BY_OBJECT_TYPE,
+        requireCurrentSchemas,
         selectSchemaId,
     });
 })();

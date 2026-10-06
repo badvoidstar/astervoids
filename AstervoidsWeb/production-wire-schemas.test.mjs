@@ -37,6 +37,34 @@ test('known gameplay objects each have one positional schema', () => {
     });
 });
 
+test('game entry requires the exact current schemas, independent of registry ordering', () => {
+    WireSchemas.requireCurrentSchemas({ schemas: [...WireSchemas.SCHEMAS].reverse() });
+    WireSchemas.requireCurrentSchemas({
+        schemas: [...WireSchemas.SCHEMAS, { id: 29, fields: [['value', 'u32']] }],
+    });
+    for (const metadata of [undefined, {}, { schemas: [] }, { schemas: {} }]) {
+        assert.throws(() => WireSchemas.requireCurrentSchemas(metadata), /Unsupported Astervoids session schemas/);
+    }
+    for (const expected of WireSchemas.SCHEMAS) {
+        for (const fields of [
+            expected.fields.slice(0, -1),
+            [...expected.fields, ['extra', 'u8']],
+            expected.fields.map((field, i) => i === 1 ? [field[0], 'f64'] : field),
+            [expected.fields[1], expected.fields[0], ...expected.fields.slice(2)],
+        ]) {
+            assert.throws(() => WireSchemas.requireCurrentSchemas({
+                schemas: WireSchemas.SCHEMAS.map(schema => schema.id === expected.id
+                    ? { ...schema, fields } : schema),
+            }), /Unsupported Astervoids session schemas/);
+        }
+    }
+    assert.throws(() => WireSchemas.requireCurrentSchemas({
+        schemas: [...WireSchemas.SCHEMAS, WireSchemas.SCHEMAS[0]],
+    }), /Unsupported Astervoids session schemas/);
+    assert.match(source, /SessionClient\.setSessionMetadataValidator\(AstervoidsWireSchemas\.requireCurrentSchemas\)/);
+    assert.match(source, /SessionClient\.setParticipantIdentityResolver\(\(\) => PlayerIdentity\.current\(\)\)/);
+});
+
 test('unified ship schema carries adaptive, replay, identity, and terminal subsets', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(1);
@@ -266,7 +294,7 @@ test('fresh GameState producer initializes six empty ledgers with a sixty-nine-b
         speedMultiplier: 1, waveDelayTimer: 0, multiplayer: {},
     };
     const { createSyncedGameState } = loadInlineGameFunctions([
-        'createSyncedGameState', 'hasParticipantScoreSchema',
+        'createSyncedGameState',
     ], {
         game, OBJECT_TYPES: { GAME_STATE: 'gameState' }, AstervoidsWireCodec: WireCodec,
         isSessionMode: () => true,

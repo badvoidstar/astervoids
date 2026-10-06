@@ -7,24 +7,9 @@ using Xunit;
 namespace AstervoidsWeb.Tests;
 
 /// <summary>
-/// Phase 4E regression tests for the registry-aware re-encode path.
-///
-/// Pre-4E, <c>SessionHub.ToObjectInfo</c> always called the parameterless
-/// <c>SyncPayloadCodec.EncodeDict(dict)</c> which collapsed every broadcast
-/// payload to SchemaId=0 (legacy MessagePack), even when the sender had
-/// already paid the cost of registering a positional schema. The wire-size
-/// win from Phase 4D survived only on <c>OnObjectsUpdated</c> (which forwards
-/// sender bytes verbatim); CreateObject responses, OnObjectReplaced, and
-/// JoinSession snapshots all reverted to the bulkier MessagePack form.
-///
-/// Post-4E, the inbound payload's SchemaId rides on
-/// <see cref="SessionObject.SchemaId"/> through storage. ToObjectInfo
-/// re-encodes via the new
-/// <see cref="SyncPayloadCodec.EncodeDict(byte, Dictionary{string, object?}?, SyncSchemaRegistry, Guid)"/>
-/// overload which replays the positional encoding for SchemaId&gt;=1 and falls
-/// back to legacy MessagePack for SchemaId=0 or when the schema isn't
-/// registered (defensive fallback so a misconfigured session can't lose
-/// state on broadcast).
+/// Registry-aware re-encoding preserves each object's chosen schema through
+/// responses, replacements and snapshots. Only explicit schema 0 records use
+/// generic dictionaries; a missing positional registration is an error.
 /// </summary>
 public class SyncPayloadCodecRegistryTests : TestBase
 {
@@ -58,6 +43,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
             new PositionalSchemaCodec.FieldSpec("terminalAngle", "f64"),
             new PositionalSchemaCodec.FieldSpec("invulnerabilityRevision", "u32"),
             new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
+            new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
+            new PositionalSchemaCodec.FieldSpec("participantTag", "str"),
         });
 
     private static Dictionary<string, object?> ShipCreateDict() => new()
@@ -80,7 +67,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
     };
 
     [Fact]
-    public void EncodeDict_SchemaId0_AlwaysFallsBackToLegacyMessagePack()
+    public void EncodeDict_SchemaId0_UsesGenericMessagePack()
     {
         var registry = new SyncSchemaRegistry();
         var sessionId = Guid.NewGuid();
@@ -88,8 +75,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
 
         var payload = SyncPayloadCodec.EncodeDict(0, ShipCreateDict(), registry, sessionId);
 
-        payload.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
-        // Round-trip via legacy decoder must reproduce the dict.
+        payload.SchemaId.Should().Be(SyncPayloadCodec.DictionarySchemaId);
+        // Round-trip via the dictionary decoder must reproduce the dict.
         var decoded = SyncPayloadCodec.DecodeDict(payload);
         decoded["type"].Should().Be("ship");
         decoded["x"].Should().Be(0.5);
@@ -110,9 +97,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
         // Positional must be byte-identical to a direct PositionalSchemaCodec.Encode call.
         var expected = PositionalSchemaCodec.Encode(schema, ShipCreateDict());
         payload.Data.Should().BeEquivalentTo(expected);
-        // And materially smaller than the legacy fallback (~20-30 byte savings on this 3-field shape).
-        var legacy = SyncPayloadCodec.EncodeDict(ShipCreateDict());
-        payload.Data!.Length.Should().BeLessThan(legacy.Data!.Length,
+        var dictionary = SyncPayloadCodec.EncodeDict(ShipCreateDict());
+        payload.Data!.Length.Should().BeLessThan(dictionary.Data!.Length,
             "positional encoding must be smaller than MessagePack for non-trivial dicts");
     }
 
@@ -133,31 +119,41 @@ public class SyncPayloadCodecRegistryTests : TestBase
     }
 
     [Fact]
-    public void EncodeDict_UnregisteredSchema_FallsBackToLegacyDictDefensively()
+    public void EncodeDict_UnregisteredSchema_RejectsInsteadOfDowngrading()
     {
         var registry = new SyncSchemaRegistry();
         var sessionId = Guid.NewGuid();
-        // Note: no schemas registered for this session at all.
-
-        var payload = SyncPayloadCodec.EncodeDict(42, ShipCreateDict(), registry, sessionId);
-
-        // Falls back rather than throwing: receivers route on the envelope's
-        // SchemaId, so a SchemaId=0 fallback is decodable by every peer.
-        // Throwing here would crash the broadcast and risk leaking state.
-        payload.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
-        var decoded = SyncPayloadCodec.DecodeDict(payload);
-        decoded.Should().ContainKey("type").WhoseValue.Should().Be("ship");
+        var encode = () => SyncPayloadCodec.EncodeDict(42, ShipCreateDict(), registry, sessionId);
+        encode.Should().Throw<InvalidOperationException>().WithMessage("*No schema registered*");
     }
 
     [Fact]
-    public void EncodeDict_NullRegistry_FallsBackToLegacyDict()
+    public void EncodeDict_NullRegistry_RejectsPositionalButAllowsExplicitDictionary()
     {
-        // Defensive: ToObjectInfo callers shouldn't pass null but the overload
-        // tolerates it so a partially-wired test or future call site doesn't
-        // NRE inside a broadcast.
-        var payload = SyncPayloadCodec.EncodeDict(1, ShipCreateDict(), null, Guid.NewGuid());
+        var encode = () => SyncPayloadCodec.EncodeDict(1, ShipCreateDict(), null, Guid.NewGuid());
+        encode.Should().Throw<InvalidOperationException>().WithMessage("*No schema registered*");
+        SyncPayloadCodec.EncodeDict(0, ShipCreateDict(), null, Guid.NewGuid())
+            .SchemaId.Should().Be(SyncPayloadCodec.DictionarySchemaId);
+    }
 
-        payload.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
+    [Fact]
+    public void EncodeDict_ClearedRegistryCannotChangeAPersistedObjectsSchema()
+    {
+        var registry = new SyncSchemaRegistry();
+        var sessionId = Guid.NewGuid();
+        registry.SetSessionSchemas(sessionId, [ShipSchema()]);
+        registry.ClearSession(sessionId);
+        var encode = () => SyncPayloadCodec.EncodeDict(1, ShipCreateDict(), registry, sessionId);
+        encode.Should().Throw<InvalidOperationException>().WithMessage("*No schema registered*");
+    }
+
+    [Fact]
+    public void DecodeDict_NilDictionaryIsRejectedButAbsentPayloadRemainsEmpty()
+    {
+        var decode = () => SyncPayloadCodec.DecodeDict(new SyncPayload(0, [0xc0]));
+        decode.Should().Throw<InvalidOperationException>().WithMessage("*must contain a dictionary*");
+        SyncPayloadCodec.DecodeDict(new SyncPayload(0, [])).Should().BeEmpty();
+        SyncPayloadCodec.DecodeDict(new SyncPayload(0, null!)).Should().BeEmpty();
     }
 
     [Fact]
@@ -181,9 +177,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
     [Fact]
     public void ObjectService_CreateObject_DefaultsSchemaIdToZero()
     {
-        // Existing callers that don't pass schemaId keep the legacy
-        // SchemaId=0 behavior. Backward-compat for every test in the suite
-        // (and for any future caller that creates server-side objects).
+        // Server-side and generic callers can create dictionary-backed records.
         var (session, creator) = CreateTestSession();
 
         var obj = ObjectService.CreateObject(
@@ -213,7 +207,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
                 },
                 ["bytes"] = new byte[] { 0, 127, 128, 255 }
             },
-            schemaId: SyncPayloadCodec.LegacyDictSchemaId)!;
+            schemaId: SyncPayloadCodec.DictionarySchemaId)!;
 
         obj = ObjectService.UpdateObject(
             session.Id,
@@ -224,7 +218,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
             obj.SchemaId, obj.Data, registry, session.Id);
         var decoded = SyncPayloadCodec.DecodeDict(snapshot);
 
-        snapshot.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
+        snapshot.SchemaId.Should().Be(SyncPayloadCodec.DictionarySchemaId);
         decoded["type"].Should().Be("generic-widget");
         Convert.ToInt64(decoded["revision"]).Should().Be(2);
         decoded["bytes"].Should().BeEquivalentTo(new byte[] { 0, 127, 128, 255 });
@@ -333,8 +327,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
     [Fact]
     public void ReplacementObjectSpec_DefaultsSchemaIdToZero()
     {
-        // Default constructor compatibility: pre-Phase-4E ReplaceObject call
-        // sites that don't supply SchemaId continue to get the legacy path.
+        // Replacement records also support the generic dictionary transport.
         var spec = new ReplacementObjectSpec(ObjectScope.Session, ShipCreateDict());
         spec.SchemaId.Should().Be(0);
     }

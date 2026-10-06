@@ -15,7 +15,7 @@ namespace AstervoidsWeb.Tests;
 /// <c>wwwroot/js/msgpack-codec.js</c>; C# encodes via the standard
 /// <see cref="MessagePackSerializer"/> with
 /// <see cref="ContractlessStandardResolver"/>. The two MUST agree on
-/// the wire format for SchemaId=0 (legacy MessagePack-encoded dict).
+/// the wire format for SchemaId=0 (generic MessagePack-encoded dictionary).
 ///
 /// These tests:
 /// 1. Pin C# encoder output to a known hex string for a handful of
@@ -187,7 +187,7 @@ public class SyncPayloadCrossWireFixturesTests
         var payload = SyncPayloadCodec.EncodeDict(original);
         var decoded = SyncPayloadCodec.DecodeDict(payload);
 
-        payload.SchemaId.Should().Be(SyncPayloadCodec.LegacyDictSchemaId);
+        payload.SchemaId.Should().Be(SyncPayloadCodec.DictionarySchemaId);
         decoded["type"].Should().Be("generic-widget");
         decoded["bytes"].Should().BeEquivalentTo(new byte[] { 0, 127, 128, 255 });
         decoded["nested"].Should().NotBeNull();

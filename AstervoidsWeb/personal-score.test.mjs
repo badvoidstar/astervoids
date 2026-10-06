@@ -8,15 +8,15 @@ import { loadClassicModule } from './test-support/classic-module.mjs';
 const require = createRequire(import.meta.url);
 const GuidUtils = require('./wwwroot/js/guid-utils.js');
 const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
-const { SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
-const SCORE_ONLY_SCHEMAS = SCHEMAS.map(schema => schema.id === 4
-    ? { ...schema, fields: schema.fields.slice(0, 18) }
-    : schema.id === 1 ? { ...schema, fields: schema.fields.slice(0, 27) } : schema);
+const { SCHEMAS, requireCurrentSchemas } = require('./wwwroot/js/game-wire-schemas.js');
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const id = number => `${number.toString(16).padStart(8, '0')}-1111-2222-3333-aabbccddeeff`;
 const participantA = id(1);
 const participantB = id(2);
 const participantC = id(3);
+const tagForParticipant = participantId => `Pilot${parseInt(participantId.slice(0, 8), 16)}`;
+const tagsForParticipants = ids => AstervoidsWireCodec.packTagMap(
+    Object.fromEntries(ids.map(participantId => [participantId, tagForParticipant(participantId)])));
 const shipA = id(101);
 const shipB = id(102);
 const shipC = id(103);
@@ -196,20 +196,21 @@ function history(scores, numbers) {
     return historyFunctions().readParticipantScoreHistory({
         participantScores: AstervoidsWireCodec.packCounterMap(scores),
         participantNumbers: AstervoidsWireCodec.packCounterMap(numbers),
+        participantTags: tagsForParticipants(Object.keys(numbers)),
     });
 }
 
 test('history readers normalize GUIDs, validate scores and numbers, and keep private mutation snapshots', () => {
     const functions = historyFunctions();
     const data = {
-        participantScores: { [participantA.toUpperCase()]: 25 },
-        participantNumbers: { [participantA.toUpperCase()]: 4 },
+        participantScores: AstervoidsWireCodec.packCounterMap({ [participantA.toUpperCase()]: 25 }),
+        participantNumbers: AstervoidsWireCodec.packCounterMap({ [participantA.toUpperCase()]: 4 }),
     };
     const first = functions.readParticipantScoreHistory(data);
     assert.deepEqual(first.scores.counters, { [participantA]: 25 });
     assert.deepEqual(first.numbers.counters, { [participantA]: 4 });
     assert.equal(functions.readParticipantScoreHistory(data, first), first);
-    data.participantScores[participantA.toUpperCase()] = 35;
+    data.participantScores[16] = 35;
     const changed = functions.readParticipantScoreHistory(data, first);
     assert.equal(changed.scores.counters[participantA], 35);
     assert.equal(first.scores.counters[participantA], 25);
@@ -264,8 +265,8 @@ test('standings use score descending, immutable number ascending and normalized 
         { [participantC]: 2, [participantB]: 1, [participantA]: 1, [id(4)]: 4 });
     const rows = rankParticipantScores(ledgers, 3);
     assert.deepEqual(rows.map(row => [row.participantId, row.label, row.score]), [
-        [participantA, 'Player 1', 90], [participantB, 'Player 1', 90],
-        [participantC, 'Player 2', 90], [id(4), 'Player 4', 0],
+        [participantA, 'Pilot1', 90], [participantB, 'Pilot2', 90],
+        [participantC, 'Pilot3', 90], [id(4), 'Pilot4', 0],
     ]);
     assert.deepEqual(rows.map(row => row.rank), [1, 2, 3, 4]);
 });
@@ -279,7 +280,7 @@ test('topK depends on actual capacity, keeps highest scorers, and never caps the
         const rows = rankParticipantScores(ledgers, maxMembers);
         assert.equal(rows.length, limit);
         assert.deepEqual(rows.map(row => row.score), Array.from({ length: limit }, (_, n) => 90 - n * 10));
-        assert.equal(rows[0].label, 'Player 10', 'labels are not assigned from rank');
+        assert.equal(rows[0].label, 'Pilot10', 'labels are not assigned from rank');
     }
     for (const capacity of [undefined, null, 0, -1, 3.5, '5']) {
         assert.equal(rankParticipantScores(ledgers, capacity), null);
@@ -287,14 +288,14 @@ test('topK depends on actual capacity, keeps highest scorers, and never caps the
     assert.equal(Object.keys(ledgers.scores.counters).length, 10);
 });
 
-test('schema capability is session-creator-owned and never upgrades a sixteen-slot registry implicitly', () => {
-    const { hasParticipantScoreSchema } = loadInlineGameFunctions(['hasParticipantScoreSchema']);
-    assert.equal(hasParticipantScoreSchema({ schemas: SCHEMAS }), true);
-    assert.equal(hasParticipantScoreSchema({
-        schemas: SCHEMAS.map(schema => schema.id === 4
-            ? { ...schema, fields: schema.fields.slice(0, 16) } : schema),
-    }), false);
-    assert.equal(hasParticipantScoreSchema({}), false);
+test('score and tag slots are mandatory in the current game session contract', () => {
+    requireCurrentSchemas({ schemas: SCHEMAS });
+    for (const slots of [16, 18]) {
+        assert.throws(() => requireCurrentSchemas({
+            schemas: SCHEMAS.map(schema => schema.id === 4
+                ? { ...schema, fields: schema.fields.slice(0, slots) } : schema),
+        }), /Unsupported Astervoids session schemas/);
+    }
 });
 
 test('session capacity is taken only from a matching valid active-session advertisement', () => {
@@ -542,7 +543,7 @@ function departureHarness({ migrate = false } = {}) {
         'handleSessionMemberLeft', 'handleGameObjectDeleted', 'syncGameState',
         'calculateGameState', 'calculateGameStateTerminal', 'applyCalculatedGameState',
         'serializeGameState', 'resetGameStateSyncCache', 'reportMalformedGameStateLedgers',
-        'hasParticipantScoreSchema', 'normalizeParticipantLedger', 'readParticipantScoreHistory',
+        'normalizeParticipantLedger', 'readParticipantScoreHistory',
         'gameStateCounterMapsEqual', 'gameStateLedgerMatches', 'readGameStateLedger',
         'packGameStateLedger', 'gameStateCalculationInputs', 'gameStateInputsEqual', 'applyGameStateData',
     ], {
@@ -693,8 +694,7 @@ test('session reset retires the local ship without pre-deleting the durable depa
 });
 
 function scoreUiHarness({
-    data, maxMembers = 3, ships = [], legacy = false, participantId = participantA,
-    tagged = false, participantTag,
+    data, maxMembers = 3, ships = [], participantId = participantA, participantTag,
 } = {}) {
     const writes = [];
     const identity = { participantId, epoch: 1 };
@@ -730,6 +730,11 @@ function scoreUiHarness({
             participantNumbers: AstervoidsWireCodec.packCounterMap({ [participantA]: 4, [participantB]: 2 }),
         },
     };
+    if (record.data.participantTags === undefined
+        && record.data.participantNumbers instanceof Uint8Array) {
+        record.data.participantTags = tagsForParticipants(
+            Object.keys(AstervoidsWireCodec.unpackCounterMap(record.data.participantNumbers)));
+    }
     const elements = Object.fromEntries([
         'hudDisplay', 'scoreDisplay', 'yourScoreDisplay', 'teamScoreDisplay', 'playerIndicatorDisplay', 'waveDisplay',
         'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverPersonalScoreEl', 'gameoverScoreEl',
@@ -739,7 +744,7 @@ function scoreUiHarness({
     const counts = { unpack: 0, layout: 0 };
     const functions = loadInlineGameFunctions([
         'updateHUD', 'updateGameplayOverlays', 'renderParticipantScoreRows', 'isPersonalScoreScrollTarget',
-        'getSessionScoreView', 'hasParticipantScoreSchema', 'normalizeParticipantLedger',
+        'getSessionScoreView', 'normalizeParticipantLedger',
         'readParticipantScoreHistory', 'readGameStateLedger', 'gameStateLedgerMatches',
         'gameStateCounterMapsEqual', 'projectParticipantScore', 'rankParticipantScores',
     ], {
@@ -756,9 +761,7 @@ function scoreUiHarness({
         SessionClient: {
             getSessionEpoch: () => identity.epoch, getParticipantId: () => identity.participantId,
             getParticipantIdentity: () => participantTag ? { id: identity.participantId, tag: participantTag } : null,
-            getCurrentSession: () => ({ metadata: { schemas: legacy
-                ? SCHEMAS.map(schema => schema.id === 4 ? { ...schema, fields: schema.fields.slice(0, 16) } : schema)
-                : tagged ? SCHEMAS : SCORE_ONLY_SCHEMAS } }),
+            getCurrentSession: () => ({ metadata: { schemas: SCHEMAS } }),
         },
         ObjectSync: {
             getObjectByType: type => type === 'gameState' ? record : null,
@@ -782,7 +785,7 @@ function standingsRows(container) {
 }
 
 test('durable tags replace placeholders without changing ordinal ranking, totals, or solo identity', () => {
-    const h = scoreUiHarness({ tagged: true, participantTag: 'Pilot_1' });
+    const h = scoreUiHarness({ participantTag: 'Pilot_1' });
     h.record.data.participantTags = AstervoidsWireCodec.packTagMap({
         [participantA]: 'Pilot_1', [participantB]: 'Nova-2',
     });
@@ -801,7 +804,7 @@ test('durable tags replace placeholders without changing ordinal ranking, totals
 });
 
 test('missing or malformed tag metadata shows Unknown without hiding valid scores', () => {
-    const h = scoreUiHarness({ tagged: true });
+    const h = scoreUiHarness();
     h.record.data.participantTags = new Uint8Array([1, 2]);
     h.updateHUD();
     h.updateGameplayOverlays();
@@ -885,7 +888,7 @@ test('multiplayer HUD projects your lifetime score above team score, and solo ke
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '125');
     assert.equal(h.yourScoreDisplay.attributes['aria-label'], 'Your Score 125');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 4');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot1');
     assert.equal(h.sessionIndicator.textContent, h.game.sessionInfo.name);
     assert.equal(h.teamScoreDisplay.textContent, '120');
     assert.equal(h.hudDisplay.classList.contains('multiplayer'), true);
@@ -910,10 +913,10 @@ test('multiplayer HUD projects your lifetime score above team score, and solo ke
     assert.equal(h.hudDisplay.classList.contains('multiplayer'), false);
 });
 
-test('HUD player names use immutable participant numbers, not rank or the current ship', () => {
+test('HUD player names use participant tags, not rank or the current ship', () => {
     const h = scoreUiHarness({ participantId: participantA.toUpperCase() });
     h.updateHUD();
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 4');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot1');
     h.record.data.groupScore = 300;
     h.record.data.participantScores = AstervoidsWireCodec.packCounterMap({
         [participantA]: 0, [participantB]: 300,
@@ -922,11 +925,11 @@ test('HUD player names use immutable participant numbers, not rank or the curren
     h.game.ship = { syncObjectId: shipA, score: 0 };
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '0');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 4');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot1');
     assert.equal(h.playerIndicatorDisplay.textContent.includes(participantA), false);
 });
 
-test('HUD waits for the canonical player number instead of inventing one for a new ship', () => {
+test('HUD waits for a valid participant tag instead of inventing one for a new ship', () => {
     const h = scoreUiHarness({
         data: {
             groupScore: 0,
@@ -937,12 +940,13 @@ test('HUD waits for the canonical player number instead of inventing one for a n
     });
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '0');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player --');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Unknown');
     h.record.data.participantScores = AstervoidsWireCodec.packCounterMap({ [participantA]: 0 });
     h.record.data.participantNumbers = AstervoidsWireCodec.packCounterMap({ [participantA]: 7 });
+    h.record.data.participantTags = tagsForParticipants([participantA]);
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '0');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 7');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot1');
 });
 
 test('HUD refreshes player and session names independently of score and across session transitions', () => {
@@ -952,12 +956,12 @@ test('HUD refreshes player and session names independently of score and across s
         participantNumbers: AstervoidsWireCodec.packCounterMap({ [participantA]: 4, [participantB]: 2 }),
     } });
     h.updateHUD();
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 4');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot1');
     h.identity.participantId = participantB;
     h.game.sessionInfo.name = 'Another session name';
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '10');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 2');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Pilot2');
     assert.equal(h.sessionIndicator.textContent, 'Another session name');
     h.game.mode = 'solo';
     h.updateHUD();
@@ -966,8 +970,9 @@ test('HUD refreshes player and session names independently of score and across s
     h.game.mode = 'session';
     h.game.sessionInfo.name = 'New session';
     h.record.data.participantNumbers = AstervoidsWireCodec.packCounterMap({ [participantA]: 1, [participantB]: 3 });
+    h.record.data.participantTags = AstervoidsWireCodec.packTagMap({ [participantA]: 'Pilot1', [participantB]: 'Nova2' });
     h.updateHUD();
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Player 3');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Nova2');
     assert.equal(h.sessionIndicator.textContent, 'New session');
     assert.equal(h.sessionIndicator.style.display, '');
 });
@@ -989,7 +994,7 @@ test('final rows use persisted historical scores, never unprocessed local projec
     assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 100');
     assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 100');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [
-        ['1', 'Player 8', '100'], ['2', 'Player 2', '0'], ['3', 'Player 4', '0'],
+        ['1', 'Pilot1', '100'], ['2', 'Pilot3', '0'], ['3', 'Pilot2', '0'],
     ]);
     assert.equal(h.gameoverResultsEl.textContent.includes(participantA), false);
     assert.equal(h.gameoverResultsEl.textContent.includes('999'), false);
@@ -1006,7 +1011,7 @@ test('final rows use persisted historical scores, never unprocessed local projec
     assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 100');
     assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 130');
     assert.deepEqual(standingsRows(h.gameoverResultsEl), [
-        ['1', 'Player 8', '100'], ['2', 'Player 4', '30'], ['3', 'Player 2', '0'],
+        ['1', 'Pilot1', '100'], ['2', 'Pilot2', '30'], ['3', 'Pilot3', '0'],
     ]);
     h.record.data.groupScore = 167;
     h.record.data.participantScores = AstervoidsWireCodec.packCounterMap({
@@ -1033,13 +1038,12 @@ test('game-over personal totals belong to the viewer even when their row is outs
     ]) {
         const h = scoreUiHarness({ data, participantId, maxMembers: 1 });
         h.updateHUD();
-        const number = AstervoidsWireCodec.unpackCounterMap(data.participantNumbers)[participantId.toLowerCase()];
-        assert.equal(h.playerIndicatorDisplay.textContent, `Player ${number}`);
+        assert.equal(h.playerIndicatorDisplay.textContent, tagForParticipant(participantId));
         h.updateGameplayOverlays();
         assert.equal(h.gameoverPersonalScoreEl.textContent, `Your Score: ${score}`);
         assert.equal(h.gameoverPersonalScoreEl.attributes['aria-label'], `Your Score ${score}`);
         assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 900');
-        assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '500']]);
+        assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Pilot2', '500']]);
     }
 });
 
@@ -1060,17 +1064,17 @@ test('missing capacity keeps the full team total visible and defers rows until t
         h.game.sessionInfo.maxMembers = maxMembers;
         h.updateGameplayOverlays();
         assert.equal(standingsRows(h.gameoverResultsEl).length, rows);
-        assert.deepEqual(standingsRows(h.gameoverResultsEl)[0], ['1', 'Player 10', '900']);
+        assert.deepEqual(standingsRows(h.gameoverResultsEl)[0], ['1', 'Pilot10', '900']);
     }
 });
 
-test('legacy and malformed score histories are visibly unavailable, not fabricated zeros, and can recover', () => {
-    for (const legacy of [false, true]) {
-        const h = scoreUiHarness({ legacy, data: { groupScore: 987654 } });
+test('missing and malformed score histories are visibly unavailable, not fabricated zeros, and can recover', () => {
+    {
+        const h = scoreUiHarness({ data: { groupScore: 987654 } });
         h.updateHUD();
         h.updateGameplayOverlays();
         assert.equal(h.yourScoreDisplay.textContent, 'unavailable');
-        assert.equal(h.playerIndicatorDisplay.textContent, '--');
+        assert.equal(h.playerIndicatorDisplay.textContent, 'Unknown');
         assert.equal(h.teamScoreDisplay.textContent, '987654');
         assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: unavailable');
         assert.equal(h.gameoverScoreEl.textContent, 'Team Score: 987654');
@@ -1079,7 +1083,7 @@ test('legacy and malformed score histories are visibly unavailable, not fabricat
     }
     const h = scoreUiHarness({ data: {
         groupScore: 200, participantScores: { [participantA]: -1 },
-        participantNumbers: { [participantA]: 1 },
+        participantNumbers: AstervoidsWireCodec.packCounterMap({ [participantA]: 1 }),
     } });
     h.updateHUD();
     h.updateGameplayOverlays();
@@ -1093,10 +1097,10 @@ test('legacy and malformed score histories are visibly unavailable, not fabricat
     h.updateGameplayOverlays();
     assert.equal(h.yourScoreDisplay.textContent, '200');
     assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: 200');
-    assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '200']]);
+    assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Pilot1', '200']]);
 });
 
-test('partial history from an older GameState owner is unavailable instead of presenting a live-player subtotal', () => {
+test('inconsistent history is unavailable instead of presenting a live-player subtotal', () => {
     const h = scoreUiHarness({ data: {
         groupScore: 200,
         participantScores: AstervoidsWireCodec.packCounterMap({ [participantA]: 50 }),
@@ -1124,10 +1128,10 @@ test('pure spectators are absent from histories, and solo Final Score hides pers
     h.updateHUD();
     h.updateGameplayOverlays();
     assert.equal(h.yourScoreDisplay.textContent, '--');
-    assert.equal(h.playerIndicatorDisplay.textContent, 'Spectator');
+    assert.equal(h.playerIndicatorDisplay.textContent, 'Unknown', 'unnamed spectators are not assigned a tag');
     assert.equal(h.gameoverPersonalScoreEl.textContent, 'Your Score: --');
     assert.equal(h.gameoverPersonalScoreEl.attributes['aria-label'], 'No personal score: spectating');
-    assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Player 1', '10']]);
+    assert.deepEqual(standingsRows(h.gameoverResultsEl), [['1', 'Pilot2', '10']]);
     assert.equal(h.yourScoreDisplay.attributes['aria-label'], 'No personal score: spectating');
     assert.equal(Object.values(h.yourScoreDisplay.attributes).some(value => value.includes(participantA)), false);
     h.game.mode = 'solo';

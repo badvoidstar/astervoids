@@ -40,6 +40,19 @@ test('register rejects empty schemas and >32 fields', () => {
     assert.throws(() => SchemaCodec.register(1, tooMany), /max 32/);
 });
 
+test('metadata registry replacement rejects duplicate IDs and old descriptor aliases atomically', () => {
+    const current = [{ id: 29, fields: [['value', 'u32']] }];
+    SchemaCodec.replaceAll(current);
+    for (const definitions of [
+        [...current, current[0]],
+        [{ Id: 29, Fields: [['value', 'u32']] }],
+        [...current, { id: 30, fields: [['value', 'invalid']] }],
+    ]) {
+        assert.throws(() => SchemaCodec.replaceAll(definitions));
+        assert.deepEqual(SchemaCodec.snapshot(), current, 'failed registration never installs a partial registry');
+    }
+});
+
 // ── Round-trip per type tag ────────────────────────────────────────────────
 
 test('round-trip: f64 / f32 / integer types', () => {

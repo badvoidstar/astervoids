@@ -36,10 +36,13 @@ test('wrap is idempotent on already-wrapped payloads', () => {
     assert.strictEqual(re, original, 'should return the same reference');
 });
 
-test('unwrap is idempotent on plain-dict inputs', () => {
-    const dict = { a: 1, b: 'two' };
-    const result = SyncPayload.unwrap(dict);
-    assert.strictEqual(result, dict);
+test('unwrap rejects pre-envelope dictionaries and malformed envelopes', () => {
+    for (const value of [{ a: 1, b: 'two' }, [], [0], [0, []], [-1, null], [256, null], [0.5, null]]) {
+        assert.throws(() => SyncPayload.unwrap(value), /Unsupported SyncPayload wire contract/);
+    }
+    for (const value of [[], 1, 'old payload', new Uint8Array(1), null]) {
+        assert.throws(() => SyncPayload.unwrap([0, MsgpackCodec.encode(value)]), /must contain a dictionary/);
+    }
 });
 
 test('unwrap of null returns null', () => {
@@ -135,8 +138,8 @@ test('unwrapObjectData is a no-op for null/undefined and missing data slot', () 
     assert.deepEqual(noData, { id: 'x' });
 });
 
-test('LEGACY_DICT_SCHEMA_ID is 0 (matches SyncPayloadCodec.LegacyDictSchemaId)', () => {
-    assert.equal(SyncPayload.LEGACY_DICT_SCHEMA_ID, 0);
+test('DICTIONARY_SCHEMA_ID is 0 (matches SyncPayloadCodec.DictionarySchemaId)', () => {
+    assert.equal(SyncPayload.DICTIONARY_SCHEMA_ID, 0);
 });
 
 test('wrap of an empty dict still produces a valid envelope', () => {
@@ -188,8 +191,19 @@ test('phase 4 unwrap of unregistered schemaId throws guidance about metadata.sch
         /metadata\.schemas before processing object events/);
 });
 
-test('phase 4 wrap defaults to schemaId=0 when arg is omitted (back-compat)', () => {
+test('wrap defaults to the generic dictionary schema when no schema is selected', () => {
     SchemaCodec.clear();
     const wrapped = SyncPayload.wrap({ a: 1 });
     assert.equal(wrapped[0], 0);
+});
+
+test('an empty positional payload preserves its selected schema instead of downgrading to a dictionary', () => {
+    SchemaCodec.replaceAll([{ id: 29, fields: [['value', 'u32']] }]);
+    for (const value of [null, undefined, {}]) {
+        const wrapped = SyncPayload.wrap(value, 29);
+        assert.equal(wrapped[0], 29);
+        assert.deepEqual(wrapped[1], new Uint8Array([0]));
+        assert.deepEqual(SyncPayload.unwrap(wrapped), {});
+    }
+    assert.throws(() => SyncPayload.wrap(null, 99), /no schema registered/);
 });

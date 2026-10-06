@@ -200,7 +200,6 @@ test('receiver getBoundingRadius for asteroid uses vertices when available', () 
         { angle: 1, distance: 0.12 },
         { angle: 2, distance: 0.08 },
     ];
-    assert.equal(getRemoteBoundingRadius({ type: ASTEROID, radius: 0.083, vertices: verts }), 0.12);
     const packed = getRemoteBoundingRadius({
         type: ASTEROID, radius: 0.083, vertices: AstervoidsWireCodec.packAsteroidVertices(verts),
     });
@@ -210,8 +209,8 @@ test('receiver getBoundingRadius for asteroid uses vertices when available', () 
     const fallback = getRemoteBoundingRadius({ type: ASTEROID, radius: 0.083 });
     assert.ok(Math.abs(fallback - 0.083 * 1.4) < 1e-9, `fallback was ${fallback}`);
 
-    // Empty vertex array: fall back too.
-    const empty = getRemoteBoundingRadius({ type: ASTEROID, radius: 0.10, vertices: [] });
+    // An empty packed geometry field also uses the seeded radius.
+    const empty = getRemoteBoundingRadius({ type: ASTEROID, radius: 0.10, vertices: new Uint8Array() });
     assert.ok(Math.abs(empty - 0.10 * 1.4) < 1e-9);
 });
 
