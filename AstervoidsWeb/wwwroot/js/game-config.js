@@ -3,8 +3,20 @@
  *
  * SHARED_DEFAULTS contains values consumed outside the inline game runtime.
  * Keep runtime-only settings beside their owning systems in index.html.
+ * Cross-stack limits come from shared-config.json, not per-browser overrides.
  */
 const AstervoidsConfig = (function() {
+    const sharedConfiguration = typeof module !== 'undefined' && module.exports
+        ? require('../shared-config.json')
+        : globalThis.ASTERVOIDS_SHARED_CONFIG;
+    const IDENTITY_TAG_MAX_LENGTH = sharedConfiguration?.identityTagMaxLength;
+    if (!Number.isInteger(IDENTITY_TAG_MAX_LENGTH)
+        || IDENTITY_TAG_MAX_LENGTH < 1 || IDENTITY_TAG_MAX_LENGTH > 0xff) {
+        throw new RangeError('Shared configuration identityTagMaxLength must fit a positive one-byte tag length');
+    }
+    const IDENTITY_TAG_PATTERN_SOURCE = String.raw`[A-Za-z0-9_\-]{1,${IDENTITY_TAG_MAX_LENGTH}}`;
+    const IDENTITY_TAG_PATTERN = new RegExp(`^${IDENTITY_TAG_PATTERN_SOURCE}$`);
+
     const SHARED_DEFAULTS = Object.freeze({
         TARGET_FPS: 60,
         SHIP_KEYBOARD_TURN_SPEED: 0.125,
@@ -396,6 +408,9 @@ const AstervoidsConfig = (function() {
     }
 
     return Object.freeze({
+        IDENTITY_TAG_MAX_LENGTH,
+        IDENTITY_TAG_PATTERN_SOURCE,
+        IDENTITY_TAG_PATTERN,
         SHARED_DEFAULTS,
         CONFIG_CONTROLS,
         DEBUG_OVERRIDABLE_KEYS,

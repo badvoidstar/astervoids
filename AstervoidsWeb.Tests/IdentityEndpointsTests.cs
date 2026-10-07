@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Identity;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
@@ -15,6 +16,11 @@ namespace AstervoidsWeb.Tests;
 
 public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Factory>
 {
+    public static TheoryData<string> OverLimitTags => new()
+    {
+        new string('A', SharedConfiguration.Current.IdentityTagMaxLength + 1)
+    };
+
     private const string StaticOrigin = "https://identity-test.azurestaticapps.net";
     private readonly Factory _factory;
 
@@ -71,7 +77,40 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
     }
 
     [Fact]
-    public async Task ResolveRootInviteClaimAndSelfHaveExactShapesAndPrivateResponses()
+    public async Task SharedConfigurationDrivesIdentityValidationAndGeneratedBrowserAsset()
+    {
+        using var client = _factory.CreateClient();
+        using var configuration = JsonDocument.Parse(await client.GetStringAsync("/shared-config.json"));
+        Assert.Equal(new[] { "identityTagMaxLength" }, Names(configuration.RootElement));
+        var maximum = configuration.RootElement.GetProperty("identityTagMaxLength").GetInt32();
+        Assert.InRange(maximum, 1, byte.MaxValue);
+
+        var script = await client.GetStringAsync("/js/shared-config-data.js");
+        const string prefix = "globalThis.ASTERVOIDS_SHARED_CONFIG = Object.freeze(";
+        Assert.StartsWith(prefix, script);
+        Assert.EndsWith(");", script.TrimEnd());
+        using var generated = JsonDocument.Parse(script.TrimEnd()[prefix.Length..^2]);
+        Assert.Equal(maximum, generated.RootElement.GetProperty("identityTagMaxLength").GetInt32());
+        Assert.True(IdentitySecrets.IsTag(new string('A', maximum)));
+        Assert.False(IdentitySecrets.IsTag(new string('A', maximum + 1)));
+
+        var browser = IdentitySecrets.NewToken();
+        using var resolved = await Send(client, "/resolve", browser, new { });
+        var binding = (await Body(resolved, 200)).GetProperty("binding");
+        using var rejected = await Send(client, "/root", browser,
+            new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = new string('A', maximum + 1) });
+        Assert.Equal("invalid_tag", (await Body(rejected, 400)).GetProperty("error").GetProperty("code").GetString());
+        using var accepted = await Send(client, "/root", browser,
+            new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = new string('A', maximum) });
+        Assert.Equal(maximum, (await Body(accepted, 201)).GetProperty("binding")
+            .GetProperty("identity").GetProperty("tag").GetString()!.Length);
+    }
+
+    [Theory]
+    [InlineData("Pilot_1", "Friend")]
+    [InlineData("A_b-123456", "Friend_123")]
+    public async Task ResolveRootInviteClaimAndSelfHaveExactShapesAndPrivateResponses(
+        string rootTag, string friendTag)
     {
         using var client = _factory.CreateClient();
         var browser = IdentitySecrets.NewToken();
@@ -85,7 +124,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         Assert.Equal(JsonValueKind.Null, binding.GetProperty("identity").ValueKind);
         Assert.Equal(0, binding.GetProperty("revision").GetInt64());
 
-        var rootRequest = new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = "Pilot_1" };
+        var rootRequest = new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = rootTag };
         using var rootResponse = await Send(client, "/root", browser, rootRequest);
         var root = await Body(rootResponse, 201);
         Assert.Single(root.EnumerateObject());
@@ -93,7 +132,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         var identity = named.GetProperty("identity");
         Assert.Equal(new[] { "id", "tag" }, Names(identity));
         Assert.NotEqual(Guid.Empty, identity.GetProperty("id").GetGuid());
-        Assert.Equal("Pilot_1", identity.GetProperty("tag").GetString());
+        Assert.Equal(rootTag, identity.GetProperty("tag").GetString());
         using var rootRetry = await Send(client, "/root", browser, rootRequest);
         Assert.Equal(root.GetRawText(), (await Body(rootRetry, 201)).GetRawText());
 
@@ -114,9 +153,10 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         {
             requestId = Guid.NewGuid(), inviteToken = token,
             expectedInviteEtag = invitation.GetProperty("etag").GetString(),
-            expectedBinding = Expected(friend.GetProperty("binding")), tag = "Friend"
+            expectedBinding = Expected(friend.GetProperty("binding")), tag = friendTag
         });
         var accepted = (await Body(acceptedResponse, 200)).GetProperty("binding");
+        Assert.Equal(friendTag, accepted.GetProperty("identity").GetProperty("tag").GetString());
         using var selfResponse = await Send(client, "/invites/self", friendBrowser,
             new { expectedBinding = Expected(accepted) });
         Assert.Equal(token, (await Body(selfResponse, 200)).GetProperty("inviteToken").GetString());
@@ -186,7 +226,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
 
     [Theory]
     [InlineData("")]
-    [InlineData("123456789")]
+    [MemberData(nameof(OverLimitTags))]
     [InlineData("P ilot")]
     [InlineData("é")]
     [InlineData(null)]

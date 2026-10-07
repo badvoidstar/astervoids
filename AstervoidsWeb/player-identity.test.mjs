@@ -5,9 +5,12 @@ import { webcrypto } from 'node:crypto';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
-const { createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY } =
+const { createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY, TAG_PATTERN } =
     require('./wwwroot/js/player-identity.js');
 const Wire = require('./wwwroot/js/astervoids-wire-codec.js');
+const { IDENTITY_TAG_MAX_LENGTH: maxTagLength } = require('./wwwroot/js/game-config.js');
+const boundaryTags = [Math.max(1, maxTagLength - 1), maxTagLength].map(length => 'A'.repeat(length));
+const overLimitTag = 'A'.repeat(maxTagLength + 1);
 const first = { id: '00112233-4455-6677-8899-aabbccddeeff', tag: 'Pilot_1' };
 const second = { id: '11223344-5566-7788-99aa-bbccddeeff00', tag: 'Nova-2' };
 const token = Buffer.alloc(32, 7).toString('base64url');
@@ -52,6 +55,47 @@ function subject(options = {}) {
     });
     return { client, requests, replies, values, storage, locks };
 }
+
+test('identity and replicated tags honor the configured maximum without changing the character set', () => {
+    for (const tag of ['A', 'A_b-1234', ...boundaryTags]) {
+        assert.equal(TAG_PATTERN.test(tag), true, tag);
+        assert.equal(Wire.isParticipantTag(tag), true, tag);
+    }
+    for (const tag of ['', overLimitTag, 'bad tag', '<img>', '\u00e9']) {
+        assert.equal(TAG_PATTERN.test(tag), false, tag);
+        assert.equal(Wire.isParticipantTag(tag), false, tag);
+    }
+});
+
+for (const tag of boundaryTags) {
+    test(`${tag.length}-character identities survive creation, binding resolution and invite decoding`, async () => {
+        const h = subject();
+        const identity = { ...first, tag };
+        const named = { ...binding, identity };
+        const invite = { ...active, tag };
+        h.replies.push(resolved(), { binding: named }, resolved(named, invite));
+        await h.client.resolve();
+        await h.client.create(tag);
+        assert.deepEqual(h.client.current(), identity);
+        assert.equal(h.requests[1].body.tag, tag);
+        const view = await h.client.resolve(token);
+        assert.deepEqual(view.binding.identity, identity);
+        assert.equal(view.invite.tag, tag);
+    });
+}
+
+test('binding and active-invite responses reject tags beyond the configured maximum', async () => {
+    const tag = overLimitTag;
+    for (const reply of [
+        resolved({ ...binding, identity: { ...first, tag } }, active),
+        resolved(empty, { ...active, tag }),
+    ]) {
+        const h = subject();
+        h.replies.push(reply);
+        await assert.rejects(h.client.resolve(token), { code: 'identity_unavailable' });
+        assert.equal(h.client.current(), null);
+    }
+});
 
 test('invites are captured once and scrubbed before any request, including malformed links', () => {
     for (const hash of [`#invite=${token}`, '#invite=bad', `#invite=${token}&invite=${token}`]) {
@@ -804,7 +848,7 @@ test('tag maps are GUID sorted, bounded ASCII, strict, and retain zero-score his
     assert.equal(packed.length, 17 * 2 + first.tag.length + second.tag.length);
     assert.deepEqual(Wire.packTagMap({ [first.id]: first.tag, [second.id]: second.tag }), packed);
     for (const value of [
-        { bad: 'Valid' }, { [first.id]: '' }, { [first.id]: '123456789' },
+        { bad: 'Valid' }, { [first.id]: '' }, { [first.id]: overLimitTag },
         { [first.id]: '<img>' }, { [first.id]: 'a b' }, { [first.id]: '\u00e9' },
         { [first.id]: first.tag, [first.id.toUpperCase()]: 'Other' },
     ]) assert.throws(() => Wire.packTagMap(value));
@@ -812,4 +856,18 @@ test('tag maps are GUID sorted, bounded ASCII, strict, and retain zero-score his
     const doubled = new Uint8Array(packed.length * 2);
     doubled.set(packed); doubled.set(packed, packed.length);
     assert.throws(() => Wire.unpackTagMap(doubled));
+});
+
+test('tag maps round-trip boundary lengths but reject a complete over-limit entry', () => {
+    for (const tag of boundaryTags) {
+        const packed = Wire.packTagMap({ [first.id]: tag });
+        assert.equal(packed.length, 17 + tag.length);
+        assert.equal(packed[16], tag.length);
+        assert.deepEqual(Wire.unpackTagMap(packed), { [first.id]: tag });
+    }
+    const oversized = new Uint8Array(17 + overLimitTag.length);
+    oversized.set(Wire.packTagMap({ [first.id]: 'A' }).subarray(0, 16));
+    oversized[16] = overLimitTag.length;
+    oversized.fill('A'.charCodeAt(0), 17);
+    assert.throws(() => Wire.unpackTagMap(oversized), /invalid/);
 });

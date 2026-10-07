@@ -137,6 +137,10 @@ System32 WSL `bash.exe` shim.
 
 - Follow nullable C# conventions and existing implicit-using/style patterns.
 - Keep normal lifecycle failures represented by result objects.
+- Give repeated or non-obvious domain limits and tuning values named constants
+  or configuration parameters. Keep cross-stack contract values in one
+  authoritative source, and derive validation, UI constraints/messages, and
+  boundary tests from it instead of scattering matching numeric literals.
 - Keep lock scopes narrow and maintain deterministic ordering where behavior
   depends on age, sequence, or version.
 - In JavaScript, follow the existing classic-script/IIFE module style and

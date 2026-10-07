@@ -1,3 +1,8 @@
+import { createRequire } from 'node:module';
+
+const { IDENTITY_TAG_PATTERN_SOURCE } = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/game-config.js');
+const taggedRowPattern = new RegExp(
+    String.raw`^[ \t]*\d+[ \t]+(${IDENTITY_TAG_PATTERN_SOURCE})[ \t]+(\d[\d,]*)[ \t]*$`, 'gm');
 const rowPattern = /\bPlayer ([1-9]\d*)(?:\s+\([Yy]ou\))?(?:\s*[:|\u2014]\s*|\s+)(\d{1,3}(?:,\d{3})+|\d+)(?![\d,])\b/g;
 
 export function rankedPersonalResults(participants, maxMembers) {
@@ -12,7 +17,7 @@ export function rankedPersonalResults(participants, maxMembers) {
 }
 
 export function personalRows(text) {
-    const tagged = [...text.matchAll(/^[ \t]*\d+[ \t]+([A-Za-z0-9_-]{1,8})[ \t]+(\d[\d,]*)[ \t]*$/gm)]
+    const tagged = [...text.matchAll(taggedRowPattern)]
         .map(match => ({ tag: match[1], score: Number(match[2].replaceAll(',', '')) }));
     if (tagged.length) return tagged;
     return [...text.matchAll(rowPattern)]

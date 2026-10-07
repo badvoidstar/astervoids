@@ -7,8 +7,13 @@ const PlayerIdentity = (function () {
     const CHANGE_KEY = 'astervoids.identity-change';
     const LOCK_NAME = 'astervoids.identity';
     const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-    const TAG_PATTERN = /^[A-Za-z0-9_-]{1,8}$/;
     const GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    function getTagPattern() {
+        const config = typeof AstervoidsConfig !== 'undefined'
+            ? AstervoidsConfig : require('./game-config.js');
+        return config.IDENTITY_TAG_PATTERN;
+    }
 
     class IdentityError extends Error {
         constructor(code) { super(code); this.code = code; }
@@ -122,7 +127,7 @@ const PlayerIdentity = (function () {
         function adopt(next) {
             if (!next || typeof next.etag !== 'string' || !Number.isSafeInteger(next.revision)
                 || next.revision < 0 || (next.identity !== null
-                    && (!GUID_PATTERN.test(next.identity?.id) || !TAG_PATTERN.test(next.identity?.tag)))) {
+                    && (!GUID_PATTERN.test(next.identity?.id) || !getTagPattern().test(next.identity?.tag)))) {
                 throw failure('identity_unavailable');
             }
             const previous = binding?.identity ?? null;
@@ -149,7 +154,7 @@ const PlayerIdentity = (function () {
                     || (inviteToken && (!GUID_PATTERN.test(result.invite?.identityId)
                         || !['pending', 'active'].includes(result.invite?.state)
                         || typeof result.invite?.etag !== 'string'
-                        || (result.invite.state === 'active' && !TAG_PATTERN.test(result.invite.tag))))) {
+                        || (result.invite.state === 'active' && !getTagPattern().test(result.invite.tag))))) {
                     throw failure('identity_unavailable');
                 }
                 adopt(result.binding);
@@ -225,7 +230,10 @@ const PlayerIdentity = (function () {
     }
 
     if (typeof window === 'undefined') {
-        return { createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY, TAG_PATTERN };
+        return {
+            createClient, captureInvite, apiOrigin, STORAGE_KEY, CHANGE_KEY,
+            get TAG_PATTERN() { return getTagPattern(); },
+        };
     }
     let storage = null;
     try { storage = window.localStorage; } catch { /* Reported when activation is attempted. */ }
@@ -237,7 +245,8 @@ const PlayerIdentity = (function () {
         get bootstrap() { return window.ASTERVOIDS_REGION_BOOTSTRAP; },
     });
     return Object.freeze({
-        ...client, TAG_PATTERN, STORAGE_KEY, CHANGE_KEY,
+        ...client, STORAGE_KEY, CHANGE_KEY,
+        get TAG_PATTERN() { return getTagPattern(); },
         takeInvite() {
             const invite = incomingInvite ?? captureInvite(window.location, window.history);
             incomingInvite = null;

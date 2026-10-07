@@ -1,6 +1,6 @@
 import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
-import { provisionPlayer } from './identity-helpers.mjs';
+import { maximumLengthTag, provisionPlayer } from './identity-helpers.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
@@ -21,7 +21,7 @@ const test = base.extend({
                 });
                 context.setDefaultTimeout(15_000);
                 context.setDefaultNavigationTimeout(30_000);
-                const tag = `Pilot${opened.length + 1}`;
+                const tag = options.tag ?? `Pilot${opened.length + 1}`;
                 await provisionPlayer(context, tag);
                 const page = await context.newPage();
                 const health = {
@@ -470,8 +470,8 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
 });
 
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
-    const host = await players.open();
-    const guest = await players.open();
+    const host = await players.open({ tag: maximumLengthTag() });
+    const guest = await players.open({ tag: maximumLengthTag('Z_9-') });
     let sessionId;
     await test.step('create and join an isolated session through the UI', async () => {
         sessionId = await create(host.page);
@@ -493,6 +493,13 @@ test('independent players create, join, play, leave and rejoin', async ({ player
         guestShip = await shipId(guest.page);
         await replicatedThrust(host.page, guest.page, hostShip);
         await replicatedThrust(guest.page, host.page, guestShip);
+        expect(await guest.page.evaluate(id => ObjectSync.getObject(id).data.participantTag, hostShip)).toBe(host.tag);
+        expect(await host.page.evaluate(id => ObjectSync.getObject(id).data.participantTag, guestShip)).toBe(guest.tag);
+        await expect.poll(() => guest.page.evaluate(() => {
+            const state = ObjectSync.getObjectByType('gameState');
+            return state ? Object.values(AstervoidsWireCodec.unpackTagMap(state.data.participantTags)).sort() : [];
+        }), { message: 'Maximum-length names survive the replicated participant ledger' })
+            .toEqual([host.tag, guest.tag].sort());
         expect(host.health.hubFrames, 'Host receives real hub WebSocket frames').toBeGreaterThan(0);
         expect(guest.health.hubFrames, 'Guest receives real hub WebSocket frames').toBeGreaterThan(0);
     });

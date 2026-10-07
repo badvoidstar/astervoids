@@ -2,12 +2,15 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
+
+const { IDENTITY_TAG_MAX_LENGTH } = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/game-config.js');
 
 test('personal score expectation uses the advertised capacity and highest scorers on overflow', () => {
     const participants = Array.from({ length: 10 }, (_, index) => ({
@@ -55,6 +58,15 @@ test('durable tag rows preserve ranking and do not parse titles as players', () 
         { id: 'a', number: 1, tag: 'Pilot_1', score: 0 },
         { id: 'b', number: 2, tag: 'Nova-2', score: 123456 },
     ], 3), [{ tag: 'Nova-2', score: 123456 }, { tag: 'Pilot_1', score: 0 }]);
+});
+
+test('personal result reader retains maximum-length tags and rejects over-limit rows', () => {
+    const first = 'A'.repeat(IDENTITY_TAG_MAX_LENGTH);
+    const second = 'B'.repeat(IDENTITY_TAG_MAX_LENGTH);
+    assert.deepEqual(personalRows(`1\t${first}\t12\n2\t${second}\t0`), [
+        { tag: first, score: 12 }, { tag: second, score: 0 },
+    ]);
+    assert.deepEqual(personalRows(`1\t${first}A\t12`), []);
 });
 
 test('personal score reader distinguishes capitalized individual and shared HUD and final labels', () => {

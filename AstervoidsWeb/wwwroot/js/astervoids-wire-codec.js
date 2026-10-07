@@ -2,6 +2,9 @@
  * Astervoids-specific packing at the game/replication boundary.
  */
 const AstervoidsWireCodec = (function () {
+    const config = typeof AstervoidsConfig !== 'undefined'
+        ? AstervoidsConfig
+        : require('./game-config.js');
     const guidUtils = typeof GuidUtils !== 'undefined'
         ? GuidUtils
         : require('./guid-utils.js');
@@ -153,7 +156,7 @@ const AstervoidsWireCodec = (function () {
     }
 
     function isParticipantTag(value) {
-        return typeof value === 'string' && /^[A-Za-z0-9_-]{1,8}$/.test(value);
+        return typeof value === 'string' && config.IDENTITY_TAG_PATTERN.test(value);
     }
 
     function packTagMap(tags) {
@@ -193,7 +196,7 @@ const AstervoidsWireCodec = (function () {
             if (offset + 17 > value.length) throw new Error('participant tags are truncated');
             const id = guidUtils.bytesToGuid(value, offset);
             const length = value[offset + 16];
-            if (length < 1 || length > 8 || offset + 17 + length > value.length
+            if (length < 1 || length > config.IDENTITY_TAG_MAX_LENGTH || offset + 17 + length > value.length
                 || Object.hasOwn(tags, id)) {
                 throw new Error('participant tags contain an invalid or duplicate entry');
             }

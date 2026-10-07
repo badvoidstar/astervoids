@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import { captureClipboard, completeIdentityAction, invitation, namePlayer } from './identity-helpers.mjs';
+import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
 
 const test = base.extend({
@@ -41,33 +41,66 @@ const atRoot = page => expect.poll(() => page.evaluate(() =>
     location.pathname === '/' && location.hash === '' && location.search === ''),
 { message: 'Only the site root remains in the address bar' }).toBe(true);
 
-test('durable root naming survives reload, solo play, self recovery and new-browser confirmation', async ({ identities }) => {
+test('maximum-length root naming survives reload, solo play, self recovery and new-browser confirmation', async ({ identities }) => {
     const original = await identities.open();
-    await namePlayer(original.page, 'Pilot_1');
+    const tag = maximumLengthTag();
+    await namePlayer(original.page, tag);
     const identity = await publicIdentity(original.page);
     await original.page.reload();
-    await expect(original.page.locator('#identity-status')).toHaveText('Playing as Pilot_1');
+    await expect(original.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
     await expect(original.page.locator('#identity-dialog')).not.toBeVisible();
     expect(await publicIdentity(original.page)).toEqual(identity);
     const self = await invitation(original.page, 'self');
     await original.page.locator('#btn-solo').click();
-    await expect(original.page.locator('#score')).toContainText('Pilot_1');
+    await expect(original.page.locator('#score')).toContainText(tag);
     await original.page.keyboard.press('Escape');
     const same = await identities.open(self, original.context);
-    await expect(same.page.locator('#identity-status')).toHaveText('Playing as Pilot_1');
+    await expect(same.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
     await expect(same.page.locator('#identity-dialog')).not.toBeVisible();
     await atRoot(same.page);
     const recovered = await identities.open(self);
     await expect(recovered.page.locator('#identity-title')).toHaveText('Confirm player identity');
-    await expect(recovered.page.locator('#identity-description')).toContainText('Pilot_1');
+    await expect(recovered.page.locator('#identity-description')).toContainText(tag);
     expect(await publicIdentity(recovered.page)).toBeNull();
     await completeIdentityAction(recovered.page);
-    await expect(recovered.page.locator('#identity-status')).toHaveText('Playing as Pilot_1');
+    await expect(recovered.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
     expect(await publicIdentity(recovered.page)).toEqual(identity);
     expect((await invitation(recovered.page, 'self')) === self, 'Self always returns the original private link').toBe(true);
     await recovered.page.reload();
     await expect(recovered.page.locator('#identity-dialog')).not.toBeVisible();
     await atRoot(recovered.page);
+});
+
+test('identity entry enforces the shared limit when typing and submitting', async ({ identities }) => {
+    const host = await identities.open();
+    await namePlayer(host.page, 'Host');
+    const friend = await identities.open(await invitation(host.page, 'friend'));
+    const input = friend.page.locator('#identity-tag');
+    const tag = maximumLengthTag();
+    await expect(input).toBeVisible();
+    await expect(input).toHaveAttribute('maxlength', String(tag.length));
+    await expect(friend.page.locator('label[for="identity-tag"]')).toContainText(`1-${tag.length}`);
+    expect(await friend.page.evaluate(() => AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH)).toBe(tag.length);
+    await input.pressSequentially(`${tag}7`);
+    await expect(input).toHaveValue(tag);
+    expect(await input.evaluate(element => element.checkValidity())).toBe(true);
+
+    let submissions = 0;
+    friend.page.on('request', request => {
+        if (new URL(request.url()).pathname === '/api/identity/invites/accept') submissions++;
+    });
+    for (const invalid of [`${tag}7`, 'bad tag', '']) {
+        await input.evaluate((element, value) => { element.value = value; }, invalid);
+        expect(await input.evaluate(element => element.checkValidity())).toBe(false);
+        await friend.page.locator('#identity-accept').click();
+        await expect(friend.page.locator('#identity-dialog')).toBeVisible();
+        expect(submissions, 'Native validation blocks invalid names before an HTTP mutation').toBe(0);
+    }
+    await input.fill(tag);
+    await completeIdentityAction(friend.page);
+    await expect(friend.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
+    expect((await publicIdentity(friend.page)).tag).toBe(tag);
+    expect(submissions).toBe(1);
 });
 
 test('friend invitations claim a name once and reconcile browser bindings with ignore or atomic replacement', async ({ identities }) => {

@@ -4,11 +4,20 @@ A classic Astervoids game built with HTML5 Canvas and ASP.NET Core.
 
 ## Player identities and invitations
 
-Choose a permanent 1-8 character player tag (letters, numbers, `_` or `-`).
+Choose a permanent 1-10 character player tag (letters, numbers, `_` or `-`).
 The backend retains the identity independently of games, including solo play.
 Tags need not be unique. Each browser profile and site origin has at most one
 active identity; clearing its site storage removes that local access, not the
 backend identity. Private browsing and other site origins are separate environments.
+
+The maximum is defined once as `identityTagMaxLength` in
+[`AstervoidsWeb/wwwroot/shared-config.json`](AstervoidsWeb/wwwroot/shared-config.json).
+The backend embeds this public configuration, and builds/static packaging generate
+the browser settings from the same file. Entry constraints, help/error text,
+identity validation, and replicated tag handling derive from that setting.
+Change the JSON and rebuild/redeploy the backend and static assets together;
+do not edit the generated `shared-config-data.js`. Shared configuration must never
+contain secrets. Lowering the limit requires accounting for already-saved names.
 
 **Invite Friend** creates a unique link for a new player. Their first acceptance
 names that identity; later visits to the same link recover it after confirmation.

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using AstervoidsWeb.Configuration;
 
 namespace AstervoidsWeb.Identity;
 
@@ -90,7 +91,8 @@ internal static class IdentitySecrets
     }
 
     public static bool IsTag(string? tag) =>
-        tag is { Length: >= 1 and <= 8 } && tag.All(IsTagCharacter);
+        tag is { Length: >= 1 } && tag.Length <= SharedConfiguration.Current.IdentityTagMaxLength
+            && tag.All(IsTagCharacter);
 
     public static bool IsHash(string? value) =>
         value is { Length: 64 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');

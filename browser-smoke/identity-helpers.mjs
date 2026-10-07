@@ -1,5 +1,12 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { expect } from '@playwright/test';
+
+const { IDENTITY_TAG_MAX_LENGTH } = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/game-config.js');
+
+export function maximumLengthTag(pattern = 'A_b-') {
+    return pattern.repeat(IDENTITY_TAG_MAX_LENGTH).slice(0, IDENTITY_TAG_MAX_LENGTH);
+}
 
 // Gameplay fixtures use real durable identities without repeating the welcome
 // dialog in every scenario. The identity spec exercises that UI separately.

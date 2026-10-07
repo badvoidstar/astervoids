@@ -372,11 +372,27 @@ or GameState record.
 
 | Value | Meaning and lifetime |
 | --- | --- |
-| Public identity | Backend-generated GUID and immutable, case-preserved `[A-Za-z0-9_-]{1,8}` tag; tags are not globally unique |
+| Public identity | Backend-generated GUID and immutable, case-preserved ASCII letters/digits/`_`/`-` tag, with length bounded by shared configuration; tags are not globally unique |
 | Browser credential | Random 256-bit bearer capability in `localStorage`, scoped to one top-level origin and browser profile/storage context |
 | Browser binding | One credential-hash row pointing to zero or one public identity, with an ETag and monotonic revision |
 | Invitation | Random 256-bit base64url capability; identifies a pending player until first naming, then remains that identity's access/recovery link |
 | Session participant | Public identity pinned for the membership, or the session-local guest identity; not an authentication proof |
+
+`identityTagMaxLength` in
+[`shared-config.json`](AstervoidsWeb/wwwroot/shared-config.json) is the single
+cross-stack length setting. C# embeds that file and validates it at startup;
+MSBuild and static-apex packaging generate `js/shared-config-data.js` from the
+same source. Node consumers read the JSON directly. `AstervoidsConfig` derives
+the tag pattern, native input constraints, and UI text; the identity client and
+game-specific codec reuse those bounds. The generated script loads before the
+configuration module, without moving the early invitation-fragment capture or
+adding a runtime configuration API call.
+
+The configured maximum must be a positive integer representable by the existing
+one-byte tag-length field. Invalid or missing settings fail explicitly, with no
+independent client/server default. This public, build-shared contract is not a
+per-browser debug override or per-region setting; rebuild and deploy both assets
+and backend when changing it, and account for stored names before lowering it.
 
 An identity can have any number of independent browser bindings, not a growing
 binding array. Self invitations return the original capability. Possession of
@@ -1401,7 +1417,8 @@ game-specific nested packing:
   nonnegative scores, positive ordinals, matching participants, and duplicate
   entries before use. These histories are distinct from the entry-life ledger.
 - Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
-  ASCII length, and 1-8 tag bytes. Invalid/duplicate entries or truncated bytes
+  ASCII length, and tag bytes bounded by shared `identityTagMaxLength`.
+  Invalid/duplicate entries or truncated bytes
   reject; tag failure must not erase valid score history.
 - Game ledger readers require packed bytes, not older dictionary-shaped wire
   fields. Decoded calculation maps are still ordinary objects. Duplicate packed
