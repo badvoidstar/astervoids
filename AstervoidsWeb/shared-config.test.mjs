@@ -64,16 +64,16 @@ for (const value of [undefined, null, {}, { identityTagMaxLength: 0 },
 test('native identity entry and validation messages derive from a non-default shared limit', () => {
     const { config } = browserConfiguration({ identityTagMaxLength: 12 });
     const identityTagInput = {};
-    const label = {};
+    const hint = {};
     const { configureIdentityTagInput, identityMessage } = loadInlineGameFunctions(
         ['configureIdentityTagInput', 'identityMessage'], {
             AstervoidsConfig: config, identityTagInput,
-            document: { querySelector: () => label },
+            document: { getElementById: () => hint },
         });
     configureIdentityTagInput();
     assert.equal(identityTagInput.maxLength, config.IDENTITY_TAG_MAX_LENGTH);
     assert.equal(identityTagInput.pattern, config.IDENTITY_TAG_PATTERN_SOURCE);
-    assert.match(label.textContent, /1-12/);
+    assert.match(hint.textContent, /1-12/);
     assert.match(identityMessage({ code: 'invalid_tag' }), /1-12/);
     assert.equal(new RegExp(`^(?:${identityTagInput.pattern})$`, 'v').test('A_b-12345678'), true);
     assert.equal(new RegExp(`^(?:${identityTagInput.pattern})$`, 'v').test('A_b-123456789'), false);

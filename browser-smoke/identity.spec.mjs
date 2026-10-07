@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer } from './identity-helpers.mjs';
+import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer, openIdentityNaming } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
 
 const test = base.extend({
@@ -41,6 +41,161 @@ const atRoot = page => expect.poll(() => page.evaluate(() =>
     location.pathname === '/' && location.hash === '' && location.search === ''),
 { message: 'Only the site root remains in the address bar' }).toBe(true);
 
+async function expectDialogComposition(page, selector) {
+    const layout = await page.locator(selector).evaluate(dialog => {
+        const box = dialog.getBoundingClientRect();
+        const body = dialog.querySelector('.dialog-body');
+        const buttons = [...dialog.querySelectorAll('button')].filter(button => button.getClientRects().length);
+        const rects = buttons.map(button => button.getBoundingClientRect());
+        return {
+            contained: box.left >= 8 && box.top >= 8
+                && box.right <= innerWidth - 8 && box.bottom <= innerHeight - 8,
+            noHorizontalOverflow: dialog.scrollWidth <= dialog.clientWidth + 1
+                && !!body && body.scrollWidth <= body.clientWidth + 1,
+            actionsVisible: rects.every(rect => rect.top >= box.top
+                && rect.bottom <= box.bottom - 8 && rect.left >= box.left
+                && rect.right <= box.right),
+            consistentTargets: rects.every(rect => rect.height >= 44
+                && Math.abs(rect.height - rects[0].height) < 1
+                && Math.abs(rect.width - rects[0].width) < 1),
+            aligned: rects.length < 2 || Math.abs(rects[0].top - rects[1].top) < 1
+                || rects[1].top >= rects[0].bottom + 7,
+            readableLabels: buttons.every(button => {
+                const range = document.createRange();
+                range.selectNodeContents(button);
+                return range.getClientRects().length === 1
+                    && parseFloat(getComputedStyle(button).fontSize) >= 13;
+            }),
+            nativeText: getComputedStyle(dialog).transform === 'none',
+        };
+    });
+    expect(layout, 'Dialog content scrolls without clipping or misaligning its native-text actions').toEqual({
+        contained: true, noHorizontalOverflow: true, actionsVisible: true,
+        consistentTargets: true, aligned: true, readableLabels: true, nativeText: true,
+    });
+}
+
+for (const viewport of [
+    { width: 1280, height: 900 },
+    { width: 320, height: 568 },
+    { width: 568, height: 320 },
+]) {
+    test(`identity dialogs and sharing stay composed at ${viewport.width}x${viewport.height}`, async ({ identities }) => {
+        const player = await identities.open();
+        await player.page.setViewportSize(viewport);
+        await openIdentityNaming(player.page);
+        await expectDialogComposition(player.page, '#identity-dialog');
+        await expect(player.page.locator('label[for="identity-tag"]')).toHaveText('Player tag');
+        await expect(player.page.locator('#identity-tag')).toHaveAttribute(
+            'aria-describedby', 'identity-tag-hint identity-error');
+        await namePlayer(player.page, maximumLengthTag());
+        const self = await invitation(player.page, 'self');
+        await expect(player.page.locator('#btn-invite-self')).toBeFocused();
+        const notice = await player.page.locator('#identity-notice').boundingBox();
+        expect(notice.width).toBeCloseTo(Math.min(440, viewport.width - 32), 0);
+        expect(notice.x + notice.width / 2).toBeCloseTo(viewport.width / 2, 0);
+        const friend = await invitation(player.page, 'friend');
+
+        await player.page.evaluate(() => {
+            Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+                writeText: async () => { throw new DOMException('Denied', 'NotAllowedError'); },
+            } });
+        });
+        for (const [kind, title] of [['self', 'Share your identity'], ['friend', 'Invite a friend']]) {
+            await player.page.locator(`#btn-invite-${kind}`).click();
+            await expect(player.page.locator('#invite-share-title')).toHaveText(title);
+            await expect(player.page.locator('#identity-notice')).not.toBeVisible();
+            await expectDialogComposition(player.page, '#invite-share-dialog');
+            await expect(player.page.locator('#invite-share-url')).toHaveAttribute(
+                'aria-describedby', 'invite-share-description invite-share-warning invite-share-error');
+            await player.page.locator('#invite-share-copy').click();
+            await expect(player.page.locator('#invite-share-error')).toContainText('denied');
+            await expect(player.page.locator('#invite-share-error')).toBeInViewport({ ratio: 0.99 });
+            await expect(player.page.locator('#invite-share-url')).toBeInViewport({ ratio: 0.99 });
+            await expectDialogComposition(player.page, '#invite-share-dialog');
+            await player.page.locator('#invite-share-close').click();
+            await expect(player.page.locator(`#btn-invite-${kind}`)).toBeFocused();
+        }
+
+        const confirmation = await identities.open(self);
+        await confirmation.page.setViewportSize(viewport);
+        await expect(confirmation.page.locator('#identity-title')).toHaveText('Confirm player identity');
+        await expectDialogComposition(confirmation.page, '#identity-dialog');
+
+        const replacement = await identities.open(friend, player.context);
+        await replacement.page.setViewportSize(viewport);
+        await expect(replacement.page.locator('#identity-description')).toContainText('replaces');
+        await expectDialogComposition(replacement.page, '#identity-dialog');
+
+        const invalid = await identities.open('/#invite=invalid');
+        await invalid.page.setViewportSize(viewport);
+        await expect(invalid.page.locator('#identity-title')).toHaveText('Invitation unavailable');
+        await expectDialogComposition(invalid.page, '#identity-dialog');
+    });
+}
+
+test('identity failure and busy states keep their actions accessible in a reduced-height viewport', async ({ identities }) => {
+    const player = await identities.open();
+    await player.page.setViewportSize({ width: 360, height: 300 });
+    await player.page.route('**/api/identity/resolve', route => route.fulfill({
+        status: 503, contentType: 'application/json',
+        body: JSON.stringify({ error: { code: 'identity_unavailable' } }),
+    }));
+    await player.page.reload();
+    await expect(player.page.locator('#identity-title')).toHaveText('Player identity unavailable');
+    await expectDialogComposition(player.page, '#identity-dialog');
+    await player.page.unroute('**/api/identity/resolve');
+
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    await player.page.route('**/api/identity/resolve', async route => {
+        await pending;
+        await route.continue();
+    });
+    try {
+        await player.page.locator('#identity-accept').click();
+        await expect(player.page.locator('#identity-description')).toContainText('Checking');
+        await expect(player.page.locator('#identity-ignore')).toBeDisabled();
+        await expectDialogComposition(player.page, '#identity-dialog');
+    } finally {
+        release();
+    }
+    await openIdentityNaming(player.page);
+    await expectDialogComposition(player.page, '#identity-dialog');
+    await player.page.locator('#identity-tag').scrollIntoViewIfNeeded();
+    await expect(player.page.locator('#identity-tag')).toBeInViewport();
+    await player.page.unroute('**/api/identity/resolve');
+
+    await player.page.route('**/api/identity/root', route => route.fulfill({
+        status: 503, contentType: 'application/json',
+        body: JSON.stringify({ error: { code: 'identity_unavailable' } }),
+    }));
+    const tag = maximumLengthTag();
+    await player.page.locator('#identity-tag').fill(tag);
+    await player.page.locator('#identity-accept').click();
+    await expect(player.page.locator('#identity-accept')).toHaveText('Retry last request');
+    await expect(player.page.locator('#identity-ignore')).toBeDisabled();
+    await expect(player.page.locator('#identity-tag')).toHaveJSProperty('readOnly', true);
+    await expect(player.page.locator('#identity-error')).toBeInViewport({ ratio: 0.99 });
+    await expectDialogComposition(player.page, '#identity-dialog');
+    await player.page.unroute('**/api/identity/root');
+    await completeIdentityAction(player.page);
+    await expect(player.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
+
+    await player.page.route('**/api/identity/invites', route => route.fulfill({
+        status: 429, contentType: 'application/json',
+        body: JSON.stringify({ error: { code: 'rate_limited' } }),
+    }));
+    await player.page.locator('#btn-invite-friend').click();
+    await expect(player.page.locator('#identity-title')).toHaveText('Invitation not confirmed');
+    await expect(player.page.locator('#identity-ignore')).toHaveText('Back to menu');
+    await expectDialogComposition(player.page, '#identity-dialog');
+    await player.page.locator('#identity-ignore').click();
+    await expect(player.page.locator('#identity-dialog')).not.toBeVisible();
+    await expect(player.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
+    await expect(player.page.locator('#btn-invite-friend')).toBeFocused();
+});
+
 test('maximum-length root naming survives reload, solo play, self recovery and new-browser confirmation', async ({ identities }) => {
     const original = await identities.open();
     const tag = maximumLengthTag();
@@ -79,7 +234,7 @@ test('identity entry enforces the shared limit when typing and submitting', asyn
     const tag = maximumLengthTag();
     await expect(input).toBeVisible();
     await expect(input).toHaveAttribute('maxlength', String(tag.length));
-    await expect(friend.page.locator('label[for="identity-tag"]')).toContainText(`1-${tag.length}`);
+    await expect(friend.page.locator('#identity-tag-hint')).toContainText(`1-${tag.length}`);
     expect(await friend.page.evaluate(() => AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH)).toBe(tag.length);
     await input.pressSequentially(`${tag}7`);
     await expect(input).toHaveValue(tag);

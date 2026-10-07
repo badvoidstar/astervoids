@@ -408,6 +408,12 @@ false leaves them anonymous, while invitation controls still permit explicit
 naming. Same-identity invitations return silently to `/`; different identities
 require Accept/Ignore, and first naming fixes the permanent tag.
 
+Identity dialogs keep their heading and actions visible while longer content
+scrolls inside the dialog. Narrow screens stack equally sized actions without
+scaling text; native input hints and privacy/error text are associated with their
+fields. Self and friend sharing have distinct titles and retain the private-link
+warning in both clipboard-success and manual-copy paths.
+
 ### HTTP and consistency contract
 
 The API authority is the regional app's own origin, or the first configured
