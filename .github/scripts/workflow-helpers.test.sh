@@ -525,8 +525,10 @@ for key in WEB_URI CONTAINER_APP_NAME CONTAINER_APPS_ENVIRONMENT RESOURCE_GROUP 
   assert_equal "$(azd_env_value "$key")" "${outputs[$key]}"
 done
 cmp AstervoidsWeb/wwwroot/index.html "$TEST_DIR/static/index.html" || fail "static shell not copied"
-diff -r AstervoidsWeb/wwwroot/js "$TEST_DIR/static/js" >/dev/null \
+diff -r --exclude=shared-config-data.js AstervoidsWeb/wwwroot/js "$TEST_DIR/static/js" >/dev/null \
   || fail "static payload must copy every JS module, including player identity"
+cmp AstervoidsWeb/wwwroot/shared-config.json "$TEST_DIR/static/shared-config.json" \
+  || fail "static payload must carry the shared configuration source"
 BOOTSTRAP=$(sed 's/^window.ASTERVOIDS_REGION_BOOTSTRAP = //; s/;$//' "$TEST_DIR/static/region-bootstrap.js")
 assert_equal "$(jq -c '.regions' <<< "$BOOTSTRAP")" "${outputs[STATIC_APEX_REGION_MANIFEST]}"
 assert_equal "$(jq '.regionId, .displayName' <<< "$BOOTSTRAP")" $'null\nnull'
@@ -542,6 +544,11 @@ const browser = {
   fetch: async url => { requests.push(url); return { ok: true, text: async () => '' }; },
 };
 runInNewContext(readFileSync(process.argv[2], 'utf8'), browser);
+const sharedConfig = JSON.parse(readFileSync(join(dirname(process.argv[2]), 'shared-config.json'), 'utf8'));
+runInNewContext(readFileSync(join(dirname(process.argv[2]), 'js/shared-config-data.js'), 'utf8'), browser);
+runInNewContext(readFileSync(join(dirname(process.argv[2]), 'js/game-config.js'), 'utf8'), browser);
+assert.equal(runInNewContext('AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH', browser),
+  sharedConfig.identityTagMaxLength, 'static packaging must derive limits from the shared source');
 runInNewContext(readFileSync(join(dirname(process.argv[2]), 'js/region-service.js'), 'utf8'), browser);
 const service = browser.window.RegionService;
 await service.load();

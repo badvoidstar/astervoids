@@ -4,6 +4,9 @@
 [Oo]ut/
 publish/
 
+# Generated from the shared public configuration by MSBuild/static packaging
+AstervoidsWeb/wwwroot/js/shared-config-data.js
+
 # .NET generated files
 *.dll
 *.exe

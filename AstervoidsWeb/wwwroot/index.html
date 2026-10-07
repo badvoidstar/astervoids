@@ -1033,8 +1033,8 @@
                         <h2 id="identity-title">Welcome to Astervoids</h2>
                         <p id="identity-description"></p>
                         <div id="identity-name-field" hidden>
-                            <label for="identity-tag">Player tag (1-10 letters, numbers, _ or -)</label>
-                            <input id="identity-tag" name="tag" maxlength="10" pattern="[A-Za-z0-9_\-]{1,10}"
+                            <label for="identity-tag">Player tag</label>
+                            <input id="identity-tag" name="tag"
                                 autocomplete="nickname" autocapitalize="off" spellcheck="false">
                         </div>
                         <p id="identity-error" role="alert"></p>
@@ -1087,6 +1087,8 @@
     <script src="/js/signalr-protocol-msgpack.min.js"></script>
     <!-- Binary GUID conversion (server sends 16-byte binary GUIDs; this converts to strings) -->
     <script src="/js/guid-utils.js"></script>
+    <!-- Generated from the configuration shared with the backend -->
+    <script src="/js/shared-config-data.js"></script>
     <!-- Shared runtime/debug/test gameplay defaults and override policy -->
     <script src="/js/game-config.js"></script>
     <!-- Pure asteroid fracture geometry and kinematics -->
@@ -12889,6 +12891,14 @@
     let noticeTimer = null;
     game.identityChanging = true;
 
+    function configureIdentityTagInput() {
+        identityTagInput.maxLength = AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH;
+        identityTagInput.pattern = AstervoidsConfig.IDENTITY_TAG_PATTERN_SOURCE;
+        document.querySelector('label[for="identity-tag"]').textContent =
+            `Player tag (1-${AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH} letters, numbers, _ or -)`;
+    }
+    configureIdentityTagInput();
+
     // Move dialogs outside the menu's visibility/scroll layout.
     document.body.append(identityDialog, shareDialog, document.getElementById('identity-notice'));
     for (const dialog of [identityDialog, shareDialog]) {
@@ -12899,7 +12909,7 @@
 
     function identityMessage(error) {
         const messages = {
-            invalid_tag: 'Use 1-10 letters, numbers, underscores or hyphens.',
+            invalid_tag: `Use 1-${AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH} letters, numbers, underscores or hyphens.`,
             invite_not_found: 'This invitation is not available.',
             invalid_browser_credential: 'The saved browser binding is invalid. Use a fresh browser profile with your self link.',
             storage_unavailable: 'Durable browser storage and Web Locks are required. Check your browser privacy settings.',

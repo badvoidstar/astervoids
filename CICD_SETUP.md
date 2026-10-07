@@ -888,6 +888,12 @@ private endpoints/VNet integration are not provisioned by this topology.
 
 The static payload recursively copies all `wwwroot` assets, including
 `js/player-identity.js`; no separate identity bundle or SWA backend is needed.
+Public cross-stack limits come only from `wwwroot/shared-config.json`.
+MSBuild embeds that source in the backend and generates `js/shared-config-data.js`;
+static-apex packaging generates its own copy directly from the same JSON, rather
+than relying on a prior local build. This file must contain no secrets. Changing
+it requires rebuilding and deploying both the backend and static assets; the
+generated JavaScript is ignored by git and must not be edited manually.
 The existing regional bootstrap routes the static apex's API requests to the
 first configured region. Browsers call app APIs, never the storage endpoint.
 Azure terminates HTTPS before forwarding HTTP to the container. Bicep therefore

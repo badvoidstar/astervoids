@@ -401,12 +401,15 @@ provision_multi_region() {
 }
 
 prepare_static_apex() {
-  local directory="$1" manifest="$2" bootstrap
+  local directory="$1" manifest="$2" bootstrap shared_config
   bootstrap=$(jq -cn --argjson regions "$manifest" \
     '{regionId: null, displayName: null, regions: $regions}') || return
+  shared_config=$(jq -c . AstervoidsWeb/wwwroot/shared-config.json) || return
   rm -rf -- "$directory" || return
   mkdir -p "$directory" || return
   cp -R AstervoidsWeb/wwwroot/. "$directory"/ || return
+  printf 'globalThis.ASTERVOIDS_SHARED_CONFIG = Object.freeze(%s);\n' "$shared_config" \
+    > "$directory/js/shared-config-data.js" || return
   printf 'window.ASTERVOIDS_REGION_BOOTSTRAP = %s;\n' "$bootstrap" > "$directory/region-bootstrap.js"
 }
 

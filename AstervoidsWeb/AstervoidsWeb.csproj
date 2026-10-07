@@ -17,4 +17,21 @@
     <InternalsVisibleTo Include="AstervoidsWeb.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="wwwroot\shared-config.json" LogicalName="AstervoidsWeb.SharedConfiguration.json" />
+    <Content Remove="wwwroot\js\shared-config-data.js" />
+    <Content Include="wwwroot\js\shared-config-data.js" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="GenerateSharedConfiguration" BeforeTargets="PrepareForBuild">
+    <PropertyGroup>
+      <_SharedConfigPath>$([System.IO.Path]::Combine('$(MSBuildProjectDirectory)', 'wwwroot', 'shared-config.json'))</_SharedConfigPath>
+      <_SharedConfigJson>$([System.IO.File]::ReadAllText('$(_SharedConfigPath)'))</_SharedConfigJson>
+      <_SharedConfigScript>globalThis.ASTERVOIDS_SHARED_CONFIG = Object.freeze($(_SharedConfigJson));</_SharedConfigScript>
+    </PropertyGroup>
+    <WriteLinesToFile File="wwwroot\js\shared-config-data.js"
+                      Lines="$([MSBuild]::Escape('$(_SharedConfigScript)'))"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" Encoding="UTF-8" />
+  </Target>
+
 </Project>

@@ -1,6 +1,6 @@
 import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
-import { provisionPlayer } from './identity-helpers.mjs';
+import { maximumLengthTag, provisionPlayer } from './identity-helpers.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
@@ -470,8 +470,8 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
 });
 
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
-    const host = await players.open({ tag: 'A_b-123456' });
-    const guest = await players.open({ tag: 'Friend_123' });
+    const host = await players.open({ tag: maximumLengthTag() });
+    const guest = await players.open({ tag: maximumLengthTag('Z_9-') });
     let sessionId;
     await test.step('create and join an isolated session through the UI', async () => {
         sessionId = await create(host.page);
@@ -498,7 +498,7 @@ test('independent players create, join, play, leave and rejoin', async ({ player
         await expect.poll(() => guest.page.evaluate(() => {
             const state = ObjectSync.getObjectByType('gameState');
             return state ? Object.values(AstervoidsWireCodec.unpackTagMap(state.data.participantTags)).sort() : [];
-        }), { message: 'Full ten-character names survive the replicated participant ledger' })
+        }), { message: 'Maximum-length names survive the replicated participant ledger' })
             .toEqual([host.tag, guest.tag].sort());
         expect(host.health.hubFrames, 'Host receives real hub WebSocket frames').toBeGreaterThan(0);
         expect(guest.health.hubFrames, 'Guest receives real hub WebSocket frames').toBeGreaterThan(0);

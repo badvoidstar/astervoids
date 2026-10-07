@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import { captureClipboard, completeIdentityAction, invitation, namePlayer } from './identity-helpers.mjs';
+import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
 
 const test = base.extend({
@@ -41,9 +41,9 @@ const atRoot = page => expect.poll(() => page.evaluate(() =>
     location.pathname === '/' && location.hash === '' && location.search === ''),
 { message: 'Only the site root remains in the address bar' }).toBe(true);
 
-test('ten-character root naming survives reload, solo play, self recovery and new-browser confirmation', async ({ identities }) => {
+test('maximum-length root naming survives reload, solo play, self recovery and new-browser confirmation', async ({ identities }) => {
     const original = await identities.open();
-    const tag = 'A_b-123456';
+    const tag = maximumLengthTag();
     await namePlayer(original.page, tag);
     const identity = await publicIdentity(original.page);
     await original.page.reload();
@@ -71,15 +71,16 @@ test('ten-character root naming survives reload, solo play, self recovery and ne
     await atRoot(recovered.page);
 });
 
-test('identity entry enforces the ten-character limit when typing and submitting', async ({ identities }) => {
+test('identity entry enforces the shared limit when typing and submitting', async ({ identities }) => {
     const host = await identities.open();
     await namePlayer(host.page, 'Host');
     const friend = await identities.open(await invitation(host.page, 'friend'));
     const input = friend.page.locator('#identity-tag');
+    const tag = maximumLengthTag();
     await expect(input).toBeVisible();
-    await expect(input).toHaveAttribute('maxlength', '10');
-    await expect(friend.page.locator('label[for="identity-tag"]')).toContainText('1-10');
-    const tag = 'A_b-123456';
+    await expect(input).toHaveAttribute('maxlength', String(tag.length));
+    await expect(friend.page.locator('label[for="identity-tag"]')).toContainText(`1-${tag.length}`);
+    expect(await friend.page.evaluate(() => AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH)).toBe(tag.length);
     await input.pressSequentially(`${tag}7`);
     await expect(input).toHaveValue(tag);
     expect(await input.evaluate(element => element.checkValidity())).toBe(true);

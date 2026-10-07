@@ -10,6 +10,11 @@ namespace AstervoidsWeb.Tests;
 
 public class PlayerIdentityServiceTests
 {
+    public static TheoryData<string> OverLimitTags => new()
+    {
+        new string('A', SharedConfiguration.Current.IdentityTagMaxLength + 1)
+    };
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -292,7 +297,7 @@ public class PlayerIdentityServiceTests
 
     [Theory]
     [InlineData("")]
-    [InlineData("12345678901")]
+    [MemberData(nameof(OverLimitTags))]
     [InlineData(" bad")]
     [InlineData("Bad Tag")]
     [InlineData("é")]
@@ -344,7 +349,7 @@ public class PlayerIdentityServiceTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData("invalid!")]
-    [InlineData("12345678901")]
+    [MemberData(nameof(OverLimitTags))]
     public async Task PendingInviteRequiresValidTag_AndRetainsPendingStateOnFailure(string? tag)
     {
         using var state = new IdentityTestState();
@@ -363,7 +368,7 @@ public class PlayerIdentityServiceTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task PendingInviteAcceptsTenCharacterTag_AndPersistsAfterRestart(bool azure)
+    public async Task PendingInviteAcceptsConfiguredMaximumTag_AndPersistsAfterRestart(bool azure)
     {
         using var state = new IdentityTestState(azure);
         var service = state.Service();
@@ -373,7 +378,7 @@ public class PlayerIdentityServiceTests
             await service.CreateInviteAsync(creator, new(Guid.NewGuid())), 201).InviteToken;
         var browser = IdentitySecrets.NewToken();
         var before = await Resolve(service, browser, token);
-        const string tag = "A_b-123456";
+        var tag = new string('A', SharedConfiguration.Current.IdentityTagMaxLength);
         var accepted = Read<BindingReply>(await service.AcceptInviteAsync(browser,
             new(Guid.NewGuid(), token, before.Invite!.Etag, Expect(before.Binding), tag))).Binding;
 

@@ -8,6 +8,9 @@ using Microsoft.Net.Http.Headers;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Reject an invalid cross-stack contract before serving assets or API responses.
+_ = SharedConfiguration.Current;
+
 // Register configuration
 builder.Services.Configure<SessionSettings>(
     builder.Configuration.GetSection(SessionSettings.SectionName));

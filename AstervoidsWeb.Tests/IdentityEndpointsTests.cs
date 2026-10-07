@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Identity;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
@@ -15,6 +16,11 @@ namespace AstervoidsWeb.Tests;
 
 public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Factory>
 {
+    public static TheoryData<string> OverLimitTags => new()
+    {
+        new string('A', SharedConfiguration.Current.IdentityTagMaxLength + 1)
+    };
+
     private const string StaticOrigin = "https://identity-test.azurestaticapps.net";
     private readonly Factory _factory;
 
@@ -68,6 +74,36 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
             if (disposing)
                 _state.Dispose();
         }
+    }
+
+    [Fact]
+    public async Task SharedConfigurationDrivesIdentityValidationAndGeneratedBrowserAsset()
+    {
+        using var client = _factory.CreateClient();
+        using var configuration = JsonDocument.Parse(await client.GetStringAsync("/shared-config.json"));
+        Assert.Equal(new[] { "identityTagMaxLength" }, Names(configuration.RootElement));
+        var maximum = configuration.RootElement.GetProperty("identityTagMaxLength").GetInt32();
+        Assert.InRange(maximum, 1, byte.MaxValue);
+
+        var script = await client.GetStringAsync("/js/shared-config-data.js");
+        const string prefix = "globalThis.ASTERVOIDS_SHARED_CONFIG = Object.freeze(";
+        Assert.StartsWith(prefix, script);
+        Assert.EndsWith(");", script.TrimEnd());
+        using var generated = JsonDocument.Parse(script.TrimEnd()[prefix.Length..^2]);
+        Assert.Equal(maximum, generated.RootElement.GetProperty("identityTagMaxLength").GetInt32());
+        Assert.True(IdentitySecrets.IsTag(new string('A', maximum)));
+        Assert.False(IdentitySecrets.IsTag(new string('A', maximum + 1)));
+
+        var browser = IdentitySecrets.NewToken();
+        using var resolved = await Send(client, "/resolve", browser, new { });
+        var binding = (await Body(resolved, 200)).GetProperty("binding");
+        using var rejected = await Send(client, "/root", browser,
+            new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = new string('A', maximum + 1) });
+        Assert.Equal("invalid_tag", (await Body(rejected, 400)).GetProperty("error").GetProperty("code").GetString());
+        using var accepted = await Send(client, "/root", browser,
+            new { requestId = Guid.NewGuid(), expectedBinding = Expected(binding), tag = new string('A', maximum) });
+        Assert.Equal(maximum, (await Body(accepted, 201)).GetProperty("binding")
+            .GetProperty("identity").GetProperty("tag").GetString()!.Length);
     }
 
     [Theory]
@@ -190,7 +226,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
 
     [Theory]
     [InlineData("")]
-    [InlineData("12345678901")]
+    [MemberData(nameof(OverLimitTags))]
     [InlineData("P ilot")]
     [InlineData("é")]
     [InlineData(null)]
