@@ -222,12 +222,137 @@ test('page boots and solo play responds to keyboard input', async ({ players }) 
     }
 });
 
+for (const touch of [false, true]) {
+    test(`menu selectors cycle once per ${touch ? 'tap' : 'click'} and keep their shared row`, async ({ players }) => {
+        const { page } = await players.open({ hasTouch: touch, isMobile: touch });
+        const difficulty = page.locator('#btn-difficulty');
+        const controls = page.locator('#btn-control-mode');
+        const activate = locator => touch ? locator.tap() : locator.click();
+        await expect(difficulty).toHaveText('💦 : Survivor');
+        await expect(controls).toHaveText('🕹️ : Polar');
+        let controlLabel = 'Polar';
+        for (const viewport of [{ width: 400, height: 300 }, { width: 320, height: 568 }]) {
+            await page.setViewportSize(viewport);
+            for (const [label, value] of [['Shifter', 0.4], ['Dancer', 0.5], ['Survivor', 0.6]]) {
+                await activate(difficulty);
+                await expect(difficulty).toHaveText(`💦 : ${label}`);
+                expect(await page.evaluate(() => [
+                    CONFIG.ASTEROID_DIFFICULTY_FACTOR, LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR,
+                ])).toEqual([value, value]);
+                await activate(controls);
+                controlLabel = controlLabel === 'Polar' ? 'Rectilinear' : 'Polar';
+                await expect(controls).toHaveText(`🕹️ : ${controlLabel}`);
+                expect(await page.evaluate(() => getAnalogControlScheme())).toBe(controlLabel.toLowerCase());
+                const geometry = await page.evaluate(() => {
+                    const controls = document.getElementById('btn-control-mode');
+                    const difficulty = document.getElementById('btn-difficulty');
+                    const left = controls.getBoundingClientRect();
+                    const right = difficulty.getBoundingClientRect();
+                    return {
+                        sameRow: controls.parentElement === difficulty.parentElement,
+                        gap: right.left - left.right, offset: right.top - left.top,
+                        widthDifference: right.width - left.width,
+                        clipped: [controls, difficulty].filter(button =>
+                            button.scrollWidth > button.clientWidth || button.scrollHeight > button.clientHeight
+                            || button.getBoundingClientRect().height !== 32
+                            || button.getBoundingClientRect().left < 0
+                            || button.getBoundingClientRect().right > innerWidth
+                            || getComputedStyle(button).transform !== 'none').map(button => button.id),
+                    };
+                });
+                expect(geometry.sameRow).toBe(true);
+                expect(geometry.gap).toBeCloseTo(7.2, 1);
+                expect(geometry.offset).toBeCloseTo(0, 1);
+                expect(geometry.widthDifference).toBeCloseTo(0, 1);
+                expect(geometry.clipped, `${controlLabel}/${label} at ${viewport.width}x${viewport.height}`).toEqual([]);
+            }
+        }
+        await activate(difficulty);
+        await activate(difficulty);
+        await expect(difficulty).toHaveText('💦 : Dancer');
+        await activate(page.locator('#btn-solo'));
+        await playing(page);
+        expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
+        await page.keyboard.press('p');
+        await expect(page.locator('#pause-menu')).toBeVisible();
+        if (touch) {
+            await page.locator('#pause-restart-btn').tap();
+        } else {
+            await page.keyboard.down('Escape');
+            try {
+                await expect(page.locator('#start-screen')).toBeVisible();
+            } finally {
+                await page.keyboard.up('Escape');
+            }
+        }
+        await expect(page.locator('#start-screen')).toBeVisible();
+        await expect(difficulty).toHaveText('💦 : Dancer');
+        await expect(difficulty).toBeEnabled();
+    });
+}
+
+test('session difficulty follows the creator and leaving restores each local preset', async ({ players }) => {
+    const host = await players.open();
+    const guest = await players.open({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
+    await host.page.locator('#btn-difficulty').click();
+    await host.page.locator('#btn-difficulty').click();
+    await guest.page.locator('#btn-difficulty').tap();
+    await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+    const sessionId = await create(host.page);
+    players.ownSession(sessionId);
+    await join(guest.page, sessionId);
+    for (const player of [host, guest]) {
+        await expect(player.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+        await expect(player.page.locator('#btn-difficulty')).toBeDisabled();
+        await expect(player.page.locator('#btn-control-mode')).toBeEnabled();
+        expect(await player.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
+    }
+    await guest.page.locator('#btn-control-mode').tap();
+    await expect(guest.page.locator('#btn-control-mode')).toHaveText('🕹️ : Rectilinear');
+    await guest.page.evaluate(() => document.getElementById('btn-difficulty').click());
+    expect(await guest.page.evaluate(() => [
+        CONFIG.ASTEROID_DIFFICULTY_FACTOR, LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR,
+    ])).toEqual([0.5, 0.4]);
+    await host.page.locator('#btn-start-enter').click();
+    await guest.page.locator('#btn-start-enter').tap();
+    await Promise.all([playing(host.page), playing(guest.page)]);
+    for (const player of [host, guest]) {
+        expect(await player.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
+    }
+    await leave(guest.page);
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+    await expect(guest.page.locator('#btn-difficulty')).toBeEnabled();
+    await guest.page.locator('#btn-difficulty').tap();
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+    await leave(host.page);
+    await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+    await expect(host.page.locator('#btn-difficulty')).toBeEnabled();
+});
+
+test('custom difficulty from URL and live debug tuning stays honest until a preset click', async ({ players }) => {
+    const { page } = await players.open({ path: '/?cfg.ASTEROID_DIFFICULTY_FACTOR=0.75' });
+    const difficulty = page.locator('#btn-difficulty');
+    await expect(difficulty).toHaveText('💦 : Custom');
+    await expect(difficulty).toHaveAttribute('aria-label', /Custom \(0\.75\)/);
+    expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.75);
+    await page.evaluate(() => {
+        const channel = new BroadcastChannel('astervoids-debug');
+        channel.postMessage({ type: 'config-update', key: 'ASTEROID_DIFFICULTY_FACTOR', value: 1.4 });
+        channel.close();
+    });
+    await expect(difficulty).toHaveAttribute('aria-label', /Custom \(1\.4\)/);
+    await difficulty.click();
+    await expect(difficulty).toHaveText('💦 : Shifter');
+    expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
+});
+
 test('main-menu buttons share size and brightness with compact spacing in portrait, landscape and lobbies', async ({ players }) => {
     const { page } = await players.open();
     async function expectMatchingButtons(inSession) {
         const ids = [
             'btn-leave-create', ...(inSession ? ['btn-start-enter'] : []), 'btn-solo',
-            'btn-fullscreen', 'btn-control-mode', 'btn-invite-self', 'btn-invite-friend',
+            'btn-fullscreen', 'btn-control-mode', 'btn-difficulty', 'btn-invite-self', 'btn-invite-friend',
         ];
         for (const viewport of [
             { width: 1280, height: 900 }, { width: 900, height: 550 },
@@ -245,6 +370,8 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     return {
                         id: button.id, width: box.width, height: box.height,
                         disabled: button.disabled,
+                        paired: button.parentElement.classList.contains('button-row')
+                            && [...button.parentElement.children].filter(sibling => sibling.getClientRects().length).length === 2,
                         fontSize: style.fontSize, nativeText: style.transform === 'none',
                         fits: box.left >= 0 && box.right <= innerWidth
                             && button.scrollWidth <= button.clientWidth
@@ -257,12 +384,15 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             for (const button of buttons) {
                 const label = `${button.id} at ${viewport.width}x${viewport.height}`;
                 const invite = button.id.startsWith('btn-invite-');
-                const paired = invite || inSession && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                const paired = button.paired;
                 expect(button.width, `${label} ${paired ? 'shares its row equally' : 'matches Solo Play width'}`)
                     .toBeCloseTo(paired ? (solo.width - 7.2) / 2 : solo.width, 1);
                 expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
                 expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
                 expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
+                if (button.id === 'btn-difficulty') {
+                    expect(button.disabled, `${label} is locked only for the shared session`).toBe(inSession);
+                }
                 if (!button.disabled) {
                     await expect(page.locator(`#${button.id}`), `${label} has a full-bright label`)
                         .toHaveCSS('color', 'rgb(255, 255, 255)');
@@ -314,13 +444,19 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     inviteGap: box('#btn-invite-friend').left - box('#btn-invite-self').right,
                     inviteOffset: box('#btn-invite-friend').top - box('#btn-invite-self').top,
                     inviteSpan: box('#btn-invite-friend').right - box('#btn-invite-self').left,
+                    settingsGap: box('#btn-difficulty').left - box('#btn-control-mode').right,
+                    settingsOffset: box('#btn-difficulty').top - box('#btn-control-mode').top,
+                    settingsSpan: box('#btn-difficulty').right - box('#btn-control-mode').left,
                 };
             });
-            expect(spacing.utilityRowCount, 'Pairing invitations frees one of the four utility rows').toBe(3);
+            expect(spacing.utilityRowCount, 'Device settings and invitations each share one utility row').toBe(3);
             expect(spacing.firstDevice, 'Fullscreen is the first visible device action').toBe('btn-fullscreen');
             expect(spacing.inviteGap, 'Invitations use the same horizontal gap as lobby actions').toBeCloseTo(7.2, 1);
             expect(spacing.inviteOffset, 'Invitations sit side by side').toBeCloseTo(0, 1);
             expect(spacing.inviteSpan, 'Invitations share one full-width row').toBeCloseTo(solo.width, 1);
+            expect(spacing.settingsGap, 'Settings use the same horizontal gap as lobby actions').toBeCloseTo(7.2, 1);
+            expect(spacing.settingsOffset, 'Controller mode and difficulty sit side by side').toBeCloseTo(0, 1);
+            expect(spacing.settingsSpan, 'Settings share one full-width row').toBeCloseTo(solo.width, 1);
             const landscape = viewport.width > viewport.height;
             const titleMargin = Math.min(27, Math.max(14, Math.min(viewport.width, viewport.height) * 0.027));
             for (const [name, previous] of [
@@ -438,6 +574,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                         regionVisible: box('create-region-row').height > 0,
                         startVisible: box('btn-start-enter').height > 0,
                         startDisabled: sessionPicker.btnStartEnter.disabled,
+                        difficultyDisabled: document.getElementById('btn-difficulty').disabled,
                         actionRowHeight: sessionPicker.btnLeaveCreate.parentElement.getBoundingClientRect().height,
                         lobbyGap: box('btn-start-enter').left - box('btn-leave-create').right,
                         lobbyOffset: box('btn-start-enter').top - box('btn-leave-create').top,
@@ -446,8 +583,8 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                         createText: sessionPicker.btnLeaveCreate.textContent,
                         clipped: buttons.filter(button => {
                             const rect = button.getBoundingClientRect();
-                            const paired = button.id.startsWith('btn-invite-') || role !== 'outside'
-                                && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                            const paired = button.parentElement.classList.contains('button-row')
+                                && [...button.parentElement.children].filter(sibling => sibling.getClientRects().length).length === 2;
                             const expectedWidth = paired ? (solo.width - 7.2) / 2 : solo.width;
                             return Math.abs(rect.width - expectedWidth) > 0.05 || rect.height !== 32
                                 || rect.left < 0 || rect.right > innerWidth
@@ -482,6 +619,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                 .toBe(state.mode === '' ? 'btn-fullscreen' : 'btn-control-mode');
             expect(state.regionVisible, label).toBe(state.multiRegion && state.role === 'outside');
             expect(state.startVisible, label).toBe(state.role !== 'outside');
+            expect(state.difficultyDisabled, `${label} locks only the shared difficulty`).toBe(state.role !== 'outside');
             expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
             expect(state.inviteGap, `${label} invitations keep the lobby action gap`).toBeCloseTo(7.2, 1);
             expect(state.inviteOffset, `${label} invitations stay side by side`).toBeCloseTo(0, 1);
@@ -762,6 +900,8 @@ for (const touch of [false, true]) {
         const host = await players.open(touch
             ? { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } } : {});
         await expect(host.page.locator('#btn-leave-create')).toBeEnabled();
+        await host.page.locator('#btn-difficulty').click();
+        await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
         let releaseVerification;
         const verification = new Promise(resolve => { releaseVerification = resolve; });
         let verificationStarted;
@@ -779,11 +919,16 @@ for (const touch of [false, true]) {
             if (touch) await host.page.locator('#btn-leave-create').tap();
             else await host.page.locator('#btn-leave-create').click();
             await expect(host.page.locator('#btn-leave-create')).toBeDisabled();
+            await expect(host.page.locator('#btn-difficulty')).toBeDisabled();
+            expect(await host.page.evaluate(() => cycleDifficulty())).toBe(false);
+            expect(await host.page.evaluate(() => LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
             expect(await host.page.evaluate(() => sessionPicker.currentSessionId)).toBeNull();
             releaseVerification();
             await sessionReady(host.page);
             players.ownSession(await host.page.evaluate(() => SessionClient.getCurrentSession().id));
             await expect(host.page.locator('#btn-start-enter')).toBeEnabled();
+            await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+            expect(await host.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
             await host.page.locator('#btn-start-enter').click();
             await playing(host.page);
             expect(host.health.hubFrames, 'Create still uses the real hub connection').toBeGreaterThan(0);

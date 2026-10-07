@@ -17,6 +17,12 @@ const AstervoidsConfig = (function() {
     const IDENTITY_TAG_PATTERN_SOURCE = String.raw`[A-Za-z0-9_\-]{1,${IDENTITY_TAG_MAX_LENGTH}}`;
     const IDENTITY_TAG_PATTERN = new RegExp(`^${IDENTITY_TAG_PATTERN_SOURCE}$`);
 
+    const ASTEROID_DIFFICULTY_PRESETS = Object.freeze([
+        Object.freeze({ label: 'Shifter', value: 0.4 }),
+        Object.freeze({ label: 'Dancer', value: 0.5 }),
+        Object.freeze({ label: 'Survivor', value: 0.6 }),
+    ]);
+
     const SHARED_DEFAULTS = Object.freeze({
         TARGET_FPS: 60,
         SHIP_KEYBOARD_TURN_SPEED: 0.125,
@@ -33,7 +39,7 @@ const AstervoidsConfig = (function() {
         ANALOG_BRAKE_GAIN: 1.0,
         EXTRA_LIFE_SCORE_THRESHOLD: 10000,
         ASTEROID_ASPECT_SIZE_SPEED_BALANCE: 0.5,
-        ASTEROID_DIFFICULTY_FACTOR: 0.6,
+        ASTEROID_DIFFICULTY_FACTOR: ASTEROID_DIFFICULTY_PRESETS.at(-1).value,
         ASTEROID_MAX_SPEED: 0.4,
         ASTEROID_MAX_SPIN: Math.PI / 6,
         MIN_ASTEROID_RADIUS: 0.025,
@@ -411,6 +417,7 @@ const AstervoidsConfig = (function() {
         IDENTITY_TAG_MAX_LENGTH,
         IDENTITY_TAG_PATTERN_SOURCE,
         IDENTITY_TAG_PATTERN,
+        ASTEROID_DIFFICULTY_PRESETS,
         SHARED_DEFAULTS,
         CONFIG_CONTROLS,
         DEBUG_OVERRIDABLE_KEYS,

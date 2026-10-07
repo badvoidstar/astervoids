@@ -364,6 +364,7 @@ function createRegionControlsHarness(regionCount = 2) {
         pingForRegion: () => ({ state: 'settled', valueMs: 10 }),
         window: { RegionService: { bestRegion: () => 'first' } },
         document: { createElement: () => ({}) },
+        updateDifficultyButton() {},
         handleLeaveCreateButton() {},
     });
     return { ...functions, sessionPicker, select, handlers };

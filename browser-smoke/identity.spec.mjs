@@ -461,8 +461,9 @@ test('clipboard rejection offers the same selectable link and responsive menu gr
                 matchesRows: [...document.querySelectorAll('#menu-utilities button')]
                     .every(button => {
                         const box = button.getBoundingClientRect();
-                        const width = button.id.startsWith('btn-invite-')
-                            ? (solo.width - 7.2) / 2 : solo.width;
+                        const paired = button.parentElement.classList.contains('button-row')
+                            && [...button.parentElement.children].filter(sibling => sibling.getClientRects().length).length === 2;
+                        const width = paired ? (solo.width - 7.2) / 2 : solo.width;
                         return Math.abs(box.width - width) < 0.05 && box.height === solo.height;
                     }),
                 fits: right.right <= innerWidth && left.left >= 0,

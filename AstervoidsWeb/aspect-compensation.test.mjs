@@ -439,13 +439,16 @@ test('debug config changes immediately rescale existing asteroids', () => {
     assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
     const handlerSource = indexSource.slice(handlerStart, handlerEnd);
 
-    assert.match(handlerSource,
+    assert.match(handlerSource, /applyGameConfigOverride\(data\.key, data\.value\)/);
+    const { applyGameConfigOverride } = loadInlineGameFunctions(['applyGameConfigOverride']);
+    const overrideSource = applyGameConfigOverride.toString();
+    assert.match(overrideSource,
         /const previousAspectScales = getEffectiveAsteroidAspectScales\(\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /const nextAspectScales = getEffectiveAsteroidAspectScales\(\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /applyLiveConfigOverride\([\s\S]*?isSessionMode\(\)\)/);
 });
 
