@@ -408,6 +408,14 @@ false leaves them anonymous, while invitation controls still permit explicit
 naming. Same-identity invitations return silently to `/`; different identities
 require Accept/Ignore, and first naming fixes the permanent tag.
 
+The menu pairs Self and Friend invitation actions in a single utility row.
+Fullscreen leads the device group; hiding it leaves no empty button slot.
+The session list shrinks to the space left by fixed-size menu controls and
+scrolls independently, with long names ellipsized instead of widening landscape
+columns. Its minimum row height shares the button-height variable. Visible menu
+content retains native touch scrolling, including the outer menu on very short
+screens, without acquiring gameplay touch controls. A layout observer recomputes
+only the list's height budget as viewport and menu content sizes change.
 Identity dialogs keep their heading and actions visible while longer content
 scrolls inside the dialog. Narrow screens stack equally sized actions without
 scaling text; native input hints and privacy/error text are associated with their
@@ -422,6 +430,21 @@ select an identity authority. All identity operations are JSON POSTs under
 `/api/identity`: `resolve`, `root`, `invites`, `invites/accept`, and `invites/self`.
 The browser sends its credential only in `X-Astervoids-Browser`; requests omit
 cookies, disable caching/referrers, and reject redirects.
+
+On the static entrypoint, a single credential-free `/api/ping` request prepares
+the configured identity region as soon as its bootstrap loads, before the game
+scripts. It neither creates a browser credential nor resolves or trusts a
+binding, and normal identity verification does not wait for it. Regional pages
+skip this extra request because their app is already serving the page. Failed
+preparation reports a constant diagnostic; verification still uses its normal
+error handling.
+
+Identity CORS preflight permissions can be cached for ten minutes; identity
+responses remain `no-store`, and every actual request still validates its origin
+and browser credential. These optimizations overlap startup with page loading
+and avoid repeated permission round trips, not container startup or first
+storage-access costs. There is no periodic warm-up or keep-alive mechanism;
+idle containers retain scale-to-zero.
 
 Invitations use the current site's origin and `#invite=...`. The early-loaded
 identity script captures and scrubs the fragment before normal startup.

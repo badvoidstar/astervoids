@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, 'wwwroot', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
@@ -27,6 +28,72 @@ test('portrait menu utilities stack and landscape uses a native two-column layou
     }
 });
 
+test('fullscreen leads the device group and hidden modes remove it without reserving space', () => {
+    assert.match(source,
+        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<button id="btn-control-mode"[^>]*>[^<]*<\/button>\s*<\/div>/);
+    for (const mode of ['fullscreen-active', 'standalone-mode', 'pseudo-fullscreen']) {
+        assert.match(source, new RegExp(`\\.${mode} #btn-fullscreen[,\\s][^}]*display: none;`));
+    }
+});
+
+test('session lists cap viewport space and truncate labels without horizontal scrolling', () => {
+    const listStyle = source.match(/#session-list \{([^}]+)\}/)?.[1];
+    assert.ok(listStyle);
+    assert.match(listStyle, /min-height: var\(--menu-button-height\);/);
+    assert.match(listStyle, /max-height: min\(135px, 25dvh, var\(--session-list-available, 100dvh\)\);/);
+    assert.match(listStyle, /overflow-x: hidden;/);
+    assert.match(listStyle, /overflow-y: auto;/);
+    assert.match(listStyle, /overscroll-behavior: contain;/);
+    assert.match(listStyle, /touch-action: pan-y;/);
+    assert.match(source, /#start-screen-content > \* \{ flex-shrink: 0; \}/);
+    const nameStyle = source.match(/\.session-item \.session-name \{([^}]+)\}/)?.[1];
+    assert.ok(nameStyle);
+    assert.match(nameStyle, /min-width: 0;/);
+    assert.match(nameStyle, /white-space: nowrap;/);
+    assert.match(nameStyle, /overflow: hidden;/);
+    assert.match(nameStyle, /text-overflow: ellipsis;/);
+    assert.match(source, /\.session-item \.session-players \{[^}]*white-space: nowrap;/);
+});
+
+test('session list sizing reserves the measured control space and grows back with the viewport', () => {
+    for (const [viewport, contentHeight, listHeight, expected] of [
+        [480, 537, 120, '63px'],
+        [320, 497, 80, '0px'],
+        [800, 480, 63, '383px'],
+        [480, 500, 80.5, '60px'],
+    ]) {
+        let height = '';
+        let writes = 0;
+        const { fitSessionListToViewport } = loadInlineGameFunctions(['fitSessionListToViewport'], {
+            isSessionPickerVisible: () => true,
+            startScreen: { clientHeight: viewport },
+            document: { getElementById: () => ({ scrollHeight: contentHeight }) },
+            sessionPicker: { listEl: {
+                getBoundingClientRect: () => ({ height: listHeight }),
+                style: {
+                    getPropertyValue: () => height,
+                    setProperty(name, value) {
+                        assert.equal(name, '--session-list-available');
+                        height = value;
+                        writes++;
+                    },
+                },
+            } },
+        });
+        fitSessionListToViewport();
+        assert.equal(height, expected);
+        fitSessionListToViewport();
+        assert.equal(writes, 1, 'An unchanged budget does not trigger another layout mutation');
+    }
+});
+
+test('hidden pickers do not measure or mutate menu layout', () => {
+    const { fitSessionListToViewport } = loadInlineGameFunctions(['fitSessionListToViewport'], {
+        isSessionPickerVisible: () => false,
+    });
+    assert.doesNotThrow(fitSessionListToViewport);
+});
+
 test('landscape aligns the play and utility groups without reserving hidden button slots', () => {
     const landscape = source.match(/@media \(orientation: landscape\) \{([\s\S]*?)\n {8}\}/)?.[1];
     assert.ok(landscape);
@@ -39,25 +106,31 @@ test('landscape aligns the play and utility groups without reserving hidden butt
     assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
 });
 
-test('main-menu buttons keep Solo Play height while lobby actions share one row', () => {
+test('main-menu buttons keep Solo Play height while lobby and invite actions share rows', () => {
     const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
     assert.ok(buttonStyle);
     assert.match(buttonStyle, /width: 100%;/);
-    assert.match(buttonStyle, /height: 32px;/);
+    assert.match(source, /#menu-columns \{[^}]*--menu-button-height: 32px;/);
+    assert.match(buttonStyle, /height: var\(--menu-button-height\);/);
     assert.match(buttonStyle, /font-size: 11px;/);
     assert.match(buttonStyle, /line-height: 12px;/);
     assert.match(buttonStyle, /padding-inline: min\(18px, 2vw\);/);
     assert.match(buttonStyle, /transition-property: background-color, border-color, color, opacity;/);
-    const rowStyle = source.match(/#picker-buttons \.button-row \{([^}]+)\}/)?.[1];
+    const rowStyle = source.match(/#menu-columns \.button-row \{([^}]+)\}/)?.[1];
     assert.ok(rowStyle);
     assert.match(rowStyle, /flex-direction: row;/);
     assert.match(rowStyle, /gap: 7\.2px;/);
-    const rowButtonStyle = source.match(/#picker-buttons \.button-row \.picker-btn \{([^}]+)\}/)?.[1];
+    const rowButtonStyle = source.match(/#menu-columns \.button-row \.picker-btn \{([^}]+)\}/)?.[1];
     assert.ok(rowButtonStyle);
     assert.match(rowButtonStyle, /flex: 1;/);
     assert.match(rowButtonStyle, /min-width: 0;/);
     assert.match(source, /#menu-columns \.picker-btn\.regional-create \{[^}]*padding-block: 2px;/);
     assert.match(source, /#menu-columns \.create-region-label \{[^}]*display: block;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/);
+});
+
+test('invite actions share one utility row and retain their existing button styling', () => {
+    assert.match(source,
+        /<div class="menu-utility-group">\s*<div class="button-row">\s*<button id="btn-invite-self" class="picker-btn solo">Invite Self<\/button>\s*<button id="btn-invite-friend" class="picker-btn solo">Invite Friend<\/button>\s*<\/div>\s*<\/div>/);
 });
 
 test('enabled main-menu labels are uniformly bright without removing disabled indicators', () => {
@@ -76,7 +149,7 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         /#start-screen h1 \{[\s\S]*?font-size: clamp\(24px, 5vmin, 38px\);[\s\S]*?margin-bottom: clamp\(11\.2px, 2\.16vmin, 21\.6px\);/);
     assert.match(
         source,
-        /#session-list \{[\s\S]*?max-height: 135px;[\s\S]*?margin-bottom: 14\.4px;/);
+        /#session-list \{[\s\S]*?max-height: min\(135px, 25dvh, var\(--session-list-available, 100dvh\)\);[\s\S]*?margin-bottom: 14\.4px;/);
     assert.match(
         source,
         /\.picker-btn \{[\s\S]*?font-size: 14px;[\s\S]*?padding: 8px 18px;/);

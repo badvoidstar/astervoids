@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -316,13 +317,16 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
     }
 
     [Theory]
-    [InlineData("https://example.com")]
-    [InlineData("https://region.example.com")]
-    [InlineData(StaticOrigin)]
-    public async Task IdentityPreflightAllowsOnlyExplicitOriginsAndHeaders(string origin)
+    [InlineData("https://example.com", "/root")]
+    [InlineData("https://example.com", "/resolve")]
+    [InlineData("https://region.example.com", "/root")]
+    [InlineData("https://region.example.com", "/resolve")]
+    [InlineData(StaticOrigin, "/root")]
+    [InlineData(StaticOrigin, "/resolve")]
+    public async Task IdentityPreflightCachesOnlyExplicitOriginsMethodsAndHeaders(string origin, string path)
     {
         using var client = _factory.CreateClient();
-        using var request = new HttpRequestMessage(HttpMethod.Options, "/api/identity/root");
+        using var request = new HttpRequestMessage(HttpMethod.Options, "/api/identity" + path);
         request.Headers.Add("Origin", origin);
         request.Headers.Add("Access-Control-Request-Method", "POST");
         request.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser");
@@ -330,11 +334,40 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         Private(response);
         Assert.Equal(origin, Assert.Single(response.Headers.GetValues("Access-Control-Allow-Origin")));
+        Assert.Equal("POST", Assert.Single(response.Headers.GetValues("Access-Control-Allow-Methods")));
+        Assert.Equal(IdentityHosting.PreflightMaxAge.TotalSeconds.ToString(CultureInfo.InvariantCulture),
+            Assert.Single(response.Headers.GetValues("Access-Control-Max-Age")));
         Assert.False(response.Headers.Contains("Access-Control-Allow-Credentials"));
         var headers = string.Join(",", response.Headers.GetValues("Access-Control-Allow-Headers")).ToLowerInvariant();
         Assert.Contains("x-astervoids-browser", headers);
         Assert.Contains("content-type", headers);
         Assert.DoesNotContain("*", headers);
+    }
+
+    [Fact]
+    public async Task PreflightPermissionDoesNotCacheIdentityDataOrAuthorizeAnInvalidCredential()
+    {
+        using var client = _factory.CreateClient();
+        using var preflight = new HttpRequestMessage(HttpMethod.Options, "/api/identity/resolve");
+        preflight.Headers.Add("Origin", StaticOrigin);
+        preflight.Headers.Add("Access-Control-Request-Method", "POST");
+        preflight.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser");
+        using var permission = await client.SendAsync(preflight);
+        Assert.Equal(HttpStatusCode.NoContent, permission.StatusCode);
+        Assert.True(permission.Headers.Contains("Access-Control-Max-Age"));
+
+        using var actual = Request("/resolve", "invalid", "{}");
+        actual.Headers.Add("Origin", StaticOrigin);
+        using var rejected = await client.SendAsync(actual);
+        await Error(rejected, 401, "invalid_browser_credential");
+        Assert.Equal(StaticOrigin, Assert.Single(rejected.Headers.GetValues("Access-Control-Allow-Origin")));
+        Assert.False(rejected.Headers.Contains("Access-Control-Max-Age"));
+
+        using var valid = Request("/resolve", IdentitySecrets.NewToken(), "{}");
+        valid.Headers.Add("Origin", StaticOrigin);
+        using var resolved = await client.SendAsync(valid);
+        await Body(resolved, 200);
+        Assert.False(resolved.Headers.Contains("Access-Control-Max-Age"));
     }
 
     [Fact]
@@ -365,6 +398,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         using var response = await client.SendAsync(preflight);
         Private(response);
         Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
+        Assert.False(response.Headers.Contains("Access-Control-Max-Age"));
 
         using var actual = Request("/resolve", IdentitySecrets.NewToken(), "{}");
         actual.Headers.Add("Origin", "https://untrusted.example.com");

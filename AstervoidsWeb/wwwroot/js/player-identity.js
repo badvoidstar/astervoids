@@ -47,6 +47,7 @@ const PlayerIdentity = (function () {
     function createClient(environment) {
         const { storage, locks, crypto, fetch, location } = environment;
         let authority = null;
+        let preparation = null;
         let binding = null;
         let pending = null;
         const listeners = new Set();
@@ -124,6 +125,17 @@ const PlayerIdentity = (function () {
             });
         }
 
+        async function prepareRegion() {
+            const bootstrap = environment.bootstrap;
+            if (!bootstrap || (typeof bootstrap.regionId === 'string' && bootstrap.regionId)
+                || (Array.isArray(bootstrap.regions) && bootstrap.regions.length === 0)) {
+                return false;
+            }
+            preparation ??= json(`${apiOrigin(location, bootstrap)}/api/ping`, { method: 'GET' });
+            await preparation;
+            return true;
+        }
+
         function adopt(next) {
             if (!next || typeof next.etag !== 'string' || !Number.isSafeInteger(next.revision)
                 || next.revision < 0 || (next.identity !== null
@@ -191,6 +203,7 @@ const PlayerIdentity = (function () {
         }
 
         return Object.freeze({
+            prepareRegion,
             resolve,
             current: () => binding?.identity ?? null,
             deactivate() {

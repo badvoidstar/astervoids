@@ -90,13 +90,13 @@ test('picker provides a polar-default analog mode toggle instead of a config sel
     const soloIndex = html.indexOf('id="btn-solo"');
     const controlModeIndex = html.indexOf('id="btn-control-mode"');
     const fullscreenIndex = html.indexOf('id="btn-fullscreen"');
-    assert.ok(soloIndex >= 0 && controlModeIndex > soloIndex
-        && fullscreenIndex > controlModeIndex);
+    assert.ok(soloIndex >= 0 && fullscreenIndex > soloIndex
+        && controlModeIndex > fullscreenIndex);
     assert.match(
         html.slice(soloIndex, controlModeIndex),
         /Start Solo Play/);
     assert.match(
-        html.slice(controlModeIndex, fullscreenIndex),
+        html.slice(controlModeIndex, html.indexOf('</button>', controlModeIndex)),
         /🕹️ Polar/);
     assert.match(
         html,

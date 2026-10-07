@@ -181,6 +181,24 @@ async function replicatedThrust(sender, receiver, id) {
         { message: 'The other browser receives released thrust, not just a stale snapshot' }).toBe(true);
 }
 
+async function swipeTouch(page, cdp, x, fromY, toY) {
+    await cdp.send('Input.dispatchTouchEvent', {
+        type: 'touchStart', touchPoints: [{ x, y: fromY, id: 1 }],
+    });
+    try {
+        for (let step = 1; step <= 12; step++) {
+            await cdp.send('Input.dispatchTouchEvent', {
+                type: 'touchMove', touchPoints: [{ x, y: fromY + (toY - fromY) * step / 12, id: 1 }],
+            });
+            await page.waitForTimeout(20);
+        }
+        // End at rest so the next opposite swipe measures panning, not leftover inertia.
+        await page.waitForTimeout(100);
+    } finally {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+}
+
 test('page boots and solo play responds to keyboard input', async ({ players }) => {
     const { page } = await players.open();
     await page.locator('#btn-solo').click();
@@ -209,7 +227,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
     async function expectMatchingButtons(inSession) {
         const ids = [
             'btn-leave-create', ...(inSession ? ['btn-start-enter'] : []), 'btn-solo',
-            'btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend',
+            'btn-fullscreen', 'btn-control-mode', 'btn-invite-self', 'btn-invite-friend',
         ];
         for (const viewport of [
             { width: 1280, height: 900 }, { width: 900, height: 550 },
@@ -217,6 +235,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             { width: 360, height: 800 }, { width: 320, height: 568 },
         ]) {
             await page.setViewportSize(viewport);
+            await page.mouse.move(0, 0);
             const buttons = await page.evaluate(() => {
                 const elements = [...document.querySelectorAll('#menu-columns .picker-btn')]
                     .filter(button => button.getClientRects().length > 0);
@@ -237,8 +256,9 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             const solo = buttons.find(button => button.id === 'btn-solo');
             for (const button of buttons) {
                 const label = `${button.id} at ${viewport.width}x${viewport.height}`;
-                const paired = inSession && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
-                expect(button.width, `${label} ${paired ? 'shares the Create row' : 'matches Solo Play width'}`)
+                const invite = button.id.startsWith('btn-invite-');
+                const paired = invite || inSession && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
+                expect(button.width, `${label} ${paired ? 'shares its row equally' : 'matches Solo Play width'}`)
                     .toBeCloseTo(paired ? (solo.width - 7.2) / 2 : solo.width, 1);
                 expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
                 expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
@@ -249,6 +269,12 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     await expect(page.locator(`#${button.id}`), `${label} is not dimmed`)
                         .toHaveCSS('opacity', '1');
                 }
+                if (invite) {
+                    await expect(page.locator(`#${button.id}`), `${label} keeps its neutral border`)
+                        .toHaveCSS('border-color', 'rgb(136, 136, 136)');
+                    await expect(page.locator(`#${button.id}`), `${label} keeps its transparent background`)
+                        .toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+                }
             }
             expect(solo.height, 'Solo Play retains its compact reference height').toBe(32);
             const spacing = await page.evaluate(() => {
@@ -257,7 +283,10 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                 const statusNext = banner.height ? banner : box('#menu-columns');
                 const utilityButtons = [...document.querySelectorAll('#menu-utilities .picker-btn')]
                     .filter(button => button.getBoundingClientRect().height);
-                const utilities = utilityButtons.map(button => button.getBoundingClientRect());
+                const utilityRows = utilityButtons.filter((button, index) => index === 0
+                    || Math.abs(button.getBoundingClientRect().top
+                        - utilityButtons[index - 1].getBoundingClientRect().top) > 0.05);
+                const utilities = utilityRows.map(button => button.getBoundingClientRect());
                 return {
                     title: box('#identity-status').top - box('#start-screen h1').bottom,
                     identity: box('#picker-status').top - box('#identity-status').bottom,
@@ -266,8 +295,11 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     solo: box('#btn-solo').top - box('#picker-buttons .button-row').bottom,
                     utilities: utilities.slice(1).map((rect, index) => ({
                         gap: rect.top - utilities[index].bottom,
-                        sharedGroup: utilityButtons[index].parentElement === utilityButtons[index + 1].parentElement,
+                        sharedGroup: utilityRows[index].closest('.menu-utility-group')
+                            === utilityRows[index + 1].closest('.menu-utility-group'),
                     })),
+                    utilityRowCount: utilities.length,
+                    firstDevice: utilityRows[0].id,
                     groups: innerWidth > innerHeight
                         ? box('#menu-utilities').left - box('#menu-play').right
                         : utilities[0].top - box('#btn-solo').bottom,
@@ -278,10 +310,17 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     lobbySpan: box('#btn-start-enter').right - box('#btn-leave-create').left,
                     topAlignment: utilities[0].top - box('#session-list').top,
                     bottomAlignment: utilities.at(-1).bottom - box('#btn-solo').bottom,
-                    inviteAlignment: box('#btn-invite-self').top
-                        - box(box('#btn-start-enter').height ? '#btn-start-enter' : '#btn-leave-create').top,
+                    inviteAlignment: box('#btn-invite-self').top - box('#btn-solo').top,
+                    inviteGap: box('#btn-invite-friend').left - box('#btn-invite-self').right,
+                    inviteOffset: box('#btn-invite-friend').top - box('#btn-invite-self').top,
+                    inviteSpan: box('#btn-invite-friend').right - box('#btn-invite-self').left,
                 };
             });
+            expect(spacing.utilityRowCount, 'Pairing invitations frees one of the four utility rows').toBe(3);
+            expect(spacing.firstDevice, 'Fullscreen is the first visible device action').toBe('btn-fullscreen');
+            expect(spacing.inviteGap, 'Invitations use the same horizontal gap as lobby actions').toBeCloseTo(7.2, 1);
+            expect(spacing.inviteOffset, 'Invitations sit side by side').toBeCloseTo(0, 1);
+            expect(spacing.inviteSpan, 'Invitations share one full-width row').toBeCloseTo(solo.width, 1);
             const landscape = viewport.width > viewport.height;
             const titleMargin = Math.min(27, Math.max(14, Math.min(viewport.width, viewport.height) * 0.027));
             for (const [name, previous] of [
@@ -381,13 +420,19 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                     updatePickerButtons();
                     const buttons = [...document.querySelectorAll('#menu-columns .picker-btn')]
                         .filter(button => button.getBoundingClientRect().height);
+                    const firstDevice = document.querySelector('#menu-utilities .menu-utility-group')
+                        .querySelectorAll('button');
+                    const firstVisibleDevice = [...firstDevice].find(button => button.getBoundingClientRect().height);
                     const solo = box('btn-solo');
                     cases.push({
                         mode, multiRegion, sessionCount, role, unavailable,
-                        top: box('btn-control-mode').top - box('session-list').top,
+                        firstDevice: firstVisibleDevice.id,
+                        top: firstVisibleDevice.getBoundingClientRect().top - box('session-list').top,
                         bottom: box('btn-invite-friend').bottom - solo.bottom,
-                        invite: box('btn-invite-self').top
-                            - box(role === 'outside' ? 'btn-leave-create' : 'btn-start-enter').top,
+                        invite: box('btn-invite-self').top - solo.top,
+                        inviteGap: box('btn-invite-friend').left - box('btn-invite-self').right,
+                        inviteOffset: box('btn-invite-friend').top - box('btn-invite-self').top,
+                        inviteWidthError: box('btn-invite-friend').right - box('btn-invite-self').left - solo.width,
                         columnGap: box('menu-utilities').left - box('menu-play').right,
                         fullscreenVisible: box('btn-fullscreen').height > 0,
                         regionVisible: box('create-region-row').height > 0,
@@ -401,7 +446,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                         createText: sessionPicker.btnLeaveCreate.textContent,
                         clipped: buttons.filter(button => {
                             const rect = button.getBoundingClientRect();
-                            const paired = role !== 'outside'
+                            const paired = button.id.startsWith('btn-invite-') || role !== 'outside'
                                 && ['btn-leave-create', 'btn-start-enter'].includes(button.id);
                             const expectedWidth = paired ? (solo.width - 7.2) / 2 : solo.width;
                             return Math.abs(rect.width - expectedWidth) > 0.05 || rect.height !== 32
@@ -433,9 +478,14 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             }
             expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
             expect(state.fullscreenVisible, label).toBe(state.mode === '');
+            expect(state.firstDevice, `${label} has no empty slot above the first device action`)
+                .toBe(state.mode === '' ? 'btn-fullscreen' : 'btn-control-mode');
             expect(state.regionVisible, label).toBe(state.multiRegion && state.role === 'outside');
             expect(state.startVisible, label).toBe(state.role !== 'outside');
             expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
+            expect(state.inviteGap, `${label} invitations keep the lobby action gap`).toBeCloseTo(7.2, 1);
+            expect(state.inviteOffset, `${label} invitations stay side by side`).toBeCloseTo(0, 1);
+            expect(state.inviteWidthError, `${label} invitations fill one row`).toBeCloseTo(0, 1);
             if (state.role !== 'outside') {
                 expect(state.lobbyGap, `${label} has a horizontal action gap`).toBeCloseTo(7.2, 1);
                 expect(state.lobbyOffset, `${label} has side-by-side actions`).toBeCloseTo(0, 1);
@@ -456,9 +506,11 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
         await expect(page.locator('#btn-fullscreen')).toBeHidden();
         const offsets = await page.evaluate(() => {
             const box = id => document.getElementById(id).getBoundingClientRect();
+            const firstVisibleDevice = [...document.querySelectorAll('#menu-utilities .menu-utility-group:first-child button')]
+                .find(button => button.getBoundingClientRect().height);
             return [
-                box('btn-control-mode').top - box('session-list').top,
-                box('btn-invite-self').top - box('btn-leave-create').top,
+                firstVisibleDevice.getBoundingClientRect().top - box('session-list').top,
+                box('btn-invite-self').top - box('btn-solo').top,
                 box('btn-invite-friend').bottom - box('btn-solo').bottom,
             ];
         });
@@ -467,6 +519,193 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
         await page.evaluate(() => toggleFullscreen());
     }
     await expect(page.locator('#btn-fullscreen')).toBeVisible();
+});
+
+for (const viewport of [
+    { width: 568, height: 320 }, { width: 400, height: 300 },
+    { width: 360, height: 480 }, { width: 320, height: 320 },
+]) {
+    test(`session list touch scrolling stays bounded at ${viewport.width}x${viewport.height}`, async ({ players }) => {
+        const { page } = await players.open({ viewport, hasTouch: true, isMobile: true });
+        await expect(page.locator('#btn-leave-create')).toBeEnabled();
+        const cdp = await page.context().newCDPSession(page);
+        await page.evaluate(async () => {
+            window.menuLayoutSaved = { ...sessionPicker };
+            // Freeze discovery only for these display projections, not fabricated hub/HTTP responses.
+            await teardownMultiRegionPicker();
+            window.menuTouchAudit = { moves: 0, prevented: 0, anchors: 0 };
+            window.auditMenuTouch = event => {
+                if (!event.target.closest('#start-screen-content')) return;
+                if (event.type === 'touchmove') menuTouchAudit.moves++;
+                if (event.defaultPrevented) menuTouchAudit.prevented++;
+                if (stickInput.moveTouchId !== null || stickInput.fireTouchId !== null) menuTouchAudit.anchors++;
+            };
+            document.addEventListener('touchstart', auditMenuTouch, { passive: true });
+            document.addEventListener('touchmove', auditMenuTouch, { passive: true });
+        });
+        try {
+            const emptyMenus = new Map();
+            for (const multiRegion of [false, true])
+            for (const count of [0, 2, 30]) {
+                const geometry = await page.evaluate(async ({ count, multiRegion }) => {
+                    const region = menuLayoutSaved.regions[0];
+                    sessionPicker.regions = [
+                        { ...region, displayName: 'Northwestern Europe with a long regional label' },
+                        ...(multiRegion ? [{ id: 'layout-secondary', displayName: 'Secondary Region' }] : []),
+                    ];
+                    sessionPicker.sessions = Array.from({ length: count }, (_, index) => ({
+                        id: `layout-${index}`, name: `LongUnbrokenSessionLabel${index}`.repeat(3),
+                        regionId: region.id, memberCount: index % 5 + 1, maxMembers: 6,
+                    }));
+                    renderCreateRegionSelector();
+                    renderSessionList();
+                    updatePickerButtons();
+                    // Let layout observation and its queued fitting frame finish.
+                    await new Promise(resolve => requestAnimationFrame(() =>
+                        requestAnimationFrame(() => requestAnimationFrame(resolve))));
+                    const list = sessionPicker.listEl;
+                    const content = document.getElementById('start-screen-content');
+                    const box = id => document.getElementById(id).getBoundingClientRect();
+                    return {
+                        listHeight: box('session-list').height,
+                        scrollable: list.scrollHeight > list.clientHeight,
+                        listFits: list.scrollWidth <= list.clientWidth
+                            && box('session-list').right <= box('menu-play').right,
+                        rootFits: content.scrollWidth <= content.clientWidth
+                            && document.documentElement.scrollWidth <= innerWidth,
+                        actionsBelow: box('picker-buttons').top >= box('session-list').bottom,
+                        groupsSeparate: innerWidth > innerHeight
+                            ? box('menu-utilities').left > box('menu-play').right
+                            : box('menu-utilities').top > box('menu-play').bottom,
+                        needsMenuScroll: content.scrollHeight > content.clientHeight,
+                        buttonsVisible: [...document.querySelectorAll('#menu-columns button')]
+                            .filter(button => button.getBoundingClientRect().height)
+                            .every(button => {
+                                const rect = button.getBoundingClientRect();
+                                return rect.top >= 0 && rect.bottom <= innerHeight;
+                            }),
+                    };
+                }, { count, multiRegion });
+                const label = `${count} sessions, ${multiRegion ? 2 : 1} regions`;
+                expect(geometry.listHeight, label).toBeLessThanOrEqual(Math.min(135, viewport.height / 4));
+                expect(geometry.listFits && geometry.rootFits, `${label}: no horizontal spill`).toBe(true);
+                expect(geometry.actionsBelow && geometry.groupsSeparate, `${label}: groups never overlap`).toBe(true);
+                if (count === 0) emptyMenus.set(multiRegion, geometry.needsMenuScroll);
+                if (!emptyMenus.get(multiRegion)) {
+                    expect(geometry.needsMenuScroll, `${label}: sessions must not push otherwise visible actions off-screen`)
+                        .toBe(false);
+                    expect(geometry.buttonsVisible, label).toBe(true);
+                }
+                if (count === 30) expect(geometry.scrollable, `${label}: rows, not the menu, take the overflow`).toBe(true);
+            }
+            const list = page.locator('#session-list');
+            const rect = await list.boundingBox();
+            const padding = Math.min(12, rect.height / 8);
+            const top = rect.y + padding;
+            const bottom = rect.y + rect.height - padding;
+            const x = rect.x + rect.width / 2;
+            const before = await list.evaluate(element => element.scrollTop);
+            await swipeTouch(page, cdp, x, bottom, top);
+            await expect.poll(() => list.evaluate(element => element.scrollTop),
+                { message: 'A real upward finger gesture scrolls the long list down' }).toBeGreaterThan(before);
+            const afterUp = await list.evaluate(element => element.scrollTop);
+            await swipeTouch(page, cdp, x, top, bottom);
+            await expect.poll(() => list.evaluate(element => element.scrollTop),
+                { message: 'A real downward finger gesture scrolls the long list back up' }).toBeLessThan(afterUp);
+            const afterDown = await list.evaluate(element => element.scrollTop);
+            const content = page.locator('#start-screen-content');
+            expect(await content.evaluate(element => element.scrollTop),
+                'List gestures do not drag the surrounding action groups').toBe(0);
+            const needsMenuScroll = await content.evaluate(element => element.scrollHeight > element.clientHeight);
+            if (needsMenuScroll) {
+                await swipeTouch(page, cdp, 4, viewport.height - 20, 40);
+                await expect.poll(() => content.evaluate(element => element.scrollTop),
+                    { message: 'Menu padding also allows native scrolling on very short screens' }).toBeGreaterThan(0);
+            }
+            for (const id of ['btn-invite-self', 'btn-invite-friend']) {
+                await expect(page.locator(`#${id}`), 'The last action row is reachable by touch').toBeInViewport({ ratio: 1 });
+            }
+            const outer = await content.evaluate(element => element.scrollTop);
+            if (needsMenuScroll) {
+                await swipeTouch(page, cdp, 4, 40, viewport.height - 20);
+                await expect.poll(() => content.evaluate(element => element.scrollTop)).toBeLessThan(outer);
+            }
+            const audit = await page.evaluate(() => menuTouchAudit);
+            expect(audit.moves, 'Native touchmove events reached the document').toBeGreaterThan(0);
+            expect(audit.prevented, 'The container does not cancel menu gestures').toBe(0);
+            expect(audit.anchors, 'Neither list nor menu-padding gestures steer or fire').toBe(0);
+            console.info(`Touch ${viewport.width}x${viewport.height}: list ${before} -> ${afterUp} -> ${afterDown}; menu ${outer}`);
+            await page.setViewportSize({ width: viewport.width, height: 800 });
+            await expect.poll(() => list.evaluate(element => element.getBoundingClientRect().height),
+                { message: 'A taller viewport restores the full list height instead of retaining a stale cap' }).toBe(135);
+            await page.setViewportSize(viewport);
+            await expect.poll(() => list.evaluate((element, previous) =>
+                Math.abs(element.getBoundingClientRect().height - previous), rect.height),
+            { message: 'Returning to the short viewport reserves control space again' }).toBeLessThan(1);
+        } finally {
+            await cdp.detach();
+            await page.evaluate(async () => {
+                document.removeEventListener('touchstart', auditMenuTouch);
+                document.removeEventListener('touchmove', auditMenuTouch);
+                const btnLeaveCreate = sessionPicker.btnLeaveCreate;
+                Object.assign(sessionPicker, menuLayoutSaved, { btnLeaveCreate });
+                delete window.menuLayoutSaved;
+                delete window.menuTouchAudit;
+                delete window.auditMenuTouch;
+                await activateSessionPickerUpdates();
+            });
+        }
+    });
+}
+
+test('menu touch taps join real sessions and canvas gestures retain both control modes', async ({ players }) => {
+    const host = await players.open();
+    const sessionId = await create(host.page);
+    players.ownSession(sessionId);
+    for (const mode of ['Polar', 'Rectilinear']) {
+        const guest = await players.open({
+            viewport: { width: 568, height: 320 }, hasTouch: true, isMobile: true,
+        });
+        if (mode === 'Rectilinear') await guest.page.locator('#btn-control-mode').tap();
+        await expect(guest.page.locator('#btn-control-mode')).toContainText(mode);
+        await guest.page.locator(`.session-item[data-session-id="${sessionId}"]`).tap();
+        await sessionReady(guest.page, sessionId);
+        if (mode === 'Polar') {
+            await host.page.locator('#btn-start-enter').click();
+            await playing(host.page);
+        }
+        await expect(guest.page.locator('#btn-start-enter')).toHaveText('Enter');
+        await guest.page.locator('#btn-start-enter').tap();
+        await playing(guest.page);
+        const rect = await guest.page.locator('#game').boundingBox();
+        const before = await guest.page.evaluate(() => ({ x: game.ship.x, y: game.ship.y }));
+        const move = { x: rect.x + rect.width / 4, y: rect.y + rect.height * 0.7, id: 1 };
+        const cdp = await guest.page.context().newCDPSession(guest.page);
+        try {
+            await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [move] });
+            move.y -= rect.height * 0.3;
+            await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [move] });
+            await expect.poll(() => guest.page.evaluate(before =>
+                stickInput.moveTouchId !== null
+                && Math.hypot(game.ship.x - before.x, game.ship.y - before.y) > 0.00001, before),
+            { message: `${mode}: a held canvas drag still moves the live player ship` }).toBe(true);
+            await cdp.send('Input.dispatchTouchEvent', {
+                type: 'touchStart', touchPoints: [
+                    move, { x: rect.x + rect.width * 0.75, y: rect.y + rect.height * 0.7, id: 2 },
+                ],
+            });
+            await expect.poll(() => guest.page.evaluate(() =>
+                stickInput.moveTouchId !== null && stickInput.fireTouchId !== null && game.bullets.length > 0),
+            { message: `${mode}: simultaneous right-side touch still fires while steering` }).toBe(true);
+        } finally {
+            await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await cdp.detach();
+        }
+        await expect.poll(() => guest.page.evaluate(() =>
+            stickInput.moveTouchId === null && stickInput.fireTouchId === null),
+        { message: `${mode}: releasing both fingers clears the gameplay anchors` }).toBe(true);
+        await players.close(guest);
+    }
 });
 
 test('independent players create, join, play, leave and rejoin', async ({ players }) => {
