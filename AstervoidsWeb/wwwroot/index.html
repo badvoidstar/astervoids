@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta name="referrer" content="no-referrer">
     <script src="/js/player-identity.js"></script>
+    <!-- Prepare the static-apex identity region while game assets load. -->
+    <script src="/region-bootstrap.js"></script>
+    <script>
+        void PlayerIdentity.prepareRegion().catch(() => {
+            console.warn('Identity region preparation failed; browser binding will still be verified.');
+        });
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <!-- iOS standalone mode (Add to Home Screen) -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -423,6 +430,8 @@
             touch-action: pan-y;
         }
 
+        #start-screen-content > * { flex-shrink: 0; }
+
         #start-screen h1 {
             font-size: clamp(24px, 5vmin, 38px);
             margin-bottom: clamp(11.2px, 2.16vmin, 21.6px);
@@ -455,6 +464,7 @@
         }
 
         #menu-columns {
+            --menu-button-height: 32px;
             display: grid;
             grid-template-columns: minmax(0, 1fr);
             row-gap: 9.6px;
@@ -472,7 +482,7 @@
 
         #menu-columns .picker-btn {
             width: 100%;
-            height: 32px;
+            height: var(--menu-button-height);
             font-size: 11px;
             line-height: 12px;
             padding-inline: min(18px, 2vw);
@@ -658,8 +668,12 @@
 
         #session-list {
             width: 100%;
-            max-height: 135px;
+            min-height: var(--menu-button-height);
+            max-height: min(135px, 25dvh, var(--session-list-available, 100dvh));
+            overflow-x: hidden;
             overflow-y: auto;
+            overscroll-behavior: contain;
+            touch-action: pan-y;
             margin-bottom: 14.4px;
             border: 1px solid #444;
             border-radius: 4px;
@@ -713,12 +727,17 @@
         }
 
         .session-item .session-name {
+            min-width: 0;
             font-size: 12px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .session-item .session-players {
             font-size: 9px;
             color: #888;
+            white-space: nowrap;
         }
 
         .session-item.disabled .session-players {
@@ -918,15 +937,19 @@
             background: rgba(255, 100, 100, 0.3);
         }
 
-        #picker-buttons .button-row {
+        #menu-columns .button-row {
             display: flex;
             flex-direction: row;
             gap: 7.2px;
         }
 
-        #picker-buttons .button-row .picker-btn {
+        #menu-columns .button-row .picker-btn {
             flex: 1;
             min-width: 0;
+        }
+
+        #menu-utilities .button-row .picker-btn {
+            padding: 2px min(8px, 1vw);
         }
 
         /* Mobile touch controls */
@@ -1085,12 +1108,14 @@
                       </div>
                       <div id="menu-utilities">
                        <div class="menu-utility-group">
-                        <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
                         <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
+                        <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
                        </div>
                        <div class="menu-utility-group">
-                        <button id="btn-invite-self" class="picker-btn solo">Invite Self</button>
-                        <button id="btn-invite-friend" class="picker-btn solo">Invite Friend</button>
+                        <div class="button-row">
+                            <button id="btn-invite-self" class="picker-btn solo">Invite Self</button>
+                            <button id="btn-invite-friend" class="picker-btn solo">Invite Friend</button>
+                        </div>
                        </div>
                       </div>
                     </div>
@@ -1189,8 +1214,6 @@
     <script>window.ASTERVOIDS_DEBUG = false;</script>
     <!-- Shared debug logging helpers — must load before any module that logs -->
     <script src="/js/debug-log.js"></script>
-    <!-- Optional injected region bootstrap for static-apex hosting -->
-    <script src="/region-bootstrap.js"></script>
     <!-- Region service — discovers peer regions and measures RTT for the session picker -->
     <script src="/js/region-service.js"></script>
     <!-- Spectator client — multi-region SignalR for cross-region session-list updates -->
@@ -10228,18 +10251,23 @@
         document.getElementById('game-container').classList.add('standalone-mode');
     }
 
-    // Prevent default touch behaviors on game container (no zooming/scrolling)
+    function isMenuScrollTarget(target) {
+        return !startScreen.classList.contains('hidden')
+            && !!target?.closest?.('#start-screen-content');
+    }
+
+    // Keep gameplay gestures captured, but let the menu's nested scrollers pan.
     // Also enable touch controls on first touch anywhere on game
     document.getElementById('game-container').addEventListener('touchstart', (e) => {
         enableTouchControls();
         // Don't auto-start on touch - let session picker handle it
-        if (e.target.classList.contains('touch-btn') || e.target.closest('#session-picker')
+        if (e.target.classList.contains('touch-btn') || isMenuScrollTarget(e.target)
             || isPersonalScoreScrollTarget(e.target)) return;
         e.preventDefault();
     }, { passive: false });
 
     document.getElementById('game-container').addEventListener('touchmove', (e) => {
-        if (isPersonalScoreScrollTarget(e.target)) return;
+        if (isMenuScrollTarget(e.target) || isPersonalScoreScrollTarget(e.target)) return;
         e.preventDefault();
     }, { passive: false });
 
@@ -10248,13 +10276,12 @@
     {
         const gameContainer = document.getElementById('game-container');
 
-        // True iff a touch occurred on a mobile overlay control or the session
-        // picker — those have their own handlers and must not be hijacked.
+        // Menu scrolling and overlay controls must not acquire gameplay anchors.
         function isStickTouchTarget(target) {
             if (!target || target.classList && target.classList.contains('touch-btn')) {
                 return false;
             }
-            if (target.closest && target.closest('#session-picker')) return false;
+            if (isMenuScrollTarget(target)) return false;
             if (isPersonalScoreScrollTarget(target)) return false;
             return true;
         }
@@ -10698,6 +10725,33 @@
 
     function isSessionPickerActive() {
         return pickerUpdatesActive && isSessionPickerVisible();
+    }
+
+    function fitSessionListToViewport() {
+        if (!isSessionPickerVisible()) return;
+        const content = document.getElementById('start-screen-content');
+        const list = sessionPicker.listEl;
+        const available = Math.max(0, Math.floor(startScreen.clientHeight
+            - content.scrollHeight + list.getBoundingClientRect().height));
+        const height = `${available}px`;
+        if (list.style.getPropertyValue('--session-list-available') !== height) {
+            list.style.setProperty('--session-list-available', height);
+        }
+    }
+
+    {
+        const content = document.getElementById('start-screen-content');
+        let scheduled = false;
+        const observer = new ResizeObserver(() => {
+            if (scheduled) return;
+            scheduled = true;
+            // Measure after layout; never resize an observed ancestor in its callback.
+            requestAnimationFrame(() => {
+                scheduled = false;
+                fitSessionListToViewport();
+            });
+        });
+        for (const element of [startScreen, content, ...content.children]) observer.observe(element);
     }
 
     function beginPickerOperation() {

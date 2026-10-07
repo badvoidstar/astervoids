@@ -8,7 +8,7 @@ const test = base.extend({
         const guards = [];
         let uncaught = 0;
         const identities = {
-            async open(path = '/', context = null) {
+            async open(path = '/', context = null, beforeNavigate = null) {
                 if (!context) {
                     context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
                     contexts.push(context);
@@ -19,6 +19,7 @@ const test = base.extend({
                 guards.push(health);
                 await installOriginGuard(page, baseURL, health);
                 await captureClipboard(page);
+                if (beforeNavigate) await beforeNavigate(page);
                 await page.goto(path);
                 await expect(page.locator('#game')).toBeVisible();
                 return { page, context };
@@ -40,6 +41,74 @@ const publicIdentity = page => page.evaluate(() => PlayerIdentity.current());
 const atRoot = page => expect.poll(() => page.evaluate(() =>
     location.pathname === '/' && location.hash === '' && location.search === ''),
 { message: 'Only the site root remains in the address bar' }).toBe(true);
+
+test('static entry prepares the identity region before delayed game scripts without trusting a binding', async ({
+    browser, baseURL, identities,
+}) => {
+    const context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
+    const probes = [];
+    const responses = [];
+    let identityRequests = 0;
+    let scriptsBlocked = false;
+    let release;
+    const scriptsReady = new Promise(resolve => { release = resolve; });
+    let opening;
+    context.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/ping') {
+            probes.push({
+                method: request.method(),
+                noCredential: !request.headers()['x-astervoids-browser'],
+                noReferrer: !request.headers().referer,
+                noBody: request.postData() === null,
+            });
+        }
+        if (path.startsWith('/api/identity/')) identityRequests++;
+    });
+    context.on('response', response => {
+        if (new URL(response.url()).pathname === '/api/ping') responses.push(response.status());
+    });
+    try {
+        opening = identities.open('/', context, async page => {
+            await page.route(`${baseURL}/region-bootstrap.js`, route => route.fulfill({
+                contentType: 'application/javascript',
+                body: `window.ASTERVOIDS_REGION_BOOTSTRAP = ${JSON.stringify({
+                    regionId: null,
+                    regions: [{ id: 'local', displayName: 'Local', hostname: baseURL }],
+                })};`,
+            }));
+            await page.route(`${baseURL}/js/signalr.min.js`, async route => {
+                scriptsBlocked = true;
+                await scriptsReady;
+                await route.fallback();
+            });
+        });
+        await expect.poll(() => scriptsBlocked, {
+            message: 'Game script loading is deliberately paused',
+        }).toBe(true);
+        await expect.poll(() => responses.length, {
+            message: 'The identity region answers while game scripts are still blocked',
+            timeout: 5_000,
+        }).toBe(1);
+        expect(responses).toEqual([200]);
+        expect(probes).toEqual([{ method: 'GET', noCredential: true, noReferrer: true, noBody: true }]);
+        expect(identityRequests, 'Preparation is not an identity resolution or mutation').toBe(0);
+        expect(await context.pages()[0].evaluate(() => ({
+            identity: PlayerIdentity.current(),
+            noCredential: localStorage.getItem(PlayerIdentity.STORAGE_KEY) === null,
+        }))).toEqual({ identity: null, noCredential: true });
+    } finally {
+        release();
+        try {
+            if (opening) {
+                const player = await opening;
+                await openIdentityNaming(player.page);
+            }
+        } finally {
+            await context.close();
+        }
+    }
+});
 
 async function expectDialogComposition(page, selector) {
     const layout = await page.locator(selector).evaluate(dialog => {
@@ -389,15 +458,17 @@ test('clipboard rejection offers the same selectable link and responsive menu gr
                 sideBySide: right.left >= left.right,
                 stacked: right.top >= left.bottom,
                 nativeText: getComputedStyle(document.getElementById('start-screen-content')).transform === 'none',
-                matchesSolo: [...document.querySelectorAll('#menu-utilities button')]
+                matchesRows: [...document.querySelectorAll('#menu-utilities button')]
                     .every(button => {
                         const box = button.getBoundingClientRect();
-                        return Math.abs(box.width - solo.width) < 0.05 && box.height === solo.height;
+                        const width = button.id.startsWith('btn-invite-')
+                            ? (solo.width - 7.2) / 2 : solo.width;
+                        return Math.abs(box.width - width) < 0.05 && box.height === solo.height;
                     }),
                 fits: right.right <= innerWidth && left.left >= 0,
             };
         });
-        expect(boxes.nativeText && boxes.matchesSolo && boxes.fits).toBe(true);
+        expect(boxes.nativeText && boxes.matchesRows && boxes.fits).toBe(true);
         expect(viewport.width > viewport.height ? boxes.sideBySide : boxes.stacked).toBe(true);
     }
 });

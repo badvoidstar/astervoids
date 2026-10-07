@@ -23,6 +23,13 @@ test('generated settings load before their consumers without delaying invitation
     const html = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
     const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(match => match[1]);
     assert.equal(scripts[0], '/js/player-identity.js');
+    const bootstrap = scripts.indexOf('/region-bootstrap.js');
+    const transport = scripts.indexOf('/js/signalr.min.js');
+    assert.ok(bootstrap > 0 && bootstrap < transport);
+    assert.equal(scripts.filter(script => script === '/region-bootstrap.js').length, 1);
+    const preparation = html.indexOf('PlayerIdentity.prepareRegion()');
+    assert.ok(preparation > html.indexOf('<script src="/region-bootstrap.js"')
+        && preparation < html.indexOf('<script src="/js/signalr.min.js"'));
     const data = scripts.indexOf('/js/shared-config-data.js');
     const config = scripts.indexOf('/js/game-config.js');
     const wire = scripts.indexOf('/js/astervoids-wire-codec.js');

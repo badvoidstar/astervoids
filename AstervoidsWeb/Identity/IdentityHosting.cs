@@ -13,6 +13,7 @@ internal static class IdentityHosting
     public const string CorsPolicy = "IdentityApi";
     public const string BrowserHeader = "X-Astervoids-Browser";
     public const string BrowserHashItem = "Astervoids.Identity.BrowserHash";
+    public static readonly TimeSpan PreflightMaxAge = TimeSpan.FromMinutes(10);
 
     public static IServiceCollection AddPlayerIdentity(
         this IServiceCollection services, IConfiguration configuration)
@@ -71,7 +72,8 @@ internal static class IdentityHosting
                 .GetSection(RegionSettings.SectionName).Get<RegionSettings>() ?? new());
             options.AddPolicy(CorsPolicy, policy => policy.WithOrigins(origins)
                 .WithMethods("POST").WithHeaders("Content-Type", BrowserHeader)
-                .WithExposedHeaders("Retry-After"));
+                .WithExposedHeaders("Retry-After")
+                .SetPreflightMaxAge(PreflightMaxAge));
         });
         services.AddRateLimiter(options =>
         {
