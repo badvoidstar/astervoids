@@ -18,9 +18,10 @@ const AstervoidsConfig = (function() {
     const IDENTITY_TAG_PATTERN = new RegExp(`^${IDENTITY_TAG_PATTERN_SOURCE}$`);
 
     const ASTEROID_DIFFICULTY_PRESETS = Object.freeze([
-        Object.freeze({ label: 'Shifter', value: 0.4 }),
-        Object.freeze({ label: 'Dancer', value: 0.5 }),
-        Object.freeze({ label: 'Survivor', value: 0.6 }),
+        Object.freeze({ label: 'Shifter', value: 0.2 }),
+        Object.freeze({ label: 'Dancer', value: 0.35 }),
+        Object.freeze({ label: 'Raver', value: 0.5 }),
+        Object.freeze({ label: 'Survivor', value: 0.65 }),
     ]);
 
     const SHARED_DEFAULTS = Object.freeze({
@@ -221,7 +222,7 @@ const AstervoidsConfig = (function() {
         }),
         control({
             key: 'ANALOG_RECTILINEAR_TURN_GAIN',
-            label: 'Analog rectilinear rotation-offset gain',
+            label: 'Analog boxy rotation-offset gain',
             min: 0, max: 5, step: 0.1,
             fmt: value => `${value.toFixed(2)} rad/radius`,
             help: 'Maps post-dead-zone lateral displacement normalized by stick radius to a relative heading offset, clamped to ±π.',
@@ -245,7 +246,7 @@ const AstervoidsConfig = (function() {
             label: 'Analog thrust-input gain',
             min: 0, max: 5, step: 0.1,
             fmt: value => `${value.toFixed(2)}x`,
-            help: 'Multiplies post-dead-zone rectilinear or post-threshold polar displacement normalized by stick radius.',
+            help: 'Multiplies post-dead-zone boxy or post-threshold polar displacement normalized by stick radius.',
         }),
         control({
             key: 'ANALOG_THRUST_MAX',
@@ -263,14 +264,14 @@ const AstervoidsConfig = (function() {
         }),
         control({
             key: 'ANALOG_RECTILINEAR_TURN_DEADZONE_PX',
-            label: 'Analog rectilinear turn dead-zone (CSS px @ 390px gameplay ref)',
+            label: 'Analog boxy turn dead-zone (CSS px @ 390px gameplay ref)',
             min: 0, max: 60, step: 1,
             fmt: value => `${Math.round(value)} px @ 390`,
             help: 'Horizontal turn dead-zone half-extent at a 390px gameplay-reference short edge; scales with the gameplay viewport.',
         }),
         control({
             key: 'ANALOG_RECTILINEAR_THRUST_DEADZONE_PX',
-            label: 'Analog rectilinear thrust/brake dead-zone (CSS px @ 390px gameplay ref)',
+            label: 'Analog boxy thrust/brake dead-zone (CSS px @ 390px gameplay ref)',
             min: 0, max: 60, step: 1,
             fmt: value => `${Math.round(value)} px @ 390`,
             help: 'Vertical thrust/brake dead-zone half-extent at a 390px gameplay-reference short edge; scales with the gameplay viewport.',

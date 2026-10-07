@@ -1067,7 +1067,7 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
+            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | P to pause (solo)
         </div>
 
         <!-- Pause menu overlay -->
@@ -1116,7 +1116,7 @@
                         <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
                         <div class="button-row">
                             <button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar</button>
-                            <button id="btn-difficulty" class="picker-btn solo">💦 : Survivor</button>
+                            <button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor</button>
                         </div>
                        </div>
                        <div class="menu-utility-group">
@@ -2093,9 +2093,9 @@
         const scheme = getAnalogControlScheme();
         const currentLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
             ? 'Polar'
-            : 'Rectilinear';
+            : 'Boxy';
         const nextLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
-            ? 'Rectilinear'
+            ? 'Boxy'
             : 'Polar';
 
         if (analogControlModeButton) {
@@ -2158,7 +2158,7 @@
             : locked
                 ? 'Leave the session to change difficulty.'
                 : `Switch to ${next.label} (${next.value}).`;
-        difficultyButton.textContent = `💦 : ${label}`;
+        difficultyButton.textContent = `🎯 : ${label}`;
         difficultyButton.disabled = locked;
         difficultyButton.title = `Difficulty: ${label} (${CONFIG.ASTEROID_DIFFICULTY_FACTOR}). ${action}`;
         difficultyButton.setAttribute('aria-label', difficultyButton.title);

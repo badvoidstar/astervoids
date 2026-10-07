@@ -30,7 +30,7 @@ test('portrait menu utilities stack and landscape uses a native two-column layou
 
 test('fullscreen leads the paired device settings and hiding it reserves no space', () => {
     assert.match(source,
-        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<div class="button-row">\s*<button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar<\/button>\s*<button id="btn-difficulty" class="picker-btn solo">💦 : Survivor<\/button>\s*<\/div>\s*<\/div>/);
+        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<div class="button-row">\s*<button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar<\/button>\s*<button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor<\/button>\s*<\/div>\s*<\/div>/);
     for (const mode of ['fullscreen-active', 'standalone-mode', 'pseudo-fullscreen']) {
         assert.match(source, new RegExp(`\\.${mode} #btn-fullscreen[,\\s][^}]*display: none;`));
     }

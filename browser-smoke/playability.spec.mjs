@@ -204,6 +204,12 @@ test('page boots and solo play responds to keyboard input', async ({ players }) 
     await page.locator('#btn-solo').click();
     await playing(page);
     await expect(page.locator('#session-indicator')).toBeHidden();
+    await expect(page.locator('#instructions')).toContainText('P to pause (solo)');
+    await expect(page.locator('#instructions')).not.toContainText('ESC to pause');
+    await page.keyboard.press('p');
+    await expect(page.locator('#pause-menu')).toBeVisible();
+    await page.keyboard.press('Enter');
+    await playing(page);
     const before = await page.evaluate(() => ({ x: game.ship.x, y: game.ship.y }));
     await page.keyboard.down('ArrowUp');
     try {
@@ -228,21 +234,25 @@ for (const touch of [false, true]) {
         const difficulty = page.locator('#btn-difficulty');
         const controls = page.locator('#btn-control-mode');
         const activate = locator => touch ? locator.tap() : locator.click();
-        await expect(difficulty).toHaveText('💦 : Survivor');
+        await expect(difficulty).toHaveText('🎯 : Survivor');
         await expect(controls).toHaveText('🕹️ : Polar');
         let controlLabel = 'Polar';
         for (const viewport of [{ width: 400, height: 300 }, { width: 320, height: 568 }]) {
             await page.setViewportSize(viewport);
-            for (const [label, value] of [['Shifter', 0.4], ['Dancer', 0.5], ['Survivor', 0.6]]) {
+            for (const [label, value] of [
+                ['Shifter', 0.2], ['Dancer', 0.35], ['Raver', 0.5], ['Survivor', 0.65],
+            ]) {
                 await activate(difficulty);
-                await expect(difficulty).toHaveText(`💦 : ${label}`);
+                await expect(difficulty).toHaveText(`🎯 : ${label}`);
                 expect(await page.evaluate(() => [
                     CONFIG.ASTEROID_DIFFICULTY_FACTOR, LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR,
                 ])).toEqual([value, value]);
                 await activate(controls);
-                controlLabel = controlLabel === 'Polar' ? 'Rectilinear' : 'Polar';
+                controlLabel = controlLabel === 'Polar' ? 'Boxy' : 'Polar';
                 await expect(controls).toHaveText(`🕹️ : ${controlLabel}`);
-                expect(await page.evaluate(() => getAnalogControlScheme())).toBe(controlLabel.toLowerCase());
+                await expect(controls).toHaveCSS('text-transform', 'uppercase');
+                expect(await page.evaluate(() => getAnalogControlScheme()))
+                    .toBe(controlLabel === 'Boxy' ? 'rectilinear' : 'polar');
                 const geometry = await page.evaluate(() => {
                     const controls = document.getElementById('btn-control-mode');
                     const difficulty = document.getElementById('btn-difficulty');
@@ -269,10 +279,10 @@ for (const touch of [false, true]) {
         }
         await activate(difficulty);
         await activate(difficulty);
-        await expect(difficulty).toHaveText('💦 : Dancer');
+        await expect(difficulty).toHaveText('🎯 : Dancer');
         await activate(page.locator('#btn-solo'));
         await playing(page);
-        expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
+        expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.35);
         await page.keyboard.press('p');
         await expect(page.locator('#pause-menu')).toBeVisible();
         if (touch) {
@@ -286,34 +296,35 @@ for (const touch of [false, true]) {
             }
         }
         await expect(page.locator('#start-screen')).toBeVisible();
-        await expect(difficulty).toHaveText('💦 : Dancer');
+        await expect(difficulty).toHaveText('🎯 : Dancer');
         await expect(difficulty).toBeEnabled();
     });
 }
 
-test('session difficulty follows the creator and leaving restores each local preset', async ({ players }) => {
+test('Raver difficulty follows the creator and leaving restores each local preset', async ({ players }) => {
     const host = await players.open();
     const guest = await players.open({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
     await host.page.locator('#btn-difficulty').click();
     await host.page.locator('#btn-difficulty').click();
+    await host.page.locator('#btn-difficulty').click();
     await guest.page.locator('#btn-difficulty').tap();
-    await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
-    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+    await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Raver');
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
     const sessionId = await create(host.page);
     players.ownSession(sessionId);
     await join(guest.page, sessionId);
     for (const player of [host, guest]) {
-        await expect(player.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+        await expect(player.page.locator('#btn-difficulty')).toHaveText('🎯 : Raver');
         await expect(player.page.locator('#btn-difficulty')).toBeDisabled();
         await expect(player.page.locator('#btn-control-mode')).toBeEnabled();
         expect(await player.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
     }
     await guest.page.locator('#btn-control-mode').tap();
-    await expect(guest.page.locator('#btn-control-mode')).toHaveText('🕹️ : Rectilinear');
+    await expect(guest.page.locator('#btn-control-mode')).toHaveText('🕹️ : Boxy');
     await guest.page.evaluate(() => document.getElementById('btn-difficulty').click());
     expect(await guest.page.evaluate(() => [
         CONFIG.ASTEROID_DIFFICULTY_FACTOR, LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR,
-    ])).toEqual([0.5, 0.4]);
+    ])).toEqual([0.5, 0.2]);
     await host.page.locator('#btn-start-enter').click();
     await guest.page.locator('#btn-start-enter').tap();
     await Promise.all([playing(host.page), playing(guest.page)]);
@@ -321,19 +332,19 @@ test('session difficulty follows the creator and leaving restores each local pre
         expect(await player.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
     }
     await leave(guest.page);
-    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
     await expect(guest.page.locator('#btn-difficulty')).toBeEnabled();
     await guest.page.locator('#btn-difficulty').tap();
-    await expect(guest.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+    await expect(guest.page.locator('#btn-difficulty')).toHaveText('🎯 : Dancer');
     await leave(host.page);
-    await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Dancer');
+    await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Raver');
     await expect(host.page.locator('#btn-difficulty')).toBeEnabled();
 });
 
 test('custom difficulty from URL and live debug tuning stays honest until a preset click', async ({ players }) => {
     const { page } = await players.open({ path: '/?cfg.ASTEROID_DIFFICULTY_FACTOR=0.75' });
     const difficulty = page.locator('#btn-difficulty');
-    await expect(difficulty).toHaveText('💦 : Custom');
+    await expect(difficulty).toHaveText('🎯 : Custom');
     await expect(difficulty).toHaveAttribute('aria-label', /Custom \(0\.75\)/);
     expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.75);
     await page.evaluate(() => {
@@ -343,8 +354,8 @@ test('custom difficulty from URL and live debug tuning stays honest until a pres
     });
     await expect(difficulty).toHaveAttribute('aria-label', /Custom \(1\.4\)/);
     await difficulty.click();
-    await expect(difficulty).toHaveText('💦 : Shifter');
-    expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
+    await expect(difficulty).toHaveText('🎯 : Shifter');
+    expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.2);
 });
 
 test('main-menu buttons share size and brightness with compact spacing in portrait, landscape and lobbies', async ({ players }) => {
@@ -800,11 +811,11 @@ test('menu touch taps join real sessions and canvas gestures retain both control
     const host = await players.open();
     const sessionId = await create(host.page);
     players.ownSession(sessionId);
-    for (const mode of ['Polar', 'Rectilinear']) {
+    for (const mode of ['Polar', 'Boxy']) {
         const guest = await players.open({
             viewport: { width: 568, height: 320 }, hasTouch: true, isMobile: true,
         });
-        if (mode === 'Rectilinear') await guest.page.locator('#btn-control-mode').tap();
+        if (mode === 'Boxy') await guest.page.locator('#btn-control-mode').tap();
         await expect(guest.page.locator('#btn-control-mode')).toContainText(mode);
         await guest.page.locator(`.session-item[data-session-id="${sessionId}"]`).tap();
         await sessionReady(guest.page, sessionId);
@@ -901,7 +912,7 @@ for (const touch of [false, true]) {
             ? { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } } : {});
         await expect(host.page.locator('#btn-leave-create')).toBeEnabled();
         await host.page.locator('#btn-difficulty').click();
-        await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
+        await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
         let releaseVerification;
         const verification = new Promise(resolve => { releaseVerification = resolve; });
         let verificationStarted;
@@ -921,14 +932,14 @@ for (const touch of [false, true]) {
             await expect(host.page.locator('#btn-leave-create')).toBeDisabled();
             await expect(host.page.locator('#btn-difficulty')).toBeDisabled();
             expect(await host.page.evaluate(() => cycleDifficulty())).toBe(false);
-            expect(await host.page.evaluate(() => LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
+            expect(await host.page.evaluate(() => LOCAL_CONFIG_BASELINE.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.2);
             expect(await host.page.evaluate(() => sessionPicker.currentSessionId)).toBeNull();
             releaseVerification();
             await sessionReady(host.page);
             players.ownSession(await host.page.evaluate(() => SessionClient.getCurrentSession().id));
             await expect(host.page.locator('#btn-start-enter')).toBeEnabled();
-            await expect(host.page.locator('#btn-difficulty')).toHaveText('💦 : Shifter');
-            expect(await host.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.4);
+            await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
+            expect(await host.page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.2);
             await host.page.locator('#btn-start-enter').click();
             await playing(host.page);
             expect(host.health.hubFrames, 'Create still uses the real hub connection').toBeGreaterThan(0);
