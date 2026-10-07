@@ -39,7 +39,7 @@ export async function completeIdentityAction(page, action = 'accept') {
     ]);
 }
 
-export async function namePlayer(page, tag) {
+export async function openIdentityNaming(page) {
     await expect.poll(() => page.evaluate(() =>
         !document.getElementById('identity-name-field').hidden
         || document.getElementById('identity-status').textContent === 'Playing as guest'),
@@ -48,6 +48,10 @@ export async function namePlayer(page, tag) {
         await page.locator('#btn-invite-self').click();
     }
     await expect(page.locator('#identity-tag')).toBeVisible();
+}
+
+export async function namePlayer(page, tag) {
+    await openIdentityNaming(page);
     await page.locator('#identity-tag').fill(tag);
     await completeIdentityAction(page);
     await expect.poll(() => page.evaluate(() =>

@@ -527,20 +527,52 @@
         .identity-dialog {
             margin: auto;
             color: #fff;
+            color-scheme: dark;
             background: #101829;
             border: 1px solid #889ab8;
             border-radius: 8px;
-            width: min(420px, calc(100vw - 32px));
+            width: 440px;
+            max-width: calc(100vw - 32px);
             max-height: calc(100dvh - 32px);
-            overflow-y: auto;
-            padding: 20px;
+            overflow: hidden;
+            padding: 0;
             font: 16px/1.4 'Courier New', monospace;
             touch-action: pan-y;
         }
 
         .identity-dialog::backdrop { background: rgba(0, 0, 0, 0.85); }
-        .identity-dialog h2 { margin: 0 0 12px; font-size: 22px; }
-        .identity-dialog p { margin: 0 0 12px; overflow-wrap: anywhere; }
+        .identity-dialog[open],
+        .identity-dialog form {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .identity-dialog h2 {
+            flex-shrink: 0;
+            margin: 0;
+            padding: 20px 20px 0;
+            font-size: 22px;
+            line-height: 1.25;
+        }
+        .identity-dialog .dialog-body {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-height: 0;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding: 16px 20px 20px;
+        }
+        .identity-dialog .dialog-body > * { flex-shrink: 0; }
+        .identity-dialog p { margin: 0; overflow-wrap: anywhere; }
+        .identity-dialog p:empty { display: none; }
+        .identity-dialog label { display: block; margin-bottom: 8px; font-weight: bold; }
+        .identity-dialog .dialog-hint {
+            margin-top: 8px;
+            color: #bdcbe0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
         .identity-dialog input {
             width: 100%;
             min-height: 44px;
@@ -548,25 +580,61 @@
             color: #fff;
             background: #080d18;
             border: 1px solid #889ab8;
+            border-radius: 4px;
             font: inherit;
         }
-        .identity-dialog .dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-        .identity-dialog button { min-height: 44px; flex: 1; }
-        #identity-error { color: #ffb4a9; margin-top: 12px; }
+        .identity-dialog .dialog-actions {
+            display: flex;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+            gap: 8px;
+            padding: 12px 20px 20px;
+            border-top: 1px solid #33435c;
+        }
+        .identity-dialog .dialog-actions .picker-btn {
+            flex: 1 1 11rem;
+            min-width: 0;
+            min-height: 44px;
+            margin: 0;
+            padding: 10px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.25;
+            letter-spacing: 1px;
+            transition-property: background-color, border-color, color, opacity;
+        }
+        .identity-dialog .picker-btn.solo { color: #cdd8e8; border-color: #889ab8; }
+        .identity-dialog :is(input, button):focus-visible {
+            outline: 2px solid #d6e6ff;
+            outline-offset: 3px;
+        }
+        #identity-description, #invite-share-description { color: #d4ddeb; }
+        #identity-error, #invite-share-error { color: #ffb4a9; }
+        #invite-share-error:not(:empty) { margin-top: 12px; }
         #identity-notice {
             position: fixed;
             top: 12px;
             left: 50%;
             transform: translateX(-50%);
             z-index: 200;
-            max-width: calc(100vw - 32px);
+            width: min(440px, calc(100vw - 32px));
+            max-height: calc(100dvh - 24px);
+            overflow-y: auto;
+            overflow-wrap: anywhere;
             padding: 12px 16px;
             color: #fff;
             background: #203448;
             border: 1px solid #9ac;
             border-radius: 6px;
-            text-align: center;
-            font-size: 16px;
+            font-size: 14px;
+            line-height: 1.4;
+            touch-action: pan-y;
+        }
+
+        @media (max-height: 420px) {
+            .identity-dialog h2 { padding-top: 12px; font-size: 20px; }
+            .identity-dialog .dialog-body { gap: 12px; padding-block: 12px; }
+            .identity-dialog .dialog-actions { padding-block: 10px 12px; }
         }
 
         #session-picker .picker-status {
@@ -1028,28 +1096,39 @@
                     </div>
                 </div>
 
-                <dialog id="identity-dialog" class="identity-dialog" aria-labelledby="identity-title">
+                <dialog id="identity-dialog" class="identity-dialog" aria-labelledby="identity-title"
+                    aria-describedby="identity-description">
                     <form id="identity-form">
                         <h2 id="identity-title">Welcome to Astervoids</h2>
-                        <p id="identity-description"></p>
-                        <div id="identity-name-field" hidden>
-                            <label for="identity-tag">Player tag</label>
-                            <input id="identity-tag" name="tag"
-                                autocomplete="nickname" autocapitalize="off" spellcheck="false">
+                        <div class="dialog-body">
+                            <p id="identity-description"></p>
+                            <div id="identity-name-field" hidden>
+                                <label for="identity-tag">Player tag</label>
+                                <input id="identity-tag" name="tag" aria-describedby="identity-tag-hint identity-error"
+                                    autocomplete="nickname" autocapitalize="off" spellcheck="false">
+                                <p id="identity-tag-hint" class="dialog-hint"></p>
+                            </div>
+                            <p id="identity-error" role="alert"></p>
                         </div>
-                        <p id="identity-error" role="alert"></p>
                         <div class="dialog-actions">
                             <button id="identity-accept" class="picker-btn action" type="submit">Continue</button>
                             <button id="identity-ignore" class="picker-btn solo" type="button">Not now</button>
                         </div>
                     </form>
                 </dialog>
-                <dialog id="invite-share-dialog" class="identity-dialog" aria-labelledby="invite-share-title">
+                <dialog id="invite-share-dialog" class="identity-dialog" aria-labelledby="invite-share-title"
+                    aria-describedby="invite-share-description">
                     <h2 id="invite-share-title">Your invite is ready</h2>
-                    <p id="invite-share-description"></p>
-                    <label for="invite-share-url">Private invitation link</label>
-                    <input id="invite-share-url" readonly autocomplete="off">
-                    <p id="invite-share-error" role="alert"></p>
+                    <div class="dialog-body">
+                        <p id="invite-share-description"></p>
+                        <div>
+                            <label for="invite-share-url">Private invitation link</label>
+                            <input id="invite-share-url" readonly autocomplete="off"
+                                aria-describedby="invite-share-description invite-share-warning invite-share-error">
+                            <p id="invite-share-error" role="alert"></p>
+                            <p id="invite-share-warning" class="dialog-hint"></p>
+                        </div>
+                    </div>
                     <div class="dialog-actions">
                         <button id="invite-share-copy" class="picker-btn action" type="button">Copy invite</button>
                         <button id="invite-share-close" class="picker-btn solo" type="button">Close</button>
@@ -12889,13 +12968,14 @@
     let identityRefreshRequested = false;
     let identityLeave = null;
     let noticeTimer = null;
+    let identityReturnFocus = null;
     game.identityChanging = true;
 
     function configureIdentityTagInput() {
         identityTagInput.maxLength = AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH;
         identityTagInput.pattern = AstervoidsConfig.IDENTITY_TAG_PATTERN_SOURCE;
-        document.querySelector('label[for="identity-tag"]').textContent =
-            `Player tag (1-${AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH} letters, numbers, _ or -)`;
+        document.getElementById('identity-tag-hint').textContent =
+            `1-${AstervoidsConfig.IDENTITY_TAG_MAX_LENGTH} characters: letters, numbers, _ or -.`;
     }
     configureIdentityTagInput();
 
@@ -12932,6 +13012,18 @@
         noticeTimer = setTimeout(() => { notice.hidden = true; }, 7000);
     }
 
+    function hideIdentityNotice() {
+        clearTimeout(noticeTimer);
+        document.getElementById('identity-notice').hidden = true;
+    }
+
+    function restoreIdentityFocus() {
+        if (identityBusy || identityDialog.open || shareDialog.open) return;
+        const trigger = identityReturnFocus;
+        identityReturnFocus = null;
+        if (trigger?.getClientRects().length && !trigger.disabled) trigger.focus();
+    }
+
     function setIdentityBusy(busy) {
         identityBusy = busy;
         identityAccept.disabled = busy;
@@ -12950,6 +13042,7 @@
     }
 
     function showIdentityDialog(title, description, naming, acceptLabel, action, ignoreAction) {
+        hideIdentityNotice();
         document.getElementById('identity-title').textContent = title;
         document.getElementById('identity-description').textContent = description;
         document.getElementById('identity-name-field').hidden = !naming;
@@ -12960,10 +13053,12 @@
         identityAccept.hidden = !action;
         identityAction = action;
         identityIgnoreAction = ignoreAction;
-        identityIgnore.textContent = identityInvite ? 'Ignore invite' : 'Play as guest';
+        identityIgnore.textContent = identityInvite ? 'Ignore invite'
+            : PlayerIdentity.current() ? 'Back to menu' : 'Play as guest';
         setIdentityBusy(false);
         releaseIdentityInput();
         if (!identityDialog.open) identityDialog.showModal();
+        identityDialog.querySelector('.dialog-body').scrollTop = 0;
         (naming ? identityTagInput : identityAccept.hidden ? identityIgnore : identityAccept).focus();
     }
 
@@ -13070,8 +13165,10 @@
                     identityAction = async () => identitySuccess(await PlayerIdentity.retry());
                 }
             }
+            identityError.scrollIntoView({ block: 'nearest' });
         } finally {
             setIdentityBusy(false);
+            restoreIdentityFocus();
         }
     }
 
@@ -13086,6 +13183,7 @@
         event.preventDefault();
         if (!identityBusy && !PlayerIdentity.hasPendingOperation()) identityIgnoreAction?.();
     });
+    identityDialog.addEventListener('close', restoreIdentityFocus);
 
     async function offerInviteLink(kind, result) {
         const link = PlayerIdentity.link(result.inviteToken);
@@ -13099,17 +13197,23 @@
             await navigator.clipboard.writeText(link);
             identityNotice(`${label} copied. Ready to share. ${warning}`);
         } catch {
+            document.getElementById('invite-share-title').textContent =
+                kind === 'self' ? 'Share your identity' : 'Invite a friend';
             document.getElementById('invite-share-description').textContent =
-                `Clipboard access was not available. Copy the link below. ${warning}`;
+                'Clipboard access was not available. Select and copy the link below.';
+            document.getElementById('invite-share-warning').textContent = warning;
             document.getElementById('invite-share-url').value = link;
             document.getElementById('invite-share-error').textContent = '';
             shareDialog.showModal();
+            shareDialog.querySelector('.dialog-body').scrollTop = 0;
             document.getElementById('invite-share-url').select();
         }
     }
 
     async function sharePlayerInvite(kind) {
         if (identityBusy || game.identityChanging || shareDialog.open) return;
+        hideIdentityNotice();
+        identityReturnFocus = document.getElementById(`btn-invite-${kind}`);
         if (!PlayerIdentity.current()) {
             await beginIdentityFlow(true);
             return;
@@ -13133,6 +13237,7 @@
                 }, activateIdentityMenu);
         } finally {
             setIdentityBusy(false);
+            restoreIdentityFocus();
         }
     }
 
@@ -13144,14 +13249,17 @@
             shareDialog.close();
             identityNotice('Invite copied. Ready to share.');
         } catch {
-            document.getElementById('invite-share-error').textContent =
+            const error = document.getElementById('invite-share-error');
+            error.textContent =
                 'Clipboard access was denied. Select the link and copy it manually.';
             document.getElementById('invite-share-url').select();
+            error.scrollIntoView({ block: 'nearest' });
         }
     });
     document.getElementById('invite-share-close').addEventListener('click', () => shareDialog.close());
     shareDialog.addEventListener('close', () => {
         document.getElementById('invite-share-url').value = '';
+        restoreIdentityFocus();
     });
 
     SessionClient.setSessionMetadataValidator(AstervoidsWireSchemas.requireCurrentSchemas);
