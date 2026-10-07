@@ -97,7 +97,7 @@ test('picker provides a polar-default analog mode toggle instead of a config sel
         /Start Solo Play/);
     assert.match(
         html.slice(controlModeIndex, html.indexOf('</button>', controlModeIndex)),
-        /🕹️ Polar/);
+        /🕹️ : Polar/);
     assert.match(
         html,
         /let analogControlScheme = ANALOG_CONTROL_SCHEMES\.POLAR/);
@@ -109,7 +109,7 @@ test('picker provides a polar-default analog mode toggle instead of a config sel
         /analogControlScheme === ANALOG_CONTROL_SCHEMES\.POLAR[\s\S]*?ANALOG_CONTROL_SCHEMES\.RECTILINEAR/);
     assert.match(
         html,
-        /analogControlModeButton\.textContent = `🕹️ \$\{currentLabel\}`/);
+        /analogControlModeButton\.textContent = `🕹️ : \$\{currentLabel\}`/);
     assert.match(
         html,
         /analogControlModeButton\.addEventListener\('click', toggleAnalogControlScheme\)/);

@@ -231,7 +231,7 @@ astervoids/
 
 ## Controls
 
-**Desktop:** Arrow keys to move, Space to fire, P to pause
+**Desktop:** Arrow keys to move, Space to fire, P to pause (solo)
 
 **Mobile:** Touch controls appear automatically on touch devices
 # Test

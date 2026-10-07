@@ -410,6 +410,18 @@ require Accept/Ignore, and first naming fixes the permanent tag.
 
 The menu pairs Self and Friend invitation actions in a single utility row.
 Fullscreen leads the device group; hiding it leaves no empty button slot.
+Controller mode and difficulty share the next equal-width row in that group,
+using joystick/target labels with a colon. Each click or tap advances one mode
+or preset and wraps around. Controller mode alternates Polar and Boxy; Boxy
+is the display name for rectilinear controls. Difficulty cycles Shifter (0.2),
+Dancer (0.35), Raver (0.5), and Survivor (0.65, the default). It updates solo/new-session
+configuration and existing asteroid scales through the same path as live debug tuning.
+The selector shows the shared difficulty read-only while joined and is also
+disabled during membership changes. Leaving restores the page's local choice;
+controller mode stays independently selectable. Neither adds reload persistence.
+Existing URL/debug factors outside the presets remain intact and display
+`Custom`, with the numeric factor in the accessible label and tooltip; the next
+enabled click selects Shifter. The wider debug tuning range is unchanged.
 The session list shrinks to the space left by fixed-size menu controls and
 scrolls independently, with long names ellipsized instead of widening landscape
 columns. Its minimum row height shares the button-height variable. Visible menu

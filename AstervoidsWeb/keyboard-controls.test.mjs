@@ -73,6 +73,7 @@ test('Enter resumes the solo pause menu while Escape restarts it', () => {
 
     const escapeBlock = mainKeydown.slice(escapeStart, enterStart);
     const enterBlock = mainKeydown.slice(enterStart, pauseKeyStart);
+    const pauseBlock = mainKeydown.slice(pauseKeyStart);
     const handleInput = handleInputSource();
 
     assert.match(escapeBlock, /isSessionMode\(\) \|\| sessionPicker\.currentSessionId/);
@@ -82,6 +83,8 @@ test('Enter resumes the solo pause menu while Escape restarts it', () => {
     assert.match(enterBlock, /!e\.repeat/);
     assert.match(enterBlock, /game\.state === 'paused'/);
     assert.match(enterBlock, /togglePause\(\)/);
+    assert.match(pauseBlock, /e\.code === 'KeyP' && !isGameOver\(\) && !isSessionMode\(\)/);
+    assert.match(pauseBlock, /togglePause\(\)/);
     assert.match(
         handleInput,
         /if \(isGameOver\(\)\) \{[\s\S]*?if \(keys\['Enter'\]\)/
@@ -91,7 +94,8 @@ test('Enter resumes the solo pause menu while Escape restarts it', () => {
         /if \(game\.state === 'paused'\) \{[\s\S]*?if \(keys\['Escape'\]\)/
     );
 
-    assert.match(html, /ESC to pause/);
+    assert.match(html, /P to pause \(solo\)/);
+    assert.doesNotMatch(html, /ESC to pause/i);
     assert.match(html, /Down Arrow or S to brake/);
     assert.match(html, /<span>ENTER<\/span> or <span>P<\/span> - Resume/);
     assert.match(html, /<span>DOWN<\/span> \/ <span>S<\/span> - Brake/);

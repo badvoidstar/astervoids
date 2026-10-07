@@ -168,11 +168,11 @@ test('debug controls state calibrated anchor and velocity units', () => {
     const rectTurnDeadzone = controls.get('ANALOG_RECTILINEAR_TURN_DEADZONE_PX');
     assert.equal(
         rectTurnDeadzone?.label,
-        'Analog rectilinear turn dead-zone (CSS px @ 390px gameplay ref)');
+        'Analog boxy turn dead-zone (CSS px @ 390px gameplay ref)');
     assert.equal(rectTurnDeadzone?.fmt(16), '16 px @ 390');
 
     const rectTurnGain = controls.get('ANALOG_RECTILINEAR_TURN_GAIN');
-    assert.equal(rectTurnGain?.label, 'Analog rectilinear rotation-offset gain');
+    assert.equal(rectTurnGain?.label, 'Analog boxy rotation-offset gain');
     assert.equal(rectTurnGain?.fmt(0.5), '0.50 rad/radius');
     assert.match(rectTurnGain?.help ?? '', /relative heading offset, clamped to ±π/);
 

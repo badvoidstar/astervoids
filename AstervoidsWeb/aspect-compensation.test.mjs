@@ -439,13 +439,16 @@ test('debug config changes immediately rescale existing asteroids', () => {
     assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
     const handlerSource = indexSource.slice(handlerStart, handlerEnd);
 
-    assert.match(handlerSource,
+    assert.match(handlerSource, /applyGameConfigOverride\(data\.key, data\.value\)/);
+    const { applyGameConfigOverride } = loadInlineGameFunctions(['applyGameConfigOverride']);
+    const overrideSource = applyGameConfigOverride.toString();
+    assert.match(overrideSource,
         /const previousAspectScales = getEffectiveAsteroidAspectScales\(\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /const nextAspectScales = getEffectiveAsteroidAspectScales\(\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /rescaleAsteroidsForAspectChange\(previousAspectScales, nextAspectScales\)/);
-    assert.match(handlerSource,
+    assert.match(overrideSource,
         /applyLiveConfigOverride\([\s\S]*?isSessionMode\(\)\)/);
 });
 
@@ -507,12 +510,13 @@ test('ASTEROID_ASPECT_SIZE_SPEED_BALANCE debug control exists with correct range
         `step ${ctrl.step} should be small (≤ 0.1)`);
 });
 
-test('difficulty defaults to 0.6 and has a 0.01 to 2.0 debug control', () => {
-    assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.6);
+test('difficulty defaults to 0.65 and has a 0.01 to 2.0 debug control', () => {
+    assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.65);
     assert.match(indexSource,
         /ASTEROID_DIFFICULTY_FACTOR:\s*SHARED_CONFIG_DEFAULTS\.ASTEROID_DIFFICULTY_FACTOR/);
     const ctrl = CONFIG_CONTROLS.find(c => c.key === 'ASTEROID_DIFFICULTY_FACTOR');
     assert.ok(ctrl, 'control must be registered');
+    assert.equal(ctrl.default, 0.65);
     assert.equal(ctrl.min, 0.01);
     assert.equal(ctrl.max, 2);
     assert.equal(ctrl.step, 0.01);

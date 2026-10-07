@@ -23,14 +23,14 @@ test('portrait menu utilities stack and landscape uses a native two-column layou
     assert.match(source, /#menu-columns \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
     assert.match(source,
         /@media \(orientation: landscape\) \{[\s\S]*?#menu-columns \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/);
-    for (const id of ['btn-control-mode', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend']) {
+    for (const id of ['btn-control-mode', 'btn-difficulty', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend']) {
         assert.match(source, new RegExp(`<button id="${id}"`));
     }
 });
 
-test('fullscreen leads the device group and hidden modes remove it without reserving space', () => {
+test('fullscreen leads the paired device settings and hiding it reserves no space', () => {
     assert.match(source,
-        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<button id="btn-control-mode"[^>]*>[^<]*<\/button>\s*<\/div>/);
+        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<div class="button-row">\s*<button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar<\/button>\s*<button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor<\/button>\s*<\/div>\s*<\/div>/);
     for (const mode of ['fullscreen-active', 'standalone-mode', 'pseudo-fullscreen']) {
         assert.match(source, new RegExp(`\\.${mode} #btn-fullscreen[,\\s][^}]*display: none;`));
     }
@@ -106,7 +106,7 @@ test('landscape aligns the play and utility groups without reserving hidden butt
     assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
 });
 
-test('main-menu buttons keep Solo Play height while lobby and invite actions share rows', () => {
+test('main-menu buttons keep Solo Play height while lobby, settings and invite actions share rows', () => {
     const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
     assert.ok(buttonStyle);
     assert.match(buttonStyle, /width: 100%;/);
@@ -131,6 +131,10 @@ test('main-menu buttons keep Solo Play height while lobby and invite actions sha
 test('invite actions share one utility row and retain their existing button styling', () => {
     assert.match(source,
         /<div class="menu-utility-group">\s*<div class="button-row">\s*<button id="btn-invite-self" class="picker-btn solo">Invite Self<\/button>\s*<button id="btn-invite-friend" class="picker-btn solo">Invite Friend<\/button>\s*<\/div>\s*<\/div>/);
+});
+
+test('paired setting labels fit narrow rows with native font size and compact tracking', () => {
+    assert.match(source, /#btn-control-mode,\s*#btn-difficulty \{\s*letter-spacing: 0;\s*\}/);
 });
 
 test('enabled main-menu labels are uniformly bright without removing disabled indicators', () => {

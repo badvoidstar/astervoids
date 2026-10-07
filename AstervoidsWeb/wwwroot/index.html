@@ -952,6 +952,11 @@
             padding: 2px min(8px, 1vw);
         }
 
+        #btn-control-mode,
+        #btn-difficulty {
+            letter-spacing: 0;
+        }
+
         /* Mobile touch controls */
         #mobile-controls {
             display: none;
@@ -1062,7 +1067,7 @@
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | ESC to pause
+            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | P to pause (solo)
         </div>
 
         <!-- Pause menu overlay -->
@@ -1109,7 +1114,10 @@
                       <div id="menu-utilities">
                        <div class="menu-utility-group">
                         <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
-                        <button id="btn-control-mode" class="picker-btn solo">🕹️ Polar</button>
+                        <div class="button-row">
+                            <button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar</button>
+                            <button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor</button>
+                        </div>
                        </div>
                        <div class="menu-utility-group">
                         <div class="button-row">
@@ -2030,6 +2038,7 @@
     };
 
     const {
+        ASTEROID_DIFFICULTY_PRESETS,
         SESSION_CONFIG_KEYS,
         applyUrlConfigOverrides,
         applyStoredDebugConfigOverrides,
@@ -2053,6 +2062,7 @@
     });
     let analogControlScheme = ANALOG_CONTROL_SCHEMES.POLAR;
     const analogControlModeButton = document.getElementById('btn-control-mode');
+    const difficultyButton = document.getElementById('btn-difficulty');
 
     const TURN_CONTROL_MODE = Object.freeze({
         KEYBOARD_RATE: 0,
@@ -2083,13 +2093,13 @@
         const scheme = getAnalogControlScheme();
         const currentLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
             ? 'Polar'
-            : 'Rectilinear';
+            : 'Boxy';
         const nextLabel = scheme === ANALOG_CONTROL_SCHEMES.POLAR
-            ? 'Rectilinear'
+            ? 'Boxy'
             : 'Polar';
 
         if (analogControlModeButton) {
-            analogControlModeButton.textContent = `🕹️ ${currentLabel}`;
+            analogControlModeButton.textContent = `🕹️ : ${currentLabel}`;
             analogControlModeButton.title = `Switch to ${nextLabel} controls`;
             analogControlModeButton.setAttribute(
                 'aria-label',
@@ -2124,6 +2134,40 @@
     }
 
     updateAnalogControlModeButton();
+
+    function isDifficultySelectionLocked() {
+        return isSessionMode() || !!sessionPicker.currentSessionId
+            || sessionPicker.operationPending === true;
+    }
+
+    function getNextDifficultyPreset() {
+        const index = ASTEROID_DIFFICULTY_PRESETS.findIndex(
+            preset => preset.value === CONFIG.ASTEROID_DIFFICULTY_FACTOR);
+        return ASTEROID_DIFFICULTY_PRESETS[(index + 1) % ASTEROID_DIFFICULTY_PRESETS.length];
+    }
+
+    function updateDifficultyButton() {
+        if (!difficultyButton) return;
+        const preset = ASTEROID_DIFFICULTY_PRESETS.find(
+            candidate => candidate.value === CONFIG.ASTEROID_DIFFICULTY_FACTOR);
+        const label = preset?.label ?? 'Custom';
+        const next = getNextDifficultyPreset();
+        const locked = isDifficultySelectionLocked();
+        const action = sessionPicker.operationPending
+            ? 'Wait for the session operation to finish.'
+            : locked
+                ? 'Leave the session to change difficulty.'
+                : `Switch to ${next.label} (${next.value}).`;
+        difficultyButton.textContent = `🎯 : ${label}`;
+        difficultyButton.disabled = locked;
+        difficultyButton.title = `Difficulty: ${label} (${CONFIG.ASTEROID_DIFFICULTY_FACTOR}). ${action}`;
+        difficultyButton.setAttribute('aria-label', difficultyButton.title);
+    }
+
+    function cycleDifficulty() {
+        if (isDifficultySelectionLocked()) return false;
+        return applyGameConfigOverride('ASTEROID_DIFFICULTY_FACTOR', getNextDifficultyPreset().value);
+    }
 
     function restoreLocalConfigBaseline(config = CONFIG) {
         for (const key of SESSION_CONFIG_KEYS) {
@@ -2189,6 +2233,18 @@
         for (const asteroid of game.cosmeticAstervoids) {
             rescaleAsteroidForAspectChange(asteroid, radiusRatio, speedRatio);
         }
+    }
+
+    function applyGameConfigOverride(key, value) {
+        const previousAspectScales = getEffectiveAsteroidAspectScales();
+        const applied = applyLiveConfigOverride(
+            CONFIG, LOCAL_CONFIG_BASELINE, key, value, isSessionMode());
+        if (applied) {
+            const nextAspectScales = getEffectiveAsteroidAspectScales();
+            rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
+        }
+        updateDifficultyButton();
+        return applied;
     }
 
     function adoptSessionConfig(metadata, config = CONFIG) {
@@ -5057,16 +5113,7 @@
         if (data && data.type === 'config-update'
             && DEBUG_OVERRIDABLE_KEYS.has(data.key)
             && data.value !== undefined) {
-            const previousAspectScales = getEffectiveAsteroidAspectScales();
-            const applied = applyLiveConfigOverride(
-                CONFIG,
-                LOCAL_CONFIG_BASELINE,
-                data.key,
-                data.value,
-                isSessionMode());
-            if (!applied) return;
-            const nextAspectScales = getEffectiveAsteroidAspectScales();
-            rescaleAsteroidsForAspectChange(previousAspectScales, nextAspectScales);
+            applyGameConfigOverride(data.key, data.value);
         }
     };
     debugChannel.postMessage({ type: 'config-request' });
@@ -10237,6 +10284,9 @@
     if (analogControlModeButton) {
         analogControlModeButton.addEventListener('click', toggleAnalogControlScheme);
     }
+    if (difficultyButton) {
+        difficultyButton.addEventListener('click', cycleDifficulty);
+    }
 
     // Track fullscreen state
     function handleFullscreenChange() {
@@ -10719,6 +10769,8 @@
     let pickerOperationGeneration = 0;
     let pickerUpdatesActive = true;
 
+    updateDifficultyButton();
+
     function isSessionPickerVisible() {
         return !document.hidden && !startScreen.classList.contains('hidden');
     }
@@ -11129,6 +11181,7 @@
     function updatePickerButtons() {
         if (!isSessionPickerVisible()) return;
         const { btnLeaveCreate, btnStartEnter, currentSessionId, isServer, gameStarted, canCreate, connected } = sessionPicker;
+        updateDifficultyButton();
         updateCreateRegionSelectorVisibility();
         btnLeaveCreate.removeAttribute('aria-label');
         
