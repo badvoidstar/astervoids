@@ -144,6 +144,50 @@ async function expectDialogComposition(page, selector) {
     });
 }
 
+test('cold root entry waits for identity and services without offering unavailable choices', async ({ identities }) => {
+    let release;
+    let resolving = false;
+    const pending = new Promise(resolve => { release = resolve; });
+    let player;
+    try {
+        player = await identities.open('/', null, async page => {
+            await page.setViewportSize({ width: 320, height: 568 });
+            await page.route('**/api/identity/resolve', async route => {
+                resolving = true;
+                await pending;
+                await route.fallback();
+            });
+        });
+        await expect.poll(() => resolving).toBe(true);
+        await expect(player.page.locator('#identity-ignore')).not.toBeVisible();
+        await expect(player.page.locator('#identity-title')).toHaveText('Getting ready');
+        await expect(player.page.locator('#identity-description')).toHaveText(
+            'Determining your player identity and warming up services. Please wait...');
+        await expect(player.page.locator('#identity-dialog').getByRole('button')).toHaveCount(0);
+        await expect(player.page.locator('#identity-dialog .dialog-actions')).not.toBeVisible();
+        await expect(player.page.locator('#identity-tag')).not.toBeVisible();
+        await expect(player.page.locator('#identity-title')).toBeFocused();
+        await expectDialogComposition(player.page, '#identity-dialog');
+        await player.page.keyboard.press('Escape');
+        await player.page.keyboard.press('Enter');
+        await expect(player.page.locator('#identity-dialog')).toBeVisible();
+        expect(await player.page.evaluate(() => ({
+            changing: game.identityChanging,
+            started: identityStarted,
+        }))).toEqual({ changing: true, started: false });
+    } finally {
+        release();
+    }
+    await openIdentityNaming(player.page);
+    await expect(player.page.locator('#identity-dialog .dialog-actions')).toBeVisible();
+    await expect(player.page.locator('#identity-ignore')).toHaveText('Play as guest');
+    await expect(player.page.locator('#identity-ignore')).toBeEnabled();
+    await expect(player.page.locator('#identity-tag')).toBeFocused();
+    await player.page.locator('#identity-ignore').click();
+    await expect(player.page.locator('#identity-dialog')).not.toBeVisible();
+    await expect(player.page.locator('#identity-status')).toHaveText('Playing as guest');
+});
+
 for (const viewport of [
     { width: 1280, height: 900 },
     { width: 320, height: 568 },
@@ -223,8 +267,12 @@ test('identity failure and busy states keep their actions accessible in a reduce
     });
     try {
         await player.page.locator('#identity-accept').click();
-        await expect(player.page.locator('#identity-description')).toContainText('Checking');
+        await expect(player.page.locator('#identity-description')).toContainText(
+            'Determining your player identity and warming up services');
+        await expect(player.page.locator('#identity-dialog .dialog-actions')).not.toBeVisible();
+        await expect(player.page.locator('#identity-ignore')).not.toBeVisible();
         await expect(player.page.locator('#identity-ignore')).toBeDisabled();
+        await expect(player.page.locator('#identity-title')).toBeFocused();
         await expectDialogComposition(player.page, '#identity-dialog');
     } finally {
         release();
