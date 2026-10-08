@@ -179,6 +179,35 @@ test('identity verification does not wait for the independent region preparation
     assert.equal(await preparing, true);
 });
 
+test('startup identity resolution offers only waiting until the browser identity is determined', async () => {
+    const dialogs = [];
+    const events = [];
+    let finishResolve;
+    const resolution = new Promise(resolve => { finishResolve = resolve; });
+    const { beginIdentityFlow } = loadInlineGameFunctions(['beginIdentityFlow'], {
+        identityFlowEpoch: 0,
+        identityInvite: null,
+        PlayerIdentity: { resolve: () => resolution },
+        showIdentityDialog: (...args) => dialogs.push(args),
+        setIdentityBusy: busy => events.push(['busy', busy]),
+        activateIdentityMenu: () => events.push(['menu']),
+        redirectIdentityRoot: () => assert.fail('Recognized root visitors do not need a redirect'),
+    });
+    const starting = beginIdentityFlow();
+    try {
+        assert.deepEqual(dialogs, [[
+            'Getting ready',
+            'Determining your player identity and warming up services. Please wait...',
+            false, '', null, null,
+        ]]);
+        assert.deepEqual(events, [['busy', true]]);
+    } finally {
+        finishResolve(resolved(binding));
+        await starting;
+    }
+    assert.deepEqual(events, [['busy', true], ['menu']]);
+});
+
 test('failed preparation is sanitized and never substitutes for authoritative identity verification', async () => {
     const h = subject({ bootstrap: { regionId: null, regions: [{ hostname: location.origin }] } });
     h.replies.push(new Error('network diagnostic containing a private hostname'));

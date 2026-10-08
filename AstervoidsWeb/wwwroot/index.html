@@ -593,7 +593,7 @@
             border-radius: 4px;
             font: inherit;
         }
-        .identity-dialog .dialog-actions {
+        .identity-dialog .dialog-actions:not([hidden]) {
             display: flex;
             flex-wrap: wrap;
             flex-shrink: 0;
@@ -1132,7 +1132,7 @@
                 <dialog id="identity-dialog" class="identity-dialog" aria-labelledby="identity-title"
                     aria-describedby="identity-description">
                     <form id="identity-form">
-                        <h2 id="identity-title">Welcome to Astervoids</h2>
+                        <h2 id="identity-title" tabindex="-1">Welcome to Astervoids</h2>
                         <div class="dialog-body">
                             <p id="identity-description"></p>
                             <div id="identity-name-field" hidden>
@@ -13158,6 +13158,8 @@
         identityError.textContent = '';
         identityAccept.textContent = acceptLabel;
         identityAccept.hidden = !action;
+        identityIgnore.hidden = !ignoreAction;
+        identityDialog.querySelector('.dialog-actions').hidden = !action && !ignoreAction;
         identityAction = action;
         identityIgnoreAction = ignoreAction;
         identityIgnore.textContent = identityInvite ? 'Ignore invite'
@@ -13166,7 +13168,11 @@
         releaseIdentityInput();
         if (!identityDialog.open) identityDialog.showModal();
         identityDialog.querySelector('.dialog-body').scrollTop = 0;
-        (naming ? identityTagInput : identityAccept.hidden ? identityIgnore : identityAccept).focus();
+        const focusTarget = naming ? identityTagInput
+            : action ? identityAccept
+            : ignoreAction ? identityIgnore
+            : document.getElementById('identity-title');
+        focusTarget.focus();
     }
 
     function activateIdentityMenu() {
@@ -13214,8 +13220,9 @@
                 false, '', null, ignore);
             return;
         }
-        showIdentityDialog('Player identity', 'Checking your browser binding...',
-            false, '', null, ignore);
+        showIdentityDialog('Getting ready',
+            'Determining your player identity and warming up services. Please wait...',
+            false, '', null, null);
         setIdentityBusy(true);
         try {
             const result = await PlayerIdentity.resolve(inviteToken);

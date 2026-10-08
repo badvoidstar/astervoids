@@ -428,7 +428,11 @@ columns. Its minimum row height shares the button-height variable. Visible menu
 content retains native touch scrolling, including the outer menu on very short
 screens, without acquiring gameplay touch controls. A layout observer recomputes
 only the list's height budget as viewport and menu content sizes change.
-Identity dialogs keep their heading and actions visible while longer content
+Identity resolution first shows a wait-only dialog explaining player-identity
+determination and service warm-up. Its heading receives focus; guest, invitation,
+and submit actions are hidden while resolution is pending. Existing verified-binding,
+naming, confirmation, and failure-recovery paths then continue normally.
+Other identity dialogs keep their heading and actions visible while longer content
 scrolls inside the dialog. Narrow screens stack equally sized actions without
 scaling text; native input hints and privacy/error text are associated with their
 fields. Self and friend sharing have distinct titles and retain the private-link
