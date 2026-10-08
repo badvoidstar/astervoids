@@ -56,7 +56,10 @@ an invite button. Guest play is not entered into the durable leaderboards.
 Development uses `App_Data/identity.json`, ignored by git. Azure deployments use
 managed identity and Azure Table Storage, shared across production regions and
 isolated for branch previews. Storage errors are reported rather than replaced
-with an ephemeral identity. See [identity architecture](ARCHITECTURE.md#durable-player-identity)
+with an ephemeral identity. Orphan preview cleanup permanently deletes that
+preview's identities, bindings, invitations and leaderboard data; a recreated
+preview starts fresh. Production data remains durable.
+See [identity architecture](ARCHITECTURE.md#durable-player-identity)
 and the deployment/retention runbook in `CICD_SETUP.md`.
 
 ## Multiplayer scores

@@ -834,22 +834,54 @@ serves a stale cert until you redeploy.
 
 ### Legacy hygiene and protected resources
 
-- The cleanup workflow only targets branch-ephemeral resources (`ca-web-<branch>`, matching branch DNS/cert artifacts).
+- The cleanup workflow targets branch-ephemeral resources (`ca-web-<branch>`,
+  explicitly branch-owned identity/leaderboard stores, and matching branch DNS/cert artifacts).
 - Production resources (`ca-web-production` and `ca-web-production-*`, production DNS/certs) are protected from automated deletion.
-- Identity storage accounts/tables are intentionally retained, including those
-  belonging to deleted branches. See [Durable player identity](#durable-player-identity)
-  for the explicit retirement procedure and ongoing storage costs.
+- Production and standalone identity storage remain manually retained. Disposable
+  preview data is permanently retired in the same cleanup run as its orphaned app,
+  after successful app deletion and confirmed absence. Older orphan stores whose
+  apps were already removed are also discovered independently.
 - Legacy resources no longer referenced by IaC (for example old Traffic Manager profiles) should be removed intentionally via a manual ops cleanup pass.
 
 ### Automatic Cleanup
 
-The cleanup workflow runs daily and can be started manually. It:
-1. Deletes orphaned branch Container Apps
-2. Removes matching DNS records (CNAME and TXT)
-3. Leaves shared production certificate resources intact
-4. Leaves durable identity accounts/tables intact; it never purges player data
+The cleanup workflow runs daily at **13:00 UTC** and can be started manually. It:
+1. Confirms remote branch absence using `git ls-remote --heads origin`, not stale
+   local tracking refs; all live names use the shared sanitizer. Any sanitized
+   collision protects the deployment, as do `main` and all production forms.
+2. Deletes matching, tagged orphan branch Container Apps in `rg-production` and
+   confirms their absence with a successful fresh inventory.
+3. Permanently deletes eligible orphan preview identity/leaderboard accounts in
+   that same run, including older accounts with no surviving app. No app-list
+   early exit or redeploy is required. See [retention](#retention-cost-and-retirement).
+4. Removes orphan branch CNAME/TXT/certificate artifacts, preserving base,
+   regional-production and live-deployment artifacts and shared wildcard certs.
+5. Retains the existing ACR image purge: older than 14 days, including untagged
+   manifests, keeping the newest image in each repository.
 
-**Note:** The main branch cleanup is blocked to prevent accidental deletion of production.
+The [cleanup runner](.github/scripts/cleanup-orphans.mjs) requires successful,
+parsed, unfiltered app/storage inventories and a valid remote branch inventory
+containing `main`. It checks every app in the group, regardless of its name, and
+its active revisions for `Identity__TableEndpoint` references. Unknown/indirect
+identity settings, incomplete revisions, failed discovery, or unconfirmed/failed
+deletes fail the run rather than becoming evidence of absence. Missing ownership
+tags, ambiguous store ownership and live references retain the store with a safe
+skip. Raw inventories, resource IDs and custom hostnames are not published.
+
+Cleanup and Azure CICD's **deploy job** share the non-cancelling
+`astervoids-azure-resource-mutations` concurrency group; builds/tests remain
+parallel. Queued deploys must still match the remote branch head after acquiring
+the interlock. GitHub can supersede pending jobs in a concurrency group; rerun a
+needed deployment if its pending job is cancelled. Cleanup re-reads branches,
+apps/revisions and storage before each app/account delete and detects changed
+app principals, revisions, storage creation times and ownership metadata.
+
+This is **not an atomic GitHub/Azure transaction**. Local azd/portal operators,
+older workflow versions without the shared group, manually configured consumers
+outside this topology, ARM visibility delays, and a branch recreated after the
+last check can still race cleanup. Pause cleanup for such work and update/rebase
+deployment workflows to use the interlock. Incomplete or unsupported deployment
+configuration is retained for operator review, not guessed safe.
 
 ## Durable player identity
 
@@ -967,15 +999,46 @@ administrative environment.
   Storage/transaction charges and regional account quotas still apply while
   apps are at zero replicas. LRS is not cross-region disaster recovery:
   a storage-region outage can make identity and leaderboard operations unavailable everywhere.
-  No backup/export schedule, data TTL, or automatic store deletion is
-  provisioned. Evaluate recovery and data-retention requirements separately.
-- The orphan workflow deliberately leaves identity storage indefinitely,
-  including branch data. Tags `astervoids-data=player-identity`,
-  `astervoids-deployment-kind`, `azd-env-name`, and
-  `astervoids-retention=manual` identify its ownership privately. Recreating
-  the same preview environment reuses that store, not production data.
-- To retire a store, an authorized administrator must first verify its exact
-  environment and account/table scope and confirm no live app/branch still
+  No backup/export schedule or row TTL is provisioned. Production/standalone
+  store retirement is manual; orphan preview retirement is automatic.
+  Evaluate recovery and data-retention requirements separately.
+- New preview accounts carry `astervoids-data=player-identity`,
+  `astervoids-deployment-kind=branch`, `azd-env-name=<sanitized-branch>` and
+  `astervoids-retention=branch-orphan`. Cleanup requires these ownership tags
+  (not an account-name prefix), the designated `rg-production` scope, no matching
+  live branch, and no remaining app/environment or active-revision reference.
+  Production, standalone, shared and unclassified accounts are not eligible.
+- **Policy change for existing previews:** legacy branch accounts with
+  `astervoids-retention=manual` and the same explicit branch ownership tags are
+  also eligible, without retagging/redeploying or a surviving app. That legacy
+  value is not a new keep policy. The first cleanup after this change can retire
+  accumulated orphans. Unknown/missing tags are skipped for private operator
+  review; do not relabel production/shared data as branch-owned.
+- Branch deletion makes preview data disposable at the next scheduled/manual
+  cleanup, with no additional retention grace period. Account deletion removes
+  identities, tags, browser bindings, invitations, and leaderboard canonical
+  scores/indexes permanently. Recreating the preview after retirement starts
+  fresh; it does not recover old bindings/scores or reuse production data.
+  Export anything that must survive **before** deleting its remote branch.
+- Cleanup uses the existing production OIDC principal. It needs management-plane
+  app/revision/storage read access and app/account delete access in
+  `rg-production`, plus the existing DNS/cert and ACR permissions. Contributor
+  covers these resource operations; no Table data read/write, storage keys,
+  Microsoft Graph privilege or new broad RBAC grant is required for retirement.
+  Locks/policy denials fail cleanup; fix the cause and rerun. If app deletion
+  succeeded but account deletion failed, the independent storage pass retries it.
+- Deleting an app/system principal alone does
+  [not automatically remove its grants](https://learn.microsoft.com/azure/azure-resource-manager/bicep/scenarios-rbac#resource-deletion-behavior).
+  Here the target `PlayerIdentity` table/account is also deleted, but the runner
+  does not enumerate or explicitly remove RBAC assignments. Account deletion
+  confirmation is not a separate verification of RBAC cleanup. Investigate any
+  lingering assignments only at that exact retired account/table scope; shared
+  Contributor, deployment delegation and other inherited grants remain untouched.
+  Existing constrained role-assignment authority is still needed for provisioning
+  and any such explicit repair, as described in the
+  [RBAC runbook](#identity-storage-rbac-portal-runbook).
+- To manually retire production/standalone data, an authorized administrator must
+  first verify its exact environment and account/table scope and confirm no live app/branch still
   uses it. Export data under an approved retention policy if necessary, then
   intentionally delete that environment's table/account and obsolete
   table-scoped role assignments. Never delete `rg-production` to clean up a
@@ -1029,7 +1092,7 @@ locally when editing Squad setup files.
 |---|---|---|
 | Production single-region | `main` push/manual with empty `REGIONS_JSON` | `rg-production`, single CAE/app + durable production identity table (greenfield-capable) |
 | Production multi-region | `main` push/manual with valid nonempty `REGIONS_JSON`, custom domain, and BYO cert URL/name | `rg-production`, per-region CAE/apps + Static Web App apex; every app shares the same production identity table |
-| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared primary CAE; branch app, isolated durable identity account/table, and optional DNS |
+| Branch shared-infra preview | non-`main` push/manual | reuses production RG/ACR/shared primary CAE; branch app, isolated identity/leaderboard account/table retired with an orphan preview, and optional DNS |
 | Standalone (local azd) | local `azd up`/`azd deploy` | separate `rg-{env}` with its own safely derived ACR/CAE/app names and durable identity account/table |
 
 ## Customization
@@ -1050,7 +1113,7 @@ retain them until all active workflow refs have migrated to secrets.
 The infrastructure is defined using Bicep templates in the `/infra` directory:
 - `main.bicep` - Main infrastructure definition
 - `main.parameters.json` - Parameters for the Bicep template
-- `core/storage/player-identity.bicep` - retained per-environment identity account/table
+- `core/storage/player-identity.bicep` - per-environment identity/leaderboard account/table; manual production/standalone retention, disposable orphan previews
 - `core/security/player-identity-role.bicep` - table-scoped access for each app's system identity
 
 To modify the infrastructure, edit these files and the changes will be applied on the next deployment.

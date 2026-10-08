@@ -24,7 +24,11 @@ test('one environment-keyed store survives app revisions and is shared by all pr
   assert.equal(template.variables.sharedResourceGroupName, 'rg-production');
   assert.match(template.variables.standaloneResourceGroupName, /parameters\('environmentName'\)/);
   assert.match(store.resourceGroup, /isStandalone.*standaloneResourceGroupName.*sharedResourceGroupName/);
-  assert.match(store.properties.parameters.tags.value, /'astervoids-retention', 'manual'/);
+  assert.match(store.properties.parameters.tags.value,
+    /'astervoids-retention', if\(variables\('isBranch'\), 'branch-orphan', 'manual'\)/);
+  assert.match(store.properties.parameters.tags.value,
+    /'astervoids-data', 'player-identity'.*'astervoids-deployment-kind', if\(variables\('isProduction'\), 'production', if\(variables\('isBranch'\), 'branch', 'standalone'\)\)/);
+  assert.deepEqual(template.variables.tags, { 'azd-env-name': "[parameters('environmentName')]" });
   assert.ok(store.dependsOn.every(dependency =>
     !/containerApps|web-|webRegional|identity-access/.test(dependency)));
 
@@ -139,7 +143,11 @@ test('identity resource details do not become public deployment outputs', () => 
     /identityStorage|identityTable|identity-access|primaryEndpoints\.table/);
 });
 
-test('orphan cleanup never deletes the retained identity store or its resource group', () => {
+test('orphan cleanup uses the guarded runner and never deletes a resource group or shared role grant', () => {
   const cleanup = readFileSync(new URL('../workflows/cleanup-orphans.yml', import.meta.url), 'utf8');
+  const runner = readFileSync(new URL('./cleanup-orphans.mjs', import.meta.url), 'utf8');
+  assert.match(cleanup, /run: node \.github\/scripts\/cleanup-orphans\.mjs/);
   assert.doesNotMatch(cleanup, /az\s+(?:storage|resource|group)\s+[^#\n]*\bdelete\b/);
+  assert.doesNotMatch(runner, /\['(?:group|resource|role)'/);
+  assert.match(runner, /\['storage', 'account', 'delete'/);
 });

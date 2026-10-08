@@ -181,6 +181,7 @@ var tags = {
 // Durable identity belongs to a deployment environment, not an app revision,
 // CAE, or gameplay region. Both production topologies resolve the same account;
 // a branch in rg-production still has its own independent account and table.
+// Branch data survives redeploys, but is permanently retired with orphan previews.
 var identityStorageAccountName = 'stid${uniqueString(subscription().subscriptionId, isStandalone ? standaloneResourceGroupName : sharedResourceGroupName, environmentName)}'
 module identityStorage 'core/storage/player-identity.bicep' = {
   name: 'identity-storage-${uniqueString(environmentName)}'
@@ -190,7 +191,7 @@ module identityStorage 'core/storage/player-identity.bicep' = {
     tags: union(tags, {
       'astervoids-data': 'player-identity'
       'astervoids-deployment-kind': isProduction ? 'production' : (isBranch ? 'branch' : 'standalone')
-      'astervoids-retention': 'manual'
+      'astervoids-retention': isBranch ? 'branch-orphan' : 'manual'
     })
   }
   dependsOn: [productionRg, standaloneRg]

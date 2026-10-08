@@ -12,20 +12,25 @@ permissions:
 
 env:
   PRODUCTION_RG: 'rg-production'
-  CONTAINER_ENV_NAME: 'cae-production'
-  CONTAINER_APP_PREFIX: 'ca-web'
 
 jobs:
   cleanup:
     name: Find and Cleanup Orphaned Deployments
     runs-on: ubuntu-latest
     environment: production
-    
+    # Shared with Azure CICD's deploy job, not its build/test jobs.
+    concurrency:
+      group: astervoids-azure-resource-mutations
+      cancel-in-progress: false
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          fetch-depth: 0  # Need full history to list branches
+          node-version: 22
 
       - name: Log in to Azure using OIDC
         uses: azure/login@v3
@@ -34,267 +39,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Find and cleanup orphaned container apps
-        run: |
-          echo "### 🔍 Scanning for Orphaned Deployments" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Make sanitize script executable
-          chmod +x .github/scripts/sanitize-branch-name.sh
-          
-          # Get all remote branches
-          git fetch --all
-          BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | tr -d ' ')
-          echo "Active branches:"
-          echo "$BRANCHES"
-          
-          # Get all container apps matching our naming pattern
-          CONTAINER_APPS=$(az containerapp list \
-            --resource-group "${{ env.PRODUCTION_RG }}" \
-            --query "[?starts_with(name, '${{ env.CONTAINER_APP_PREFIX }}-')].name" \
-            -o tsv 2>/dev/null || echo "")
-          
-          if [ -z "$CONTAINER_APPS" ]; then
-            echo "No container apps found"
-            echo "No container apps found in resource group." >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-          
-          echo ""
-          echo "Container apps found:"
-          echo "$CONTAINER_APPS"
-          
-          ORPHANS_FOUND=0
-          ORPHANS_CLEANED=0
-          
-          for APP in $CONTAINER_APPS; do
-            echo ""
-            echo "Checking: $APP"
-            
-            # Skip production container apps:
-            # single-region → ca-web-production
-            # multi-region  → ca-web-production-<region> (e.g. ca-web-production-westus2)
-            if [ "$APP" = "${{ env.CONTAINER_APP_PREFIX }}-production" ] || \
-               [[ "$APP" == "${{ env.CONTAINER_APP_PREFIX }}-production-"* ]]; then
-              echo "  -> Skipping production"
-              continue
-            fi
-            
-            # Extract the sanitized branch name from container app name
-            SANITIZED_BRANCH="${APP#${{ env.CONTAINER_APP_PREFIX }}-}"
-            
-            # Check if any branch matches this sanitized name
-            BRANCH_EXISTS=false
-            for BRANCH in $BRANCHES; do
-              # Sanitize the branch name using shared script
-              BRANCH_SANITIZED=$(.github/scripts/sanitize-branch-name.sh "$BRANCH")
-              
-              if [ "$BRANCH_SANITIZED" = "$SANITIZED_BRANCH" ]; then
-                BRANCH_EXISTS=true
-                echo "  -> Branch exists: $BRANCH"
-                break
-              fi
-            done
-            
-            if [ "$BRANCH_EXISTS" = "false" ]; then
-              echo "  -> ORPHAN DETECTED - No matching branch found"
-              ORPHANS_FOUND=$((ORPHANS_FOUND + 1))
-              
-              # Delete the container app
-              echo "  -> Deleting container app: $APP"
-              if az containerapp delete \
-                --name "$APP" \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --yes 2>/dev/null; then
-                echo "  -> Container app deleted"
-                ORPHANS_CLEANED=$((ORPHANS_CLEANED + 1))
-                echo "- ✅ Deleted container app: \`$APP\`" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "  -> Failed to delete container app"
-                echo "- ❌ Failed to delete: \`$APP\`" >> $GITHUB_STEP_SUMMARY
-              fi
-              
-              # Delete DNS records if custom domain is configured
-              if [ -n "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] && [ -n "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
-                DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
-                BRANCH_SUBDOMAIN="${{ secrets.CUSTOM_SUBDOMAIN }}-$SANITIZED_BRANCH"
-                
-                echo "  -> Deleting DNS records for: $BRANCH_SUBDOMAIN.$DOMAIN_NAME"
-                
-                # Delete CNAME record
-                az network dns record-set cname delete \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --zone-name "$DOMAIN_NAME" \
-                  --name "$BRANCH_SUBDOMAIN" \
-                  --yes 2>/dev/null || echo "  -> CNAME not found"
-                
-                # Delete TXT verification record
-                az network dns record-set txt delete \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --zone-name "$DOMAIN_NAME" \
-                  --name "asuid.$BRANCH_SUBDOMAIN" \
-                  --yes 2>/dev/null || echo "  -> TXT not found"
-                
-                # Delete managed certificate
-                CERT_NAME="cert-${BRANCH_SUBDOMAIN}-${DOMAIN_NAME//./-}"
-                CAE_CANDIDATES=$(az containerapp env list \
-                  --resource-group "${{ env.PRODUCTION_RG }}" \
-                  --query "[?name=='${{ env.CONTAINER_ENV_NAME }}' || starts_with(name, '${{ env.CONTAINER_ENV_NAME }}-')].name" \
-                  -o tsv 2>/dev/null || echo "")
-                if [ -z "$CAE_CANDIDATES" ]; then
-                  echo "  -> No shared CAE found for cert cleanup"
-                else
-                  for CAE in $CAE_CANDIDATES; do
-                    az containerapp env certificate delete \
-                      --resource-group "${{ env.PRODUCTION_RG }}" \
-                      --name "$CAE" \
-                      --certificate "$CERT_NAME" \
-                      --yes 2>/dev/null || true
-                  done
-                fi
-              fi
-            fi
-          done
-          
-          echo ""
-          echo "=== Summary ==="
-          echo "Orphans found: $ORPHANS_FOUND"
-          echo "Orphans cleaned: $ORPHANS_CLEANED"
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Summary:** Found $ORPHANS_FOUND orphaned deployments, cleaned up $ORPHANS_CLEANED" >> $GITHUB_STEP_SUMMARY
-
-      - name: Cleanup orphaned DNS records and certificates
-        run: |
-          source .github/scripts/orphan-safety.sh
-
-          # Check if custom domain is configured
-          if [ -z "${{ secrets.CUSTOM_DOMAIN_NAME }}" ] || [ -z "${{ secrets.CUSTOM_SUBDOMAIN }}" ]; then
-            echo "Custom domain not configured, skipping DNS/cert cleanup"
-            exit 0
-          fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🧹 Scanning for Orphaned DNS/Certificates" >> $GITHUB_STEP_SUMMARY
-          
-          DOMAIN_NAME="${{ secrets.CUSTOM_DOMAIN_NAME }}"
-          SUBDOMAIN_PREFIX="${{ secrets.CUSTOM_SUBDOMAIN }}"
-          
-          # Get list of active container apps.
-          # Keep production variants in this set so their DNS suffixes are
-          # treated as protected and never considered orphaned.
-          ACTIVE_APPS=$(az containerapp list \
-            --resource-group "${{ env.PRODUCTION_RG }}" \
-            --query "[?starts_with(name, '${{ env.CONTAINER_APP_PREFIX }}-')].name" \
-            -o tsv 2>/dev/null || echo "")
-          
-          # Build list of expected subdomain suffixes from active apps
-          ACTIVE_SUFFIXES=""
-          for APP in $ACTIVE_APPS; do
-            SUFFIX="${APP#${{ env.CONTAINER_APP_PREFIX }}-}"
-            ACTIVE_SUFFIXES="$ACTIVE_SUFFIXES $SUFFIX"
-            # Multi-region production apps are named ca-web-production-<region>
-            # (suffix "production-<region>"), but their per-region DNS records are
-            # named <subdomain>-<region> — i.e. the bare region with NO
-            # "production-" prefix (see infra/main.bicep dnsRecordsPerRegion). Add
-            # the bare region as a protected suffix too, otherwise the DNS/cert
-            # scan below treats production regional CNAME/TXT/cert records as
-            # orphans and deletes them, breaking production custom-domain routing.
-            case "$SUFFIX" in
-              production-*) ACTIVE_SUFFIXES="$ACTIVE_SUFFIXES ${SUFFIX#production-}" ;;
-            esac
-          done
-          echo "Active branch suffixes: $ACTIVE_SUFFIXES"
-          
-          # Scan CNAME records for orphans
-          echo ""
-          echo "Scanning CNAME records..."
-          CNAME_RECORDS=$(az network dns record-set cname list \
-            --resource-group "${{ env.PRODUCTION_RG }}" \
-            --zone-name "$DOMAIN_NAME" \
-            --query "[?starts_with(name, '${SUBDOMAIN_PREFIX}-')].name" \
-            -o tsv 2>/dev/null || echo "")
-          
-          for CNAME in $CNAME_RECORDS; do
-            # Extract suffix (e.g., "astervoids-feature-test" -> "feature-test")
-            SUFFIX="${CNAME#${SUBDOMAIN_PREFIX}-}"
-            if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
-              echo "  Protected CNAME: $CNAME (production or active deployment)"
-              continue
-            fi
-
-            echo "  Orphan CNAME: $CNAME"
-            az network dns record-set cname delete \
-              --resource-group "${{ env.PRODUCTION_RG }}" \
-              --zone-name "$DOMAIN_NAME" \
-              --name "$CNAME" \
-              --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
-          done
-          
-          # Scan TXT records for orphans
-          echo ""
-          echo "Scanning TXT verification records..."
-          TXT_RECORDS=$(az network dns record-set txt list \
-            --resource-group "${{ env.PRODUCTION_RG }}" \
-            --zone-name "$DOMAIN_NAME" \
-            --query "[?starts_with(name, 'asuid.${SUBDOMAIN_PREFIX}-')].name" \
-            -o tsv 2>/dev/null || echo "")
-          
-          for TXT in $TXT_RECORDS; do
-            # Extract suffix (e.g., "asuid.astervoids-feature-test" -> "feature-test")
-            SUFFIX="${TXT#asuid.${SUBDOMAIN_PREFIX}-}"
-            if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
-              echo "  Protected TXT: $TXT (production or active deployment)"
-              continue
-            fi
-
-            echo "  Orphan TXT: $TXT"
-            az network dns record-set txt delete \
-              --resource-group "${{ env.PRODUCTION_RG }}" \
-              --zone-name "$DOMAIN_NAME" \
-              --name "$TXT" \
-              --yes 2>/dev/null && DNS_CLEANED=$((DNS_CLEANED + 1)) && echo "  -> Deleted"
-          done
-          
-          # Scan certificates for orphans
-          echo ""
-          echo "Scanning certificates..."
-          CAE_CANDIDATES=$(az containerapp env list \
-            --resource-group "${{ env.PRODUCTION_RG }}" \
-            --query "[?name=='${{ env.CONTAINER_ENV_NAME }}' || starts_with(name, '${{ env.CONTAINER_ENV_NAME }}-')].name" \
-            -o tsv 2>/dev/null || echo "")
-          for CAE in $CAE_CANDIDATES; do
-            CERTS=$(az containerapp env certificate list \
-              --resource-group "${{ env.PRODUCTION_RG }}" \
-              --name "$CAE" \
-              --query "[?starts_with(name, 'cert-${SUBDOMAIN_PREFIX}-') && name != 'cert-${SUBDOMAIN_PREFIX}-${DOMAIN_NAME//./-}'].name" \
-              -o tsv 2>/dev/null || echo "")
-            for CERT in $CERTS; do
-              [ -z "$CERT" ] && continue
-              DOMAIN_SUFFIX="${DOMAIN_NAME//./-}"
-              TEMP="${CERT#cert-${SUBDOMAIN_PREFIX}-}"
-              SUFFIX="${TEMP%-${DOMAIN_SUFFIX}}"
-              if is_protected_deployment_suffix "$SUFFIX" "$ACTIVE_SUFFIXES"; then
-                echo "  Protected cert on $CAE: $CERT (production or active deployment)"
-                continue
-              fi
-
-              echo "  Orphan certificate on $CAE: $CERT"
-              if az containerapp env certificate delete \
-                --resource-group "${{ env.PRODUCTION_RG }}" \
-                --name "$CAE" \
-                --certificate "$CERT" \
-                --yes 2>&1; then
-                echo "  -> Deleted"
-              else
-                echo "  -> Failed to delete (may still be bound to a domain)"
-              fi
-            done
-          done
-          
-          echo ""
-          echo "DNS/Cert cleanup complete"
-          echo "**DNS/Cert cleanup:** Complete" >> $GITHUB_STEP_SUMMARY
+      - name: Cleanup orphaned branch apps, storage, DNS and certificates
+        env:
+          CUSTOM_DOMAIN_NAME: ${{ secrets.CUSTOM_DOMAIN_NAME }}
+          CUSTOM_SUBDOMAIN: ${{ secrets.CUSTOM_SUBDOMAIN }}
+        run: node .github/scripts/cleanup-orphans.mjs
 
       - name: Cleanup old ACR container images (> 14 days)
         run: |
