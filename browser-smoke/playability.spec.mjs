@@ -201,8 +201,10 @@ async function swipeTouch(page, cdp, x, fromY, toY) {
 
 test('page boots and solo play responds to keyboard input', async ({ players }) => {
     const { page } = await players.open();
+    await expect(page.locator('#btn-difficulty')).toHaveText('🎯 : Dancer');
     await page.locator('#btn-solo').click();
     await playing(page);
+    expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.35);
     await expect(page.locator('#session-indicator')).toBeHidden();
     await expect(page.locator('#instructions')).toContainText('P to pause (solo)');
     await expect(page.locator('#instructions')).not.toContainText('ESC to pause');
@@ -234,13 +236,13 @@ for (const touch of [false, true]) {
         const difficulty = page.locator('#btn-difficulty');
         const controls = page.locator('#btn-control-mode');
         const activate = locator => touch ? locator.tap() : locator.click();
-        await expect(difficulty).toHaveText('🎯 : Survivor');
+        await expect(difficulty).toHaveText('🎯 : Dancer');
         await expect(controls).toHaveText('🕹️ : Polar');
         let controlLabel = 'Polar';
         for (const viewport of [{ width: 400, height: 300 }, { width: 320, height: 568 }]) {
             await page.setViewportSize(viewport);
             for (const [label, value] of [
-                ['Shifter', 0.2], ['Dancer', 0.35], ['Raver', 0.5], ['Survivor', 0.65],
+                ['Raver', 0.5], ['Survivor', 0.65], ['Shifter', 0.2], ['Dancer', 0.35],
             ]) {
                 await activate(difficulty);
                 await expect(difficulty).toHaveText(`🎯 : ${label}`);
@@ -278,11 +280,10 @@ for (const touch of [false, true]) {
             }
         }
         await activate(difficulty);
-        await activate(difficulty);
-        await expect(difficulty).toHaveText('🎯 : Dancer');
+        await expect(difficulty).toHaveText('🎯 : Raver');
         await activate(page.locator('#btn-solo'));
         await playing(page);
-        expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.35);
+        expect(await page.evaluate(() => CONFIG.ASTEROID_DIFFICULTY_FACTOR)).toBe(0.5);
         await page.keyboard.press('p');
         await expect(page.locator('#pause-menu')).toBeVisible();
         if (touch) {
@@ -296,7 +297,7 @@ for (const touch of [false, true]) {
             }
         }
         await expect(page.locator('#start-screen')).toBeVisible();
-        await expect(difficulty).toHaveText('🎯 : Dancer');
+        await expect(difficulty).toHaveText('🎯 : Raver');
         await expect(difficulty).toBeEnabled();
     });
 }
@@ -305,8 +306,8 @@ test('Raver difficulty follows the creator and leaving restores each local prese
     const host = await players.open();
     const guest = await players.open({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
     await host.page.locator('#btn-difficulty').click();
-    await host.page.locator('#btn-difficulty').click();
-    await host.page.locator('#btn-difficulty').click();
+    await guest.page.locator('#btn-difficulty').tap();
+    await guest.page.locator('#btn-difficulty').tap();
     await guest.page.locator('#btn-difficulty').tap();
     await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Raver');
     await expect(guest.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
@@ -363,7 +364,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
     async function expectMatchingButtons(inSession) {
         const ids = [
             'btn-leave-create', ...(inSession ? ['btn-start-enter'] : []), 'btn-solo',
-            'btn-fullscreen', 'btn-control-mode', 'btn-difficulty', 'btn-invite-self', 'btn-invite-friend',
+            'btn-fullscreen', 'btn-leaderboards', 'btn-control-mode', 'btn-difficulty', 'btn-invite-self', 'btn-invite-friend',
         ];
         for (const viewport of [
             { width: 1280, height: 900 }, { width: 900, height: 550 },
@@ -460,7 +461,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                     settingsSpan: box('#btn-difficulty').right - box('#btn-control-mode').left,
                 };
             });
-            expect(spacing.utilityRowCount, 'Device settings and invitations each share one utility row').toBe(3);
+            expect(spacing.utilityRowCount, 'Fullscreen and Leaderboards each precede the settings and invitation pairs').toBe(4);
             expect(spacing.firstDevice, 'Fullscreen is the first visible device action').toBe('btn-fullscreen');
             expect(spacing.inviteGap, 'Invitations use the same horizontal gap as lobby actions').toBeCloseTo(7.2, 1);
             expect(spacing.inviteOffset, 'Invitations sit side by side').toBeCloseTo(0, 1);
@@ -627,7 +628,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
             expect(state.fullscreenVisible, label).toBe(state.mode === '');
             expect(state.firstDevice, `${label} has no empty slot above the first device action`)
-                .toBe(state.mode === '' ? 'btn-fullscreen' : 'btn-control-mode');
+                .toBe(state.mode === '' ? 'btn-fullscreen' : 'btn-leaderboards');
             expect(state.regionVisible, label).toBe(state.multiRegion && state.role === 'outside');
             expect(state.startVisible, label).toBe(state.role !== 'outside');
             expect(state.difficultyDisabled, `${label} locks only the shared difficulty`).toBe(state.role !== 'outside');
@@ -911,6 +912,8 @@ for (const touch of [false, true]) {
         const host = await players.open(touch
             ? { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } } : {});
         await expect(host.page.locator('#btn-leave-create')).toBeEnabled();
+        await host.page.locator('#btn-difficulty').click();
+        await host.page.locator('#btn-difficulty').click();
         await host.page.locator('#btn-difficulty').click();
         await expect(host.page.locator('#btn-difficulty')).toHaveText('🎯 : Shifter');
         let releaseVerification;

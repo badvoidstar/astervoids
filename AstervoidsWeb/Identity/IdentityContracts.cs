@@ -7,6 +7,7 @@ using AstervoidsWeb.Configuration;
 namespace AstervoidsWeb.Identity;
 
 internal sealed record PlayerIdentity(Guid Id, string Tag);
+internal sealed record VerifiedPlayerResult(PlayerIdentity? Identity, string? ErrorCode = null);
 internal sealed record BrowserBinding(PlayerIdentity? Identity, string Etag, long Revision);
 internal sealed record ExpectedBinding(Guid? IdentityId, string Etag);
 internal sealed record InviteView(Guid IdentityId, string State, string? Tag, string Etag);

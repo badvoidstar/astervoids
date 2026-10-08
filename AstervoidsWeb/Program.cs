@@ -3,6 +3,7 @@ using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Formatters;
 using AstervoidsWeb.Hubs;
 using AstervoidsWeb.Identity;
+using AstervoidsWeb.Leaderboards;
 using AstervoidsWeb.Services;
 using Microsoft.Net.Http.Headers;
 
@@ -17,6 +18,7 @@ builder.Services.Configure<SessionSettings>(
 builder.Services.Configure<RegionSettings>(
     builder.Configuration.GetSection(RegionSettings.SectionName));
 builder.Services.AddPlayerIdentity(builder.Configuration);
+builder.Services.AddLeaderboards(builder.Configuration);
 
 // Register services
 builder.Services.AddSingleton<ISessionNameGenerator, FruitNameGenerator>();
@@ -33,7 +35,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
 });
 
-// Add response compression (Brotli + Gzip for non-identity HTTP responses).
+// Add response compression (Brotli + Gzip outside the identity/leaderboard boundaries).
 // Compresses static files (HTML/JS/CSS), SignalR negotiation, and fallback transports.
 // EnableForHttps is safe here: payloads contain game state, not secrets susceptible to
 // CRIME/BREACH side-channel attacks.
@@ -155,10 +157,18 @@ app.UseWhen(IdentityEndpoints.IsIdentityRequest, identity =>
     identity.UseCors(IdentityHosting.CorsPolicy);
     identity.UseMiddleware<IdentityValidationMiddleware>();
 });
-app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context),
+app.UseWhen(LeaderboardEndpoints.IsLeaderboardRequest, leaderboard =>
+{
+    leaderboard.UseMiddleware<LeaderboardRequestMiddleware>();
+    leaderboard.UseCors(IdentityHosting.CorsPolicy);
+    leaderboard.UseMiddleware<LeaderboardValidationMiddleware>();
+});
+app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context)
+    && !LeaderboardEndpoints.IsLeaderboardRequest(context),
     regional => regional.UseCors("RegionalApi"));
 app.UseRateLimiter();
 app.MapPlayerIdentity();
+app.MapLeaderboards();
 
 // GET /api/ping — minimal latency probe. The client measures RTT by timing the
 // round trip; we return the server wall-clock so cold-start vs network-only RTT
@@ -188,9 +198,10 @@ app.MapGet("/api/regions", (Microsoft.Extensions.Options.IOptions<RegionSettings
     });
 }).RequireCors("RegionalApi");
 
-// Identity responses contain bearer capabilities and must never be compressed,
-// including failures. Endpoint registration order cannot exclude this middleware.
-app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context),
+// Keep both isolated APIs uncompressed, including failures. Endpoint registration
+// order cannot exclude this middleware.
+app.UseWhen(context => !IdentityEndpoints.IsIdentityRequest(context)
+    && !LeaderboardEndpoints.IsLeaderboardRequest(context),
     nonIdentity => nonIdentity.UseResponseCompression());
 app.UseDefaultFiles();
 

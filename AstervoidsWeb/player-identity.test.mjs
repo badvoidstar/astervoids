@@ -273,6 +273,92 @@ test('the shipped empty bootstrap falls through to the regional manifest without
     assert.equal(h.requests[1].url, `${location.origin}/api/identity/resolve`);
 });
 
+const leaderboardScore = {
+    playerId: first.id, runId: '22334455-6677-8899-aabb-ccddeeff0011',
+    score: 120, wave: 3, teamSize: 1, aspectRatio: 1, difficulty: 0.65,
+};
+
+test('public leaderboard queries discover the authority without identity activation or credentials', async () => {
+    const h = subject({
+        bootstrap: { regionId: null, regions: [{ hostname: 'https://region.example.com' }] },
+        storage: {
+            getItem() { assert.fail('Public queries do not read browser credentials'); },
+            setItem() { assert.fail('Public queries do not create browser credentials'); },
+        },
+        locks: { request() { assert.fail('Public queries do not require Web Locks'); } },
+    });
+    const view = { entries: [], limit: 50, maxTeamSize: 4 };
+    h.replies.push(view);
+    assert.deepEqual(await h.client.queryLeaderboard({ teamSize: null }), view);
+    assert.equal(h.requests[0].url, 'https://region.example.com/api/leaderboard/query');
+    assert.deepEqual(h.requests[0].init.headers, { 'Content-Type': 'application/json' });
+    assert.equal(h.requests[0].init.credentials, 'omit');
+    assert.equal(h.requests[0].init.cache, 'no-store');
+    assert.equal(h.requests[0].init.redirect, 'error');
+    assert.equal(h.client.current(), null);
+    assert.equal(h.client.hasPendingOperation(), false);
+});
+
+test('score submission uses a private binding credential but never the identity mutation slot', async () => {
+    const h = subject();
+    h.replies.push(resolved(binding), { recorded: true });
+    await h.client.resolve();
+    assert.deepEqual(await h.client.saveLeaderboardScore(leaderboardScore), { recorded: true });
+    assert.equal(h.requests[1].url, `${location.origin}/api/leaderboard/scores`);
+    assert.equal(h.requests[1].init.headers['X-Astervoids-Browser'], h.values.get(STORAGE_KEY));
+    assert.equal(h.requests[1].init.keepalive, true);
+    assert.deepEqual(h.requests[1].body, leaderboardScore);
+    assert.equal(h.client.hasPendingOperation(), false);
+    assert.deepEqual(h.client.current(), first);
+});
+
+test('unbound and differently bound browsers cannot submit a queued score as a new player', async () => {
+    const h = subject();
+    await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'identity_required' });
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.values.size, 0);
+    h.replies.push(resolved({ ...binding, identity: second }));
+    await h.client.resolve();
+    await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'binding_changed' });
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.client.hasPendingOperation(), false);
+});
+
+test('a delayed score request does not hold the identity lock or block a fresh binding resolution', async () => {
+    const h = subject();
+    h.replies.push(resolved(binding));
+    await h.client.resolve();
+    let finish;
+    h.replies.push(() => new Promise(resolve => { finish = resolve; }), resolved(binding));
+    const saving = h.client.saveLeaderboardScore(leaderboardScore);
+    await new Promise(resolve => setImmediate(resolve));
+    try {
+        await h.client.resolve();
+        assert.equal(h.requests.length, 3);
+        assert.equal(h.client.hasPendingOperation(), false);
+    } finally {
+        finish({ recorded: true });
+        await saving;
+    }
+});
+
+test('score errors are sanitized and uncertain writes do not pin an unrelated invitation operation', async () => {
+    for (const reply of [
+        new Error('private network diagnostic'),
+        { body: { error: { code: 'leaderboard_unavailable' } }, status: 503 },
+        { recorded: false }, {},
+    ]) {
+        const h = subject();
+        h.replies.push(resolved(binding), reply);
+        await h.client.resolve();
+        await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'leaderboard_unavailable' });
+        assert.equal(h.client.hasPendingOperation(), false);
+        h.replies.push({ inviteToken: token });
+        await h.client.inviteFriend();
+        assert.equal(h.requests.at(-1).url, `${location.origin}/api/identity/invites`);
+    }
+});
+
 test('silent root activation clears the loading state and enables both invitation buttons', () => {
     const elements = Object.fromEntries(['identity-status', 'btn-invite-self', 'btn-invite-friend']
         .map(id => [id, { disabled: true }]));
@@ -284,6 +370,7 @@ test('silent root activation clears the loading state and enables both invitatio
         identityDialog: { close() {} },
         identityAccept: accept, identityIgnore: {}, identityTagInput: input,
         PlayerIdentity: { current: () => first, hasPendingOperation: () => false },
+        leaderboardOutbox: { refresh: async () => {}, flush: async () => {} },
         document: { getElementById: id => elements[id] },
     });
     activateIdentityMenu();
@@ -359,6 +446,7 @@ test('identity invalidation cancels picker joins before a session snapshot exist
     const { leaveIdentityGame } = loadInlineGameFunctions(['leaveIdentityGame'], {
         game, identityStarted: true, identityLeave: null, startGameOperation: null,
         pendingRejoinSessionId: 'old-session',
+        finishLeaderboardRun: () => null,
         cancelPickerOperations: () => events.push('cancel-picker'),
         beginVoluntarySessionLeave: () => events.push('prevent-rejoin'),
         releaseIdentityInput: () => events.push('release-input'),
@@ -462,6 +550,7 @@ function pickerEntrySubject(options = {}) {
         'beginVoluntarySessionLeave', 'clearPickerMembership',
     ], {
         game, sessionPicker, pickerOperationGeneration: 0,
+        finishLeaderboardRun: () => null,
         identityStarted: true, identityBusy: false, identityRefresh: null,
         identityRefreshRequested: false, identityLeave: null, startGameOperation: null,
         leavingSession: false, pendingRejoinSessionId: null,
@@ -750,6 +839,7 @@ function recoverySubject() {
         'handlePlayerIdentityChange',
     ], {
         game, sessionPicker, document,
+        finishLeaderboardRun: () => null,
         identityStarted: true, identityBusy: false, identityRefresh: null,
         identityRefreshRequested: false, identityLeave: null, startGameOperation: null,
         leavingSession: false, rejoinInProgress: false, pendingRejoinSessionId: null,

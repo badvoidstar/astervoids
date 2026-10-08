@@ -430,6 +430,13 @@ ship; rejoining creates a fresh ship that replicates again. The clients leave
 only their own session, then verify it is absent from the active-session list.
 Empty-session retention/expiry is still server-owned. No fake hubs, transport
 responses, or test-only production hooks are used.
+The leaderboard screen is also opened without starting a game to exercise its
+public query and navigation. Scripted high-score seeding, ranking/filter, and
+drag/inertia scenarios run only in the isolated local File-provider fixture;
+they are explicitly skipped against deployed tables. Regular named gameplay
+scenarios can record their earned scores in the branch preview's isolated
+identity/leaderboard table. Local persistence coverage does not certify live
+Azure writes or cross-region consistency.
 
 **Privacy and evidence:** remote output contains only authored scenario names
 and outcomes. Screenshots, videos, traces, raw console messages, object payloads,
@@ -903,6 +910,25 @@ apex/peer/default-SWA configuration. Identity POST origin validation stays stric
 without trusting arbitrary forwarded headers or allowing wildcard hosts.
 Identity credentials are not added to public deployment URLs or outputs.
 
+### Durable leaderboard storage
+
+Leaderboards reuse this environment's identity provider, primary Table endpoint,
+table, and table-scoped managed-identity grant. Their canonical score records and
+ranking indexes live in a separate leaderboard partition, not in identity rows.
+No additional account, table, role assignment, secret, warm-up loop, or runtime
+table creation is required. Production regions see the same scores; previews
+and standalone environments retain their existing storage isolation.
+
+`Leaderboard:MaxEntries` defaults to **50** (valid range **1–500**). Set
+`Leaderboard__MaxEntries` as an app environment setting, or change the application
+configuration, to adjust the maximum rows returned for each filtered view.
+The API also returns `Session:MaxMembersPerSession` for the Team Size selector.
+For local File-provider runs, the leaderboard path is
+`<Identity:DataFile>.leaderboard.json`; choose an isolated identity path to isolate
+both data sets.
+Leaderboard APIs fail explicitly on storage outages rather than affecting app
+startup or falling back to ephemeral scores.
+
 ### Provisioning order and readiness
 
 The account/table are provisioned first, then each app/system principal, then
@@ -926,12 +952,12 @@ administrative environment.
 
 - Normal incremental Bicep/azd provisioning, image updates, scale-to-zero,
   process restarts, and region selection retain the account and table.
-  Identity, tag, binding, and invite data are durable; this does not make
-  sessions or high scores persistent.
+  Identity, tag, binding, invite, and leaderboard score/index data are durable.
+  Live multiplayer sessions remain process-local and do not survive restarts.
 - Accounts use `Standard_LRS` in their resource group's home location.
   Storage/transaction charges and regional account quotas still apply while
   apps are at zero replicas. LRS is not cross-region disaster recovery:
-  a storage-region outage can make identity operations unavailable everywhere.
+  a storage-region outage can make identity and leaderboard operations unavailable everywhere.
   No backup/export schedule, data TTL, or automatic store deletion is
   provisioned. Evaluate recovery and data-retention requirements separately.
 - The orphan workflow deliberately leaves identity storage indefinitely,

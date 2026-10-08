@@ -619,6 +619,8 @@ test('voluntary leave retains ship inputs for atomic departure while GameState p
         let deletedBeforeDeparture = false;
         const { [name]: leave } = loadInlineGameFunctions([name], {
             game: local,
+            finishLeaderboardRun: () => null,
+            closeLeaderboards() {},
             beginVoluntarySessionLeave() {},
             deleteSyncedShip: async () => {
                 deletedBeforeDeparture = true;

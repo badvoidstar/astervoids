@@ -13,11 +13,12 @@ function touchHarness() {
     const end = source.indexOf('    // ─── Anchor-based analog schemes', start);
     assert.ok(helper && stickTarget && start >= 0 && end > start);
     const handlers = new Map();
-    const state = { menuHidden: false, touches: 0 };
+    const state = { menuHidden: false, leaderboardHidden: true, touches: 0 };
     const isStickTouchTarget = runInNewContext(
         `${helper}\n${source.slice(start, end)}\n(${stickTarget})`,
         {
             startScreen: { classList: { contains: () => state.menuHidden } },
+            leaderboardScreen: { get hidden() { return state.leaderboardHidden; } },
             document: { getElementById: () => ({
                 addEventListener(type, handler, options) {
                     assert.equal(options.passive, false);
@@ -37,11 +38,12 @@ function touchHarness() {
     };
 }
 
-function target({ menu = false, results = false, button = false } = {}) {
+function target({ menu = false, results = false, button = false, leaderboard = false } = {}) {
     return {
         results,
         classList: { contains: value => value === 'touch-btn' && button },
-        closest: selector => selector === '#start-screen-content' && menu ? {} : null,
+        closest: selector => (selector === '#start-screen-content' && menu)
+            || (selector === '#leaderboard-screen' && leaderboard) ? {} : null,
     };
 }
 
@@ -60,6 +62,18 @@ test('canvas starts and drags remain captured by the gameplay touch controls', (
     assert.equal(h.dispatch('touchstart', canvas), true);
     assert.equal(h.dispatch('touchmove', canvas), true);
     assert.equal(h.isStickTouchTarget(canvas), true);
+});
+
+test('leaderboard gestures stay in its pointer scroller and never acquire gameplay anchors', () => {
+    const h = touchHarness();
+    h.state.menuHidden = true;
+    h.state.leaderboardHidden = false;
+    const child = target({ leaderboard: true });
+    assert.equal(h.dispatch('touchstart', child), false);
+    assert.equal(h.dispatch('touchmove', child), false);
+    assert.equal(h.isStickTouchTarget(child), false);
+    h.state.leaderboardHidden = true;
+    assert.equal(h.isStickTouchTarget(child), true);
 });
 
 test('only visible menu content receives the native scrolling exemption', () => {

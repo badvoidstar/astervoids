@@ -51,7 +51,7 @@ Accept or Ignore; acceptance atomically replaces only this browser's binding,
 and other tabs stop using the previous identity. Other browsers remain bound.
 Root onboarding is controlled by `Identity:PromptOnRoot` (default `true`).
 When disabled, an unbound visitor remains a guest until explicitly naming through
-an invite button. No durable high scores or cross-game score totals are stored.
+an invite button. Guest play is not entered into the durable leaderboards.
 
 Development uses `App_Data/identity.json`, ignored by git. Azure deployments use
 managed identity and Azure Table Storage, shared across production regions and
@@ -85,6 +85,51 @@ unsupported older contracts at entry; create a new session rather than joining
 with reduced score or identity features. Guest identities remain supported.
 Missing/malformed tag metadata shows `Unknown` without hiding valid scores.
 Solo retains its existing score mechanics and shows the active tag beside `Score`.
+
+## Leaderboards
+
+**Leaderboards**, second in the main menu's second button group after Fullscreen,
+opens a durable high-score table with **Rank, Name, Score, Wave, and Difficulty**.
+Each named player's solo game or multiplayer participation has one entry, updated
+as their personal score grows. Guests and pure spectators never create entries.
+Multiple browsers using the same identity in one multiplayer session share an
+entry, just as they share the session's participant total.
+
+The three filter buttons advance once per click/tap and wrap back to **Any**:
+
+| Filter | Values after Any |
+| --- | --- |
+| Team Size | 1 through the configured session capacity |
+| Aspect Ratio | Portrait, Landscape, Rectangle |
+| Difficulty | Shifter, Dancer, Raver, Survivor |
+
+Team Size is the peak simultaneous session membership observed while the player
+participates, including guest and spectator members; solo games use 1. Aspect
+Ratio uses the actual play region, including multiplayer letterboxing, rather
+than the surrounding device screen. Debug-only difficulty factors appear as
+`Custom (value)` in Any difficulty.
+
+The current filtered view ranks by score and displays up to **50** records.
+Configure `Leaderboard:MaxEntries` (environment variable
+`Leaderboard__MaxEntries`, range 1–500) to change that cap. Hold and drag inside
+the table with a mouse or touch; releasing preserves momentum and slows to a
+stop. Wheel and keyboard scrolling also work. Reduced-motion preference disables
+post-release momentum. **Back to Main** or Escape returns to the menu.
+
+Scores are best-observed checkpoints, not certified final-game results.
+The browser saves a bounded retry queue at start, periodically during play,
+on game over, and before departure; failed delivery is visible and retried.
+An interrupted game retains its best delivered checkpoint and wave rather than
+waiting for the entire multiplayer session to finish. Abrupt browser/storage
+loss can lose progress not yet saved. Authentication protects name attribution,
+not against altered clients submitting fabricated scores.
+
+Development persists scores in `<Identity:DataFile>.leaderboard.json`, beside the
+configured identity file. Azure reuses
+the environment's identity table in a separate leaderboard partition, sharing
+production scores across regions and keeping branch-preview data isolated.
+See [leaderboard contracts](ARCHITECTURE.md#durable-leaderboards) for ranking,
+snapshot, retry, and storage details.
 
 ## Local Development
 
@@ -125,6 +170,12 @@ Identity scenarios cover naming/reload, repeat/self invitations, new-browser
 confirmation, competing claims, atomic replacement across tabs, clipboard denial,
 and responsive native-text menu layout. Gameplay fixtures create synthetic tags
 through the real backend; no identity or transport responses are fabricated.
+Leaderboard scenarios cover personal solo/multiplayer checkpoints, reload
+durability, guest exclusion, filter cycles, the configured row limit, and
+mouse/touch inertia. Scripted score-seeding fixtures run only against isolated
+local storage, not deployed tables. Remote smoke includes read-only access to
+the public leaderboard; ordinary named gameplay scenarios can still record
+their earned scores in the preview's isolated table.
 
 To test an **already deployed branch preview**, copy its non-secret default ACA
 URL from the deployment summary (the following hostname is a placeholder):

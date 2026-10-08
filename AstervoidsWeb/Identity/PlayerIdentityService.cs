@@ -8,6 +8,29 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
 {
     private const int MaximumAttempts = 12;
 
+    public async Task<VerifiedPlayerResult> VerifyPlayerAsync(
+        string credential, Guid expectedPlayerId, CancellationToken cancellationToken = default)
+    {
+        if (!IdentitySecrets.IsToken(credential))
+            return new(null, "invalid_browser_credential");
+        if (expectedPlayerId == Guid.Empty)
+            return new(null, "invalid_request");
+        try
+        {
+            var browser = await ReadAsync<BrowserIdentityRow>(
+                IdentityRows.BrowserKey(IdentitySecrets.Hash(credential)), cancellationToken);
+            if (browser?.IdentityId is null)
+                return new(null, "identity_required");
+            if (browser.IdentityId != expectedPlayerId)
+                return new(null, "binding_changed");
+            return new((await BindingAsync(browser, cancellationToken)).Identity);
+        }
+        catch (IdentityStoreUnavailableException)
+        {
+            return new(null, "identity_unavailable");
+        }
+    }
+
     public Task<IdentityResult> ResolveAsync(
         string credential, ResolveIdentityRequest request, CancellationToken cancellationToken = default)
     {
