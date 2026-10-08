@@ -1701,7 +1701,7 @@ The repository's Traffic Manager module is not invoked by the current
 | --- | --- |
 | Production, empty region manifest | One production CAE/app, same-origin frontend/APIs, durable production identity store |
 | Production, valid multi-region configuration | Static entrypoint, independent CAE/app/logs per region, shared primary registry and the same production identity store |
-| Branch preview with shared infrastructure | Separate single-region app/memory and retained identity account, reusing production RG/ACR/primary CAE and DNS, never production identity data |
+| Branch preview with shared infrastructure | Separate single-region app/memory and identity account retired with an orphan preview, reusing production RG/ACR/primary CAE and DNS, never production identity data |
 | Standalone azd environment | Separate resource group, registry, CAE/app, and environment identity account |
 | Local development | Same application boundaries through `dotnet watch`; development file identity store, with explicit configuration needed outside Development |
 
@@ -1742,10 +1742,15 @@ must not wait for Table permission propagation. Bicep forces `Identity__Provider
 to `AzureTable` and supplies the endpoint/table; caller `Identity__*` overrides
 are filtered. `IDENTITY_PROMPT_ON_ROOT` controls onboarding only, never storage.
 
-Storage survives ordinary deploys, app restarts, scale-to-zero, and orphan preview
-cleanup. Retention is manual: there is no automatic TTL, backup schedule, or
-deletion lock. LRS is not cross-region disaster recovery, and deleting an
-environment's table/account or resource group can invalidate bindings/invites.
+Storage survives ordinary deploys, app restarts and scale-to-zero. Production
+and standalone retention remains manual. Confirmed orphan preview accounts are
+permanently deleted in the same cleanup run as their apps, after successful app
+deletion and confirmed absence; previously orphaned stores are also discovered
+without an app. This intentionally includes legacy branch-owned accounts tagged
+`astervoids-retention=manual`; new previews use `branch-orphan`.
+Deletion loses identities, bindings, invites and leaderboard scores/indexes;
+recreating a retired preview starts fresh. There is no row TTL, backup schedule
+or deletion lock. LRS is not cross-region disaster recovery.
 See [identity deployment and retirement](CICD_SETUP.md#durable-player-identity)
 for readiness, cost, scope verification, and deliberate retirement procedures.
 
@@ -1808,10 +1813,16 @@ from local playability. A successful rollout or unvisited URL does not prove a
 playable preview.
 
 [Orphan cleanup](.github/workflows/cleanup-orphans.yml) removes branch-ephemeral
-apps and related DNS/certificate resources on its scheduled/manual path.
+apps, explicitly branch-owned identity/leaderboard stores, and related
+DNS/certificate resources on its scheduled/manual path.
 Production and regional resources must be protected from branch-name collisions.
 Previews cannot use the reserved `production`/`production-*` environment namespace.
-Identity accounts/tables and their player data are deliberately not purged.
+Cleanup fails closed on incomplete discovery, revalidates live remote branches
+with the shared sanitizer, and checks all apps/active revisions in `rg-production`
+for store references regardless of app name. Production/standalone/shared data is
+protected. Cleanup and deploy jobs share a non-cancelling resource-mutation
+interlock; manual operators, older workflows and the final check/delete interval
+remain concurrency limitations, not a race-free guarantee.
 Operational procedures and deployment commands remain in CICD_SETUP rather
 than being repeated here.
 

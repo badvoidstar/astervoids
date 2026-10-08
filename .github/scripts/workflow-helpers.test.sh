@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "$SCRIPT_DIR/easy-auth-monitor.test.sh"
+node --test "$SCRIPT_DIR/orphan-cleanup.test.mjs"
 . "$SCRIPT_DIR/deployment-helpers.sh"
 . "$SCRIPT_DIR/orphan-safety.sh"
 
