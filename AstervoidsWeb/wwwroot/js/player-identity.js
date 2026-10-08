@@ -77,7 +77,7 @@ const PlayerIdentity = (function () {
             }
         }
 
-        async function json(url, options) {
+        async function json(url, options, unavailable = 'identity_unavailable') {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 15_000);
             try {
@@ -86,14 +86,15 @@ const PlayerIdentity = (function () {
                     credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer',
                 });
                 let data;
-                try { data = await response.json(); } catch { throw failure('identity_unavailable'); }
+                try { data = await response.json(); } catch { throw failure(unavailable); }
                 if (!response.ok) {
                     const known = new Set([
                         'invalid_request', 'invalid_tag', 'invalid_browser_credential',
                         'invite_not_found', 'identity_required', 'binding_changed',
                         'invite_changed', 'request_reused', 'rate_limited', 'identity_unavailable',
+                        'leaderboard_unavailable', 'leaderboard_ineligible',
                     ]);
-                    const error = failure(known.has(data?.error?.code) ? data.error.code : 'identity_unavailable');
+                    const error = failure(known.has(data?.error?.code) ? data.error.code : unavailable);
                     const retryAfter = Number(response.headers?.get('Retry-After'));
                     if (Number.isFinite(retryAfter) && retryAfter > 0) error.retryAfter = retryAfter;
                     throw error;
@@ -102,19 +103,24 @@ const PlayerIdentity = (function () {
             } catch (error) {
                 if (error instanceof IdentityError) throw error;
                 // Fetch exceptions may contain a private hostname. Do not propagate them.
-                throw failure('identity_unavailable');
+                throw failure(unavailable);
             } finally {
                 clearTimeout(timeout);
             }
         }
 
-        async function request(route, body) {
+        async function resolveAuthority() {
             if (!authority) {
                 const bootstrap = environment.bootstrap;
                 const manifest = bootstrap && Array.isArray(bootstrap.regions) && bootstrap.regions.length
                     ? bootstrap : await json(`${location.origin}/api/regions`, { method: 'GET' });
                 authority = apiOrigin(location, manifest);
             }
+            return authority;
+        }
+
+        async function request(route, body) {
+            await resolveAuthority();
             return json(`${authority}/api/identity${route}`, {
                 method: 'POST',
                 headers: {
@@ -123,6 +129,19 @@ const PlayerIdentity = (function () {
                 },
                 body: JSON.stringify(body),
             });
+        }
+
+        async function leaderboardRequest(route, body, token) {
+            const origin = await resolveAuthority();
+            return json(`${origin}/api/leaderboard${route}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(token ? { 'X-Astervoids-Browser': token } : {}),
+                },
+                body: JSON.stringify(body),
+                ...(token ? { keepalive: true } : {}),
+            }, 'leaderboard_unavailable');
         }
 
         async function prepareRegion() {
@@ -139,7 +158,9 @@ const PlayerIdentity = (function () {
         function adopt(next) {
             if (!next || typeof next.etag !== 'string' || !Number.isSafeInteger(next.revision)
                 || next.revision < 0 || (next.identity !== null
-                    && (!GUID_PATTERN.test(next.identity?.id) || !getTagPattern().test(next.identity?.tag)))) {
+                    && (!GUID_PATTERN.test(next.identity?.id) || !getTagPattern().test(next.identity?.tag)
+                        || (next.identity.excludeFromLeaderboards !== undefined
+                            && typeof next.identity.excludeFromLeaderboards !== 'boolean')))) {
                 throw failure('identity_unavailable');
             }
             const previous = binding?.identity ?? null;
@@ -147,9 +168,11 @@ const PlayerIdentity = (function () {
                 etag: next.etag, revision: next.revision,
                 identity: next.identity ? Object.freeze({
                     id: next.identity.id.toLowerCase(), tag: next.identity.tag,
+                    ...(next.identity.excludeFromLeaderboards === true ? { excludeFromLeaderboards: true } : {}),
                 }) : null,
             };
-            if (previous?.id !== binding.identity?.id || previous?.tag !== binding.identity?.tag) {
+            if (previous?.id !== binding.identity?.id || previous?.tag !== binding.identity?.tag
+                || previous?.excludeFromLeaderboards !== binding.identity?.excludeFromLeaderboards) {
                 for (const listener of listeners) listener(binding.identity, previous);
             }
         }
@@ -206,6 +229,22 @@ const PlayerIdentity = (function () {
             prepareRegion,
             resolve,
             current: () => binding?.identity ?? null,
+            queryLeaderboard: (filters = {}) => leaderboardRequest('/query', filters),
+            async saveLeaderboardScore(snapshot) {
+                // Only credential lookup holds the identity lock. An unavailable
+                // score service must not stall onboarding or binding changes.
+                const token = await exclusive(() => {
+                    if (!binding?.identity) throw failure('identity_required');
+                    if (binding.identity.id !== snapshot.playerId?.toLowerCase()) {
+                        throw failure('binding_changed');
+                    }
+                    if (binding.identity.excludeFromLeaderboards) throw failure('leaderboard_ineligible');
+                    return credential();
+                });
+                const result = await leaderboardRequest('/scores', snapshot, token);
+                if (result?.recorded !== true) throw failure('leaderboard_unavailable');
+                return result;
+            },
             deactivate() {
                 const previous = binding?.identity ?? null;
                 binding = null;

@@ -24,6 +24,7 @@ readable and the contracts below still stand on their own.
 - [Client architecture](#client-architecture)
 - [Discovery and session lifecycle](#discovery-and-session-lifecycle)
 - [Durable player identity](#durable-player-identity)
+- [Durable leaderboards](#durable-leaderboards)
 - [Replication contracts](#replication-contracts)
 - [Timing, simulation and presentation](#timing-simulation-and-presentation)
 - [Gameplay flows](#gameplay-flows)
@@ -398,8 +399,9 @@ An identity can have any number of independent browser bindings, not a growing
 binding array. Self invitations return the original capability. Possession of
 an active link authorizes assuming that identity; the confirmation dialog is not
 a second authentication factor. The current protocol has no automatic invitation
-expiry or rotation. Changing origin or clearing storage requires link recovery;
-identity storage is not a persistent high-score service.
+expiry or rotation. Changing origin or clearing storage requires link recovery.
+The separate [leaderboard domain](#durable-leaderboards) authenticates submissions
+through this binding but does not put scores in identity documents.
 
 Credential creation and requests use Web Locks. Unavailable storage/locking does
 not silently mint a temporary per-tab credential. Known bindings activate without
@@ -409,12 +411,13 @@ naming. Same-identity invitations return silently to `/`; different identities
 require Accept/Ignore, and first naming fixes the permanent tag.
 
 The menu pairs Self and Friend invitation actions in a single utility row.
-Fullscreen leads the device group; hiding it leaves no empty button slot.
-Controller mode and difficulty share the next equal-width row in that group,
+Fullscreen leads the second menu group, followed by Leaderboards; hiding
+Fullscreen leaves no empty button slot. Controller mode and difficulty share
+the next equal-width row in that group,
 using joystick/target labels with a colon. Each click or tap advances one mode
 or preset and wraps around. Controller mode alternates Polar and Boxy; Boxy
 is the display name for rectilinear controls. Difficulty cycles Shifter (0.2),
-Dancer (0.35), Raver (0.5), and Survivor (0.65, the default). It updates solo/new-session
+Dancer (0.35, the default), Raver (0.5), and Survivor (0.65). It updates solo/new-session
 configuration and existing asteroid scales through the same path as live debug tuning.
 The selector shows the shared difficulty read-only while joined and is also
 disabled during membership changes. Leaving restores the page's local choice;
@@ -521,6 +524,137 @@ per-instance browser-hash and connection-IP rate limits with `Retry-After`.
 Responses, including failures, are uncompressed and `no-store`; error responses
 and SDK diagnostics must not expose capabilities or storage details. Identity
 availability is separate from `/api/ping` and app startup readiness.
+
+## Durable leaderboards
+
+### Run and score semantics
+
+Named players have one durable record per `(playerId, runId)`. Solo play creates
+a fresh run GUID after successful game initialization. Multiplayer uses the
+existing session GUID: reentry adopts that session's GameState, terminal entry
+is view-only, and returning to the menu leaves the session. A future in-session
+restart must introduce a new run identity before reusing this contract.
+Guests and pure spectators do not submit records; valid zero-score players do.
+
+Gameplay constructs snapshots inline. Multiplayer uses the existing personal
+ledger plus positive unprocessed ship counters, including the local live ship,
+never `game.score` (the team total). The identity is pinned at entry; multiple
+browser bindings of that identity contribute to the same participant/run.
+Missing or inconsistent score history is visibly unavailable, not a zero result.
+No generic replication, transport, hub, or object-data schema changes are needed.
+
+A submission contains `playerId`, `runId`, unsigned 32-bit `score`, positive
+32-bit `wave`, `teamSize`, finite positive `aspectRatio`, and the effective
+`difficulty` in the existing 0.01–2 debug range. The greatest `(score, wave)` tuple
+wins; its aspect and difficulty travel with it. A tied tuple retains the earlier
+classification. Team size independently takes the maximum, so reordered lower
+scores can still report a larger membership without replacing winning metadata.
+Records are not permanently finalized: late checkpoints and same-session reentry
+may improve them. A departed participant keeps their own best observed checkpoint,
+not the wave eventually reached by players who stayed.
+
+`teamSize` is peak simultaneous **session members observed during participation**,
+including guests and lobby spectators, and is bounded by configured session
+capacity. Solo is 1. It is not `peakShipCount`, which counts unique participants
+paid entry lives and can exceed concurrent capacity. Aspect uses the actual
+gameplay rectangle, not browser orientation or letterbox margins:
+ratios below 0.75 are Portrait, above 4/3 are Landscape, and the inclusive middle
+is Rectangle (stored as `square`). These thresholds are logarithmic midpoints between reference
+ratios 9:16, 1:1, and 16:9. Resizing/tuning can change a later winning snapshot's
+classification; frozen retries never adopt current viewport/configuration values.
+
+These are authenticated, client-authoritative **best-observed scores**, not an
+anti-cheat or server-verified final-result system. Abrupt loss before a checkpoint
+is saved can lose recent progress. Session state itself remains process-local.
+
+### HTTP and durable storage
+
+`POST /api/leaderboard/scores` accepts the snapshot with the existing
+`X-Astervoids-Browser` capability. The service verifies its durable binding,
+requires the submitted player GUID to match, and derives the immutable name
+server-side. Guests, mismatched bindings, invalid metadata, and unavailable
+storage fail explicitly. Authorization linearizes at the binding read, not an
+atomic transaction spanning later leaderboard writes and identity rebinding.
+The response acknowledges recording with `{ recorded: true }`.
+
+Automated identities have immutable `excludeFromLeaderboards: true` metadata,
+set when creating the root identity or a new invitation identity. Identity
+creation accepts that JSON flag or `X-Astervoids-Test-Identity: true`; it can only
+exclude newly created identities, never reclassify an existing player.
+Invitations descended from an excluded identity inherit exclusion, and accepting
+or recovering an identity retains it even without the marker. Ordinary replies
+omit the false flag, preserving existing response shapes and receipt hashes.
+Gameplay does not capture scores for excluded identities; the server independently
+rejects submissions with HTTP 403 `leaderboard_ineligible` before score-storage
+access. Exclusion does not rely on teardown cleanup or query-time identity scans.
+Legacy identities with no flag remain eligible: historical test rows cannot be
+safely inferred from non-unique names and are not automatically removed.
+
+`POST /api/leaderboard/query` is public and credential-free. The body has optional
+nullable `teamSize`, `aspect` (`portrait`, `landscape`, `square`), and `difficulty`.
+Missing/null means Any. Responses contain `entries`, `limit`, and `maxTeamSize`;
+each entry has `rank`, `name`, `score`, `wave`, `difficulty`, `teamSize`, and `aspect`.
+Ranks are consecutive in the filtered view, ordered by score descending, then
+normalized player GUID and run GUID ascending. Wave does not break score ties.
+`Leaderboard:MaxEntries` defaults to 50 and validates 1–500; session capacity
+comes from `Session:MaxMembersPerSession`, not a hardcoded browser constant.
+
+Both routes enforce exact configured origins, strict bounded JSON POST bodies,
+separate request budgets, uncompressed/no-store responses, and sanitized errors.
+Public queries do not mint credentials or identities. Browser API authority and
+credential privacy remain owned by `PlayerIdentity`; score requests do not use
+its identity-mutation retry slot or hold its Web Lock across network I/O.
+Storage unavailability must not block startup, `/api/ping`, or local gameplay.
+
+The leaderboard has its own store contract. File mode uses a companion of
+`Identity:DataFile`, a stable exclusive lock, strict JSON, and atomic same-directory
+replacement; an isolated identity path also isolates scores. Corruption never
+resets the file. Azure mode reuses the configured primary identity account/table
+and table-scoped managed-identity role, in a separate transaction partition.
+A canonical player/run record and eight wildcard/exact team/aspect/difficulty
+indexes update atomically with conditional concurrency checks. Rank keys encode
+inverse score and GUID tie-breakers. Top-N queries use partition and RowKey
+ranges, not a full-history scan or application-side sort. Changed classifications
+remove stale indexes; overlapping index keys are updates, not duplicate operations
+in one Azure transaction. Missing tables and permission/outage failures never
+fall back to local or in-memory storage.
+
+### Browser queue and presentation
+
+`leaderboards.js` owns a localStorage outbox bounded to 100 distinct player/run
+records. A short cross-tab Web Lock protects read/merge/write and generation-safe
+acknowledgements. A separate send lock serializes deliveries without holding up
+enqueueing. Snapshots freeze before async work. Successful acknowledgement removes
+only that exact generation, never a newer score queued while it was in flight.
+Capacity, corruption, unavailable storage, and pending/retry states are visible;
+unsaved records are not silently evicted or attributed to a newly bound identity.
+Records for another identity remain queued for that original identity.
+Failed local captures retain a warning for the page lifetime until a covering
+checkpoint for that same player/run is persisted; an unrelated or older
+acknowledgement cannot clear it. If play ends before a failed enqueue recovers,
+only earlier persisted checkpoints are durable. Server-rejected queued records
+remain stored but move behind other records so they cannot starve later games.
+
+Gameplay enqueues at successful entry, every 15 seconds when changed, at observed
+game over, and before voluntary reset/departure. Visibility/page-hide events make
+a best-effort checkpoint; abrupt termination cannot guarantee completion of a
+browser storage task. HTTP delivery never blocks solo startup or gameplay.
+Unchanged checkpoints make no write request. Transient failures back off and
+respect `Retry-After`; no background storage polling keeps an empty server awake.
+
+The native HTML/CSS Leaderboards screen is second in the main menu's second
+button group. Any-first cycling filters select team size, play-region aspect,
+and the four difficulty presets. Nonpreset difficulty factors remain visible
+under Any as `Custom (value)`. Five columns show Rank, Name, Score, Wave, Difficulty.
+Loading/error/empty states are distinct; query generations suppress stale results.
+Filter controls reflow into columns with enough label space and retain a fixed
+single-line height. Native font sizes fit the measured content width on very
+narrow layouts; neither labels nor their containers are transform-scaled.
+The table has its own focusable scroller with mouse/touch pointer capture and
+decaying post-release inertia; wheel, keyboard, cancellation, boundaries, and
+reduced-motion preference stop inertia. Text is not canvas-scaled. Screen input
+does not acquire gameplay controls; Back to Main/Escape restores menu focus and
+regional picker activity.
 
 ## Replication contracts
 
@@ -1057,6 +1191,9 @@ ordinal ascending, then normalized GUID lexical order. Show only the highest
 `floor(maxMembers * 1.5)` rows; the viewer's own persisted total remains above
 the team total even when their row is outside that limit. Pure spectators show
 `Your Score: --`; unavailable history does not invent zero scores.
+The personal and team totals use consecutive text lines without an extra
+vertical margin between them; spacing above the personal total and the solo
+`Final Score` layout are unchanged.
 
 Capacity comes from a matching session advertisement and survives same-session
 reentry. If absent, one lookup per entry uses the already joined hub's

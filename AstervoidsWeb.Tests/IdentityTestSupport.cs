@@ -57,10 +57,10 @@ internal sealed class IdentityTestState : IDisposable
         Read<ResolveIdentityReply>(await service.ResolveAsync(browser, new(invite)));
 
     public static async Task<(BrowserBinding Binding, RootIdentityRequest Request)> Root(
-        PlayerIdentityService service, string browser, string tag = "Pilot")
+        PlayerIdentityService service, string browser, string tag = "Pilot", bool excludeFromLeaderboards = false)
     {
         var resolved = await Resolve(service, browser);
-        var request = new RootIdentityRequest(Guid.NewGuid(), Expect(resolved.Binding), tag);
+        var request = new RootIdentityRequest(Guid.NewGuid(), Expect(resolved.Binding), tag, excludeFromLeaderboards);
         return (Read<BindingReply>(await service.CreateRootAsync(browser, request), 201).Binding, request);
     }
 

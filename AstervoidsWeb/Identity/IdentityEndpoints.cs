@@ -21,15 +21,17 @@ internal static class IdentityEndpoints
     public static void MapPlayerIdentity(this IEndpointRouteBuilder endpoints)
     {
         Map<ResolveIdentityRequest>(endpoints, "/resolve",
-            (service, browser, request, cancellation) => service.ResolveAsync(browser, request, cancellation));
+            (service, browser, request, _, cancellation) => service.ResolveAsync(browser, request, cancellation));
         Map<RootIdentityRequest>(endpoints, "/root",
-            (service, browser, request, cancellation) => service.CreateRootAsync(browser, request, cancellation));
+            (service, browser, request, exclude, cancellation) => service.CreateRootAsync(browser,
+                request with { ExcludeFromLeaderboards = request.ExcludeFromLeaderboards || exclude }, cancellation));
         Map<CreateInviteRequest>(endpoints, "/invites",
-            (service, browser, request, cancellation) => service.CreateInviteAsync(browser, request, cancellation));
+            (service, browser, request, exclude, cancellation) => service.CreateInviteAsync(browser,
+                request with { ExcludeFromLeaderboards = request.ExcludeFromLeaderboards || exclude }, cancellation));
         Map<AcceptInviteRequest>(endpoints, "/invites/accept",
-            (service, browser, request, cancellation) => service.AcceptInviteAsync(browser, request, cancellation));
+            (service, browser, request, _, cancellation) => service.AcceptInviteAsync(browser, request, cancellation));
         Map<SelfInviteRequest>(endpoints, "/invites/self",
-            (service, browser, request, cancellation) => service.SelfInviteAsync(browser, request, cancellation));
+            (service, browser, request, _, cancellation) => service.SelfInviteAsync(browser, request, cancellation));
     }
 
     public static Task WriteAsync(HttpContext context, IdentityResult result, CancellationToken cancellationToken)
@@ -43,7 +45,7 @@ internal static class IdentityEndpoints
         (request.Path.Value ?? "").TrimEnd('/').ToLowerInvariant();
 
     private static void Map<T>(IEndpointRouteBuilder endpoints, string path,
-        Func<PlayerIdentityService, string, T, CancellationToken, Task<IdentityResult>> execute) where T : class
+        Func<PlayerIdentityService, string, T, bool, CancellationToken, Task<IdentityResult>> execute) where T : class
     {
         endpoints.MapPost(Prefix + path, (RequestDelegate)(async context =>
         {
@@ -85,7 +87,8 @@ internal static class IdentityEndpoints
             }
 
             var result = await execute(context.RequestServices.GetRequiredService<PlayerIdentityService>(),
-                context.Request.Headers[IdentityHosting.BrowserHeader].ToString(), request, cancellation);
+                context.Request.Headers[IdentityHosting.BrowserHeader].ToString(), request,
+                context.Request.Headers[IdentityHosting.TestIdentityHeader] == "true", cancellation);
             await WriteAsync(context, result, cancellation);
         })).RequireCors(IdentityHosting.CorsPolicy);
     }
@@ -139,6 +142,9 @@ internal sealed class IdentityValidationMiddleware(RequestDelegate next)
         else if (!request.Headers.TryGetValue(IdentityHosting.BrowserHeader, out var browser)
             || browser.Count != 1 || !IdentitySecrets.IsToken(browser[0]))
             rejection = IdentityResult.Failure("invalid_browser_credential");
+        else if (request.Headers.TryGetValue(IdentityHosting.TestIdentityHeader, out var automated)
+            && (automated.Count != 1 || automated[0] != "true"))
+            rejection = IdentityResult.Failure("invalid_request");
         else if (request.ContentLength > IdentityEndpoints.MaximumBodyBytes)
             rejection = IdentityResult.Failure("invalid_request", 413);
         else if (!request.HasJsonContentType()

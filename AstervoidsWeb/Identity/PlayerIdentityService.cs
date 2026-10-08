@@ -8,6 +8,29 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
 {
     private const int MaximumAttempts = 12;
 
+    public async Task<VerifiedPlayerResult> VerifyPlayerAsync(
+        string credential, Guid expectedPlayerId, CancellationToken cancellationToken = default)
+    {
+        if (!IdentitySecrets.IsToken(credential))
+            return new(null, "invalid_browser_credential");
+        if (expectedPlayerId == Guid.Empty)
+            return new(null, "invalid_request");
+        try
+        {
+            var browser = await ReadAsync<BrowserIdentityRow>(
+                IdentityRows.BrowserKey(IdentitySecrets.Hash(credential)), cancellationToken);
+            if (browser?.IdentityId is null)
+                return new(null, "identity_required");
+            if (browser.IdentityId != expectedPlayerId)
+                return new(null, "binding_changed");
+            return new((await BindingAsync(browser, cancellationToken)).Identity);
+        }
+        catch (IdentityStoreUnavailableException)
+        {
+            return new(null, "identity_unavailable");
+        }
+    }
+
     public Task<IdentityResult> ResolveAsync(
         string credential, ResolveIdentityRequest request, CancellationToken cancellationToken = default)
     {
@@ -54,11 +77,11 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
             if (!Matches(browser, request.ExpectedBinding) || browser!.IdentityId is not null)
                 return Task.FromResult(PlanFailure("binding_changed"));
 
-            var identity = NewIdentity(request.Tag);
+            var identity = NewIdentity(request.Tag, request.ExcludeFromLeaderboards);
             var binding = Rebind(browser, identity.Id);
             return Task.FromResult(new MutationPlan(
                 IdentityResult.Success(201, new BindingReply(
-                    new(new(identity.Id, identity.Tag!), binding.Version, binding.Revision))), binding,
+                    new(PublicIdentity(identity), binding.Version, binding.Revision))), binding,
                 [new(identity), new(NewLookup(identity))]));
         }, cancellationToken);
     }
@@ -69,8 +92,9 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
         {
             if (browser?.IdentityId is null)
                 return PlanFailure("identity_required");
-            await BindingAsync(browser, cancellationToken);
-            var invite = NewIdentity(null);
+            var binding = await BindingAsync(browser, cancellationToken);
+            var invite = NewIdentity(null,
+                binding.Identity!.ExcludeFromLeaderboards || request.ExcludeFromLeaderboards);
             return new(IdentityResult.Success(201, new InviteTokenReply(invite.InviteToken)),
                 browser, [new(invite), new(NewLookup(invite))]);
         }, cancellationToken);
@@ -108,7 +132,7 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
             }
             var binding = Rebind(browser!, identity.Id);
             return new(IdentityResult.Success(200, new BindingReply(
-                new(new(identity.Id, identity.Tag!), binding.Version, binding.Revision))), binding, writes);
+                new(PublicIdentity(identity), binding.Version, binding.Revision))), binding, writes);
         }, cancellationToken);
     }
 
@@ -196,7 +220,7 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
             IdentityRows.PlayerKey(browser.IdentityId.Value), cancellationToken);
         if (identity?.Tag is null)
             throw new IdentityStoreUnavailableException();
-        return new(new(identity.Id, identity.Tag), browser.Version, browser.Revision);
+        return new(PublicIdentity(identity), browser.Version, browser.Revision);
     }
 
     private async Task<PlayerIdentityRow?> FindInviteAsync(string token, CancellationToken cancellationToken)
@@ -218,11 +242,14 @@ internal sealed class PlayerIdentityService(IIdentityStore store, IOptions<Ident
         return row as T ?? throw new IdentityStoreUnavailableException();
     }
 
-    private static PlayerIdentityRow NewIdentity(string? tag)
+    private static PlayerIdentity PublicIdentity(PlayerIdentityRow identity) =>
+        new(identity.Id, identity.Tag!, identity.ExcludeFromLeaderboards);
+
+    private static PlayerIdentityRow NewIdentity(string? tag, bool excludeFromLeaderboards)
     {
         var id = Guid.NewGuid();
         return new(IdentityRows.PlayerKey(id), IdentitySecrets.NewEtag(), id, tag,
-            tag is null ? "pending" : "active", IdentitySecrets.NewToken());
+            tag is null ? "pending" : "active", IdentitySecrets.NewToken(), excludeFromLeaderboards);
     }
 
     private static InviteLookupRow NewLookup(PlayerIdentityRow identity) =>

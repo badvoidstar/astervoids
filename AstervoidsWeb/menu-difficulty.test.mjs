@@ -47,7 +47,7 @@ function harness(value = SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR) {
     return { ...functions, state, config, baseline, difficultyButton, sessionPicker, game };
 }
 
-test('difficulty presets define the ordered cycle and preserve the Survivor default', () => {
+test('difficulty presets define the ordered cycle and default to Dancer', () => {
     assert.deepEqual(ASTEROID_DIFFICULTY_PRESETS, [
         { label: 'Shifter', value: 0.2 },
         { label: 'Dancer', value: 0.35 },
@@ -56,15 +56,15 @@ test('difficulty presets define the ordered cycle and preserve the Survivor defa
     ]);
     assert.ok(Object.isFrozen(ASTEROID_DIFFICULTY_PRESETS));
     assert.ok(ASTEROID_DIFFICULTY_PRESETS.every(Object.isFrozen));
-    assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR,
-        ASTEROID_DIFFICULTY_PRESETS.at(-1).value);
+    assert.equal(SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR, 0.35);
 });
 
 test('each difficulty click advances one preset, updates the label and wraps repeatedly', () => {
     const h = harness();
-    assert.equal(h.difficultyButton.textContent, '🎯 : Survivor');
+    assert.equal(h.difficultyButton.textContent, '🎯 : Dancer');
     assert.equal(h.difficultyButton.disabled, false);
-    for (const preset of [...ASTEROID_DIFFICULTY_PRESETS, ...ASTEROID_DIFFICULTY_PRESETS]) {
+    const cycle = [...ASTEROID_DIFFICULTY_PRESETS.slice(2), ...ASTEROID_DIFFICULTY_PRESETS.slice(0, 2)];
+    for (const preset of [...cycle, ...cycle]) {
         assert.equal(h.cycleDifficulty(), true);
         assert.equal(h.config.ASTEROID_DIFFICULTY_FACTOR, preset.value);
         assert.equal(h.baseline.ASTEROID_DIFFICULTY_FACTOR, preset.value);
@@ -78,7 +78,7 @@ test('each difficulty click advances one preset, updates the label and wraps rep
 test('difficulty clicks reuse live rescaling for gameplay and cosmetic asteroid geometry', () => {
     const h = harness();
     let clicks = 0;
-    for (const preset of ASTEROID_DIFFICULTY_PRESETS) {
+    for (const preset of [...ASTEROID_DIFFICULTY_PRESETS.slice(2), ...ASTEROID_DIFFICULTY_PRESETS.slice(0, 2)]) {
         h.cycleDifficulty();
         clicks++;
         const ratio = Math.sqrt(preset.value / SHARED_DEFAULTS.ASTEROID_DIFFICULTY_FACTOR);
@@ -101,9 +101,9 @@ for (const lock of ['session mode', 'recorded membership', 'pending membership o
         h.updateDifficultyButton();
         assert.equal(h.difficultyButton.disabled, true);
         assert.equal(h.cycleDifficulty(), false);
-        assert.equal(h.config.ASTEROID_DIFFICULTY_FACTOR, 0.65);
-        assert.equal(h.baseline.ASTEROID_DIFFICULTY_FACTOR, 0.65);
-        assert.equal(h.difficultyButton.textContent, '🎯 : Survivor');
+        assert.equal(h.config.ASTEROID_DIFFICULTY_FACTOR, 0.35);
+        assert.equal(h.baseline.ASTEROID_DIFFICULTY_FACTOR, 0.35);
+        assert.equal(h.difficultyButton.textContent, '🎯 : Dancer');
         assert.match(h.difficultyButton.title, /session/i);
         assert.equal(h.game.astervoids[0].rebuilds, 0);
     });
@@ -112,16 +112,17 @@ for (const lock of ['session mode', 'recorded membership', 'pending membership o
 test('session adoption shows the creator choice and leaving restores the local selection', () => {
     const host = harness();
     host.cycleDifficulty();
-    host.cycleDifficulty();
     const guest = harness();
+    guest.cycleDifficulty();
+    guest.cycleDifficulty();
     guest.cycleDifficulty();
     applySessionConfigMetadata({ config: buildSessionConfigMetadata(host.config) }, guest.config);
     guest.state.session = true;
     guest.sessionPicker.currentSessionId = 'joined-session';
     guest.updateDifficultyButton();
-    assert.equal(guest.difficultyButton.textContent, '🎯 : Dancer');
+    assert.equal(guest.difficultyButton.textContent, '🎯 : Raver');
     assert.equal(guest.difficultyButton.disabled, true);
-    assert.equal(guest.config.ASTEROID_DIFFICULTY_FACTOR, 0.35);
+    assert.equal(guest.config.ASTEROID_DIFFICULTY_FACTOR, 0.5);
     assert.equal(guest.baseline.ASTEROID_DIFFICULTY_FACTOR, 0.2);
 
     guest.state.session = false;

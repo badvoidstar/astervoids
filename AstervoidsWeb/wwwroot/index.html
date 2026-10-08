@@ -320,6 +320,10 @@
                 calc(var(--vp-height, 600) * 0.12 * 1px));
         }
 
+        #gameover-overlay.multiplayer #gameover-score {
+            margin-top: 0;
+        }
+
         #gameover-prompt {
             font-size: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
             margin-top: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
@@ -416,6 +420,114 @@
 
         #start-screen.hidden {
             display: none;
+        }
+
+        #leaderboard-screen {
+            position: absolute;
+            inset: 0;
+            z-index: 101;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.94);
+            color: #fff;
+            touch-action: pan-y;
+        }
+
+        #leaderboard-screen[hidden],
+        #leaderboard-notice[hidden] { display: none; }
+
+        .leaderboard-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: min(100%, 820px);
+            height: 100%;
+            min-height: 330px;
+            margin: auto;
+            padding: 12px;
+        }
+
+        #leaderboard-title {
+            flex-shrink: 0;
+            margin: 0;
+            text-align: center;
+            font-size: clamp(22px, 4vmin, 32px);
+        }
+
+        #leaderboard-filters {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        #btn-leaderboards {
+            white-space: nowrap;
+            letter-spacing: 0;
+        }
+
+        #leaderboard-screen .picker-btn {
+            height: 36px;
+            min-height: 36px;
+            min-width: 0;
+            padding: 6px 8px;
+            margin: 0;
+            font-size: 13px;
+            line-height: 1;
+            letter-spacing: 0;
+            white-space: nowrap;
+            flex-shrink: 0;
+            transition-property: background-color, border-color, color, opacity;
+        }
+
+        #leaderboard-scroll {
+            flex: 1;
+            min-height: 70px;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            touch-action: none;
+            user-select: none;
+            cursor: grab;
+            border: 1px solid #607080;
+        }
+
+        #leaderboard-scroll.dragging { cursor: grabbing; }
+        #leaderboard-scroll:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+        #leaderboard-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        #leaderboard-table th,
+        #leaderboard-table td {
+            padding: 9px 4px;
+            font-size: clamp(11px, 2.4vmin, 16px);
+            text-align: left;
+            overflow-wrap: anywhere;
+        }
+        #leaderboard-table th { position: sticky; top: 0; background: #18202b; z-index: 1; }
+        #leaderboard-table td { border-top: 1px solid #303946; }
+        #leaderboard-table th:nth-child(1) { width: 12%; }
+        #leaderboard-table th:nth-child(2) { width: 25%; }
+        #leaderboard-table th:nth-child(3) { width: 26%; }
+        #leaderboard-table th:nth-child(4) { width: 13%; }
+        #leaderboard-table th:nth-child(5) { width: 24%; }
+        #leaderboard-table td:nth-child(3),
+        #leaderboard-table td:nth-child(4) { text-align: right; font-variant-numeric: tabular-nums; }
+        #leaderboard-status,
+        #leaderboard-save-status { flex-shrink: 0; font-size: 12px; line-height: 1.4; margin: 0; }
+        #leaderboard-status:empty,
+        #leaderboard-save-status:empty { display: none; }
+        #leaderboard-notice {
+            position: absolute;
+            z-index: 102;
+            bottom: 8px;
+            left: 8px;
+            right: 8px;
+            padding: 6px;
+            background: #241d10;
+            color: #ffe0a0;
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        @media (min-width: 540px) {
+            .leaderboard-panel { min-height: 240px; }
         }
 
         /* Keep native text and allow short viewports to scroll the menu. */
@@ -1114,9 +1226,10 @@
                       <div id="menu-utilities">
                        <div class="menu-utility-group">
                         <button id="btn-fullscreen" class="picker-btn solo">⛶ Fullscreen</button>
+                        <button id="btn-leaderboards" class="picker-btn solo">Leaderboards</button>
                         <div class="button-row">
                             <button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar</button>
-                            <button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor</button>
+                            <button id="btn-difficulty" class="picker-btn solo">🎯 : Dancer</button>
                         </div>
                        </div>
                        <div class="menu-utility-group">
@@ -1171,6 +1284,27 @@
             </div>
         </div>
 
+        <section id="leaderboard-screen" aria-labelledby="leaderboard-title" hidden>
+            <div class="leaderboard-panel">
+                <h1 id="leaderboard-title" tabindex="-1">Leaderboards</h1>
+                <div id="leaderboard-filters" aria-label="Leaderboard filters">
+                    <button id="leaderboard-team" class="picker-btn solo" type="button" disabled>Team Size : Any</button>
+                    <button id="leaderboard-aspect" class="picker-btn solo" type="button">Aspect Ratio : Any</button>
+                    <button id="leaderboard-difficulty" class="picker-btn solo" type="button">Difficulty : Any</button>
+                </div>
+                <p id="leaderboard-status" role="status"></p>
+                <div id="leaderboard-scroll" role="region" aria-label="Ranked high scores" tabindex="0">
+                    <table id="leaderboard-table" aria-label="High scores">
+                        <thead><tr><th scope="col">Rank</th><th scope="col">Name</th><th scope="col">Score</th><th scope="col">Wave</th><th scope="col">Difficulty</th></tr></thead>
+                        <tbody id="leaderboard-rows"></tbody>
+                    </table>
+                </div>
+                <p id="leaderboard-save-status" role="status"></p>
+                <button id="leaderboard-back" class="picker-btn solo" type="button">Back to Main</button>
+            </div>
+        </section>
+        <div id="leaderboard-notice" role="status" hidden></div>
+
         <!-- Wave announcement overlay (shown during wave transitions) -->
         <div id="wave-overlay" class="gameplay-overlay">
             <span id="wave-text">WAVE 1</span>
@@ -1203,6 +1337,7 @@
     <script src="/js/shared-config-data.js"></script>
     <!-- Shared runtime/debug/test gameplay defaults and override policy -->
     <script src="/js/game-config.js"></script>
+    <script src="/js/leaderboards.js"></script>
     <!-- Pure asteroid fracture geometry and kinematics -->
     <script src="/js/asteroid-fracture.js"></script>
     <!-- Pure swept-collision geometry for fast projectiles -->
@@ -5133,6 +5268,7 @@
         lastFrameTime: 0,     // Timestamp of last frame for delta time
         mode: 'solo',         // 'solo' or 'session'
         sessionInfo: null,    // Current session details when in session mode
+        leaderboardRun: null,
         // Viewport for constrained aspect ratio in session mode
         viewport: {
             x: 0,             // X offset of gameplay area within canvas
@@ -10117,11 +10253,278 @@
 
     // ============================================
     // SECTION 7: EVENT LISTENERS & INITIALIZATION
+    // Durable personal scores and their menu view; independent of realtime sync.
+    const leaderboardScreen = document.getElementById('leaderboard-screen');
+    const leaderboardScroll = document.getElementById('leaderboard-scroll');
+    const leaderboardRows = document.getElementById('leaderboard-rows');
+    const leaderboardStatus = document.getElementById('leaderboard-status');
+    const leaderboardDrag = Leaderboards.attachDragScroll(leaderboardScroll);
+    const leaderboardButtons = [
+        document.getElementById('btn-leaderboards'), ...leaderboardScreen.querySelectorAll('.picker-btn'),
+    ];
+    const leaderboardButtonObserver = new ResizeObserver(() => Leaderboards.fitButtonLabels(leaderboardButtons));
+    for (const button of leaderboardButtons) leaderboardButtonObserver.observe(button);
+    const leaderboardFilters = { teamSize: null, aspect: null, difficulty: null };
+    let leaderboardMaxTeamSize = null;
+    let leaderboardCaptureIssue = '';
+    let leaderboardSaveState = { pending: 0, otherIdentity: 0, code: null };
+    let leaderboardStorage = null;
+    try { leaderboardStorage = window.localStorage; } catch { /* Outbox reports unavailable storage. */ }
+    const leaderboardOutbox = Leaderboards.createOutbox({
+        storage: leaderboardStorage, locks: navigator.locks, crypto: window.crypto,
+        identity: PlayerIdentity,
+        changed(status) {
+            const saved = status.pending < leaderboardSaveState.pending;
+            leaderboardSaveState = status;
+            renderLeaderboardSaveStatus();
+            if (saved && !leaderboardScreen.hidden) void leaderboardQuery.load(leaderboardFilters);
+        },
+    });
+    const leaderboardQuery = Leaderboards.createQuery(async filters => {
+        await leaderboardOutbox.flush();
+        return PlayerIdentity.queryLeaderboard(filters);
+    }, renderLeaderboardView);
+
+    function renderLeaderboardSaveStatus() {
+        const messages = {
+            queue_corrupt: 'Some high scores could not be saved because the queue was unreadable. Existing data was not replaced.',
+            queue_full: 'Some high scores could not be saved because this browser\'s queue filled.',
+            storage_unavailable: 'Some high scores could not be saved on this browser. Check durable storage and Web Locks.',
+            invalid_score: 'The latest high score is unavailable and has not been saved.',
+            invalid_request: 'A queued high score was rejected. It remains saved on this browser.',
+            invalid_browser_credential: 'High scores are waiting for a valid player identity in this browser.',
+            identity_required: 'High scores are waiting for their original player identity.',
+            binding_changed: 'High scores are waiting for their original player identity.',
+            rate_limited: 'High scores are saved on this browser and waiting to retry.',
+            identity_unavailable: 'High scores are saved on this browser. Services are unavailable; retrying.',
+            leaderboard_unavailable: 'High scores are saved on this browser. Leaderboards are unavailable; retrying.',
+            leaderboard_ineligible: 'Automated test accounts are not entered in the leaderboards.',
+        };
+        const state = leaderboardSaveState;
+        const problem = leaderboardCaptureIssue || messages[state.code] || (state.otherIdentity
+            ? 'Some high scores are waiting for their original player identity in this browser.' : '');
+        const pending = state.pending ? `${state.pending} high score${state.pending === 1 ? '' : 's'} waiting to save.` : '';
+        const identity = PlayerIdentity.current();
+        const text = [problem, pending].filter(Boolean).join(' ')
+            || (identity?.excludeFromLeaderboards === true ? messages.leaderboard_ineligible
+                : identity ? '' : 'Guest play is not recorded.');
+        const status = document.getElementById('leaderboard-save-status');
+        if (status.textContent !== text) status.textContent = text;
+        const notice = document.getElementById('leaderboard-notice');
+        if (notice.textContent !== problem) notice.textContent = problem;
+        notice.hidden = !problem || !leaderboardScreen.hidden;
+    }
+
+    function observeLeaderboardMembers() {
+        const run = game.leaderboardRun;
+        if (!run || run.mode !== 'session') return;
+        if (run.teamSize > 0 && isGameOver()) return;
+        const session = SessionClient.getCurrentSession();
+        if (session?.id === run.runId && Array.isArray(session.members)) {
+            run.teamSize = Math.max(run.teamSize, session.members.length);
+        }
+    }
+
+    function beginLeaderboardRun() {
+        const identity = game.playerIdentity;
+        if (!identity || identity.excludeFromLeaderboards === true || !game.ship) {
+            game.leaderboardRun = null;
+            return;
+        }
+        const mode = isSessionMode() ? 'session' : 'solo';
+        const runId = mode === 'session' ? game.sessionInfo?.id : crypto.randomUUID();
+        const previous = game.leaderboardRun;
+        if (!previous || previous.runId !== runId || previous.playerId !== identity.id) {
+            game.leaderboardRun = {
+                playerId: identity.id, runId, mode, teamSize: mode === 'solo' ? 1 : 0,
+                best: null, queued: null, lastAttempt: -Infinity, terminal: false,
+            };
+        }
+        leaderboardCaptureIssue = '';
+        observeLeaderboardMembers();
+        void checkpointLeaderboard();
+    }
+
+    function currentLeaderboardSnapshot(run) {
+        if (run.mode !== game.mode || !game.ship
+            || (run.mode === 'session' && run.runId !== game.sessionInfo?.id)) return null;
+        observeLeaderboardMembers();
+        let score = game.score;
+        if (run.mode === 'session') {
+            const view = getSessionScoreView();
+            score = view?.history ? projectParticipantScore(
+                view.history, view.processedScores.counters,
+                ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP), run.playerId, game.ship) : null;
+            if (score === null) throw new Error('score_history_unavailable');
+        }
+        return Leaderboards.normalizeSnapshot({
+            playerId: run.playerId, runId: run.runId, score,
+            wave: game.wave, teamSize: run.teamSize,
+            aspectRatio: getGameWidth() / getGameHeight(),
+            difficulty: CONFIG.ASTEROID_DIFFICULTY_FACTOR,
+        });
+    }
+
+    async function checkpointLeaderboard() {
+        const run = game.leaderboardRun;
+        if (!run) return true;
+        run.lastAttempt = performance.now();
+        try {
+            const snapshot = currentLeaderboardSnapshot(run);
+            if (snapshot) run.best = Leaderboards.mergeSnapshots(run.best, snapshot);
+            leaderboardCaptureIssue = '';
+        } catch {
+            leaderboardCaptureIssue = 'Your latest high score is unavailable. Earlier saved checkpoints are kept.';
+            renderLeaderboardSaveStatus();
+        }
+        if (!run.best || Leaderboards.sameSnapshot(run.best, run.queued)) return false;
+        const snapshot = run.best;
+        const persisted = await leaderboardOutbox.enqueue(snapshot);
+        if (persisted) {
+            run.queued = Leaderboards.mergeSnapshots(run.queued, snapshot);
+            void leaderboardOutbox.flush();
+        }
+        return persisted;
+    }
+
+    function finishLeaderboardRun() {
+        if (!game.leaderboardRun) return null;
+        const persisted = checkpointLeaderboard();
+        game.leaderboardRun = null;
+        return persisted;
+    }
+
+    function maintainLeaderboards() {
+        const run = game.leaderboardRun;
+        if (run && !game.identityChanging && !game.connectionLost) {
+            const terminal = isGameOver();
+            if ((terminal && !run.terminal) || performance.now() - run.lastAttempt >= 15_000) {
+                run.terminal = terminal;
+                void checkpointLeaderboard();
+            }
+        }
+        void leaderboardOutbox.flush();
+    }
+
+    function updateLeaderboardFilters() {
+        document.getElementById('leaderboard-team').textContent = `Team Size : ${leaderboardFilters.teamSize ?? 'Any'}`;
+        document.getElementById('leaderboard-team').disabled = leaderboardMaxTeamSize === null;
+        const aspects = { portrait: 'Portrait', landscape: 'Landscape', square: 'Rectangle' };
+        document.getElementById('leaderboard-aspect').textContent =
+            `Aspect Ratio : ${aspects[leaderboardFilters.aspect] ?? 'Any'}`;
+        document.getElementById('leaderboard-difficulty').textContent = `Difficulty : ${
+            leaderboardFilters.difficulty === null ? 'Any'
+                : Leaderboards.difficultyLabel(leaderboardFilters.difficulty, AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS)}`;
+        Leaderboards.fitButtonLabels(leaderboardButtons);
+    }
+
+    function renderLeaderboardView(view) {
+        leaderboardDrag.cancel();
+        leaderboardRows.replaceChildren();
+        leaderboardScroll.scrollTop = 0;
+        leaderboardScroll.setAttribute('aria-busy', String(view.state === 'loading'));
+        if (view.state !== 'ready') {
+            leaderboardStatus.textContent = view.state === 'loading' ? 'Loading high scores...'
+                : view.code === 'rate_limited' ? 'Too many requests. Wait a moment, then change a filter to retry.'
+                : 'Leaderboards are unavailable. Change a filter or reopen this screen to retry.';
+            return;
+        }
+        leaderboardMaxTeamSize = view.maxTeamSize;
+        updateLeaderboardFilters();
+        leaderboardStatus.textContent = view.entries.length
+            ? `Top ${view.limit} scores for this view.` : 'No scores match this view yet.';
+        const fragment = document.createDocumentFragment();
+        for (const entry of view.entries) {
+            const row = document.createElement('tr');
+            for (const value of [entry.rank, entry.name, entry.score, entry.wave,
+                Leaderboards.difficultyLabel(entry.difficulty, AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS)]) {
+                const cell = document.createElement('td');
+                cell.textContent = value;
+                row.append(cell);
+            }
+            fragment.append(row);
+        }
+        leaderboardRows.append(fragment);
+    }
+
+    function openLeaderboards() {
+        if (game.identityChanging || startScreen.classList.contains('hidden')) return;
+        releaseIdentityInput();
+        startScreen.classList.add('hidden');
+        leaderboardScreen.hidden = false;
+        pickerUpdatesActive = false;
+        pausePickerAssessment();
+        void teardownMultiRegionPicker().catch(() => {
+            _warn('[Picker] Failed to stop regional updates for leaderboards');
+        });
+        leaderboardFilters.teamSize = leaderboardFilters.aspect = leaderboardFilters.difficulty = null;
+        updateLeaderboardFilters();
+        renderLeaderboardSaveStatus();
+        document.getElementById('leaderboard-title').focus();
+        void leaderboardQuery.load(leaderboardFilters);
+    }
+
+    function closeLeaderboards(resumePicker = true) {
+        if (leaderboardScreen.hidden) return;
+        leaderboardScreen.hidden = true;
+        leaderboardQuery.close();
+        leaderboardDrag.cancel();
+        startScreen.classList.remove('hidden');
+        renderLeaderboardSaveStatus();
+        if (resumePicker) {
+            document.getElementById('btn-leaderboards').focus();
+            void activateSessionPickerUpdates().catch(() => {
+                _warn('[Picker] Failed to resume updates after leaderboards');
+            });
+        }
+    }
+
+    document.getElementById('btn-leaderboards').addEventListener('click', openLeaderboards);
+    document.getElementById('leaderboard-back').addEventListener('click', () => closeLeaderboards());
+    for (const [suffix, key] of [['team', 'teamSize'], ['aspect', 'aspect'], ['difficulty', 'difficulty']]) {
+        document.getElementById(`leaderboard-${suffix}`).addEventListener('click', () => {
+            if (key === 'teamSize') {
+                leaderboardFilters[key] = (leaderboardFilters[key] ?? 0) >= leaderboardMaxTeamSize
+                    ? null : (leaderboardFilters[key] ?? 0) + 1;
+            } else {
+                const values = key === 'aspect' ? Leaderboards.ASPECTS
+                    : AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS.map(preset => preset.value);
+                leaderboardFilters[key] = Leaderboards.nextFilter(leaderboardFilters[key], [null, ...values]);
+            }
+            updateLeaderboardFilters();
+            void leaderboardQuery.load(leaderboardFilters);
+        });
+    }
+    leaderboardScreen.addEventListener('keydown', event => {
+        event.stopPropagation();
+        if (event.code === 'Escape') {
+            event.preventDefault();
+            closeLeaderboards();
+        }
+    });
+    leaderboardScreen.addEventListener('keyup', event => event.stopPropagation());
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            leaderboardDrag.cancel();
+            void checkpointLeaderboard();
+        } else {
+            void leaderboardOutbox.refresh();
+            void leaderboardOutbox.flush();
+        }
+    });
+    window.addEventListener('pagehide', () => { void checkpointLeaderboard(); });
+    window.addEventListener('online', () => { void leaderboardOutbox.flush(); });
+    window.addEventListener('storage', event => {
+        if (event.key === Leaderboards.STORAGE_KEY || event.key === null) void leaderboardOutbox.refresh();
+    });
+    setInterval(maintainLeaderboards, 1000);
+
     // Set up input handling and start the game
     // ============================================
 
     // Track key presses
     document.addEventListener('keydown', (e) => {
+        if (!leaderboardScreen.hidden) return;
         if (isPersonalScoreScrollTarget(e.target)
             && ['Space', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.code)) return;
         keys[e.code] = true;
@@ -10302,8 +10705,8 @@
     }
 
     function isMenuScrollTarget(target) {
-        return !startScreen.classList.contains('hidden')
-            && !!target?.closest?.('#start-screen-content');
+        return (!startScreen.classList.contains('hidden') && !!target?.closest?.('#start-screen-content'))
+            || (!leaderboardScreen.hidden && !!target?.closest?.('#leaderboard-screen'));
     }
 
     // Keep gameplay gestures captured, but let the menu's nested scrollers pan.
@@ -11999,6 +12402,7 @@
     // Handle solo play without waiting for multiplayer services.
     async function handleSoloPlay() {
         if (game.identityChanging) return;
+        const scoreCheckpoint = finishLeaderboardRun();
         cancelPickerOperations();
         const shouldLeaveSessionInBackground = sessionPicker.currentSessionId
             && SessionClient.isConnected();
@@ -12016,6 +12420,7 @@
             leaveSessionInBackground('Failed to leave session before solo:');
         }
 
+        if (scoreCheckpoint) await scoreCheckpoint;
         restoreSoloMode();
         await startGameFromPicker();
     }
@@ -12047,8 +12452,10 @@
 
     // Leave lobby and return to start state
     async function handleLeaveLobby(message = null) {
+        const scoreCheckpoint = finishLeaderboardRun();
         beginVoluntarySessionLeave();
         try {
+            if (scoreCheckpoint) await scoreCheckpoint;
             if (SessionClient.isConnected() && SessionClient.isInSession()) {
                 try {
                     await SessionClient.leaveSession();
@@ -12143,7 +12550,8 @@
                 }
                 // Recalculate viewport with new session aspect ratio before initializing (force recalc)
                 resizeCanvas(true);
-                await init(isCurrent);
+                const initialized = await init(isCurrent);
+                if (initialized && isCurrent()) beginLeaderboardRun();
             } catch (err) {
                 if (isCurrent()) {
                     _error('[Game] Failed to start game:', err);
@@ -12160,9 +12568,12 @@
 
     // Return to start screen
     async function returnToStartScreen(errorMessage = null) {
+        const scoreCheckpoint = finishLeaderboardRun();
         beginVoluntarySessionLeave();
         sessionPicker.selectedSessionId = null;
         try {
+            if (scoreCheckpoint) await scoreCheckpoint;
+            closeLeaderboards(false);
             // Leave session if in one
             if (isSessionMode() && SessionClient.isConnected()) {
                 SessionClient.leaveSession().catch(console.error);
@@ -12426,6 +12837,7 @@
     // Freeze gameplay when SignalR enters reconnecting state
     SessionClient.on('onReconnecting', (error) => {
         RemoteObjects.stopClockSync();
+        void checkpointLeaderboard();
         setPickerConnectionState('reconnecting');
         updatePickerButtons();
         setPickerStatus('Reconnecting...', 'connecting');
@@ -12536,6 +12948,7 @@
     // Handle member joining - track event sequence
     SessionClient.on('onMemberJoined', (memberInfo, senderMemberId, memberSequence) => {
         ObjectSync.trackEventSequence(senderMemberId, memberSequence);
+        observeLeaderboardMembers();
         updateCurrentSessionStatus();
     });
 
@@ -12633,6 +13046,7 @@
 
     // Leave session on page unload
     window.addEventListener('beforeunload', () => {
+        void checkpointLeaderboard();
         if ((isSessionMode() || sessionPicker.currentSessionId) && SessionClient.isConnected()) {
             SessionClient.leaveSession();
         }
@@ -13180,6 +13594,8 @@
         game.identityChanging = false;
         setIdentityBusy(false);
         const identity = PlayerIdentity.current();
+        void leaderboardOutbox.refresh();
+        void leaderboardOutbox.flush();
         document.getElementById('identity-status').textContent = identity
             ? `Playing as ${identity.tag}` : 'Playing as guest';
         if (!identityStarted) {
@@ -13197,6 +13613,7 @@
         game.identityChanging = true;
         if (!identityStarted) return;
         if (identityLeave) return identityLeave;
+        const scoreCheckpoint = finishLeaderboardRun();
         cancelPickerOperations();
         startGameOperation = null;
         beginVoluntarySessionLeave();
@@ -13204,6 +13621,7 @@
         // Disconnect invalidates membership/queued operations synchronously,
         // including a join whose snapshot has not arrived yet.
         identityLeave = (async () => {
+            if (scoreCheckpoint) await scoreCheckpoint;
             await SessionClient.disconnect();
             await returnToStartScreen();
             game.playerIdentity = null;

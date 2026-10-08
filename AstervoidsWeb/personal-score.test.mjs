@@ -619,6 +619,8 @@ test('voluntary leave retains ship inputs for atomic departure while GameState p
         let deletedBeforeDeparture = false;
         const { [name]: leave } = loadInlineGameFunctions([name], {
             game: local,
+            finishLeaderboardRun: () => null,
+            closeLeaderboards() {},
             beginVoluntarySessionLeave() {},
             deleteSyncedShip: async () => {
                 deletedBeforeDeparture = true;
@@ -1153,6 +1155,7 @@ test('HUD layout and scroll exceptions stay localized to the score column and vi
     assert.match(source, /#hud\.multiplayer #wave,[\s\S]*#hud\.multiplayer #lives \{[^}]*flex-shrink: 0;/);
     assert.match(source, /#gameover-results \{[^}]*width: min\(420px, 90%\);/);
     assert.match(source, /#gameover-results \{[^}]*overflow-y: auto;[^}]*touch-action: pan-y;/);
+    assert.match(source, /#gameover-overlay\.multiplayer #gameover-score \{\s*margin-top: 0;\s*\}/);
     assert.match(source, /isPersonalScoreScrollTarget\(e\.target\)[\s\S]*'PageUp', 'PageDown', 'Home', 'End'/);
     const h = scoreUiHarness();
     const row = { closest: selector => selector === '#gameover-results' ? h.gameoverResultsEl : null };

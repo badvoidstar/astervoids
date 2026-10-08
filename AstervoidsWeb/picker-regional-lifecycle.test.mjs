@@ -433,6 +433,7 @@ function createPickerHarness(options = {}) {
         updateSessionList: result => { sessionResults.push(result); domUpdates.push('sessions'); },
         setPickerStatus: recordDom('set-status'),
         cancelPickerOperations() {},
+        finishLeaderboardRun: () => null,
         clearPickerMembership: () => { sessionPicker.currentSessionId = null; },
         restoreSoloMode: () => { game.mode = 'solo'; },
         resizeCanvas() {},

@@ -1,8 +1,6 @@
 using System.Globalization;
 using System.Threading.RateLimiting;
 using AstervoidsWeb.Configuration;
-using Azure.Data.Tables;
-using Azure.Identity;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Options;
 
@@ -12,6 +10,7 @@ internal static class IdentityHosting
 {
     public const string CorsPolicy = "IdentityApi";
     public const string BrowserHeader = "X-Astervoids-Browser";
+    public const string TestIdentityHeader = "X-Astervoids-Test-Identity";
     public const string BrowserHashItem = "Astervoids.Identity.BrowserHash";
     public static readonly TimeSpan PreflightMaxAge = TimeSpan.FromMinutes(10);
 
@@ -34,28 +33,8 @@ internal static class IdentityHosting
                     return new FileIdentityStore(Path.IsPathRooted(settings.DataFile)
                         ? settings.DataFile : Path.Combine(environment.ContentRootPath, settings.DataFile));
                 }
-                if (settings.Provider.Equals("AzureTable", StringComparison.OrdinalIgnoreCase)
-                    && Uri.TryCreate(settings.TableEndpoint, UriKind.Absolute, out var endpoint)
-                    && endpoint.Scheme == Uri.UriSchemeHttps
-                    && endpoint.AbsolutePath == "/" && string.IsNullOrEmpty(endpoint.Query)
-                    && string.IsNullOrEmpty(endpoint.Fragment) && string.IsNullOrEmpty(endpoint.UserInfo)
-                    && IsTableName(settings.TableName))
-                {
-                    var clientOptions = new TableClientOptions();
-                    clientOptions.Diagnostics.IsLoggingEnabled = false;
-                    clientOptions.Diagnostics.IsLoggingContentEnabled = false;
-                    clientOptions.Diagnostics.IsDistributedTracingEnabled = false;
-                    clientOptions.Retry.MaxRetries = 2;
-                    clientOptions.Retry.Delay = TimeSpan.FromMilliseconds(200);
-                    clientOptions.Retry.MaxDelay = TimeSpan.FromSeconds(1);
-                    clientOptions.Retry.NetworkTimeout = TimeSpan.FromSeconds(10);
-                    var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
-                    {
-                        Diagnostics = { IsLoggingEnabled = false, IsLoggingContentEnabled = false }
-                    });
-                    return new AzureTableIdentityStore(
-                        new TableClient(endpoint, settings.TableName, credential, clientOptions));
-                }
+                if (IdentityTableClient.Create(settings) is { } table)
+                    return new AzureTableIdentityStore(table);
             }
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
             {
@@ -71,7 +50,7 @@ internal static class IdentityHosting
             var origins = IdentityOrigins.Configured(configuration
                 .GetSection(RegionSettings.SectionName).Get<RegionSettings>() ?? new());
             options.AddPolicy(CorsPolicy, policy => policy.WithOrigins(origins)
-                .WithMethods("POST").WithHeaders("Content-Type", BrowserHeader)
+                .WithMethods("POST").WithHeaders("Content-Type", BrowserHeader, TestIdentityHeader)
                 .WithExposedHeaders("Retry-After")
                 .SetPreflightMaxAge(PreflightMaxAge));
         });
@@ -113,8 +92,6 @@ internal static class IdentityHosting
             })
             : RateLimitPartition.GetNoLimiter("other");
 
-    private static bool IsTableName(string? name) => name is { Length: >= 3 and <= 63 }
-        && char.IsAsciiLetter(name[0]) && name.All(char.IsAsciiLetterOrDigit);
 }
 
 internal sealed class IdentityOrigins(IOptions<RegionSettings> settings)

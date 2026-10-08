@@ -157,9 +157,13 @@ internal sealed class FileIdentityStore(string path) : IIdentityStore
                         if (!document.Rows.ContainsKey(IdentityRows.InviteKey(token)))
                             throw new IdentityStoreUnavailableException();
                     }
-                    else if (operation.Body.Deserialize<BindingReply>(IdentityJson.Options)!
-                        .Binding.Identity!.Tag != originalIdentity.Tag)
-                        throw new IdentityStoreUnavailableException();
+                    else
+                    {
+                        var recorded = operation.Body.Deserialize<BindingReply>(IdentityJson.Options)!.Binding.Identity!;
+                        if (recorded.Tag != originalIdentity.Tag
+                            || recorded.ExcludeFromLeaderboards != originalIdentity.ExcludeFromLeaderboards)
+                            throw new IdentityStoreUnavailableException();
+                    }
                     break;
             }
         }

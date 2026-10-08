@@ -1,6 +1,8 @@
 import { test as base, expect } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer, openIdentityNaming } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
+import { configureAutomatedIdentities } from './automated-identities.mjs';
 
 const test = base.extend({
     identities: async ({ browser, baseURL }, use) => {
@@ -13,9 +15,13 @@ const test = base.extend({
                     context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
                     contexts.push(context);
                 }
+                await configureAutomatedIdentities(context);
                 const page = await context.newPage();
                 page.on('pageerror', () => { uncaught++; });
-                const health = { offOrigin: 0, redirects: 0, requestFailures: 0 };
+                const health = { offOrigin: 0, redirects: 0, requestFailures: 0, scoreRequests: 0 };
+                page.on('request', request => {
+                    if (new URL(request.url()).pathname === '/api/leaderboard/scores') health.scoreRequests++;
+                });
                 guards.push(health);
                 await installOriginGuard(page, baseURL, health);
                 await captureClipboard(page);
@@ -30,8 +36,8 @@ const test = base.extend({
             for (const context of contexts.reverse()) await context.close();
             expect(uncaught, 'Identity flows have no uncaught script exceptions').toBe(0);
             for (const health of guards) {
-                expect(health, 'Identity flows stay on the selected origin without redirects or failed requests')
-                    .toEqual({ offOrigin: 0, redirects: 0, requestFailures: 0 });
+                expect(health, 'Identity flows stay on the selected origin without redirects, failures or score writes')
+                    .toEqual({ offOrigin: 0, redirects: 0, requestFailures: 0, scoreRequests: 0 });
             }
         }
     },
@@ -318,6 +324,7 @@ test('maximum-length root naming survives reload, solo play, self recovery and n
     const tag = maximumLengthTag();
     await namePlayer(original.page, tag);
     const identity = await publicIdentity(original.page);
+    expect(identity.excludeFromLeaderboards, 'Automated UI creation persists leaderboard exclusion').toBe(true);
     await original.page.reload();
     await expect(original.page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
     await expect(original.page.locator('#identity-dialog')).not.toBeVisible();
@@ -341,6 +348,52 @@ test('maximum-length root naming survives reload, solo play, self recovery and n
     await recovered.page.reload();
     await expect(recovered.page.locator('#identity-dialog')).not.toBeVisible();
     await atRoot(recovered.page);
+});
+
+test('automated identities and invitation descendants stay off public boards before, during and after real play', async ({ identities }) => {
+    const original = await identities.open();
+    await namePlayer(original.page, maximumLengthTag(randomUUID().replaceAll('-', '')));
+    await original.context.setExtraHTTPHeaders({});
+    await verifyPlayExclusion(original.page);
+
+    const self = await invitation(original.page, 'self');
+    const recovered = await identities.open(self, null, page => page.context().setExtraHTTPHeaders({}));
+    await completeIdentityAction(recovered.page);
+    await expect(recovered.page.locator('#identity-dialog')).not.toBeVisible();
+    await verifyPlayExclusion(recovered.page);
+
+    const friend = await identities.open(await invitation(recovered.page, 'friend'), null,
+        page => page.context().setExtraHTTPHeaders({}));
+    await namePlayer(friend.page, maximumLengthTag(randomUUID().replaceAll('-', '')));
+    await verifyPlayExclusion(friend.page);
+
+    async function verifyPlayExclusion(page) {
+        let scoreRequests = 0;
+        page.on('request', request => {
+            if (new URL(request.url()).pathname === '/api/leaderboard/scores') scoreRequests++;
+        });
+        expect(await page.evaluate(() => PlayerIdentity.current()?.excludeFromLeaderboards === true),
+            'Eligibility is durable, not a current-request marker').toBe(true);
+        const publiclyVisible = () => page.evaluate(async () => (await PlayerIdentity.queryLeaderboard())
+            .entries.some(entry => entry.name === PlayerIdentity.current().tag));
+        expect(await publiclyVisible(), 'Excluded identities are absent before play').toBe(false);
+        await page.locator('#btn-solo').click();
+        await expect(page.locator('#start-screen')).toBeHidden();
+        await expect.poll(() => page.evaluate(() => !!game.ship && game.wave >= 1)).toBe(true);
+        expect(await page.evaluate(() => game.leaderboardRun === null),
+            'Real named gameplay does not open an excluded score run').toBe(true);
+        expect(await publiclyVisible(), 'Excluded identities are absent during play').toBe(false);
+        await page.keyboard.press('p');
+        await expect(page.locator('#pause-menu')).toBeVisible();
+        await page.keyboard.down('Escape');
+        try {
+            await expect(page.locator('#start-screen')).toBeVisible();
+        } finally {
+            await page.keyboard.up('Escape');
+        }
+        expect(await publiclyVisible(), 'Excluded identities are absent after play, without cleanup').toBe(false);
+        expect(scoreRequests, 'No automated gameplay checkpoint was submitted').toBe(0);
+    }
 });
 
 test('identity entry enforces the shared limit when typing and submitting', async ({ identities }) => {

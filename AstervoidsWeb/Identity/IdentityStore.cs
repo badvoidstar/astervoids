@@ -17,7 +17,9 @@ internal abstract record IdentityRow(string Key, string Version)
 }
 
 internal sealed record PlayerIdentityRow(
-    string Key, string Version, Guid Id, string? Tag, string State, string InviteToken) : IdentityRow(Key, Version);
+    string Key, string Version, Guid Id, string? Tag, string State, string InviteToken,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ExcludeFromLeaderboards = false)
+    : IdentityRow(Key, Version);
 internal sealed record InviteLookupRow(
     string Key, string Version, Guid IdentityId) : IdentityRow(Key, Version);
 internal sealed record BrowserIdentityRow(

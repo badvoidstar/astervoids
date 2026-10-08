@@ -23,14 +23,14 @@ test('portrait menu utilities stack and landscape uses a native two-column layou
     assert.match(source, /#menu-columns \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
     assert.match(source,
         /@media \(orientation: landscape\) \{[\s\S]*?#menu-columns \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/);
-    for (const id of ['btn-control-mode', 'btn-difficulty', 'btn-fullscreen', 'btn-invite-self', 'btn-invite-friend']) {
+    for (const id of ['btn-control-mode', 'btn-difficulty', 'btn-fullscreen', 'btn-leaderboards', 'btn-invite-self', 'btn-invite-friend']) {
         assert.match(source, new RegExp(`<button id="${id}"`));
     }
 });
 
-test('fullscreen leads the paired device settings and hiding it reserves no space', () => {
+test('leaderboards is second after fullscreen, followed by paired device settings with no reserved slots', () => {
     assert.match(source,
-        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<div class="button-row">\s*<button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar<\/button>\s*<button id="btn-difficulty" class="picker-btn solo">🎯 : Survivor<\/button>\s*<\/div>\s*<\/div>/);
+        /<div class="menu-utility-group">\s*<button id="btn-fullscreen"[^>]*>[^<]*<\/button>\s*<button id="btn-leaderboards" class="picker-btn solo">Leaderboards<\/button>\s*<div class="button-row">\s*<button id="btn-control-mode" class="picker-btn solo">🕹️ : Polar<\/button>\s*<button id="btn-difficulty" class="picker-btn solo">🎯 : Dancer<\/button>\s*<\/div>\s*<\/div>/);
     for (const mode of ['fullscreen-active', 'standalone-mode', 'pseudo-fullscreen']) {
         assert.match(source, new RegExp(`\\.${mode} #btn-fullscreen[,\\s][^}]*display: none;`));
     }
