@@ -8,10 +8,12 @@ using System.Text.Json;
 using AstervoidsWeb.Configuration;
 using AstervoidsWeb.Identity;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace AstervoidsWeb.Tests;
 
@@ -167,6 +169,147 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
     }
 
     [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task CreationOnlyExclusionAcceptsExplicitJsonOrAutomationHeaderAndPersistsWithoutEither(
+        bool header, bool body)
+    {
+        using var factory = new Factory();
+        using var client = factory.CreateClient();
+        if (header) client.DefaultRequestHeaders.Add(IdentityHosting.TestIdentityHeader, "true");
+        var browser = IdentitySecrets.NewToken();
+        using var resolved = await Send(client, "/resolve", browser, new { });
+        var binding = (await Body(resolved, 200)).GetProperty("binding");
+        var requestId = Guid.NewGuid();
+        var root = new
+        {
+            requestId, expectedBinding = Expected(binding), tag = "Policy", excludeFromLeaderboards = body
+        };
+        using var created = await Send(client, "/root", browser, root);
+        var createdBody = await Body(created, 201);
+        var identity = createdBody.GetProperty("binding").GetProperty("identity");
+        Assert.Equal(header || body, identity.TryGetProperty("excludeFromLeaderboards", out var excluded));
+        if (header || body) Assert.True(excluded.GetBoolean());
+        using var replay = await Send(client, "/root", browser, root);
+        Assert.Equal(createdBody.GetRawText(), (await Body(replay, 201)).GetRawText());
+        client.DefaultRequestHeaders.Remove(IdentityHosting.TestIdentityHeader);
+        using var later = await Send(client, "/resolve", browser, new { });
+        Assert.Equal(identity.GetRawText(),
+            (await Body(later, 200)).GetProperty("binding").GetProperty("identity").GetRawText());
+        if (header && !body)
+        {
+            using var changedPolicy = await Send(client, "/root", browser, root);
+            await Error(changedPolicy, 409, "request_reused");
+        }
+    }
+
+    [Theory]
+    [InlineData("false")]
+    [InlineData("True")]
+    [InlineData("1")]
+    [InlineData("true,false")]
+    public async Task AutomationHeaderIsAnExactOptInRatherThanAnAmbiguousOverride(string marker)
+    {
+        using var client = _factory.CreateClient();
+        using var request = Request("/resolve", IdentitySecrets.NewToken(), "{}");
+        request.Headers.TryAddWithoutValidation(IdentityHosting.TestIdentityHeader, marker);
+        using var response = await client.SendAsync(request);
+        await Error(response, 400, "invalid_request");
+    }
+
+    [Fact]
+    public async Task AnActualEmptyAutomationHeaderIsRejectedByValidation()
+    {
+        // HttpClient omits empty header values, so test this at the HTTP middleware boundary.
+        var context = new DefaultHttpContext();
+        context.Request.Path = "/api/identity/resolve";
+        context.Request.Method = "POST";
+        context.Request.ContentType = "application/json";
+        context.Request.Headers[IdentityHosting.BrowserHeader] = IdentitySecrets.NewToken();
+        context.Request.Headers[IdentityHosting.TestIdentityHeader] = "";
+        context.Response.Body = new MemoryStream();
+        var middleware = new IdentityValidationMiddleware(_ =>
+            throw new InvalidOperationException("Invalid headers must not reach identity operations."));
+        await middleware.InvokeAsync(context, new IdentityOrigins(Options.Create(new RegionSettings())));
+        Assert.Equal(400, context.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RepeatedAutomationHeadersAreRejected()
+    {
+        using var client = _factory.CreateClient();
+        using var request = Request("/resolve", IdentitySecrets.NewToken(), "{}");
+        request.Headers.TryAddWithoutValidation(IdentityHosting.TestIdentityHeader, new[] { "true", "true" });
+        using var response = await client.SendAsync(request);
+        await Error(response, 400, "invalid_request");
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("\"true\"")]
+    [InlineData("1")]
+    [InlineData("{}")]
+    [InlineData("[]")]
+    [InlineData("true,\"excludeFromLeaderboards\":false")]
+    public async Task ExclusionJsonRemainsStrictAndDoesNotAcceptDuplicateFields(string value)
+    {
+        using var client = _factory.CreateClient();
+        foreach (var path in new[] { "/root", "/invites" })
+        {
+            var root = path == "/root" ? ",\"tag\":\"Pilot\",\"expectedBinding\":{\"identityId\":null,\"etag\":\"b1\"}" : "";
+            using var request = Request(path, IdentitySecrets.NewToken(),
+                "{\"requestId\":\"" + Guid.NewGuid() + "\"" + root + ",\"excludeFromLeaderboards\":" + value + "}");
+            using var response = await client.SendAsync(request);
+            await Error(response, 400, "invalid_request");
+        }
+    }
+
+    [Fact]
+    public async Task AutomationCannotReclassifyAnExistingPlayerOrPendingInvitation()
+    {
+        using var factory = new Factory();
+        using var client = factory.CreateClient();
+        var original = IdentitySecrets.NewToken();
+        await CreateRoot(client, original);
+        using var inviteResponse = await Send(client, "/invites", original, new { requestId = Guid.NewGuid() });
+        var pendingToken = (await Body(inviteResponse, 201)).GetProperty("inviteToken").GetString();
+        using var resolve = await Send(client, "/resolve", original, new { });
+        var originalBinding = (await Body(resolve, 200)).GetProperty("binding");
+        using var self = await Send(client, "/invites/self", original,
+            new { expectedBinding = Expected(originalBinding) });
+        var selfToken = (await Body(self, 200)).GetProperty("inviteToken").GetString();
+
+        client.DefaultRequestHeaders.Add(IdentityHosting.TestIdentityHeader, "true");
+        using var rename = await Send(client, "/root", original, new
+        {
+            requestId = Guid.NewGuid(), expectedBinding = Expected(originalBinding), tag = "Pilot",
+            excludeFromLeaderboards = true
+        });
+        await Error(rename, 409, "binding_changed");
+        foreach (var token in new[] { selfToken, pendingToken })
+        {
+            var browser = IdentitySecrets.NewToken();
+            using var resolving = await Send(client, "/resolve", browser, new { inviteToken = token });
+            var view = await Body(resolving, 200);
+            var invitation = view.GetProperty("invite");
+            var accepting = new
+            {
+                requestId = Guid.NewGuid(), inviteToken = token,
+                expectedInviteEtag = invitation.GetProperty("etag").GetString(),
+                expectedBinding = Expected(view.GetProperty("binding")),
+                tag = invitation.GetProperty("state").GetString() == "pending" ? "Friend" : null
+            };
+            using var accepted = await Send(client, "/invites/accept", browser, accepting);
+            Assert.False((await Body(accepted, 200)).GetProperty("binding").GetProperty("identity")
+                .TryGetProperty("excludeFromLeaderboards", out _));
+        }
+        using var unchanged = await Send(client, "/resolve", original, new { });
+        Assert.Equal(originalBinding.GetRawText(), (await Body(unchanged, 200)).GetProperty("binding").GetRawText());
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData("")]
     [InlineData("short")]
@@ -217,6 +360,9 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
     [InlineData("/invites/self", "{\"expectedBinding\":{\"etag\":\"x\"}}")]
     [InlineData("/invites/self", "{\"expectedBinding\":{\"identityId\":\"invalid\",\"etag\":\"x\"}}")]
     [InlineData("/invites/self", "{\"expectedBinding\":null}")]
+    [InlineData("/resolve", "{\"excludeFromLeaderboards\":true}")]
+    [InlineData("/invites/accept", "{\"excludeFromLeaderboards\":true}")]
+    [InlineData("/invites/self", "{\"excludeFromLeaderboards\":true}")]
     public async Task MissingRequiredOrMalformedFieldsAreInvalidRequests(string path, string json)
     {
         using var client = _factory.CreateClient();
@@ -329,7 +475,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         using var request = new HttpRequestMessage(HttpMethod.Options, "/api/identity" + path);
         request.Headers.Add("Origin", origin);
         request.Headers.Add("Access-Control-Request-Method", "POST");
-        request.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser");
+        request.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser,x-astervoids-test-identity");
         using var response = await client.SendAsync(request);
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         Private(response);
@@ -340,6 +486,7 @@ public class IdentityEndpointsTests : IClassFixture<IdentityEndpointsTests.Facto
         Assert.False(response.Headers.Contains("Access-Control-Allow-Credentials"));
         var headers = string.Join(",", response.Headers.GetValues("Access-Control-Allow-Headers")).ToLowerInvariant();
         Assert.Contains("x-astervoids-browser", headers);
+        Assert.Contains("x-astervoids-test-identity", headers);
         Assert.Contains("content-type", headers);
         Assert.DoesNotContain("*", headers);
     }

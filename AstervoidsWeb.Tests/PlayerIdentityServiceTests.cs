@@ -16,6 +16,126 @@ public class PlayerIdentityServiceTests
     };
 
     [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task LeaderboardExclusionIsDurableImmutableAndBoundToTheCreationReceipt(bool azure, bool excluded)
+    {
+        using var state = new IdentityTestState(azure);
+        var browser = IdentitySecrets.NewToken();
+        var (binding, request) = await Root(state.Service(), browser, "SameTag", excluded);
+        Assert.Equal(excluded, binding.Identity!.ExcludeFromLeaderboards);
+        var restarted = state.Restart();
+        Assert.Equal(binding, (await Resolve(restarted, browser)).Binding);
+        Assert.Equal(binding.Identity, (await restarted.VerifyPlayerAsync(browser, binding.Identity.Id)).Identity);
+        var replay = await restarted.CreateRootAsync(browser, request);
+        Assert.Equal(binding, Read<BindingReply>(replay, 201).Binding);
+        Assert.Equal(excluded, replay.Body.GetProperty("binding").GetProperty("identity")
+            .TryGetProperty("excludeFromLeaderboards", out _));
+        Error(await restarted.CreateRootAsync(browser,
+            request with { ExcludeFromLeaderboards = !excluded }), "request_reused");
+        Error(await restarted.CreateRootAsync(browser,
+            new(Guid.NewGuid(), Expect(binding), binding.Identity.Tag, !excluded)), "binding_changed");
+
+        var identity = Assert.IsType<PlayerIdentityRow>(
+            await state.Store.ReadAsync(IdentityRows.PlayerKey(binding.Identity.Id), default));
+        Assert.Equal(excluded, identity.ExcludeFromLeaderboards);
+        var (sameTag, _) = await Root(restarted, IdentitySecrets.NewToken(), "SameTag", !excluded);
+        Assert.NotEqual(binding.Identity.Id, sameTag.Identity!.Id);
+        Assert.Equal(!excluded, sameTag.Identity.ExcludeFromLeaderboards);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyEligibleIdentityRowsAndIdempotencyHashesKeepTheirExistingShape(bool azure)
+    {
+        using var state = new IdentityTestState(azure);
+        var browser = IdentitySecrets.NewToken();
+        var (binding, request) = await Root(state.Service(), browser);
+        var legacyBody = JsonSerializer.Serialize(new
+        {
+            requestId = request.RequestId, expectedBinding = request.ExpectedBinding, tag = request.Tag
+        }, IdentityJson.Options);
+        Assert.Equal(legacyBody, JsonSerializer.Serialize(request, IdentityJson.Options));
+        var receipt = Assert.IsType<IdentityOperationRow>(await state.Store.ReadAsync(
+            IdentityRows.OperationKey(IdentitySecrets.Hash(browser), request.RequestId), default));
+        Assert.Equal(IdentitySecrets.Hash(legacyBody), receipt.BodyHash);
+        var row = await state.Store.ReadAsync(IdentityRows.PlayerKey(binding.Identity!.Id), default);
+        var payload = JsonSerializer.Serialize<IdentityRow>(row!, IdentityJson.Options);
+        Assert.DoesNotContain("excludeFromLeaderboards", payload);
+        Assert.False(Assert.IsType<PlayerIdentityRow>(
+            JsonSerializer.Deserialize<IdentityRow>(payload, IdentityJson.Options)).ExcludeFromLeaderboards);
+        var invite = new CreateInviteRequest(Guid.NewGuid());
+        Assert.Equal(JsonSerializer.Serialize(new { requestId = invite.RequestId }, IdentityJson.Options),
+            JsonSerializer.Serialize(invite, IdentityJson.Options));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExcludedInvitationsAndAllDescendantsKeepTheirPolicyWithoutAnotherOptIn(bool azure)
+    {
+        using var state = new IdentityTestState(azure);
+        var browser = IdentitySecrets.NewToken();
+        var (original, _) = await Root(state.Service(), browser, excludeFromLeaderboards: true);
+        var self = await Self(state.Service(), browser, original);
+        var recoveredBrowser = IdentitySecrets.NewToken();
+        var recovered = await Resolve(state.Restart(), recoveredBrowser, self);
+        var recoveredBinding = Read<BindingReply>(await state.Restart().AcceptInviteAsync(recoveredBrowser,
+            new(Guid.NewGuid(), self, recovered.Invite!.Etag, Expect(recovered.Binding)))).Binding;
+        Assert.Equal(original.Identity, recoveredBinding.Identity);
+
+        browser = recoveredBrowser;
+        for (var generation = 0; generation < 3; generation++)
+        {
+            var request = new CreateInviteRequest(Guid.NewGuid(), ExcludeFromLeaderboards: false);
+            var invitation = Read<InviteTokenReply>(
+                await state.Restart().CreateInviteAsync(browser, request), 201).InviteToken;
+            Assert.Equal(invitation, Read<InviteTokenReply>(
+                await state.Restart().CreateInviteAsync(browser, request), 201).InviteToken);
+            var recipient = IdentitySecrets.NewToken();
+            var pending = await Resolve(state.Restart(), recipient, invitation);
+            var pendingRow = Assert.IsType<PlayerIdentityRow>(await state.Store.ReadAsync(
+                IdentityRows.PlayerKey(pending.Invite!.IdentityId), default));
+            Assert.True(pendingRow.ExcludeFromLeaderboards);
+            Assert.Null(pendingRow.Tag);
+            var accepted = Read<BindingReply>(await state.Restart().AcceptInviteAsync(recipient,
+                new(Guid.NewGuid(), invitation, pending.Invite.Etag, Expect(pending.Binding), "Friend"))).Binding;
+            Assert.True(accepted.Identity!.ExcludeFromLeaderboards);
+            Assert.True((await Resolve(state.Restart(), recipient)).Binding.Identity!.ExcludeFromLeaderboards);
+            browser = recipient;
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OptingOutANewInvitationDoesNotReclassifyItsCreatorOrExistingInvitations(bool azure)
+    {
+        using var state = new IdentityTestState(azure);
+        var creator = IdentitySecrets.NewToken();
+        var (binding, _) = await Root(state.Service(), creator);
+        var normalInvite = Read<InviteTokenReply>(
+            await state.Service().CreateInviteAsync(creator, new(Guid.NewGuid())), 201).InviteToken;
+        var excludedRequest = new CreateInviteRequest(Guid.NewGuid(), ExcludeFromLeaderboards: true);
+        var excludedInvite = Read<InviteTokenReply>(
+            await state.Service().CreateInviteAsync(creator, excludedRequest), 201).InviteToken;
+        Error(await state.Service().CreateInviteAsync(creator,
+            excludedRequest with { ExcludeFromLeaderboards = false }), "request_reused");
+        Assert.Equal(binding, (await Resolve(state.Restart(), creator)).Binding);
+        foreach (var (invite, excluded) in new[] { (normalInvite, false), (excludedInvite, true) })
+        {
+            var recipient = IdentitySecrets.NewToken();
+            var pending = await Resolve(state.Restart(), recipient, invite);
+            var accepted = Read<BindingReply>(await state.Restart().AcceptInviteAsync(recipient,
+                new(Guid.NewGuid(), invite, pending.Invite!.Etag, Expect(pending.Binding), "Friend"))).Binding;
+            Assert.Equal(excluded, accepted.Identity!.ExcludeFromLeaderboards);
+        }
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task ConcurrentResolve_InsertsOneUnboundBrowser_WithoutIssuingAnIdentity(bool azure)

@@ -1,5 +1,6 @@
 import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
+import { configureAutomatedIdentities } from './automated-identities.mjs';
 import { maximumLengthTag, provisionPlayer } from './identity-helpers.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
@@ -21,17 +22,21 @@ const test = base.extend({
                 });
                 context.setDefaultTimeout(15_000);
                 context.setDefaultNavigationTimeout(30_000);
+                await configureAutomatedIdentities(context);
                 const tag = options.tag ?? `Pilot${opened.length + 1}`;
                 await provisionPlayer(context, tag);
                 const page = await context.newPage();
                 const health = {
                     uncaught: 0, consoleErrors: 0, hubFrames: 0,
-                    offOrigin: 0, redirects: 0, requestFailures: 0,
+                    offOrigin: 0, redirects: 0, requestFailures: 0, scoreRequests: 0,
                 };
                 opened.push({ context, page, health, closed: false });
                 page.on('pageerror', () => health.uncaught++);
                 page.on('console', message => {
                     if (message.type() === 'error') health.consoleErrors++;
+                });
+                page.on('request', request => {
+                    if (new URL(request.url()).pathname === '/api/leaderboard/scores') health.scoreRequests++;
                 });
                 page.on('websocket', socket => {
                     const url = new URL(socket.url());
@@ -94,6 +99,7 @@ const test = base.extend({
                 expect(health.offOrigin, 'No requests leave the selected origin').toBe(0);
                 expect(health.redirects, 'No HTTP redirects are followed').toBe(0);
                 expect(health.requestFailures, 'No guarded HTTP requests fail').toBe(0);
+                expect(health.scoreRequests, 'Automated named players never submit public high scores').toBe(0);
             }
         }
     },
@@ -1214,6 +1220,8 @@ async function readablePersonalResults(page, expected, requireScroll = false) {
         .toBeLessThanOrEqual(geometry.personalTotal.top + 1);
     expect(geometry.personalTotal.bottom, 'Your Score stays above Team Score at game over')
         .toBeLessThanOrEqual(geometry.total.top + 1);
+    expect(geometry.total.top - geometry.personalTotal.bottom,
+        'Personal and team totals are consecutive lines without an extra blank line').toBeCloseTo(0, 1);
     expect(geometry.total.bottom, 'The score summary does not overlap the scrollable standings')
         .toBeLessThanOrEqual(geometry.results.top + 1);
     expect(geometry.prompt.fontSize, 'The desktop menu instruction remains readable').toBeGreaterThanOrEqual(10);

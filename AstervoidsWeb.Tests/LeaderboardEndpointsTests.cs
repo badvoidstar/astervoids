@@ -159,6 +159,90 @@ public class LeaderboardEndpointsTests : IClassFixture<LeaderboardEndpointsTests
         Assert.Empty((await Body(query, 200)).GetProperty("entries").EnumerateArray());
     }
 
+    [Fact]
+    public async Task AutomationIsNeverVisibleToPublicQueriesEvenWithoutMarkerAndAfterInvitationRecovery()
+    {
+        using var factory = new Factory();
+        using var automatedClient = factory.CreateClient();
+        using var ordinaryClient = factory.CreateClient();
+        var browser = IdentitySecrets.NewToken();
+        automatedClient.DefaultRequestHeaders.Add(IdentityHosting.TestIdentityHeader, "true");
+        var binding = await CreatePlayer(automatedClient, browser, "SameTag");
+        Assert.True(binding.Identity!.ExcludeFromLeaderboards);
+        automatedClient.DefaultRequestHeaders.Remove(IdentityHosting.TestIdentityHeader);
+        var request = LeaderboardTestState.Submission(binding.Identity.Id, score: 0);
+        using var before = await Send(ordinaryClient, QueryPath, null, new { });
+        Assert.Empty((await Body(before, 200)).GetProperty("entries").EnumerateArray());
+        using var initial = await Send(automatedClient, ScoresPath, browser, request);
+        await Error(initial, 403, "leaderboard_ineligible");
+        Assert.False(File.Exists(LeaderboardHosting.CompanionDataFile(factory.DataFile)));
+
+        var ordinaryBrowser = IdentitySecrets.NewToken();
+        var ordinary = await CreatePlayer(ordinaryClient, ordinaryBrowser, "SameTag");
+        Assert.False(ordinary.Identity!.ExcludeFromLeaderboards);
+        using var realScore = await Send(ordinaryClient, ScoresPath, ordinaryBrowser,
+            LeaderboardTestState.Submission(ordinary.Identity.Id, score: 23));
+        await Body(realScore, 200);
+        foreach (var score in new uint[] { 1, 100, uint.MaxValue })
+        {
+            using var checkpoint = await Send(automatedClient, ScoresPath, browser, request with { Score = score });
+            await Error(checkpoint, 403, "leaderboard_ineligible");
+            await AssertOnlyOrdinaryScore();
+        }
+
+        using var self = await Send(automatedClient, "/api/identity/invites/self", browser,
+            new SelfInviteRequest(IdentityTestState.Expect(binding)));
+        var selfToken = (await Body(self, 200)).GetProperty("inviteToken").GetString()!;
+        using var friend = await Send(automatedClient, "/api/identity/invites", browser,
+            new CreateInviteRequest(Guid.NewGuid()));
+        var friendToken = (await Body(friend, 201)).GetProperty("inviteToken").GetString()!;
+        foreach (var token in new[] { selfToken, friendToken })
+        {
+            var otherBrowser = IdentitySecrets.NewToken();
+            using var resolved = await Send(ordinaryClient, "/api/identity/resolve", otherBrowser, new { inviteToken = token });
+            var view = (await Body(resolved, 200)).Deserialize<ResolveIdentityReply>(IdentityJson.Options)!;
+            using var accepted = await Send(ordinaryClient, "/api/identity/invites/accept", otherBrowser,
+                new AcceptInviteRequest(Guid.NewGuid(), token, view.Invite!.Etag,
+                    IdentityTestState.Expect(view.Binding), view.Invite.State == "pending" ? "Friend" : null));
+            var inherited = (await Body(accepted, 200)).Deserialize<BindingReply>(IdentityJson.Options)!.Binding;
+            Assert.True(inherited.Identity!.ExcludeFromLeaderboards);
+            using var forged = await Send(ordinaryClient, ScoresPath, otherBrowser,
+                request with { PlayerId = inherited.Identity.Id, Score = uint.MaxValue });
+            await Error(forged, 403, "leaderboard_ineligible");
+            await AssertOnlyOrdinaryScore();
+        }
+        Assert.DoesNotContain(factory.Logs.Messages, message =>
+            message.Contains(browser, StringComparison.Ordinal) || message.Contains(selfToken, StringComparison.Ordinal)
+            || message.Contains(friendToken, StringComparison.Ordinal) || message.Contains("SameTag", StringComparison.Ordinal));
+
+        async Task AssertOnlyOrdinaryScore()
+        {
+            using var query = await Send(ordinaryClient, QueryPath, null, new { });
+            var row = Assert.Single((await Body(query, 200)).GetProperty("entries").EnumerateArray());
+            Assert.Equal(23u, row.GetProperty("score").GetUInt32());
+            Assert.Equal("SameTag", row.GetProperty("name").GetString());
+        }
+    }
+
+    [Fact]
+    public async Task ExcludedSubmissionsStillUseTheExistingIdentityAndScoreRateLimits()
+    {
+        using var factory = new Factory();
+        factory.Overrides["Identity:RateLimit:BrowserPermitLimit"] = "1";
+        factory.Overrides["Leaderboard:RateLimit:ScoreBrowserPermitLimit"] = "1";
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add(IdentityHosting.TestIdentityHeader, "true");
+        var browser = IdentitySecrets.NewToken();
+        var player = await CreatePlayer(client, browser);
+        using var invitation = await Send(client, "/api/identity/invites", browser, new { requestId = Guid.NewGuid() });
+        await Limited(invitation, 60);
+        var request = LeaderboardTestState.Submission(player.Identity!.Id);
+        using var excluded = await Send(client, ScoresPath, browser, request);
+        await Error(excluded, 403, "leaderboard_ineligible");
+        using var limited = await Send(client, ScoresPath, browser, request);
+        await Limited(limited, 60);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -272,6 +356,8 @@ public class LeaderboardEndpointsTests : IClassFixture<LeaderboardEndpointsTests
     [InlineData(",\"score\":0")]
     [InlineData(",\"Score\":0")]
     [InlineData(",\"binding\":{\"identityId\":\"forged\"}")]
+    [InlineData(",\"excludeFromLeaderboards\":false")]
+    [InlineData(",\"excludeFromLeaderboards\":true")]
     public async Task NamesDuplicatesAndUnmappedScoreFieldsAreNeverAccepted(string extra)
     {
         using var client = _factory.CreateClient();
@@ -382,7 +468,7 @@ public class LeaderboardEndpointsTests : IClassFixture<LeaderboardEndpointsTests
         using var preflight = new HttpRequestMessage(HttpMethod.Options, path);
         preflight.Headers.Add("Origin", StaticOrigin);
         preflight.Headers.Add("Access-Control-Request-Method", "POST");
-        preflight.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser");
+        preflight.Headers.Add("Access-Control-Request-Headers", "content-type,x-astervoids-browser,x-astervoids-test-identity");
         using var permission = await client.SendAsync(preflight);
         Assert.Equal(HttpStatusCode.NoContent, permission.StatusCode);
         Private(permission);

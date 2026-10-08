@@ -92,7 +92,7 @@ const PlayerIdentity = (function () {
                         'invalid_request', 'invalid_tag', 'invalid_browser_credential',
                         'invite_not_found', 'identity_required', 'binding_changed',
                         'invite_changed', 'request_reused', 'rate_limited', 'identity_unavailable',
-                        'leaderboard_unavailable',
+                        'leaderboard_unavailable', 'leaderboard_ineligible',
                     ]);
                     const error = failure(known.has(data?.error?.code) ? data.error.code : unavailable);
                     const retryAfter = Number(response.headers?.get('Retry-After'));
@@ -158,7 +158,9 @@ const PlayerIdentity = (function () {
         function adopt(next) {
             if (!next || typeof next.etag !== 'string' || !Number.isSafeInteger(next.revision)
                 || next.revision < 0 || (next.identity !== null
-                    && (!GUID_PATTERN.test(next.identity?.id) || !getTagPattern().test(next.identity?.tag)))) {
+                    && (!GUID_PATTERN.test(next.identity?.id) || !getTagPattern().test(next.identity?.tag)
+                        || (next.identity.excludeFromLeaderboards !== undefined
+                            && typeof next.identity.excludeFromLeaderboards !== 'boolean')))) {
                 throw failure('identity_unavailable');
             }
             const previous = binding?.identity ?? null;
@@ -166,9 +168,11 @@ const PlayerIdentity = (function () {
                 etag: next.etag, revision: next.revision,
                 identity: next.identity ? Object.freeze({
                     id: next.identity.id.toLowerCase(), tag: next.identity.tag,
+                    ...(next.identity.excludeFromLeaderboards === true ? { excludeFromLeaderboards: true } : {}),
                 }) : null,
             };
-            if (previous?.id !== binding.identity?.id || previous?.tag !== binding.identity?.tag) {
+            if (previous?.id !== binding.identity?.id || previous?.tag !== binding.identity?.tag
+                || previous?.excludeFromLeaderboards !== binding.identity?.excludeFromLeaderboards) {
                 for (const listener of listeners) listener(binding.identity, previous);
             }
         }
@@ -234,6 +238,7 @@ const PlayerIdentity = (function () {
                     if (binding.identity.id !== snapshot.playerId?.toLowerCase()) {
                         throw failure('binding_changed');
                     }
+                    if (binding.identity.excludeFromLeaderboards) throw failure('leaderboard_ineligible');
                     return credential();
                 });
                 const result = await leaderboardRequest('/scores', snapshot, token);

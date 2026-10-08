@@ -91,7 +91,8 @@ Solo retains its existing score mechanics and shows the active tag beside `Score
 **Leaderboards**, second in the main menu's second button group after Fullscreen,
 opens a durable high-score table with **Rank, Name, Score, Wave, and Difficulty**.
 Each named player's solo game or multiplayer participation has one entry, updated
-as their personal score grows. Guests and pure spectators never create entries.
+as their personal score grows. Guests, pure spectators, and explicitly excluded
+automated test accounts never create entries.
 Multiple browsers using the same identity in one multiplayer session share an
 entry, just as they share the session's participant total.
 
@@ -102,6 +103,9 @@ The three filter buttons advance once per click/tap and wrap back to **Any**:
 | Team Size | 1 through the configured session capacity |
 | Aspect Ratio | Portrait, Landscape, Rectangle |
 | Difficulty | Shifter, Dancer, Raver, Survivor |
+
+Button labels remain on one line at a fixed height. Narrow layouts reflow the
+controls and fit native text sizes rather than wrapping or scaling rendered text.
 
 Team Size is the peak simultaneous session membership observed while the player
 participates, including guest and spectator members; solo games use 1. Aspect
@@ -174,8 +178,11 @@ Leaderboard scenarios cover personal solo/multiplayer checkpoints, reload
 durability, guest exclusion, filter cycles, the configured row limit, and
 mouse/touch inertia. Scripted score-seeding fixtures run only against isolated
 local storage, not deployed tables. Remote smoke includes read-only access to
-the public leaderboard; ordinary named gameplay scenarios can still record
-their earned scores in the preview's isolated table.
+the public leaderboard. Ordinary named gameplay and identity scenarios create
+durably excluded test identities and assert that no score requests are sent,
+including after recovery in a browser without the automation marker. Local-only
+score-persistence scenarios explicitly use eligible identities in their isolated
+temporary File store; that opt-out is rejected for remote runs.
 
 To test an **already deployed branch preview**, copy its non-secret default ACA
 URL from the deployment summary (the following hostname is a placeholder):

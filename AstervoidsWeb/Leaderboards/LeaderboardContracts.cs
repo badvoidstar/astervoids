@@ -28,6 +28,7 @@ internal sealed record LeaderboardResult(int StatusCode, JsonElement Body)
     public static LeaderboardResult Failure(string code, int? statusCode = null) => new(statusCode ?? (code switch
     {
         "invalid_browser_credential" => 401,
+        "leaderboard_ineligible" => 403,
         "identity_required" or "binding_changed" => 409,
         "rate_limited" => 429,
         "leaderboard_unavailable" => 503,

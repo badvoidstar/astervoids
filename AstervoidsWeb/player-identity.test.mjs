@@ -97,6 +97,39 @@ test('binding and active-invite responses reject tags beyond the configured maxi
     }
 });
 
+test('durable leaderboard exclusion survives creation, refresh and invitation recovery as frozen public metadata', async () => {
+    const h = subject();
+    const identity = { ...first, excludeFromLeaderboards: true };
+    const excluded = { ...binding, identity };
+    h.replies.push(resolved(), { binding: excluded }, resolved(excluded, active), { binding: excluded });
+    await h.client.resolve();
+    await h.client.create(first.tag);
+    assert.deepEqual(h.client.current(), identity);
+    assert.equal(Object.isFrozen(h.client.current()), true);
+    await h.client.resolve(token);
+    await h.client.accept(token, active);
+    assert.deepEqual(h.client.current(), identity);
+    assert.equal(h.requests.some(request => request.init.headers['X-Astervoids-Test-Identity']), false);
+});
+
+test('ordinary and legacy identities keep the same public shape when exclusion is absent or explicitly false', async () => {
+    for (const identity of [first, { ...first, excludeFromLeaderboards: false }]) {
+        const h = subject();
+        h.replies.push(resolved({ ...binding, identity }));
+        await h.client.resolve();
+        assert.deepEqual(h.client.current(), first);
+    }
+});
+
+test('malformed leaderboard eligibility metadata cannot silently activate an identity', async () => {
+    for (const excludeFromLeaderboards of [null, 0, 1, 'true', {}, []]) {
+        const h = subject();
+        h.replies.push(resolved({ ...binding, identity: { ...first, excludeFromLeaderboards } }));
+        await assert.rejects(h.client.resolve(), { code: 'identity_unavailable' });
+        assert.equal(h.client.current(), null);
+    }
+});
+
 test('invites are captured once and scrubbed before any request, including malformed links', () => {
     for (const hash of [`#invite=${token}`, '#invite=bad', `#invite=${token}&invite=${token}`]) {
         const calls = [];
@@ -322,6 +355,28 @@ test('unbound and differently bound browsers cannot submit a queued score as a n
     await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'binding_changed' });
     assert.equal(h.requests.length, 1);
     assert.equal(h.client.hasPendingOperation(), false);
+});
+
+test('excluded identities can query but do not attempt queued score requests or acknowledge them as recorded', async () => {
+    const h = subject();
+    h.replies.push(resolved({ ...binding, identity: { ...first, excludeFromLeaderboards: true } }));
+    await h.client.resolve();
+    await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'leaderboard_ineligible' });
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.client.hasPendingOperation(), false);
+    const view = { entries: [], limit: 50, maxTeamSize: 4 };
+    h.replies.push(view);
+    assert.deepEqual(await h.client.queryLeaderboard(), view);
+    assert.deepEqual(h.requests[1].init.headers, { 'Content-Type': 'application/json' });
+});
+
+test('the authoritative server ineligible outcome stays explicit even for an older client binding view', async () => {
+    const h = subject();
+    h.replies.push(resolved(binding), { status: 403, body: { error: { code: 'leaderboard_ineligible' } } });
+    await h.client.resolve();
+    await assert.rejects(h.client.saveLeaderboardScore(leaderboardScore), { code: 'leaderboard_ineligible' });
+    assert.equal(h.client.hasPendingOperation(), false);
+    assert.deepEqual(h.client.current(), first);
 });
 
 test('a delayed score request does not hold the identity lock or block a fresh binding resolution', async () => {

@@ -429,13 +429,22 @@ directions through live SignalR; leaving removes membership and the departed
 ship; rejoining creates a fresh ship that replicates again. The clients leave
 only their own session, then verify it is absent from the active-session list.
 Empty-session retention/expiry is still server-owned. No fake hubs, transport
-responses, or test-only production hooks are used.
+responses, or test-only gameplay hooks are used.
 The leaderboard screen is also opened without starting a game to exercise its
 public query and navigation. Scripted high-score seeding, ranking/filter, and
 drag/inertia scenarios run only in the isolated local File-provider fixture;
 they are explicitly skipped against deployed tables. Regular named gameplay
-scenarios can record their earned scores in the branch preview's isolated
-identity/leaderboard table. Local persistence coverage does not certify live
+and identity scenarios create identities with immutable leaderboard exclusion.
+The server refuses their score submissions even after recovery or invitation
+acceptance without the test marker, and browser fixtures assert that gameplay
+sends no score requests. Only isolated local File-provider score scenarios opt
+out; the helper rejects that opt-out when a remote target is configured.
+
+Deploy the updated identity service before running these smoke fixtures: they
+verify the persisted exclusion before named gameplay starts and fail against
+older servers instead of seeding scores. Legacy unmarked identities remain
+eligible; historical test scores are not guessed from non-unique player names
+or automatically deleted. Local persistence coverage does not certify live
 Azure writes or cross-region consistency.
 
 **Privacy and evidence:** remote output contains only authored scenario names

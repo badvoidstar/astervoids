@@ -577,6 +577,19 @@ storage fail explicitly. Authorization linearizes at the binding read, not an
 atomic transaction spanning later leaderboard writes and identity rebinding.
 The response acknowledges recording with `{ recorded: true }`.
 
+Automated identities have immutable `excludeFromLeaderboards: true` metadata,
+set when creating the root identity or a new invitation identity. Identity
+creation accepts that JSON flag or `X-Astervoids-Test-Identity: true`; it can only
+exclude newly created identities, never reclassify an existing player.
+Invitations descended from an excluded identity inherit exclusion, and accepting
+or recovering an identity retains it even without the marker. Ordinary replies
+omit the false flag, preserving existing response shapes and receipt hashes.
+Gameplay does not capture scores for excluded identities; the server independently
+rejects submissions with HTTP 403 `leaderboard_ineligible` before score-storage
+access. Exclusion does not rely on teardown cleanup or query-time identity scans.
+Legacy identities with no flag remain eligible: historical test rows cannot be
+safely inferred from non-unique names and are not automatically removed.
+
 `POST /api/leaderboard/query` is public and credential-free. The body has optional
 nullable `teamSize`, `aspect` (`portrait`, `landscape`, `square`), and `difficulty`.
 Missing/null means Any. Responses contain `entries`, `limit`, and `maxTeamSize`;
@@ -634,6 +647,9 @@ button group. Any-first cycling filters select team size, play-region aspect,
 and the four difficulty presets. Nonpreset difficulty factors remain visible
 under Any as `Custom (value)`. Five columns show Rank, Name, Score, Wave, Difficulty.
 Loading/error/empty states are distinct; query generations suppress stale results.
+Filter controls reflow into columns with enough label space and retain a fixed
+single-line height. Native font sizes fit the measured content width on very
+narrow layouts; neither labels nor their containers are transform-scaled.
 The table has its own focusable scroller with mouse/touch pointer capture and
 decaying post-release inertia; wheel, keyboard, cancellation, boundaries, and
 reduced-motion preference stop inertia. Text is not canvas-scaled. Screen input
@@ -1175,6 +1191,9 @@ ordinal ascending, then normalized GUID lexical order. Show only the highest
 `floor(maxMembers * 1.5)` rows; the viewer's own persisted total remains above
 the team total even when their row is outside that limit. Pure spectators show
 `Your Score: --`; unavailable history does not invent zero scores.
+The personal and team totals use consecutive text lines without an extra
+vertical margin between them; spacing above the personal total and the solo
+`Final Score` layout are unchanged.
 
 Capacity comes from a matching session advertisement and survives same-session
 reentry. If absent, one lookup per entry uses the already joined hub's

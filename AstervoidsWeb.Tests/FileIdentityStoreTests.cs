@@ -62,6 +62,8 @@ public class FileIdentityStoreTests
     [InlineData("invalid-key")]
     [InlineData("invalid-revision")]
     [InlineData("invalid-receipt")]
+    [InlineData("invalid-exclusion")]
+    [InlineData("inconsistent-exclusion")]
     public async Task StructurallyCorruptRowsCannotProducePartialOrResetState(string corruption)
     {
         using var state = new IdentityTestState();
@@ -90,6 +92,12 @@ public class FileIdentityStoreTests
                 break;
             case "invalid-receipt":
                 rows.First(pair => pair.Key.StartsWith("O:", StringComparison.Ordinal)).Value!["body"] = new JsonObject();
+                break;
+            case "invalid-exclusion":
+                identity.Value!["excludeFromLeaderboards"] = "true";
+                break;
+            case "inconsistent-exclusion":
+                identity.Value!["excludeFromLeaderboards"] = true;
                 break;
         }
         var corrupt = document.ToJsonString();

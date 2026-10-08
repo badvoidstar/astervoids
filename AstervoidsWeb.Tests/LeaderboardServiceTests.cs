@@ -9,6 +9,61 @@ public class LeaderboardServiceTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task ExcludedPlayersNeverReachScoreStorageBeforeDuringOrAfterAutomationAndRebinding(bool azure)
+    {
+        using var state = new LeaderboardTestState(azure);
+        var (browser, player) = await state.Player("SameTag", excludeFromLeaderboards: true);
+        var service = state.Service();
+        var request = Submission(player.Id, score: 0);
+        Assert.Empty(Read<LeaderboardQueryReply>(await service.QueryAsync(new())).Entries);
+        Error(await state.Service(store: new UnavailableLeaderboardStore()).SubmitAsync(browser, request),
+            "leaderboard_ineligible", 403);
+        Error(await service.SubmitAsync(browser, request), "leaderboard_ineligible", 403);
+        Assert.Empty(Read<LeaderboardQueryReply>(await service.QueryAsync(new())).Entries);
+        Assert.False(File.Exists(state.DataFile));
+        if (state.Table is not null)
+        {
+            Assert.Equal(0, state.Table.ReadCount);
+            Assert.Empty(state.Table.Transactions);
+        }
+
+        var (eligibleBrowser, eligible) = await state.Player("SameTag");
+        Recorded(await service.SubmitAsync(eligibleBrowser, Submission(eligible.Id, score: 17)));
+        var expected = new LeaderboardEntry(1, "SameTag", 17, 1, 0.65, 1, "square");
+        foreach (var checkpoint in new uint[] { 1, 100, uint.MaxValue })
+        {
+            Error(await state.Service().SubmitAsync(browser, request with { Score = checkpoint }),
+                "leaderboard_ineligible", 403);
+            Assert.Equal(expected, Assert.Single(Read<LeaderboardQueryReply>(
+                await state.Service().QueryAsync(new())).Entries));
+            Assert.Equal(expected, Assert.Single(Read<LeaderboardQueryReply>(
+                await state.Service().QueryAsync(new(1, "square", 0.65))).Entries));
+        }
+
+        var binding = (await IdentityTestState.Resolve(state.Identity.Restart(), browser)).Binding;
+        var invitation = await IdentityTestState.Self(state.Identity.Restart(), browser, binding);
+        var anotherBrowser = IdentitySecrets.NewToken();
+        var view = await IdentityTestState.Resolve(state.Identity.Restart(), anotherBrowser, invitation);
+        var accepted = IdentityTestState.Read<BindingReply>(await state.Identity.Restart().AcceptInviteAsync(
+            anotherBrowser, new(Guid.NewGuid(), invitation, view.Invite!.Etag, IdentityTestState.Expect(view.Binding))));
+        Assert.True(accepted.Binding.Identity!.ExcludeFromLeaderboards);
+        var results = await Task.WhenAll(Enumerable.Range(0, 8).Select(index =>
+            state.Service().SubmitAsync(index % 2 == 0 ? browser : anotherBrowser,
+                request with { Score = uint.MaxValue })));
+        Assert.All(results, result => Error(result, "leaderboard_ineligible", 403));
+        Assert.Null(await state.RestartStore().ReadAsync(request.PlayerId, request.RunId, default));
+        Assert.Equal(expected, Assert.Single(Read<LeaderboardQueryReply>(
+            await state.Service().QueryAsync(new())).Entries));
+        if (state.Table is not null)
+        {
+            Assert.Single(state.Table.Transactions);
+            Assert.Equal(9, state.Table.Snapshot().Count);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task VerifiedIdentitySuppliesImmutableTagAndPublicQueryExposesOnlyRankedScoreMetadata(bool azure)
     {
         using var state = new LeaderboardTestState(azure);

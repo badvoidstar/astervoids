@@ -4,7 +4,7 @@
   "scripts": {
     "test:browser": "playwright test",
     "test:browser:remote": "node browser-smoke/run-remote.mjs",
-    "test:browser:helpers": "node --test browser-smoke/helpers.test.mjs"
+    "test:browser:helpers": "node --test browser-smoke/*.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

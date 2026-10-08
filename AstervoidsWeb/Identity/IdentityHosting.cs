@@ -10,6 +10,7 @@ internal static class IdentityHosting
 {
     public const string CorsPolicy = "IdentityApi";
     public const string BrowserHeader = "X-Astervoids-Browser";
+    public const string TestIdentityHeader = "X-Astervoids-Test-Identity";
     public const string BrowserHashItem = "Astervoids.Identity.BrowserHash";
     public static readonly TimeSpan PreflightMaxAge = TimeSpan.FromMinutes(10);
 
@@ -49,7 +50,7 @@ internal static class IdentityHosting
             var origins = IdentityOrigins.Configured(configuration
                 .GetSection(RegionSettings.SectionName).Get<RegionSettings>() ?? new());
             options.AddPolicy(CorsPolicy, policy => policy.WithOrigins(origins)
-                .WithMethods("POST").WithHeaders("Content-Type", BrowserHeader)
+                .WithMethods("POST").WithHeaders("Content-Type", BrowserHeader, TestIdentityHeader)
                 .WithExposedHeaders("Retry-After")
                 .SetPreflightMaxAge(PreflightMaxAge));
         });

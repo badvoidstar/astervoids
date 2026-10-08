@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { expect } from '@playwright/test';
+import { automatedIdentityHeaders, AUTOMATED_IDENTITY_HEADER } from './automated-identities.mjs';
 
 const { IDENTITY_TAG_MAX_LENGTH } = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/game-config.js');
 
@@ -12,7 +13,8 @@ export function maximumLengthTag(pattern = 'A_b-') {
 // dialog in every scenario. The identity spec exercises that UI separately.
 export async function provisionPlayer(context, tag) {
     const credential = randomBytes(32).toString('base64url');
-    const headers = { 'X-Astervoids-Browser': credential };
+    const automation = await automatedIdentityHeaders(context);
+    const headers = { ...automation, 'X-Astervoids-Browser': credential };
     const resolve = await context.request.post('/api/identity/resolve', {
         headers, data: {}, maxRedirects: 0,
     });
@@ -27,6 +29,10 @@ export async function provisionPlayer(context, tag) {
         },
     });
     expect(create.status(), 'Real backend persists the gameplay fixture identity').toBe(201);
+    const created = await create.json();
+    expect(created.binding?.identity?.excludeFromLeaderboards === true,
+        'The backend persists the fixture leaderboard policy before gameplay')
+        .toBe(automation[AUTOMATED_IDENTITY_HEADER] === 'true');
     await context.addInitScript(value => {
         localStorage.setItem('astervoids.browser-binding', value);
     }, credential);
@@ -51,6 +57,7 @@ export async function openIdentityNaming(page) {
 }
 
 export async function namePlayer(page, tag) {
+    const automation = await automatedIdentityHeaders(page.context());
     await openIdentityNaming(page);
     await page.locator('#identity-tag').fill(tag);
     await completeIdentityAction(page);
@@ -59,6 +66,9 @@ export async function namePlayer(page, tag) {
     { message: 'Onboarding replaces the invitation URL with the site root' }).toBe(true);
     await expect(page.locator('#identity-dialog')).not.toBeVisible();
     await expect(page.locator('#identity-status')).toHaveText(`Playing as ${tag}`);
+    expect(await page.evaluate(() => PlayerIdentity.current()?.excludeFromLeaderboards === true),
+        'UI naming confirms the durable fixture leaderboard policy before gameplay')
+        .toBe(automation[AUTOMATED_IDENTITY_HEADER] === 'true');
 }
 
 export async function captureClipboard(page) {

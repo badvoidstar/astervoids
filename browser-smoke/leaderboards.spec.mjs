@@ -1,14 +1,20 @@
 import { test as base, expect } from '@playwright/test';
 import { provisionPlayer } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
+import { configureAutomatedIdentities } from './automated-identities.mjs';
+
+const localScores = { tag: '@local-score-fixture' };
 
 const test = base.extend({
-    boards: async ({ browser, baseURL }, use) => {
+    boards: async ({ browser, baseURL }, use, testInfo) => {
         const opened = [];
         const boards = {
             async open({ guest = false, viewport = { width: 960, height: 720 }, touch = false } = {}) {
                 const context = await browser.newContext({
                     baseURL, viewport, hasTouch: touch, serviceWorkers: 'block',
+                });
+                await configureAutomatedIdentities(context, {
+                    isolatedLocalScores: testInfo.tags.includes(localScores.tag),
                 });
                 const tag = `LB${Math.random().toString(36).slice(2, 9)}`;
                 if (!guest) await provisionPlayer(context, tag);
@@ -59,7 +65,6 @@ const test = base.extend({
 });
 
 // Scripted high-score fixtures must not seed a real deployed leaderboard.
-const localScores = { tag: '@local-score-fixture' };
 test.beforeEach(async ({}, testInfo) => {
     test.skip(!!process.env.BROWSER_SMOKE_BASE_URL && testInfo.tags.includes(localScores.tag),
         'Synthetic high scores use only the isolated local File-provider browser fixture.');
@@ -110,6 +115,64 @@ test('public Leaderboards screen is readable without playing and returns to the 
     await player.page.locator('#leaderboard-back').click();
     await expect(player.page.locator('#start-screen')).toBeVisible();
     await expect(player.page.locator('#btn-leaderboards')).toBeFocused();
+});
+
+test('leaderboard labels fit one line without changing button height at narrow and column-breakpoint widths', async ({ boards }) => {
+    const { page } = await boards.open({ guest: true });
+    for (const width of [320, 480, 640, 960]) {
+        await page.setViewportSize({ width, height: 480 });
+        const button = page.locator('#btn-leaderboards');
+        await button.scrollIntoViewIfNeeded();
+        await expect.poll(() => button.evaluate(element => {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            const style = getComputedStyle(element);
+            return {
+                lines: range.getClientRects().length,
+                fits: range.getBoundingClientRect().width <= element.clientWidth
+                    - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) + 0.5,
+                height: element.getBoundingClientRect().height,
+                nativeText: style.transform === 'none',
+            };
+        })).toEqual({ lines: 1, fits: true, height: 32, nativeText: true });
+    }
+    await openBoard(page);
+    for (const width of [180, 240, 280, 320, 480, 539, 540, 600, 720, 768, 960]) {
+        await page.setViewportSize({ width, height: 568 });
+        const failures = await page.evaluate(() => {
+            const failures = [];
+            for (const teamSize of [null, 1, leaderboardMaxTeamSize, 2147483647]) {
+                for (const aspect of [null, ...Leaderboards.ASPECTS]) {
+                    for (const difficulty of [null, ...AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS.map(preset => preset.value)]) {
+                        Object.assign(leaderboardFilters, { teamSize, aspect, difficulty });
+                        updateLeaderboardFilters();
+                        for (const button of document.querySelectorAll('#leaderboard-screen .picker-btn')) {
+                            const box = button.getBoundingClientRect();
+                            const style = getComputedStyle(button);
+                            const range = document.createRange();
+                            range.selectNodeContents(button);
+                            const text = range.getBoundingClientRect();
+                            const left = box.left + button.clientLeft + parseFloat(style.paddingLeft);
+                            const right = box.left + button.clientLeft + button.clientWidth - parseFloat(style.paddingRight);
+                            if (range.getClientRects().length !== 1 || style.whiteSpace !== 'nowrap'
+                                || text.left < left - 0.5 || text.right > right + 0.5
+                                || text.top < box.top + 2 || text.bottom > box.bottom - 2
+                                || box.height !== 36 || style.transform !== 'none') {
+                                failures.push({ id: button.id, label: button.textContent,
+                                    height: box.height, fontSize: style.fontSize, width: box.width });
+                            }
+                        }
+                    }
+                }
+            }
+            return failures;
+        });
+        expect(failures, `All filter values and Back to Main fit their native fixed-height buttons at ${width}px`)
+            .toEqual([]);
+    }
+    await page.setViewportSize({ width: 960, height: 720 });
+    await expect(page.locator('#leaderboard-aspect')).toHaveCSS('font-size', '13px');
+    await page.locator('#leaderboard-back').click();
 });
 
 test('named solo checkpoints include zero, update one run and survive a page reload', localScores, async ({ boards }) => {

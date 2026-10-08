@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { webcrypto } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
@@ -199,6 +200,15 @@ test('unbound browsers never submit scores or remove pending records', async () 
     await h.outbox.flush();
     assert.equal(h.requests.length, 0);
     assert.equal(h.entries().length, 1);
+});
+
+test('an excluded identity cannot send any previously queued checkpoint', async () => {
+    const h = outboxHarness();
+    await h.outbox.enqueue(sample());
+    h.environment.identity.current = () => ({ id: playerId, excludeFromLeaderboards: true });
+    await h.outbox.flush();
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.entries().length, 1, 'Exclusion does not silently delete already queued local data');
 });
 
 test('the queue reports capacity instead of evicting unacknowledged records', async () => {
@@ -400,6 +410,53 @@ test('malformed and unavailable queries show errors, not a success-shaped empty 
     assert.equal(changes.at(-1).code, 'leaderboard_unavailable');
 });
 
+test('leaderboard buttons keep a fixed single-line height and reflow into columns that fit', () => {
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    const style = source.match(/#leaderboard-screen \.picker-btn \{([^}]+)\}/)?.[1];
+    assert.ok(style);
+    assert.match(style, /\bheight: 36px;/);
+    assert.match(style, /min-width: 0;/);
+    assert.match(style, /white-space: nowrap;/);
+    assert.match(style, /transition-property: background-color, border-color, color, opacity;/);
+    assert.match(source, /#leaderboard-filters \{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 240px\), 1fr\)\);/);
+    assert.match(source, /#btn-leaderboards \{[^}]*white-space: nowrap;/);
+});
+
+test('button fitting uses native font sizes and available content width, restoring size after widening', () => {
+    const button = {
+        clientWidth: 144, defaultFontSize: 13,
+        textContent: 'Aspect Ratio : Landscape',
+        style: { removeProperty(key) { assert.equal(key, 'font-size'); delete this.fontSize; } },
+    };
+    let target;
+    const width = () => target.textContent.length
+        * parseFloat(target.style.fontSize ?? target.defaultFontSize) * 0.7;
+    const environment = {
+        getComputedStyle: element => ({
+            fontSize: `${element.defaultFontSize}px`, paddingLeft: '8px', paddingRight: '8px',
+        }),
+        document: { createRange: () => ({
+            selectNodeContents(element) { target = element; },
+            getBoundingClientRect: () => ({ width: width() }),
+        }) },
+    };
+    Leaderboards.fitButtonLabels([button], environment);
+    assert.ok(parseFloat(button.style.fontSize) < 13);
+    assert.ok(width() <= button.clientWidth - 16, 'The full label fits inside both padding edges');
+    assert.deepEqual(Object.keys(button.style).sort(), ['fontSize', 'removeProperty']);
+    button.textContent = 'Team Size : 2147483647';
+    Leaderboards.fitButtonLabels([button], environment);
+    assert.ok(width() <= button.clientWidth - 16, 'Configured capacity does not overflow the label');
+    button.clientWidth = 300;
+    Leaderboards.fitButtonLabels([button], environment);
+    assert.equal(button.style.fontSize, undefined, 'Wider buttons regain their normal CSS font size');
+    button.clientWidth = 0;
+    Leaderboards.fitButtonLabels([button], {
+        getComputedStyle() { assert.fail('Hidden buttons must not be measured'); },
+    });
+});
+
 function dragHarness(reduced = false) {
     const handlers = new Map();
     const frames = new Map();
@@ -505,7 +562,9 @@ function captureHarness(options = {}) {
     const snapshots = [];
     const game = {
         mode: options.session ? 'session' : 'solo', state: 'playing', score: 400, wave: 2,
-        playerIdentity: options.guest ? null : { id: playerId, tag: 'Pilot' },
+        playerIdentity: options.guest ? null : {
+            id: playerId, tag: 'Pilot', ...(options.excluded ? { excludeFromLeaderboards: true } : {}),
+        },
         ship: options.spectator ? null : { syncObjectId: shipId, participantId: playerId, score: 25 },
         sessionInfo: options.session ? { id: runId } : null, leaderboardRun: null,
     };
@@ -549,8 +608,8 @@ function captureHarness(options = {}) {
     return { ...functions, game, session, config, dimensions, snapshots, reports: () => reports };
 }
 
-test('only actual named players start records, with zero scores valid and a pinned solo run identity', async () => {
-    for (const options of [{ guest: true }, { spectator: true, session: true }]) {
+test('only eligible named players start records, with zero scores valid and a pinned solo run identity', async () => {
+    for (const options of [{ guest: true }, { excluded: true }, { spectator: true, session: true }]) {
         const h = captureHarness(options);
         h.beginLeaderboardRun();
         await drain();

@@ -26,6 +26,8 @@ internal sealed class LeaderboardService(
         if (verification.Identity is null)
             return LeaderboardResult.Failure(verification.ErrorCode == "identity_unavailable"
                 ? "leaderboard_unavailable" : verification.ErrorCode!);
+        if (verification.Identity.ExcludeFromLeaderboards)
+            return LeaderboardResult.Failure("leaderboard_ineligible");
 
         try
         {

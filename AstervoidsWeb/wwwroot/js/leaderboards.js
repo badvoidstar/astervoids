@@ -133,6 +133,7 @@ const Leaderboards = (function () {
                 'storage_unavailable', 'queue_corrupt', 'queue_full', 'invalid_score',
                 'identity_required', 'binding_changed', 'invalid_browser_credential',
                 'rate_limited', 'invalid_request', 'leaderboard_unavailable', 'identity_unavailable',
+                'leaderboard_ineligible',
             ]);
             const failureCode = allowed.has(error?.code) ? error.code : 'storage_unavailable';
             if (snapshot) {
@@ -221,8 +222,9 @@ const Leaderboards = (function () {
         }
 
         async function sendOne() {
-            const playerId = identity.current()?.id;
-            if (!playerId || now() < nextAttempt) return;
+            const current = identity.current();
+            const playerId = current?.id;
+            if (!playerId || current.excludeFromLeaderboards === true || now() < nextAttempt) return;
             // Sending has its own lock. Network latency never holds the queue
             // lock needed to preserve a newer checkpoint or leave a game.
             await locks.request(SEND_LOCK, { ifAvailable: true }, async lock => {
@@ -275,6 +277,23 @@ const Leaderboards = (function () {
         }
 
         return Object.freeze({ enqueue, flush, refresh });
+    }
+
+    function fitButtonLabels(buttons, environment = globalThis) {
+        for (const button of buttons) {
+            if (button.clientWidth <= 0) continue;
+            button.style.removeProperty('font-size');
+            const style = environment.getComputedStyle(button);
+            const available = button.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+            if (available <= 0) continue;
+            const range = environment.document.createRange();
+            range.selectNodeContents(button);
+            const width = range.getBoundingClientRect().width;
+            if (width > available) {
+                const size = Math.floor(parseFloat(style.fontSize) * available / width * 10) / 10;
+                button.style.fontSize = `${Math.max(1, size)}px`;
+            }
+        }
     }
 
     function attachDragScroll(element, environment = globalThis) {
@@ -357,7 +376,7 @@ const Leaderboards = (function () {
 
     return Object.freeze({
         STORAGE_KEY, MAX_PENDING, ASPECTS, normalizeSnapshot, sameSnapshot, mergeSnapshots,
-        difficultyLabel, nextFilter, validateView, createQuery, createOutbox, attachDragScroll,
+        difficultyLabel, nextFilter, validateView, createQuery, createOutbox, fitButtonLabels, attachDragScroll,
     });
 })();
 

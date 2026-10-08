@@ -320,6 +320,10 @@
                 calc(var(--vp-height, 600) * 0.12 * 1px));
         }
 
+        #gameover-overlay.multiplayer #gameover-score {
+            margin-top: 0;
+        }
+
         #gameover-prompt {
             font-size: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
             margin-top: calc(var(--vp-ref, 600) / 600 * 20 * 1px);
@@ -451,16 +455,28 @@
 
         #leaderboard-filters {
             display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
             gap: 6px;
             flex-shrink: 0;
         }
 
+        #btn-leaderboards {
+            white-space: nowrap;
+            letter-spacing: 0;
+        }
+
         #leaderboard-screen .picker-btn {
+            height: 36px;
             min-height: 36px;
+            min-width: 0;
             padding: 6px 8px;
             margin: 0;
             font-size: 13px;
+            line-height: 1;
+            letter-spacing: 0;
+            white-space: nowrap;
             flex-shrink: 0;
+            transition-property: background-color, border-color, color, opacity;
         }
 
         #leaderboard-scroll {
@@ -511,7 +527,6 @@
         }
 
         @media (min-width: 540px) {
-            #leaderboard-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
             .leaderboard-panel { min-height: 240px; }
         }
 
@@ -10244,6 +10259,11 @@
     const leaderboardRows = document.getElementById('leaderboard-rows');
     const leaderboardStatus = document.getElementById('leaderboard-status');
     const leaderboardDrag = Leaderboards.attachDragScroll(leaderboardScroll);
+    const leaderboardButtons = [
+        document.getElementById('btn-leaderboards'), ...leaderboardScreen.querySelectorAll('.picker-btn'),
+    ];
+    const leaderboardButtonObserver = new ResizeObserver(() => Leaderboards.fitButtonLabels(leaderboardButtons));
+    for (const button of leaderboardButtons) leaderboardButtonObserver.observe(button);
     const leaderboardFilters = { teamSize: null, aspect: null, difficulty: null };
     let leaderboardMaxTeamSize = null;
     let leaderboardCaptureIssue = '';
@@ -10278,13 +10298,16 @@
             rate_limited: 'High scores are saved on this browser and waiting to retry.',
             identity_unavailable: 'High scores are saved on this browser. Services are unavailable; retrying.',
             leaderboard_unavailable: 'High scores are saved on this browser. Leaderboards are unavailable; retrying.',
+            leaderboard_ineligible: 'Automated test accounts are not entered in the leaderboards.',
         };
         const state = leaderboardSaveState;
         const problem = leaderboardCaptureIssue || messages[state.code] || (state.otherIdentity
             ? 'Some high scores are waiting for their original player identity in this browser.' : '');
         const pending = state.pending ? `${state.pending} high score${state.pending === 1 ? '' : 's'} waiting to save.` : '';
+        const identity = PlayerIdentity.current();
         const text = [problem, pending].filter(Boolean).join(' ')
-            || (PlayerIdentity.current() ? '' : 'Guest play is not recorded.');
+            || (identity?.excludeFromLeaderboards === true ? messages.leaderboard_ineligible
+                : identity ? '' : 'Guest play is not recorded.');
         const status = document.getElementById('leaderboard-save-status');
         if (status.textContent !== text) status.textContent = text;
         const notice = document.getElementById('leaderboard-notice');
@@ -10304,7 +10327,7 @@
 
     function beginLeaderboardRun() {
         const identity = game.playerIdentity;
-        if (!identity || !game.ship) {
+        if (!identity || identity.excludeFromLeaderboards === true || !game.ship) {
             game.leaderboardRun = null;
             return;
         }
@@ -10392,6 +10415,7 @@
         document.getElementById('leaderboard-difficulty').textContent = `Difficulty : ${
             leaderboardFilters.difficulty === null ? 'Any'
                 : Leaderboards.difficultyLabel(leaderboardFilters.difficulty, AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS)}`;
+        Leaderboards.fitButtonLabels(leaderboardButtons);
     }
 
     function renderLeaderboardView(view) {

@@ -6,14 +6,17 @@ using AstervoidsWeb.Configuration;
 
 namespace AstervoidsWeb.Identity;
 
-internal sealed record PlayerIdentity(Guid Id, string Tag);
+internal sealed record PlayerIdentity(Guid Id, string Tag,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ExcludeFromLeaderboards = false);
 internal sealed record VerifiedPlayerResult(PlayerIdentity? Identity, string? ErrorCode = null);
 internal sealed record BrowserBinding(PlayerIdentity? Identity, string Etag, long Revision);
 internal sealed record ExpectedBinding(Guid? IdentityId, string Etag);
 internal sealed record InviteView(Guid IdentityId, string State, string? Tag, string Etag);
 internal sealed record ResolveIdentityRequest(string? InviteToken = null);
-internal sealed record RootIdentityRequest(Guid RequestId, ExpectedBinding ExpectedBinding, string Tag);
-internal sealed record CreateInviteRequest(Guid RequestId);
+internal sealed record RootIdentityRequest(Guid RequestId, ExpectedBinding ExpectedBinding, string Tag,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ExcludeFromLeaderboards = false);
+internal sealed record CreateInviteRequest(Guid RequestId,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ExcludeFromLeaderboards = false);
 internal sealed record AcceptInviteRequest(
     Guid RequestId, string InviteToken, string ExpectedInviteEtag,
     ExpectedBinding ExpectedBinding, string? Tag = null);

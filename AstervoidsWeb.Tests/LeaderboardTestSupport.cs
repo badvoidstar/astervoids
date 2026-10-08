@@ -33,10 +33,11 @@ internal sealed class LeaderboardTestState : IDisposable
             Options.Create(new LeaderboardSettings { MaxEntries = limit }),
             Options.Create(new SessionSettings { MaxMembersPerSession = maxTeamSize }));
 
-    public async Task<(string Browser, PlayerIdentity Player)> Player(string tag = "Pilot")
+    public async Task<(string Browser, PlayerIdentity Player)> Player(
+        string tag = "Pilot", bool excludeFromLeaderboards = false)
     {
         var browser = IdentitySecrets.NewToken();
-        var (binding, _) = await IdentityTestState.Root(Identity.Service(), browser, tag);
+        var (binding, _) = await IdentityTestState.Root(Identity.Service(), browser, tag, excludeFromLeaderboards);
         return (browser, binding.Identity!);
     }
 
