@@ -205,10 +205,10 @@ Include when:
 ## Escalation
 
 If blocked or uncertain:
-- Architecture questions → @picard
-- Security concerns → @worf
-- Infrastructure/deployment → @belanna
-- Memory/history questions → @scribe
+- Architecture questions → current architecture owner from `routing.md`
+- Security concerns → current security owner from `routing.md`
+- Infrastructure/deployment → current delivery owner from `routing.md`
+- Memory/history questions → current memory owner from `routing.md`
 
 ---
 
