@@ -146,6 +146,26 @@ test('origin guard retains direct off-origin rejection', async ({ browser }) => 
     });
 });
 
+test('only the explicitly registered loopback fixture is permitted in its guarded tab', async ({ browser }) => {
+    await withOrigins(browser, async ({ page, baseURL, destinationURL, health, destinationRequests }) => {
+        const other = await page.context().newPage();
+        const otherHealth = { offOrigin: 0, redirects: 0, requestFailures: 0 };
+        await installOriginGuard(other, baseURL, otherHealth, { loopbackOrigins: [destinationURL] });
+        await other.goto(baseURL);
+        expect(await other.evaluate(url => fetch(url).then(response => response.ok), destinationURL)).toBe(true);
+        expect(destinationRequests()).toBe(1);
+        expect(otherHealth).toEqual({ offOrigin: 0, redirects: 0, requestFailures: 0 });
+        await page.goto(baseURL);
+        expect(await page.evaluate(url => fetch(url).then(() => false, () => true), destinationURL)).toBe(true);
+        expect(destinationRequests(), 'Another guarded tab cannot inherit the fixture allowlist').toBe(1);
+        expect(health).toEqual({ offOrigin: 1, redirects: 0, requestFailures: 0 });
+        const unregistered = destinationURL.replace('127.0.0.1', 'localhost');
+        expect(await other.evaluate(url => fetch(url).then(() => false, () => true), unregistered)).toBe(true);
+        expect(destinationRequests()).toBe(1);
+        expect(otherHealth).toEqual({ offOrigin: 1, redirects: 0, requestFailures: 0 });
+    });
+});
+
 test('origin guard refuses same-origin redirects under the no-redirect policy', async ({ browser }) => {
     await withOrigins(browser, async ({ page, baseURL, health, sameOriginDestinationRequests }) => {
         await page.goto(baseURL);

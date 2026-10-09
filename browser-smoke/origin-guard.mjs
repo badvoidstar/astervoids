@@ -1,6 +1,22 @@
-const guardedPages = new WeakSet();
+const guardedPages = new WeakMap();
 
-export async function installOriginGuard(page, baseURL, health) {
+export function allowedGuardOrigins(baseURL, loopbackOrigins = []) {
+    const origins = new Set([baseURL]);
+    if (!loopbackOrigins.length) return origins;
+    for (const value of [baseURL, ...loopbackOrigins]) {
+        let url;
+        try { url = new URL(value); } catch { throw new Error('Only explicitly registered loopback origins are allowed.'); }
+        if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+            || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+            throw new Error('Only explicitly registered loopback origins are allowed.');
+        }
+        origins.add(url.origin);
+    }
+    return origins;
+}
+
+export async function installOriginGuard(page, baseURL, health, { loopbackOrigins = [] } = {}) {
+    const allowedOrigins = allowedGuardOrigins(baseURL, loopbackOrigins);
     const context = page.context();
     const session = await context.newCDPSession(page);
     session.on('Fetch.requestPaused', async event => {
@@ -9,7 +25,7 @@ export async function installOriginGuard(page, baseURL, health) {
             if ([301, 302, 303, 307, 308].includes(responseStatusCode)) {
                 health.redirects++;
                 const location = responseHeaders?.find(header => header.name.toLowerCase() === 'location')?.value;
-                if (location && new URL(location, request.url).origin !== baseURL) health.offOrigin++;
+                if (location && !allowedOrigins.has(new URL(location, request.url).origin)) health.offOrigin++;
                 await session.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
             } else {
                 if (responseErrorReason && responseErrorReason !== 'BlockedByClient' && !context.isClosed()) {
@@ -30,20 +46,21 @@ export async function installOriginGuard(page, baseURL, health) {
     // interception must already be enabled when Chromium creates the request.
     // Native response bodies (including streams) and WebSockets stay intact.
     await session.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Response' }] });
-    guardedPages.add(page);
+    guardedPages.set(page, { allowedOrigins, health });
 
     await context.route('**/*', async route => {
         try {
             const url = route.request().url();
-            if (new URL(url).origin !== baseURL) {
-                health.offOrigin++;
+            // Only explicitly guarded tabs may share a browser binding.
+            // Unguarded popups and frameless workers still cannot bypass interception.
+            const policy = guardedPages.get(route.request().frame().page());
+            if (!policy) {
+                health.requestFailures++;
                 await route.abort('blockedbyclient');
                 return;
             }
-            // Only explicitly guarded tabs may share a browser binding.
-            // Unguarded popups and frameless workers still cannot bypass interception.
-            if (!guardedPages.has(route.request().frame().page())) {
-                health.requestFailures++;
+            if (!policy.allowedOrigins.has(new URL(url).origin)) {
+                policy.health.offOrigin++;
                 await route.abort('blockedbyclient');
                 return;
             }

@@ -1,8 +1,13 @@
 import { test as base, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import { captureClipboard, completeIdentityAction, invitation, maximumLengthTag, namePlayer, openIdentityNaming } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
 import { configureAutomatedIdentities } from './automated-identities.mjs';
+
+const { INITIAL_RESOLVE_POLICY: startupPolicy } =
+    createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/player-identity.js');
 
 const test = base.extend({
     identities: async ({ browser, baseURL }, use) => {
@@ -10,7 +15,7 @@ const test = base.extend({
         const guards = [];
         let uncaught = 0;
         const identities = {
-            async open(path = '/', context = null, beforeNavigate = null) {
+            async open(path = '/', context = null, beforeNavigate = null, guardOptions = {}) {
                 if (!context) {
                     context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
                     contexts.push(context);
@@ -23,7 +28,7 @@ const test = base.extend({
                     if (new URL(request.url()).pathname === '/api/leaderboard/scores') health.scoreRequests++;
                 });
                 guards.push(health);
-                await installOriginGuard(page, baseURL, health);
+                await installOriginGuard(page, baseURL, health, guardOptions);
                 await captureClipboard(page);
                 if (beforeNavigate) await beforeNavigate(page);
                 await page.goto(path);
@@ -48,7 +53,128 @@ const atRoot = page => expect.poll(() => page.evaluate(() =>
     location.pathname === '/' && location.hash === '' && location.search === ''),
 { message: 'Only the site root remains in the address bar' }).toBe(true);
 
-test('static entry prepares the identity region before delayed game scripts without trusting a binding', async ({
+test('static multiregion cold startup overlaps full assessment with automatic initial identity recovery', async ({
+    baseURL, identities,
+}) => {
+    test.skip(Object.hasOwn(process.env, 'BROWSER_SMOKE_BASE_URL'), 'Controlled startup faults are loopback-only.');
+    const servers = [];
+    const delayed = [];
+    const early = new Set();
+    const measured = new Set();
+    const identityOrigins = new Set();
+    let resolves = 0;
+    let releaseIdentity;
+    let releaseRegion = false;
+    let player;
+    const identityReady = new Promise(resolve => { releaseIdentity = resolve; });
+    try {
+        for (let index = 0; index < 2; index++) {
+            const server = createServer((request, reply) => {
+                const path = new URL(request.url, baseURL).pathname;
+                const headers = {
+                    'Access-Control-Allow-Origin': baseURL,
+                    'Access-Control-Allow-Credentials': 'true',
+                    'Access-Control-Allow-Headers': request.headers['access-control-request-headers']
+                        || 'Content-Type,X-Astervoids-Test-Identity,X-SignalR-User-Agent',
+                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                    'Content-Type': 'application/json',
+                };
+                if (request.method === 'OPTIONS') {
+                    reply.writeHead(204, headers).end();
+                } else if (path === '/api/ping') {
+                    const send = () => { if (!reply.destroyed) reply.writeHead(200, headers).end('{"now":0}'); };
+                    if (index === 1 && !releaseRegion) delayed.push(send);
+                    else send();
+                } else if (path === '/api/sessions') {
+                    reply.writeHead(200, headers).end(JSON.stringify({
+                        sessions: [], maxSessions: 6, canCreateSession: true,
+                    }));
+                } else {
+                    // These owned fixtures model regional HTTP readiness, not
+                    // gameplay transport. No identity or membership is accepted.
+                    reply.writeHead(503, headers).end('{"error":"fixture_unavailable"}');
+                }
+            });
+            await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+            servers.push(server);
+        }
+        const origins = [baseURL, ...servers.map(server => `http://127.0.0.1:${server.address().port}`)];
+        player = await identities.open('/', null, async page => {
+            page.on('request', request => {
+                const url = new URL(request.url());
+                if (url.pathname === '/api/ping' && request.method() === 'GET') {
+                    if (url.search) measured.add(url.origin);
+                    else {
+                        early.add(url.origin);
+                        expect(request.headers()['x-astervoids-browser']).toBeUndefined();
+                        expect(request.headers().cookie).toBeUndefined();
+                        expect(request.headers().referer).toBeUndefined();
+                        expect(request.postData()).toBeNull();
+                    }
+                }
+                if (url.pathname.startsWith('/api/identity/')) {
+                    identityOrigins.add(url.origin);
+                    expect(url.pathname, 'Startup never submits an identity mutation').toBe('/api/identity/resolve');
+                }
+            });
+            await page.route(`${baseURL}/region-bootstrap.js`, route => route.fulfill({
+                contentType: 'application/javascript',
+                body: `window.ASTERVOIDS_REGION_BOOTSTRAP = ${JSON.stringify({
+                    regionId: null,
+                    regions: origins.map((hostname, index) => ({ id: `r${index}`, displayName: `Local ${index}`, hostname })),
+                })};`,
+            }));
+            await page.route(`${baseURL}/api/identity/resolve`, async route => {
+                if (++resolves <= 3) {
+                    await route.fulfill({ status: 503, contentType: 'text/html', body: '<html>Starting</html>' });
+                } else {
+                    await identityReady;
+                    await route.fallback();
+                }
+            });
+        }, { loopbackOrigins: origins.slice(1) });
+        await expect.poll(() => resolves, { message: 'Repeated cold HTML 503 responses are automatically retried' }).toBe(4);
+        await expect.poll(() => early.size, { message: 'Every region starts credential-free preparation' }).toBe(3);
+        await expect.poll(() => measured.size, { message: 'Every RTT burst starts before identity completes' }).toBe(3);
+        expect([...identityOrigins]).toEqual([baseURL]);
+        await expect(player.page.locator('#identity-title')).toHaveText('Getting ready');
+        await expect(player.page.locator('#identity-dialog').getByRole('button')).toHaveCount(0);
+        expect(await player.page.evaluate(() => ({
+            started: identityStarted, identity: PlayerIdentity.current(),
+            member: SessionClient.isInSession(), create: getCreateEligibility().canCreateNow,
+        }))).toEqual({ started: false, identity: null, member: false, create: false });
+        await expect.poll(() => player.page.evaluate(() => RegionService.isRegionAvailable('r0'))).toBe(true);
+
+        releaseIdentity();
+        await expect.poll(() => player.page.evaluate(() => !identityBusy)).toBe(true);
+        expect(resolves, 'Recovery required no manual Retry click').toBe(4);
+        if (await player.page.locator('#identity-dialog').isVisible()) {
+            await expect(player.page.locator('#identity-tag')).toBeVisible();
+            await player.page.locator('#identity-ignore').click();
+        }
+        expect(await player.page.evaluate(() => ({
+            all: RegionService.areAllRegionsAssessed(),
+            create: getCreateEligibility().canCreateNow,
+            connected: Boolean(SessionClient.isConnected()),
+        }))).toEqual({ all: false, create: false, connected: false });
+        releaseRegion = true;
+        for (const send of delayed.splice(0)) send();
+        await expect.poll(() => player.page.evaluate(() => RegionService.areAllRegionsAssessed())).toBe(true);
+        await expect.poll(() => player.page.evaluate(() => getCreateEligibility().canCreateNow)).toBe(true);
+        expect(await player.page.evaluate(() => SessionClient.isInSession())).toBe(false);
+    } finally {
+        releaseIdentity();
+        releaseRegion = true;
+        for (const send of delayed.splice(0)) send();
+        if (player) await player.context.close();
+        for (const server of servers) {
+            server.closeAllConnections();
+            await new Promise(resolve => server.close(resolve));
+        }
+    }
+});
+
+test('static entry prepares its single configured region before delayed game scripts without trusting a binding', async ({
     browser, baseURL, identities,
 }) => {
     const context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
@@ -256,12 +382,20 @@ for (const viewport of [
 test('identity failure and busy states keep their actions accessible in a reduced-height viewport', async ({ identities }) => {
     const player = await identities.open();
     await player.page.setViewportSize({ width: 360, height: 300 });
-    await player.page.route('**/api/identity/resolve', route => route.fulfill({
-        status: 503, contentType: 'application/json',
-        body: JSON.stringify({ error: { code: 'identity_unavailable' } }),
-    }));
+    let failedAttempts = 0;
+    await player.page.route('**/api/identity/resolve', route => {
+        failedAttempts++;
+        return route.fulfill({
+            status: 503, contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'identity_unavailable' } }),
+        });
+    });
     await player.page.reload();
-    await expect(player.page.locator('#identity-title')).toHaveText('Player identity unavailable');
+    await expect(player.page.locator('#identity-title')).toHaveText('Player identity unavailable', {
+        timeout: startupPolicy.budgetMs + 5_000,
+    });
+    expect(failedAttempts, 'Persistent cold failures exhaust only the bounded startup attempts')
+        .toBe(startupPolicy.maxAttempts);
     await expectDialogComposition(player.page, '#identity-dialog');
     await player.page.unroute('**/api/identity/resolve');
 

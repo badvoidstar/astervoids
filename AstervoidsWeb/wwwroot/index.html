@@ -4,11 +4,11 @@
     <meta charset="UTF-8">
     <meta name="referrer" content="no-referrer">
     <script src="/js/player-identity.js"></script>
-    <!-- Prepare the static-apex identity region while game assets load. -->
+    <!-- Prepare all configured static-apex regions while game assets load. -->
     <script src="/region-bootstrap.js"></script>
     <script>
-        void PlayerIdentity.prepareRegion().catch(() => {
-            console.warn('Identity region preparation failed; browser binding will still be verified.');
+        void PlayerIdentity.prepareRegions().catch(() => {
+            console.warn('Regional preparation incomplete; browser binding will still be verified.');
         });
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
@@ -13200,7 +13200,10 @@
     // here is non-fatal (e.g. local dev with no manifest configured) — the
     // picker simply shows no region/ping cells. We bind the rttUpdated/coldStart
     // listeners BEFORE awaiting load() so even synchronous emissions are caught.
+    let regionServiceInitialized = false;
     async function initRegionService() {
+        if (regionServiceInitialized) return;
+        regionServiceInitialized = true;
         if (!window.RegionService) {
             sessionPicker.regionDiscoveryState = 'fallback';
             updatePickerButtons();
@@ -13332,6 +13335,17 @@
     }
     document.addEventListener('visibilitychange', handlePickerVisibilityChange);
 
+    function handlePickerPageHide() {
+        void teardownMultiRegionPicker().catch(err => _warn('[Picker] Failed to suspend updates:', err));
+    }
+    function handlePickerPageShow(event) {
+        if (event.persisted && !startGameOperation && isSessionPickerVisible()) {
+            void activateSessionPickerUpdates().catch(err => _warn('[Picker] Failed to restore updates:', err));
+        }
+    }
+    window.addEventListener('pagehide', handlePickerPageHide);
+    window.addEventListener('pageshow', handlePickerPageShow);
+
     async function startMultiRegionPicker() {
         if (!isSessionPickerActive()) return;
 
@@ -13376,6 +13390,8 @@
     }
 
     function pausePickerAssessment() {
+        PlayerIdentity.cancelPreparation();
+        pauseInitialIdentityFlow();
         window.RegionService?.stop();
         sessionListRequestSequence++;
         if (sessionRefreshTimeout != null) {
@@ -13388,6 +13404,7 @@
         if (startScreen.classList.contains('hidden')) return;
         pickerUpdatesActive = true;
         if (!isSessionPickerActive()) return;
+        resumeInitialIdentityFlow();
 
         if (sessionPicker.regionDiscoveryState === 'loaded' && sessionPicker.regions.length > 0) {
             window.RegionService?.start();
@@ -13484,6 +13501,9 @@
     let identityBusy = false;
     let identityStarted = false;
     let identityFlowEpoch = 0;
+    let identityFlowController = null;
+    let identityStartupPaused = false;
+    let identityStartupForceNaming = false;
     let identityInvite = PlayerIdentity.takeInvite();
     let identityRefresh = null;
     let identityRefreshRequested = false;
@@ -13600,8 +13620,12 @@
             ? `Playing as ${identity.tag}` : 'Playing as guest';
         if (!identityStarted) {
             identityStarted = true;
-            initRegionService();
-            connectToSessionHub();
+            const bootstrap = window.ASTERVOIDS_REGION_BOOTSTRAP;
+            // A static multi-region entrypoint has no same-origin hub. Connect
+            // SessionClient only when Create/Join selects its regional route.
+            if (bootstrap?.regionId || !(bootstrap?.regions?.length > 1)) {
+                connectToSessionHub();
+            }
         }
     }
 
@@ -13629,7 +13653,25 @@
         try { await identityLeave; } finally { identityLeave = null; }
     }
 
+    function pauseInitialIdentityFlow() {
+        if (identityStarted || !identityFlowController) return;
+        identityStartupPaused = true;
+        identityFlowEpoch++;
+        identityFlowController.abort();
+        identityFlowController = null;
+    }
+
+    function resumeInitialIdentityFlow() {
+        if (!identityStartupPaused || !isSessionPickerActive()) return;
+        identityStartupPaused = false;
+        void beginIdentityFlow(identityStartupForceNaming);
+    }
+
     async function beginIdentityFlow(forceNaming = false) {
+        identityFlowController?.abort();
+        identityFlowController = null;
+        identityStartupPaused = false;
+        identityStartupForceNaming = forceNaming;
         const epoch = ++identityFlowEpoch;
         const inviteToken = identityInvite?.token;
         const ignore = identityInvite ? redirectIdentityRoot : activateIdentityMenu;
@@ -13642,8 +13684,15 @@
             'Determining your player identity and warming up services. Please wait...',
             false, '', null, null);
         setIdentityBusy(true);
+        if (!identityStarted && !isSessionPickerActive()) {
+            identityStartupPaused = true;
+            return;
+        }
+        const controller = identityFlowController = new AbortController();
         try {
-            const result = await PlayerIdentity.resolve(inviteToken);
+            const result = await (identityStarted
+                ? PlayerIdentity.resolve(inviteToken, { signal: controller.signal })
+                : PlayerIdentity.resolveInitial(inviteToken, { signal: controller.signal }));
             if (epoch !== identityFlowEpoch) return;
             const current = result.binding.identity;
             const invite = result.invite;
@@ -13672,11 +13721,18 @@
                 }, ignore);
         } catch (error) {
             if (epoch !== identityFlowEpoch) return;
+            if (controller.signal.aborted || error.code === 'identity_cancelled') {
+                if (!identityStarted && !isSessionPickerActive()) identityStartupPaused = true;
+                return;
+            }
             const cleanup = leaveIdentityGame();
             PlayerIdentity.deactivate();
             await cleanup;
+            if (epoch !== identityFlowEpoch) return;
             showIdentityDialog('Player identity unavailable', identityMessage(error), false,
-                'Retry', () => beginIdentityFlow(forceNaming), ignore);
+                'Retry', () => beginIdentityFlow(forceNaming), identityInvite ? ignore : null);
+        } finally {
+            if (identityFlowController === controller) identityFlowController = null;
         }
     }
 
@@ -13858,6 +13914,9 @@
         }
     });
 
+    // Discovery/RTT and read-only picker watchers do not require a trusted
+    // identity. Start them in parallel, without enabling gameplay or membership.
+    void initRegionService();
     void beginIdentityFlow();
     
     requestAnimationFrame(gameLoop);  // Use rAF to provide timestamp
