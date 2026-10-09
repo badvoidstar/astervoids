@@ -462,7 +462,6 @@
 
         #btn-leaderboards {
             white-space: nowrap;
-            letter-spacing: 0;
         }
 
         #leaderboard-screen .picker-btn {
@@ -492,23 +491,28 @@
 
         #leaderboard-scroll.dragging { cursor: grabbing; }
         #leaderboard-scroll:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-        #leaderboard-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        #leaderboard-table {
+            --leaderboard-cell-padding: 4px;
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+        }
         #leaderboard-table th,
         #leaderboard-table td {
-            padding: 9px 4px;
+            padding: 9px var(--leaderboard-cell-padding);
             font-size: clamp(11px, 2.4vmin, 16px);
             text-align: left;
             overflow-wrap: anywhere;
         }
         #leaderboard-table th { position: sticky; top: 0; background: #18202b; z-index: 1; }
         #leaderboard-table td { border-top: 1px solid #303946; }
-        #leaderboard-table th:nth-child(1) { width: 12%; }
-        #leaderboard-table th:nth-child(2) { width: 25%; }
-        #leaderboard-table th:nth-child(3) { width: 26%; }
-        #leaderboard-table th:nth-child(4) { width: 13%; }
-        #leaderboard-table th:nth-child(5) { width: 24%; }
-        #leaderboard-table td:nth-child(3),
-        #leaderboard-table td:nth-child(4) { text-align: right; font-variant-numeric: tabular-nums; }
+        #leaderboard-table th:nth-child(1) { width: calc(4ch + 2 * var(--leaderboard-cell-padding)); }
+        #leaderboard-table th:nth-child(3) { width: calc(10ch + 2 * var(--leaderboard-cell-padding)); }
+        #leaderboard-table th:nth-child(4) { width: calc(4ch + 2 * var(--leaderboard-cell-padding)); }
+        #leaderboard-table th:nth-child(5) { width: calc(10ch + 2 * var(--leaderboard-cell-padding)); }
+        #leaderboard-table :is(th, td):nth-child(1),
+        #leaderboard-table :is(th, td):nth-child(4) { text-align: center; font-variant-numeric: tabular-nums; }
+        #leaderboard-table :is(th, td):nth-child(3) { text-align: right; font-variant-numeric: tabular-nums; }
         #leaderboard-status,
         #leaderboard-save-status { flex-shrink: 0; font-size: 12px; line-height: 1.4; margin: 0; }
         #leaderboard-status:empty,
@@ -528,6 +532,10 @@
 
         @media (min-width: 540px) {
             .leaderboard-panel { min-height: 240px; }
+            #leaderboard-table { --leaderboard-cell-padding: 12px; }
+            #leaderboard-table th:nth-child(3) { width: 25%; }
+            #leaderboard-table th:nth-child(4) { width: 16%; }
+            #leaderboard-table th:nth-child(5) { width: 25%; }
         }
 
         /* Keep native text and allow short viewports to scroll the menu. */
@@ -1268,7 +1276,7 @@
                 <p id="leaderboard-status" role="status"></p>
                 <div id="leaderboard-scroll" role="region" aria-label="Ranked high scores" tabindex="0">
                     <table id="leaderboard-table" aria-label="High scores">
-                        <thead><tr><th scope="col">Rank</th><th scope="col">Name</th><th scope="col">Score</th><th scope="col">Wave</th><th scope="col">Difficulty</th></tr></thead>
+                        <thead><tr><th scope="col">Rank</th><th scope="col">Name</th><th scope="col">Score</th><th scope="col" title="Wave reached in the run that produced this score">Wave</th><th scope="col">Difficulty</th></tr></thead>
                         <tbody id="leaderboard-rows"></tbody>
                     </table>
                 </div>

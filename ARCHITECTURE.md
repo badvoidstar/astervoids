@@ -703,9 +703,16 @@ Unchanged checkpoints make no write request. Transient failures back off and
 respect `Retry-After`; no background storage polling keeps an empty server awake.
 
 The native HTML/CSS Leaderboards screen is second in the main menu's second
-button group. Any-first cycling filters select team size, play-region aspect,
+button group; its menu label shares Fullscreen's font and letter spacing.
+Any-first cycling filters select team size, play-region aspect,
 and the four difficulty presets. Nonpreset difficulty factors remain visible
 under Any as `Custom (value)`. Five columns show Rank, Name, Score, Wave, Difficulty.
+Rank has a compact content-sized column, Name takes the remaining space, and
+cell gutters widen on desktop. Rank and Wave are centered; Score is right-aligned,
+with each heading matching its values. Mobile widths reserve room for full-length
+names, scores, and the Difficulty heading without shrinking the native font.
+Wave is saved with that score's run checkpoint, not the player's highest wave
+from another run; its heading tooltip makes that association explicit.
 Loading/error/empty states are distinct; query generations suppress stale results.
 Filter controls reflow into columns with enough label space and retain a fixed
 single-line height. Native font sizes fit the measured content width on very

@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import { provisionPlayer } from './identity-helpers.mjs';
+import { maximumLengthTag, provisionPlayer } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
 import { configureAutomatedIdentities } from './automated-identities.mjs';
 
@@ -119,8 +119,11 @@ test('public Leaderboards screen is readable without playing and returns to the 
 
 test('leaderboard labels fit one line without changing button height at narrow and column-breakpoint widths', async ({ boards }) => {
     const { page } = await boards.open({ guest: true });
-    for (const width of [320, 480, 640, 960]) {
-        await page.setViewportSize({ width, height: 480 });
+    for (const viewport of [
+        { width: 320, height: 240 }, { width: 360, height: 300 },
+        ...[320, 480, 640, 960].map(width => ({ width, height: 480 })),
+    ]) {
+        await page.setViewportSize(viewport);
         const button = page.locator('#btn-leaderboards');
         await button.scrollIntoViewIfNeeded();
         await expect.poll(() => button.evaluate(element => {
@@ -135,6 +138,13 @@ test('leaderboard labels fit one line without changing button height at narrow a
                 nativeText: style.transform === 'none',
             };
         })).toEqual({ lines: 1, fits: true, height: 32, nativeText: true });
+        const typography = await page.evaluate(() =>
+            ['btn-fullscreen', 'btn-leaderboards'].map(id => {
+                const style = getComputedStyle(document.getElementById(id));
+                return { font: style.font, letterSpacing: style.letterSpacing, textTransform: style.textTransform };
+            }));
+        expect(typography[1], `Leaderboards matches Fullscreen at ${viewport.width}x${viewport.height}`)
+            .toEqual(typography[0]);
     }
     await openBoard(page);
     for (const width of [180, 240, 280, 320, 480, 539, 540, 600, 720, 768, 960]) {
@@ -175,6 +185,69 @@ test('leaderboard labels fit one line without changing button height at narrow a
     await page.locator('#leaderboard-back').click();
 });
 
+test('leaderboard columns have balanced gutters and readable headings at mobile and desktop widths', async ({ boards }) => {
+    const player = await boards.open({ guest: true });
+    const { page } = player;
+    await openBoard(page);
+    // Layout-only records exercise the production renderer without saving synthetic scores.
+    await page.evaluate(name => renderLeaderboardView({
+        state: 'ready', limit: 50, maxTeamSize: 4,
+        entries: [
+            { rank: 1, name, score: 3_456_789_012, wave: 1234, difficulty: 0.65 },
+            { rank: 2, name: 'Nova', score: 987650, wave: 12, difficulty: 0.35 },
+            { rank: 50, name: 'Custom', score: 42, wave: 0x7fffffff, difficulty: 0.7000000000000001 },
+        ],
+    }), maximumLengthTag());
+    for (const viewport of [
+        { width: 320, height: 568 }, { width: 360, height: 300 },
+        { width: 539, height: 568 }, { width: 540, height: 568 },
+        { width: 820, height: 900 }, { width: 1280, height: 900 },
+    ]) {
+        await page.setViewportSize(viewport);
+        const geometry = await page.locator('#leaderboard-table').evaluate(table => {
+            const measure = row => [...row.cells].map(cell => {
+                const range = document.createRange();
+                range.selectNodeContents(cell);
+                const text = range.getBoundingClientRect();
+                return { left: text.left, right: text.right, lines: range.getClientRects().length,
+                    width: cell.getBoundingClientRect().width };
+            });
+            const headings = measure(table.tHead.rows[0]);
+            const rows = [...table.tBodies[0].rows].map(measure);
+            const anchor = (cell, index) => index === 0 || index === 3
+                ? (cell.left + cell.right) / 2 : index === 2 ? cell.right : cell.left;
+            return {
+                noHorizontalOverflow: table.parentElement.scrollWidth <= table.parentElement.clientWidth + 1,
+                headingLines: headings.map(cell => cell.lines),
+                typicalRowLines: rows.slice(0, 2).flatMap(row => row.map(cell => cell.lines)),
+                compactRank: headings[0].width < headings[1].width
+                    && headings[0].width <= headings[0].right - headings[0].left
+                        + 2 * parseFloat(getComputedStyle(table.tHead.rows[0].cells[0]).paddingLeft) + 1,
+                gaps: [headings, ...rows].flatMap(row =>
+                    row.slice(1).map((cell, index) => cell.left - row[index].right)),
+                alignment: rows.flatMap(row =>
+                    row.map((cell, index) => anchor(cell, index) - anchor(headings[index], index))),
+                nativeText: getComputedStyle(table).transform === 'none',
+            };
+        });
+        const label = `${viewport.width}x${viewport.height}`;
+        expect(geometry.noHorizontalOverflow, `All columns stay inside the scroller at ${label}`).toBe(true);
+        expect(geometry.headingLines, `Column headings stay on one line at ${label}`).toEqual([1, 1, 1, 1, 1]);
+        expect(geometry.typicalRowLines, `Full-length names and scores remain readable at ${label}`)
+            .toEqual(Array(10).fill(1));
+        expect(geometry.compactRank, `Rank does not waste the name column's space at ${label}`).toBe(true);
+        for (const gap of geometry.gaps) {
+            expect(gap, `Every adjacent column has a clear gutter at ${label}`)
+                .toBeGreaterThanOrEqual((viewport.width >= 540 ? 24 : 8) - 0.5);
+        }
+        for (const offset of geometry.alignment) {
+            expect(Math.abs(offset), `Each value aligns under its own heading at ${label}`).toBeLessThan(0.5);
+        }
+        expect(geometry.nativeText).toBe(true);
+    }
+    expect(player.scoreRequests(), 'Layout samples never write to the leaderboard').toBe(0);
+});
+
 test('named solo checkpoints include zero, update one run and survive a page reload', localScores, async ({ boards }) => {
     const { page, tag } = await boards.open();
     await page.locator('#btn-solo').click();
@@ -206,6 +279,64 @@ test('named solo checkpoints include zero, update one run and survive a page rel
     await page.keyboard.press('Escape');
     await expect(page.locator('#start-screen')).toBeVisible();
     await expect(page.locator('#btn-leaderboards')).toBeFocused();
+});
+
+test('Wave stays visible and paired with its recorded score across runs and filters', localScores, async ({ boards }) => {
+    const { page, tag } = await boards.open();
+    await page.evaluate(async () => {
+        for (const [score, wave, difficulty] of [[12340, 3, 0.35], [5670, 9, 0.65]]) {
+            await PlayerIdentity.saveLeaderboardScore({
+                playerId: PlayerIdentity.current().id, runId: crypto.randomUUID(),
+                score, wave, difficulty, teamSize: 1, aspectRatio: 16 / 9,
+            });
+        }
+    });
+    await openBoard(page);
+    await expect(page.locator('#leaderboard-table th').nth(3))
+        .toHaveAttribute('title', 'Wave reached in the run that produced this score');
+    const scores = () => page.locator('#leaderboard-rows tr').evaluateAll((rows, tag) =>
+        rows.filter(row => row.cells[1].textContent === tag)
+            .map(row => ({ score: Number(row.cells[2].textContent), wave: Number(row.cells[3].textContent) })), tag);
+    for (const viewport of [{ width: 960, height: 720 }, { width: 320, height: 568 }]) {
+        await page.setViewportSize(viewport);
+        expect(await scores(), 'A higher wave in another run never replaces the higher score run wave')
+            .toEqual([{ score: 12340, wave: 3 }, { score: 5670, wave: 9 }]);
+        const columns = await page.evaluate(tag => {
+            const table = document.getElementById('leaderboard-table');
+            const scroll = document.getElementById('leaderboard-scroll').getBoundingClientRect();
+            const textBox = cell => {
+                const range = document.createRange();
+                range.selectNodeContents(cell);
+                return range.getBoundingClientRect();
+            };
+            return [...table.tBodies[0].rows].filter(row => row.cells[1].textContent === tag)
+                .flatMap(row => [2, 3].map(index => {
+                    const text = textBox(row.cells[index]);
+                    const heading = textBox(table.tHead.rows[0].cells[index]);
+                    return {
+                        heading: table.tHead.rows[0].cells[index].textContent,
+                        alignment: index === 3
+                            ? (text.left + text.right - heading.left - heading.right) / 2
+                            : text.right - heading.right,
+                        visible: text.left >= scroll.left && text.right <= scroll.right
+                            && text.top >= scroll.top && text.bottom <= scroll.bottom,
+                    };
+                }));
+        }, tag);
+        for (const column of columns) {
+            expect(column.visible, `${column.heading} values are visible at ${viewport.width}px`).toBe(true);
+            expect(column.alignment, `${column.heading} values align under their own heading`).toBeCloseTo(0, 1);
+        }
+    }
+    await clickFilter(page, 'difficulty', 'Difficulty : Shifter', 'difficulty', 0.2);
+    await clickFilter(page, 'difficulty', 'Difficulty : Dancer', 'difficulty', 0.35);
+    expect(await scores()).toEqual([{ score: 12340, wave: 3 }]);
+    await clickFilter(page, 'difficulty', 'Difficulty : Raver', 'difficulty', 0.5);
+    await clickFilter(page, 'difficulty', 'Difficulty : Survivor', 'difficulty', 0.65);
+    expect(await scores()).toEqual([{ score: 5670, wave: 9 }]);
+    await page.reload();
+    await openBoard(page);
+    expect(await scores()).toEqual([{ score: 12340, wave: 3 }, { score: 5670, wave: 9 }]);
 });
 
 test('guest solo play creates no high-score request or pending entry but can view public scores', localScores, async ({ boards }) => {

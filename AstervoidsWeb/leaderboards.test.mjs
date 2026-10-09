@@ -423,6 +423,19 @@ test('leaderboard buttons keep a fixed single-line height and reflow into column
     assert.match(source, /#btn-leaderboards \{[^}]*white-space: nowrap;/);
 });
 
+test('the menu inherits shared button typography and numeric table headers align with their values', () => {
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    const menuStyle = source.match(/#btn-leaderboards \{([^}]+)\}/)?.[1];
+    assert.ok(menuStyle);
+    assert.doesNotMatch(menuStyle, /font(?:-[a-z-]+)?:|letter-spacing:/);
+    assert.match(source,
+        /#leaderboard-table :is\(th, td\):nth-child\(1\),\s*#leaderboard-table :is\(th, td\):nth-child\(4\) \{ text-align: center;/);
+    assert.match(source, /#leaderboard-table :is\(th, td\):nth-child\(3\) \{ text-align: right;/);
+    assert.match(source,
+        /<th scope="col" title="Wave reached in the run that produced this score">Wave<\/th>/);
+});
+
 test('button fitting uses native font sizes and available content width, restoring size after widening', () => {
     const button = {
         clientWidth: 144, defaultFontSize: 13,
