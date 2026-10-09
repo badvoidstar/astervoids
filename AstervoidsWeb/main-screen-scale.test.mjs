@@ -36,9 +36,10 @@ test('leaderboards is second after fullscreen, followed by paired device setting
     }
 });
 
-test('session lists cap viewport space and truncate labels without horizontal scrolling', () => {
+test('session lists default to two button rows, fit the viewport, and truncate labels without horizontal scrolling', () => {
     const listStyle = source.match(/#session-list \{([^}]+)\}/)?.[1];
     assert.ok(listStyle);
+    assert.match(listStyle, /\n\s*height: calc\(2 \* var\(--menu-button-height\) \+ var\(--menu-row-gap\)\);/);
     assert.match(listStyle, /min-height: var\(--menu-button-height\);/);
     assert.match(listStyle, /max-height: min\(135px, 25dvh, var\(--session-list-available, 100dvh\)\);/);
     assert.match(listStyle, /overflow-x: hidden;/);
@@ -99,11 +100,27 @@ test('landscape aligns the play and utility groups without reserving hidden butt
     assert.ok(landscape);
     assert.match(landscape, /#menu-play \{[^}]*display: flex;[^}]*flex-direction: column;/);
     assert.match(landscape, /#picker-buttons \{ margin-top: auto; \}/);
-    assert.match(landscape, /#menu-utilities \{[^}]*justify-content: space-between;[^}]*gap: 11\.2px;/);
-    assert.match(landscape, /\.menu-utility-group \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*gap: 11\.2px;/);
+    assert.match(source, /#menu-columns \{[^}]*--menu-row-gap: 11\.2px;/);
+    assert.match(landscape, /#menu-utilities \{[^}]*justify-content: space-between;[^}]*gap: var\(--menu-row-gap\);/);
+    assert.match(landscape, /\.menu-utility-group \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*gap: var\(--menu-row-gap\);/);
     assert.match(landscape, /#menu-utilities \.picker-btn\.solo \{ margin-top: 0; \}/);
     assert.match(source, /\.menu-utility-group \{ display: contents; \}/);
     assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
+});
+
+test('the native region picker shares button dimensions without a visible caption', () => {
+    const selectStyle = source.match(/#create-region-select \{([^}]+)\}/)?.[1];
+    const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
+    for (const style of [selectStyle, buttonStyle]) {
+        assert.ok(style);
+        assert.match(style, /\n\s*width: 100%;/);
+        assert.match(style, /\n\s*height: var\(--menu-button-height\);/);
+    }
+    assert.doesNotMatch(selectStyle, /min-height|appearance|transform/);
+    const row = source.match(/<div class="region-select-row"[^>]*>([\s\S]*?)<\/div>/)?.[1];
+    assert.ok(row);
+    assert.match(row, /<select id="create-region-select" aria-label="Host region"><\/select>/);
+    assert.doesNotMatch(row, /<label\b/);
 });
 
 test('main-menu buttons keep Solo Play height while lobby, settings and invite actions share rows', () => {
@@ -165,12 +182,11 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         ['#session-picker .picker-status', 'margin-bottom', 14],
         ['#session-list', 'margin-bottom', 18],
         ['#region-banner', 'margin-bottom', 9],
-        ['.region-select-row', 'gap', 5],
         ['.region-select-row', 'margin-bottom', 7],
         ['#picker-buttons', 'gap', 7],
     ]) {
         const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const propertyPattern = new RegExp(`${property}: ([\\d.]+)px;`);
+        const propertyPattern = new RegExp(`(?:^|[;\\n])\\s*${property}: ([\\d.]+)px;`);
         const style = [...source.matchAll(new RegExp(`${escaped} \\{([^}]+)\\}`, 'g'))]
             .map(match => match[1]).find(rule => propertyPattern.test(rule));
         assert.ok(style, `${selector} defines ${property}`);

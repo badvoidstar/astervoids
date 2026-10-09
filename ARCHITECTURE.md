@@ -427,11 +427,16 @@ controller mode stays independently selectable. Neither adds reload persistence.
 Existing URL/debug factors outside the presets remain intact and display
 `Custom`, with the numeric factor in the accessible label and tooltip; the next
 enabled click selects Shifter. The wider debug tuning range is unchanged.
-The session list shrinks to the space left by fixed-size menu controls and
-scrolls independently, with long names ellipsized instead of widening landscape
-columns. Its minimum row height shares the button-height variable. Visible menu
-content retains native touch scrolling, including the outer menu on very short
-screens, without acquiring gameplay touch controls. A layout observer recomputes
+The native host-region dropdown matches a full-width menu button, including
+while disabled; it has no visible caption and retains the accessible name
+`Host region`. The session list's nominal height is two buttons plus their
+shared vertical gap (2 × 32px + 11.2px = 75.2px), independent of row count.
+In landscape this spans the first two visible utility rows. Viewport limits
+and the space left by fixed-size menu controls can shrink it to one button row.
+It scrolls independently, with long names ellipsized instead of widening
+landscape columns. Visible menu content retains native touch scrolling,
+including the outer menu on very short screens, without acquiring gameplay
+touch controls. A layout observer recomputes
 only the list's height budget as viewport and menu content sizes change.
 Identity resolution first shows a wait-only dialog explaining player-identity
 determination and service warm-up. Its heading receives focus; guest, invitation,

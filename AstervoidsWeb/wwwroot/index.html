@@ -577,6 +577,7 @@
 
         #menu-columns {
             --menu-button-height: 32px;
+            --menu-row-gap: 11.2px;
             display: grid;
             grid-template-columns: minmax(0, 1fr);
             row-gap: 9.6px;
@@ -636,12 +637,12 @@
             #picker-buttons { margin-top: auto; }
             #menu-utilities {
                 justify-content: space-between;
-                gap: 11.2px;
+                gap: var(--menu-row-gap);
             }
             .menu-utility-group {
                 display: flex;
                 flex-direction: column;
-                gap: 11.2px;
+                gap: var(--menu-row-gap);
             }
             #menu-utilities .picker-btn.solo { margin-top: 0; }
         }
@@ -780,6 +781,7 @@
 
         #session-list {
             width: 100%;
+            height: calc(2 * var(--menu-button-height) + var(--menu-row-gap));
             min-height: var(--menu-button-height);
             max-height: min(135px, 25dvh, var(--session-list-available, 100dvh));
             overflow-x: hidden;
@@ -938,29 +940,16 @@
             text-overflow: ellipsis;
         }
 
-        /* Region selector for Create. Native <select> so mobile gets the
-           OS-native wheel/sheet — best touch UX possible and zero JS to
-           build a custom dropdown. 44px min-height is the WCAG 2.5.5 /
-           Apple HIG minimum tap target. The selector lives in its own
-           row above the Create button on touch viewports; the surrounding
-           layout already accommodates a vertical stack so there's no
-           desktop-vs-mobile branching at the markup level. */
+        /* Match the menu buttons while retaining the native region dropdown. */
         .region-select-row {
             width: 100%;
             display: flex;
             flex-direction: column;
             align-items: stretch;
-            gap: 4px;
             margin-bottom: 5.6px;
         }
-        .region-select-row label {
-            font-size: 11px;
-            color: #a8b3c7;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
         #create-region-select {
-            min-height: 44px;
+            height: var(--menu-button-height);
             width: 100%;
             background: rgba(10, 16, 30, 0.92);
             border: 1px solid #56698f;
@@ -1213,8 +1202,7 @@
                         <div id="session-list"></div>
                         <div id="picker-buttons">
                         <div class="region-select-row" id="create-region-row" style="display: none;">
-                            <label for="create-region-select">Host region</label>
-                            <select id="create-region-select"></select>
+                            <select id="create-region-select" aria-label="Host region"></select>
                         </div>
                         <div class="button-row">
                             <button id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer</button>
