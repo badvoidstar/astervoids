@@ -27,7 +27,7 @@ test('generated settings load before their consumers without delaying invitation
     const transport = scripts.indexOf('/js/signalr.min.js');
     assert.ok(bootstrap > 0 && bootstrap < transport);
     assert.equal(scripts.filter(script => script === '/region-bootstrap.js').length, 1);
-    const preparation = html.indexOf('PlayerIdentity.prepareRegion()');
+    const preparation = html.indexOf('PlayerIdentity.prepareRegions()');
     assert.ok(preparation > html.indexOf('<script src="/region-bootstrap.js"')
         && preparation < html.indexOf('<script src="/js/signalr.min.js"'));
     const data = scripts.indexOf('/js/shared-config-data.js');

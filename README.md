@@ -53,6 +53,22 @@ Root onboarding is controlled by `Identity:PromptOnRoot` (default `true`).
 When disabled, an unbound visitor remains a guest until explicitly naming through
 an invite button. Guest play is not entered into the durable leaderboards.
 
+Cold static entry starts credential-free preparation of all configured regions
+concurrently, then overlaps normal regional RTT assessment with the wait-only
+identity check. Create still waits for every region's measured or unavailable
+assessment and chooses by RTT, not which server wakes first. Identity authority
+remains the first configured region (or the regional page's own origin).
+Initial identity resolution alone retries transient network/timeouts and cold
+HTTP 408/429/502/503/504 errors: at most 10 attempts within 60 seconds, with
+15-second HTTP timeouts and backoff increasing from 1 to 9 seconds (honoring
+longer numeric `Retry-After` within that budget). Permanent/protocol/storage
+failures and exhaustion require explicit Retry; mutations are never automatically replayed.
+Hiding or leaving the picker cancels pending startup work; a visible picker
+resumes an interrupted initial check with a fresh budget, not an already
+completed consent/error dialog. No minimum replicas, idle keep-alives or
+background warmers are added. Scale-to-zero still means startup can be slow;
+overlapping the work cannot eliminate container or storage initialization time.
+
 Development uses `App_Data/identity.json`, ignored by git. Azure deployments use
 managed identity and Azure Table Storage, shared across production regions and
 isolated for branch previews. Storage errors are reported rather than replaced
@@ -176,7 +192,13 @@ expires the now-empty session normally.
 Identity scenarios cover naming/reload, repeat/self invitations, new-browser
 confirmation, competing claims, atomic replacement across tabs, clipboard denial,
 and responsive native-text menu layout. Gameplay fixtures create synthetic tags
-through the real backend; no identity or transport responses are fabricated.
+through the real backend. A separate local-only startup regression uses owned
+loopback regional HTTP fixtures and a controlled HTML 503/delayed initial resolve
+to verify concurrent assessment and automatic recovery in Chromium; it does not
+claim live Azure performance or multiplayer playability for those fixtures.
+Run it with `npm run test:browser -- identity.spec.mjs --grep "static multiregion cold startup"`.
+Node startup regressions also cover request timeouts, retry/Retry-After budgets,
+permanent errors, supersession and hidden/solo cancellation.
 Leaderboard scenarios cover personal solo/multiplayer checkpoints, reload
 durability, guest exclusion, filter cycles, the configured row limit, and
 mouse/touch inertia. Scripted score-seeding fixtures run only against isolated

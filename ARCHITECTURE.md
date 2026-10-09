@@ -218,9 +218,11 @@ Picker-facing names come from deployment configuration, never hardcoded labels.
 
 The picker measures regional `/api/ping` RTT in bursts, excludes warm-up and
 initial cold-start contamination, and exposes an EMA and assessment confidence.
-Best-region selection uses hysteresis. Stable successful bursts back off;
+Best-region selection uses hysteresis. Create requires **all configured regions**
+to finish assessment (measured RTT or concluded unavailable), not the first
+region to finish cold-starting. Stable successful bursts back off;
 failure, meaningful latency change, visibility, and network changes cause
-reassessment. Create waits for a usable assessed route; join always follows the
+reassessment. Create also waits for a usable assessed route; join always follows the
 chosen session's `regionId`, not whichever region currently has the lowest RTT.
 
 [MultiRegionSessions](AstervoidsWeb/wwwroot/js/multi-region-sessions.js) merges
@@ -450,20 +452,64 @@ select an identity authority. All identity operations are JSON POSTs under
 The browser sends its credential only in `X-Astervoids-Browser`; requests omit
 cookies, disable caching/referrers, and reject redirects.
 
-On the static entrypoint, a single credential-free `/api/ping` request prepares
-the configured identity region as soon as its bootstrap loads, before the game
-scripts. It neither creates a browser credential nor resolves or trusts a
-binding, and normal identity verification does not wait for it. Regional pages
-skip this extra request because their app is already serving the page. Failed
-preparation reports a constant diagnostic; verification still uses its normal
-error handling.
+On a visible static entrypoint, `prepareRegions()` sends one credential-free
+`/api/ping` per distinct configured region concurrently as soon as its bootstrap
+loads, before the game scripts. All origins are validated before any preparation
+request; only root HTTPS origins (or HTTP loopback) without user info, query or
+fragment are accepted. Requests omit credentials, cookies, bodies and referrers,
+reject redirects, and time out after 15 seconds. Preparation neither creates a
+browser credential nor resolves or trusts a binding. Regional pages and empty
+bootstraps skip it. Failures are memoized and report a constant diagnostic.
+Hiding/leaving the page or tearing down the picker aborts preparation; cancelled
+preparation is not replayed on resume.
+
+Once the game scripts load, normal regional discovery, RTT bursts and read-only
+picker watchers start independently of initial identity resolution. Discovery
+listeners initialize once, not again at identity/menu activation. The identity
+gate still controls gameplay and membership; `identityStarted` does not become
+true early. A static multi-region entrypoint does not connect SessionClient to a
+nonexistent same-origin hub: Create/Join connects the selected regional route.
+Normal visibility/gameplay teardown gates late manifest completions and stops
+probes, polling and watchers. Returning to the visible picker resumes assessment
+without changing the full-comparison, cold-sample exclusion or RTT selection rules.
+
+Only `resolveInitial()` automatically retries: at most **10 attempts in 60
+seconds**, including manifest discovery, Web Lock acquisition, requests and
+backoff. Each HTTP request retains its **15-second** timeout. The first healthy
+response has no added delay. Network failures, request timeouts, and HTTP
+408/429/502/503/504 cold responses may retry with backoff increasing by one
+second per retry (1, 2, ... 9 seconds); a positive numeric `Retry-After` is a
+minimum wait, never permission to exceed the total budget. This permits a
+sequence of quick gateway failures while a region wakes, not just one failed
+attempt. Gateway HTML/empty errors are handled without requiring a JSON body.
+Known permanent errors, unknown JSON error protocols, malformed successful
+responses, invalid invitations/credentials and unavailable local storage/locks
+do not automatically retry. Exhaustion/permanent failure shows explicit Retry,
+not an unverified guest activation.
+
+Each attempt releases its Web Lock before waiting, retains the same durable
+browser credential and uses the unchanged fixed identity authority. A changed
+credential between attempts requires explicit recovery. Normal `resolve()`
+(refresh/reconnect) and all mutations remain single-attempt; mutation receipt
+and exact-request manual retry semantics are unchanged. Cancellation aborts
+queued locks, fetch/body waits and timers; superseded work cannot adopt an
+internal binding, even if a late response arrives. Initial resolution stays
+wait-only while pending. An initially hidden page defers it; hiding or tearing
+down a pending initial flow pauses it. Only a visible active picker (including a
+restored back/forward-cache page) resumes that interrupted flow with a fresh
+bounded budget and the same invitation. A completed confirmation or explicit
+failure dialog is not automatically restarted.
 
 Identity CORS preflight permissions can be cached for ten minutes; identity
 responses remain `no-store`, and every actual request still validates its origin
 and browser credential. These optimizations overlap startup with page loading
 and avoid repeated permission round trips, not container startup or first
-storage-access costs. There is no periodic warm-up or keep-alive mechanism;
-idle containers retain scale-to-zero.
+storage-access costs. There is no minimum replica, periodic/background warm-up,
+scheduled ping or keep-alive change; idle containers retain scale-to-zero.
+This overlaps user-triggered cold work; it cannot guarantee a cold region or
+storage dependency becomes available inside the budget. Controlled
+delay/503/timeout regressions demonstrate ordering and recovery, not live Azure
+startup latency.
 
 Invitations use the current site's origin and `#invite=...`. The early-loaded
 identity script captures and scrubs the fragment before normal startup.

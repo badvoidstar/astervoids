@@ -2,9 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { createRequire } from 'node:module';
+import { webcrypto } from 'node:crypto';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const regionSource = readFileSync(new URL('wwwroot/js/region-service.js', import.meta.url), 'utf8');
+const { createClient } = createRequire(import.meta.url)('./wwwroot/js/player-identity.js');
 const regions = [
     { id: 'a', displayName: 'A', hostname: 'https://a.example.com' },
     { id: 'b', displayName: 'B', hostname: 'https://b.example.com' },
@@ -374,6 +377,8 @@ function createPickerHarness(options = {}) {
     const sessionResults = [];
     const regionalRefreshes = [];
     const spectatorHandlers = new Map();
+    const identityDialogs = [];
+    let identityActivations = 0;
     let screenHidden = false;
     let hubHostname = regions[0].hostname;
     let singleRefreshes = 0;
@@ -408,11 +413,22 @@ function createPickerHarness(options = {}) {
         'initRegionService', 'initMultiRegionPicker', 'startMultiRegionPicker',
         'pausePickerAssessment', 'pauseMultiRegionPicker', 'teardownMultiRegionPicker',
         'activateSessionPickerUpdates', 'handlePickerVisibilityChange',
+        'handlePickerPageHide', 'handlePickerPageShow',
         'getSessionClientRegion', 'refreshSessionList', 'handleSessionListChanged',
         'handleSoloPlay', 'startGameFromPicker', 'captureGameStartContext', 'isGameStartContextCurrent',
+        'beginIdentityFlow', 'pauseInitialIdentityFlow', 'resumeInitialIdentityFlow',
     ], {
         window: h.window, document: h.document, startScreen, sessionPicker, game, SessionClient,
         pickerUpdatesActive: true, multiRegionActive: false, multiRegionInitialized: false,
+        regionServiceInitialized: false,
+        identityFlowEpoch: 0, identityFlowController: null, identityStarted: false,
+        identityStartupPaused: false, identityStartupForceNaming: false, identityInvite: null,
+        PlayerIdentity: options.playerIdentity ?? { cancelPreparation() {}, current: () => null },
+        showIdentityDialog: (...args) => identityDialogs.push(args),
+        setIdentityBusy() {},
+        activateIdentityMenu: () => { identityActivations++; },
+        leaveIdentityGame: async () => {},
+        identityMessage: error => error.code,
         sessionRefreshTimeout: null, sessionListRequestSequence: 0,
         staleRegions: new Set(), reconnectingSince: new Map(), startGameOperation: null,
         setTimeout: h.setTimeout, clearTimeout: h.clearTimeout,
@@ -443,11 +459,121 @@ function createPickerHarness(options = {}) {
     h.document.addEventListener('visibilitychange', functions.handlePickerVisibilityChange);
     return {
         ...h, ...functions, game, sessionPicker, domUpdates, sessionResults, regionalRefreshes, spectatorHandlers,
+        identityDialogs, identityActivations: () => identityActivations,
         setScreenHidden: hidden => { screenHidden = hidden; },
         setHubHostname: hostname => { hubHostname = hostname; },
         getSingleRefreshes: () => singleRefreshes,
     };
 }
+
+function pendingIdentity() {
+    const requests = [];
+    const responses = [];
+    const values = new Map();
+    let tail = Promise.resolve();
+    const client = createClient({
+        crypto: webcrypto, location: { origin: regions[0].hostname },
+        bootstrap: { regionId: null, regions },
+        storage: { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) },
+        locks: { request(_, options, action) {
+            const next = tail.then(typeof options === 'function' ? options : action);
+            tail = next.catch(() => {});
+            return next;
+        } },
+        fetch: async (url, init) => {
+            requests.push({ url, init });
+            const result = deferred();
+            responses.push(result);
+            return result.promise;
+        },
+    });
+    const answer = index => responses[index].resolve(ok({
+        promptOnRoot: true, invite: null,
+        binding: {
+            identity: { id: '00112233-4455-6677-8899-aabbccddeeff', tag: 'Pilot' },
+            etag: 'b1', revision: 1,
+        },
+    }));
+    return { client, requests, answer };
+}
+
+test('all regional RTT bursts and read-only discovery begin before a stalled initial identity completes', async t => {
+    const identity = pendingIdentity();
+    const h = createPickerHarness({ playerIdentity: identity.client });
+    t.after(() => { h.service.stop(); identity.client.deactivate(); });
+    const init = h.initRegionService();
+    const starting = h.beginIdentityFlow();
+    await init;
+    await h.runTimers();
+    assert.equal(identity.requests.length, 1);
+    assert.equal(h.identityActivations(), 0);
+    assert.deepEqual([...new Set(h.requests.map(request => new URL(request.url).origin))],
+        regions.map(region => region.hostname));
+    assert.equal(h.requests.length, regions.length * 3, 'Actual RTT bursts, not only preparation pings, overlap');
+    assert.ok(h.regionalRefreshes.includes('all'));
+    assert.ok(h.service.areAllRegionsAssessed());
+    await h.initRegionService();
+    await h.runTimers();
+    assert.equal(h.requests.length, regions.length * 3, 'Repeated init must not add listeners or restart bursts');
+    assert.deepEqual(h.identityDialogs.map(dialog => dialog[0]), ['Getting ready']);
+    identity.answer(0);
+    await starting;
+    assert.equal(h.identityActivations(), 1);
+});
+
+for (const stop of ['hidden', 'solo', 'pagehide']) {
+    test(`${stop} cancels initial identity and regional startup; returning to the picker resumes a fresh resolution`, async t => {
+        const identity = pendingIdentity();
+        const h = createPickerHarness({ playerIdentity: identity.client });
+        t.after(() => { h.service.stop(); identity.client.deactivate(); });
+        await h.initRegionService();
+        const starting = h.beginIdentityFlow();
+        await h.runTimers();
+        if (stop === 'hidden') h.visibility(true);
+        else if (stop === 'pagehide') h.handlePickerPageHide();
+        else await h.handleSoloPlay();
+        await starting;
+        assert.equal(identity.requests[0].init.signal.aborted, true);
+        identity.answer(0);
+        await drain();
+        assert.equal(identity.client.current(), null, 'Cancelled responses must not adopt a binding internally');
+        assert.equal(h.identityActivations(), 0);
+        const pings = h.requests.length;
+        await h.runTimers(60_000);
+        assert.equal(h.requests.length, pings);
+        assert.equal(identity.requests.length, 1, 'No retries survive a hidden or torn-down picker');
+        if (stop === 'hidden') h.visibility(false);
+        else if (stop === 'pagehide') h.handlePickerPageShow({ persisted: true });
+        else {
+            h.setScreenHidden(false);
+            h.game.state = 'start';
+            await h.activateSessionPickerUpdates();
+        }
+        await h.runTimers();
+        assert.equal(identity.requests.length, 2);
+        assert.equal(h.requests.length, pings + regions.length * 3);
+        identity.answer(1);
+        await drain();
+        assert.equal(h.identityActivations(), 1);
+    });
+}
+
+test('an initially hidden page defers identity and assessment until the first visible picker', async t => {
+    const identity = pendingIdentity();
+    const h = createPickerHarness({ hidden: true, playerIdentity: identity.client });
+    t.after(() => { h.service.stop(); identity.client.deactivate(); });
+    await h.initRegionService();
+    await h.beginIdentityFlow();
+    await h.runTimers(60_000);
+    assert.equal(identity.requests.length, 0);
+    assert.equal(h.requests.length, 0);
+    h.visibility(false);
+    await h.runTimers();
+    assert.equal(identity.requests.length, 1);
+    identity.answer(0);
+    await drain();
+    assert.equal(h.identityActivations(), 1);
+});
 
 for (const count of [1, 2]) {
     for (const mode of ['solo', 'session']) {

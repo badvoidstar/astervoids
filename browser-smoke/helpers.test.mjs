@@ -6,11 +6,28 @@ import { createRequire } from 'node:module';
 import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
+import { allowedGuardOrigins } from './origin-guard.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
 
 const { IDENTITY_TAG_MAX_LENGTH } = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/game-config.js');
+
+test('startup fault fixtures allow only explicit root loopback origins, never a remote bypass', () => {
+    const local = 'http://127.0.0.1:5189';
+    assert.deepEqual([...allowedGuardOrigins(local, ['http://localhost:5190'])],
+        [local, 'http://localhost:5190']);
+    const remote = 'https://preview.azurecontainerapps.io';
+    assert.deepEqual([...allowedGuardOrigins(remote)], [remote]);
+    for (const candidate of [
+        'https://example.com', 'http://example.com', 'http://127.0.0.1:5190/path',
+        'http://127.0.0.1:5190/?redirect=1', 'http://127.0.0.1:5190/#invite',
+        'http://user:password@127.0.0.1:5190', 'invalid',
+    ]) {
+        assert.throws(() => allowedGuardOrigins(local, [candidate]), /explicitly registered loopback/);
+    }
+    assert.throws(() => allowedGuardOrigins(remote, [local]), /explicitly registered loopback/);
+});
 
 test('personal score expectation uses the advertised capacity and highest scorers on overflow', () => {
     const participants = Array.from({ length: 10 }, (_, index) => ({

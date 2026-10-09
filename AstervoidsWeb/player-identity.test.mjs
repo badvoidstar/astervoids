@@ -159,7 +159,7 @@ test('runtime discovery uses own regional origin or the static deployment manife
     }
 });
 
-test('static entry prepares only its identity region once without credentials, storage or Web Locks', async () => {
+test('static entry prepares every configured region once without credentials, storage or Web Locks', async () => {
     const h = subject({
         bootstrap: { regionId: null, regions: [
             { hostname: 'https://first.example.com' }, { hostname: 'https://second.example.com' },
@@ -170,19 +170,20 @@ test('static entry prepares only its identity region once without credentials, s
         },
         locks: { request() { assert.fail('preparation must not hold the identity lock'); } },
     });
-    h.replies.push({ now: 0 });
-    assert.deepEqual(await Promise.all([h.client.prepareRegion(), h.client.prepareRegion()]), [true, true]);
-    assert.equal(await h.client.prepareRegion(), true);
-    assert.equal(h.requests.length, 1);
-    const request = h.requests[0];
-    assert.equal(request.url, 'https://first.example.com/api/ping');
-    assert.equal(request.init.method, 'GET');
-    assert.equal(request.init.headers, undefined);
-    assert.equal(request.body, null);
-    assert.equal(request.init.credentials, 'omit');
-    assert.equal(request.init.redirect, 'error');
-    assert.equal(request.init.cache, 'no-store');
-    assert.equal(request.init.referrerPolicy, 'no-referrer');
+    h.replies.push({ now: 0 }, { now: 0 });
+    assert.deepEqual(await Promise.all([h.client.prepareRegions(), h.client.prepareRegions()]), [true, true]);
+    assert.equal(await h.client.prepareRegions(), true);
+    assert.deepEqual(h.requests.map(request => request.url),
+        ['https://first.example.com/api/ping', 'https://second.example.com/api/ping']);
+    for (const request of h.requests) {
+        assert.equal(request.init.method, 'GET');
+        assert.equal(request.init.headers, undefined);
+        assert.equal(request.body, null);
+        assert.equal(request.init.credentials, 'omit');
+        assert.equal(request.init.redirect, 'error');
+        assert.equal(request.init.cache, 'no-store');
+        assert.equal(request.init.referrerPolicy, 'no-referrer');
+    }
     assert.equal(h.client.current(), null);
 });
 
@@ -190,7 +191,7 @@ test('regional pages and the empty bootstrap do not generate an extra preparatio
     for (const bootstrap of [undefined, null, { regionId: 'local', regions: [] },
         { regionId: null, regions: [] }]) {
         const h = subject({ bootstrap });
-        assert.equal(await h.client.prepareRegion(), false);
+        assert.equal(await h.client.prepareRegions(), false);
         assert.equal(h.requests.length, 0);
         assert.equal(h.values.size, 0);
     }
@@ -200,7 +201,7 @@ test('identity verification does not wait for the independent region preparation
     const h = subject({ bootstrap: { regionId: null, regions: [{ hostname: location.origin }] } });
     let release;
     h.replies.push(() => new Promise(resolve => { release = resolve; }), resolved(binding));
-    const preparing = h.client.prepareRegion();
+    const preparing = h.client.prepareRegions();
     try {
         await h.client.resolve();
         assert.deepEqual(h.client.current(), first);
@@ -218,9 +219,11 @@ test('startup identity resolution offers only waiting until the browser identity
     let finishResolve;
     const resolution = new Promise(resolve => { finishResolve = resolve; });
     const { beginIdentityFlow } = loadInlineGameFunctions(['beginIdentityFlow'], {
-        identityFlowEpoch: 0,
+        identityFlowEpoch: 0, identityFlowController: null, identityStarted: false,
+        identityStartupPaused: false, identityStartupForceNaming: false,
         identityInvite: null,
-        PlayerIdentity: { resolve: () => resolution },
+        isSessionPickerActive: () => true,
+        PlayerIdentity: { resolveInitial: () => resolution },
         showIdentityDialog: (...args) => dialogs.push(args),
         setIdentityBusy: busy => events.push(['busy', busy]),
         activateIdentityMenu: () => events.push(['menu']),
@@ -244,8 +247,8 @@ test('startup identity resolution offers only waiting until the browser identity
 test('failed preparation is sanitized and never substitutes for authoritative identity verification', async () => {
     const h = subject({ bootstrap: { regionId: null, regions: [{ hostname: location.origin }] } });
     h.replies.push(new Error('network diagnostic containing a private hostname'));
-    await assert.rejects(h.client.prepareRegion(), { message: 'identity_unavailable' });
-    await assert.rejects(h.client.prepareRegion(), { message: 'identity_unavailable' });
+    await assert.rejects(h.client.prepareRegions(), { message: 'identity_unavailable' });
+    await assert.rejects(h.client.prepareRegions(), { message: 'identity_unavailable' });
     assert.equal(h.requests.length, 1);
     assert.equal(h.values.size, 0);
     assert.equal(h.client.current(), null);
@@ -259,7 +262,7 @@ test('region preparation rejects malformed bootstrap authorities before making a
     for (const bootstrap of [{ regions: 'invalid' },
         { regions: [{ hostname: 'https://example.com/redirect' }] }]) {
         const h = subject({ bootstrap });
-        await assert.rejects(h.client.prepareRegion(), { message: 'identity_unavailable' });
+        await assert.rejects(h.client.prepareRegions(), { message: 'identity_unavailable' });
         assert.equal(h.requests.length, 0);
     }
 });
