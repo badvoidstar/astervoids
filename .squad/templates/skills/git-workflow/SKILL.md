@@ -6,6 +6,13 @@ confidence: "high"
 source: "team-decision"
 ---
 
+## Astervoids override
+
+Astervoids integrates on `main`, not `dev`. The branch and PR examples below
+describe upstream Squad's release process, not this application. Use `main`
+for this repository's integration branch; do not install the generic insiders,
+npm publishing, or promotion automation.
+
 ## Context
 
 Squad uses a three-branch model. **All feature work starts from `dev`, not `main`.**
@@ -98,8 +105,11 @@ Each agent operates inside its worktree exactly like the single-issue workflow:
 ```bash
 cd ../squad-195
 
-# Work normally — commits, tests, pushes
-git add -A && git commit -m "fix: stamp bug (#195)"
+# Stage only the files changed for this issue, then inspect the commit contents
+git add -- path/to/intentionally-changed-file
+git diff --cached --stat
+git diff --cached
+git commit -m "fix: stamp bug (#195)"
 git push -u origin squad/195-fix-stamp-bug
 
 # Create PR targeting dev

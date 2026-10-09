@@ -164,6 +164,44 @@ dotnet watch run --project AstervoidsWeb/AstervoidsWeb.csproj
 docker-compose -f AstervoidsWeb/docker-compose.yml up --build
 ```
 
+### Squad repository setup
+
+The coordinator and selected installed/stored skills have a **1.0.1 repository
+refresh**, sourced from the CLI package inside the official
+[Windows x64 release bundle](https://github.com/bradygaster/squad/releases/download/v1.0.1/squad-win32-x64.zip).
+The bundle was SHA-256 verified against the release asset digest:
+`f38a8f85e60982dba340187b761488f01de1aec68ea50c1b85725783d32df2fe`.
+`@bradygaster/squad-cli@1.0.1` was unavailable from npm when this refresh was prepared.
+
+Repository template versions do not identify or upgrade the installed CLI/SDK.
+Check `squad --version` separately. For a WinGet-managed installation, use a
+separately approved installed-CLI update:
+
+```powershell
+winget upgrade --id bradygaster.Squad --exact --source winget
+```
+
+Do not switch a WinGet installation to global npm via `squad upgrade --self`.
+Other installations should retain their existing package manager.
+[1.0.1](https://github.com/bradygaster/squad/releases/tag/v1.0.1) repairs upstream
+WinGet/Homebrew publishing authentication, not game startup. Runtime fixes,
+including 0.13.1's casting-state persistence fix, require a separate CLI/SDK update.
+
+The selective refresh adds explicit task-scope guards, contract-focused test
+guidance, selective Git staging, and routing-based escalation. Existing roster,
+aliases, routing, ceremonies, Scribe/history/log duties, approval-gated
+learning/reflect, local state, model preferences, and workflow/template pairs
+remain intact. Upstream support-only rosters, decision-only Scribe, and alternative
+learning persistence are deliberately not adopted. Unused bootstrap, release,
+and gh-aw assets are not installed or refreshed; Astervoids still integrates on
+`main`, not upstream Squad's generic `dev` branch.
+
+Do not run a wholesale `squad upgrade` over these overrides: its repository
+refresh also overwrites setup files/workflows and runs migrations. Review assets
+selectively and validate with `node --test .github\scripts\squad-setup.test.mjs`
+and `git diff --check`. Start a **new Copilot session after merging** to load the
+changed coordinator and skills.
+
 ### Real-browser playability smoke
 
 Requires .NET 10 and Node.js 22 or later. Playwright is a **dev-only** dependency;

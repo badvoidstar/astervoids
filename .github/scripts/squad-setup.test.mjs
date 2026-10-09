@@ -22,6 +22,8 @@ const workflowNames = [
   'sync-squad-labels.yml',
 ];
 const workflows = new Map(workflowNames.map((name) => [name, read(`.github/workflows/${name}`)]));
+const squadRepositoryVersion = '1.0.1';
+const coordinator = read('.github/agents/squad.agent.md');
 
 function tableRows(markdown, heading) {
   const section = markdown.split(`## ${heading}\n`)[1]?.split(/\n## /)[0];
@@ -133,6 +135,89 @@ test('all versioned setup JSON parses, including portable MCP configuration', ()
   const config = JSON.parse(read('.mcp.json'));
   assert.equal(config.mcpServers.squad_state.command, 'squad');
   assert.ok(Array.isArray(config.mcpServers.squad_state.args));
+});
+
+test('installed and stored coordinator copies share the reviewed repository version', () => {
+  const stored = read('.squad/templates/squad.agent.md.template');
+  const capabilities = /<!-- SQUAD:TEAM-CAPABILITIES:BEGIN -->[\s\S]*?<!-- SQUAD:TEAM-CAPABILITIES:END -->/;
+  for (const source of [coordinator, stored]) {
+    assert.equal(source.match(/^<!-- version: ([^ ]+) -->$/m)?.[1], squadRepositoryVersion);
+    assert.equal(source.match(/^- \*\*Version:\*\* (\S+)/m)?.[1], squadRepositoryVersion);
+    assert.ok(source.includes(`\`Squad v${squadRepositoryVersion}\``));
+    assert.doesNotMatch(source, /Squad v\{version\}|0\.0\.0-source/);
+    assert.equal(source.match(/<!-- SQUAD:TEAM-CAPABILITIES:BEGIN -->/g)?.length, 1);
+    assert.equal(source.match(/<!-- SQUAD:TEAM-CAPABILITIES:END -->/g)?.length, 1);
+    assert.match(source, capabilities);
+  }
+  assert.equal(coordinator.replace(capabilities, ''), stored.replace(capabilities, ''));
+  assert.doesNotMatch(coordinator.match(capabilities)[0], /Pending cast sync/);
+});
+
+test('repository refresh explicitly preserves Astervoids routing, learning and main integration', () => {
+  const overrides = coordinator.match(
+    /<!-- ASTERVOIDS:PROJECT-OVERRIDES:BEGIN -->([\s\S]*?)<!-- ASTERVOIDS:PROJECT-OVERRIDES:END -->/,
+  )?.[1];
+  assert.ok(overrides, 'Missing project overrides in the generated coordinator');
+  for (const path of ['.squad/team.md', '.squad/routing.md', '.squad/ceremonies.md',
+    '.github/skills/learning-review/SKILL.md']) {
+    assert.ok(overrides.includes(path), `Missing preserved project authority: ${path}`);
+  }
+  assert.match(overrides, /Fact Checker and Rai remain routed/);
+  assert.match(overrides, /Scribe and Ralph are not issue-assignment owners/);
+  assert.match(overrides, /case-sensitive charter paths/);
+  assert.match(overrides, /existing Scribe\/history\/log lifecycle/);
+  assert.match(overrides, /approval-gated/);
+  assert.match(overrides, /application integrates on `main`/);
+  assert.match(overrides, /does not upgrade the installed CLI or SDK/);
+  assert.doesNotMatch(coordinator, /They are not specialist registry entries or routing-table destinations/);
+  assert.doesNotMatch(coordinator, /Escalate unmatched work and ownership disputes to `architect`/);
+});
+
+test('coordinator scope guard requires explicit exclusions and approval for adjacent work', () => {
+  const scope = coordinator.match(/### Scope Control\n([\s\S]*?)### Routing\n/)?.[1];
+  assert.ok(scope, 'Missing shipped scope-control guidance');
+  assert.match(scope, /Every specialist prompt must state the requested deliverable and explicit exclusions/);
+  assert.match(scope, /must not be implemented, edited, or delegated as part of the current work/);
+  assert.match(scope, /Expanding scope requires explicit user approval/);
+  assert.match(scope, /do not silently fold it into the original task or PR/);
+});
+
+test('refreshed installed skills match their stored copies and retain substantive safety guidance', () => {
+  for (const name of ['git-workflow', 'reviewer-protocol', 'squad-version-check',
+    'test-discipline', 'tiered-memory']) {
+    assert.equal(read(`.github/skills/${name}/SKILL.md`),
+      read(`.squad/templates/skills/${name}/SKILL.md`), `Skill copy drift: ${name}`);
+  }
+  const git = read('.github/skills/git-workflow/SKILL.md');
+  assert.match(git, /Astervoids integrates on `main`, not `dev`/);
+  assert.match(git, /git add -- path\/to\/intentionally-changed-file/);
+  assert.match(git, /git diff --cached --stat/);
+  assert.doesNotMatch(git, /git add -A/);
+  const discipline = read('.github/skills/test-discipline/SKILL.md');
+  assert.match(discipline, /Mutation-test critical gates/);
+  assert.match(discipline, /not just\s+an exit code or broad success status/);
+  assert.match(discipline, /Exercise every caller path/);
+  assert.match(read('.github/skills/reviewer-protocol/SKILL.md'),
+    /Quality and test reviewers may block a PR or merge on quality, coverage, or regression grounds/);
+  const memory = read('.github/skills/tiered-memory/SKILL.md');
+  assert.match(memory, /current architecture owner from `routing.md`/);
+  assert.match(memory, /current delivery owner from `routing.md`/);
+  assert.doesNotMatch(memory, /@(picard|worf|belanna)\b/);
+});
+
+test('repository and installed WinGet upgrades stay separate in setup guidance', () => {
+  const wingetUpgrade = 'winget upgrade --id bradygaster.Squad --exact --source winget';
+  for (const source of [read('README.md'), read('.github/skills/squad-version-check/SKILL.md')]) {
+    assert.ok(source.includes(wingetUpgrade));
+    assert.match(source, /selective 1\.0\.1|1\.0\.1 repository/);
+    assert.match(source, /For a WinGet-managed installation/);
+    assert.match(source, /Other installations should retain their existing package manager/);
+  }
+  const readme = read('README.md');
+  assert.match(readme, /template versions do not identify or upgrade the installed CLI\/SDK/);
+  assert.match(readme, /Check `squad --version` separately/);
+  assert.match(readme, /new Copilot session after merging/);
+  assert.match(readme, /WinGet\/Homebrew publishing authentication, not game startup/);
 });
 
 test('roster, registry and case-sensitive charter paths describe the same team', () => {

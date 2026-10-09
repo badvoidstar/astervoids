@@ -4,13 +4,13 @@ description: "Internals of how @bradygaster/squad-cli stamps its version, how `s
 allowedTools: []
 confidence: medium
 domain: squad-internals
-source: "Discovered by Data; validated in bradygaster/squad#1173 recon (2026-05-26)."
+source: "validated in bradygaster/squad#1173 recon (2026-05-26)."
 ---
 
 # SKILL: Squad CLI Internals — Version Stamping & Upgrade Mechanics
 
 **Confidence:** medium
-**Discovered by:** Data
+**Discovered by:** repository investigation
 **Date:** 2026-05-26
 **Validated in:** Issue #1173 recon (bradygaster/squad)
 
@@ -23,6 +23,19 @@ Reusable knowledge about how `@bradygaster/squad-cli` stamps its version into `s
 ---
 
 ## Package & Registry Facts
+
+### Astervoids distribution override
+
+Repository template stamps and the installed CLI version are separate. The
+repository's selective 1.0.1 refresh came from the official, checksum-verified
+Windows release bundle; that CLI version was not on npm when checked.
+
+For a WinGet-managed installation, a separately approved installed update uses
+`winget upgrade --id bradygaster.Squad --exact --source winget`.
+Do not use `squad upgrade --self` to switch a WinGet installation to global npm.
+Other installations should retain their existing package manager.
+Plain `squad upgrade` does not request self-upgrade, but still overwrites repository
+assets and runs migrations; preserve the project overrides documented in README.md.
 
 - **Package name:** `@bradygaster/squad-cli`
 - **Registry:** npm (public)
@@ -72,7 +85,7 @@ Reads the stamped version back from `squad.agent.md`:
 - `.squad/config.json` — **never touched**; `stateBackend` survives intact
 - User-added files not in TEMPLATE_MANIFEST
 
-### Self-upgrade path (`selfUpgradeCli()`):
+### Self-upgrade path (`selfUpgradeCli()`, opt-in via `--self`):
 Detects npm/pnpm/yarn via `npm_execpath` and `npm_config_user_agent`. Runs:
 - npm: `npm install -g @bradygaster/squad-cli@latest`
 - pnpm: `pnpm add -g @bradygaster/squad-cli@latest`
