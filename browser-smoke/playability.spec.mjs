@@ -375,6 +375,7 @@ test('main-menu buttons share size and brightness with compact spacing in portra
         for (const viewport of [
             { width: 1280, height: 900 }, { width: 900, height: 550 },
             { width: 568, height: 320 }, { width: 400, height: 300 },
+            { width: 360, height: 300 }, { width: 320, height: 240 },
             { width: 360, height: 800 }, { width: 320, height: 568 },
         ]) {
             await page.setViewportSize(viewport);
@@ -385,12 +386,20 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                 return elements.map(button => {
                     const box = button.getBoundingClientRect();
                     const style = getComputedStyle(button);
+                    const range = document.createRange();
+                    range.selectNodeContents(button);
+                    const text = range.getBoundingClientRect();
                     return {
                         id: button.id, width: box.width, height: box.height,
                         disabled: button.disabled,
                         paired: button.parentElement.classList.contains('button-row')
                             && [...button.parentElement.children].filter(sibling => sibling.getClientRects().length).length === 2,
                         fontSize: style.fontSize, nativeText: style.transform === 'none',
+                        textFits: text.top >= box.top + button.clientTop
+                            && text.bottom <= box.bottom - button.clientTop
+                            && text.left >= box.left + button.clientLeft
+                            && text.right <= box.right - button.clientLeft,
+                        textCenterOffset: (text.top + text.bottom - box.top - box.bottom) / 2,
                         fits: box.left >= 0 && box.right <= innerWidth
                             && button.scrollWidth <= button.clientWidth
                             && button.scrollHeight <= button.clientHeight,
@@ -408,6 +417,9 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                 expect(button.height, `${label} matches Solo Play height`).toBeCloseTo(solo.height, 1);
                 expect(button.fontSize, `${label} uses Solo Play native font size`).toBe(solo.fontSize);
                 expect(button.nativeText && button.fits, `${label} fits without stretching or clipping`).toBe(true);
+                expect(button.textFits, `${label} rendered text stays inside its border`).toBe(true);
+                expect(Math.abs(button.textCenterOffset), `${label} vertically centers one or two text lines`)
+                    .toBeLessThanOrEqual(1);
                 if (button.id === 'btn-difficulty') {
                     expect(button.disabled, `${label} is locked only for the shared session`).toBe(inSession);
                 }
@@ -531,10 +543,13 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
     for (const viewport of [
         { width: 1280, height: 900 }, { width: 900, height: 550 },
         { width: 568, height: 320 }, { width: 400, height: 300 },
+        { width: 360, height: 300 }, { width: 320, height: 240 },
     ]) {
         await page.setViewportSize(viewport);
         const cases = await page.evaluate(() => {
             const saved = { ...sessionPicker };
+            const list = sessionPicker.listEl;
+            const available = list.style.getPropertyValue('--session-list-available');
             const container = document.getElementById('game-container');
             const originalClass = container.className;
             const invites = ['btn-invite-self', 'btn-invite-friend'].map(id => document.getElementById(id));
@@ -546,9 +561,11 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             // Project display states through production renderers in one browser turn,
             // then restore the live picker before any transport callbacks can run.
             try {
+                // Measure the default footprint before any viewport-fitting calculations.
+                list.style.removeProperty('--session-list-available');
                 for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen'])
                 for (const multiRegion of [false, true])
-                for (const sessionCount of [0, 6])
+                for (const sessionCount of [0, 2, 6])
                 for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
                 for (const unavailable of [false, true]) {
                     container.className = `${originalClass} ${mode}`;
@@ -577,11 +594,24 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                     const firstDevice = document.querySelector('#menu-utilities .menu-utility-group')
                         .querySelectorAll('button');
                     const firstVisibleDevice = [...firstDevice].find(button => button.getBoundingClientRect().height);
+                    const firstDeviceBox = firstVisibleDevice.getBoundingClientRect();
+                    const secondDeviceBox = [...firstDevice].find(button => {
+                        const rect = button.getBoundingClientRect();
+                        return rect.height && rect.top > firstDeviceBox.top + 0.05;
+                    }).getBoundingClientRect();
                     const solo = box('btn-solo');
+                    const sessionList = box('session-list');
+                    const regionSelect = box('create-region-select');
                     cases.push({
                         mode, multiRegion, sessionCount, role, unavailable,
                         firstDevice: firstVisibleDevice.id,
-                        top: firstVisibleDevice.getBoundingClientRect().top - box('session-list').top,
+                        top: firstDeviceBox.top - sessionList.top,
+                        unfittedListHeight: sessionList.height,
+                        twoRowSpan: secondDeviceBox.bottom - firstDeviceBox.top,
+                        secondRowAlignment: sessionList.bottom - secondDeviceBox.bottom,
+                        regionWidthError: regionSelect.width - solo.width,
+                        regionHeightError: regionSelect.height - solo.height,
+                        regionRowHeight: box('create-region-row').height,
                         bottom: box('btn-invite-friend').bottom - solo.bottom,
                         invite: box('btn-invite-self').top - solo.top,
                         inviteGap: box('btn-invite-friend').left - box('btn-invite-self').right,
@@ -601,6 +631,9 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                         createText: sessionPicker.btnLeaveCreate.textContent,
                         clipped: buttons.filter(button => {
                             const rect = button.getBoundingClientRect();
+                            const range = document.createRange();
+                            range.selectNodeContents(button);
+                            const text = range.getBoundingClientRect();
                             const paired = button.parentElement.classList.contains('button-row')
                                 && [...button.parentElement.children].filter(sibling => sibling.getClientRects().length).length === 2;
                             const expectedWidth = paired ? (solo.width - 7.2) / 2 : solo.width;
@@ -608,6 +641,10 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                                 || rect.left < 0 || rect.right > innerWidth
                                 || button.scrollWidth > button.clientWidth
                                 || button.scrollHeight > button.clientHeight
+                                || text.top < rect.top + button.clientTop
+                                || text.bottom > rect.bottom - button.clientTop
+                                || text.left < rect.left + button.clientLeft
+                                || text.right > rect.right - button.clientLeft
                                 || getComputedStyle(button).transform !== 'none';
                         }).map(button => button.id),
                     });
@@ -620,10 +657,12 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                 renderCreateRegionSelector();
                 renderSessionList();
                 updatePickerButtons();
+                if (available) list.style.setProperty('--session-list-available', available);
+                else list.style.removeProperty('--session-list-available');
             }
             return cases;
         });
-        expect(cases).toHaveLength(128);
+        expect(cases).toHaveLength(192);
         for (const state of cases) {
             const label = `${viewport.width}x${viewport.height} ${state.mode || 'windowed'}`
                 + ` regions=${state.multiRegion ? 2 : 1} sessions=${state.sessionCount}`
@@ -631,11 +670,20 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             for (const edge of ['top', 'bottom', 'invite']) {
                 expect(state[edge], `${label} ${edge} alignment`).toBeCloseTo(0, 1);
             }
+            expect(state.unfittedListHeight, `${label} has a content-independent two-row baseline before fitting`)
+                .toBeCloseTo(state.twoRowSpan, 1);
+            expect(state.secondRowAlignment, `${label} list ends at the second visible utility row before fitting`)
+                .toBeCloseTo(0, 1);
             expect(state.columnGap, `${label} column gap`).toBeCloseTo(12, 1);
             expect(state.fullscreenVisible, label).toBe(state.mode === '');
             expect(state.firstDevice, `${label} has no empty slot above the first device action`)
                 .toBe(state.mode === '' ? 'btn-fullscreen' : 'btn-leaderboards');
             expect(state.regionVisible, label).toBe(state.multiRegion && state.role === 'outside');
+            if (state.regionVisible) {
+                expect(state.regionWidthError, `${label} region select matches full button width`).toBeCloseTo(0, 1);
+                expect(state.regionHeightError, `${label} region select matches button height`).toBeCloseTo(0, 1);
+                expect(state.regionRowHeight, `${label} has no extra caption row`).toBe(32);
+            }
             expect(state.startVisible, label).toBe(state.role !== 'outside');
             expect(state.difficultyDisabled, `${label} locks only the shared difficulty`).toBe(state.role !== 'outside');
             expect(state.actionRowHeight, `${label} keeps the single-row Create footprint`).toBe(32);
@@ -651,7 +699,8 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             } else if (state.multiRegion && !state.unavailable) {
                 expect(state.destination, `${label} full destination remains accessible`)
                     .toBe('Create Multiplayer in Northwestern Europe');
-                expect(state.createText, label).toBe(state.destination);
+                expect(state.createText, `${label} the region picker does not add a third line to Create`)
+                    .toBe('Create Multiplayer');
             }
             expect(state.clipped, `${label} buttons retain their dimensions without clipping`).toEqual([]);
         }
@@ -677,13 +726,114 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
     await expect(page.locator('#btn-fullscreen')).toBeVisible();
 });
 
+test('menu fitting is resize-order independent and only shrinks space the layout can reclaim', async ({ players }) => {
+    const { page } = await players.open();
+    await expect(page.locator('#btn-leave-create')).toBeEnabled();
+    await page.evaluate(async () => {
+        window.menuResizeSaved = { ...sessionPicker };
+        await teardownMultiRegionPicker();
+    });
+    try {
+        for (const multiRegion of [false, true]) {
+            await page.evaluate(multiRegion => {
+                const region = menuResizeSaved.regions.find(candidate => candidate.id === getCreateRegionId());
+                if (!region) throw new Error('Resize coverage requires an assessed create region');
+                sessionPicker.regions = [
+                    region, ...(multiRegion ? [{ id: 'layout-secondary', displayName: 'Secondary Region' }] : []),
+                ];
+                sessionPicker.sessions = [];
+                renderCreateRegionSelector();
+                renderSessionList();
+                updatePickerButtons();
+            }, multiRegion);
+            const seen = new Map();
+            for (const fullscreenHidden of [false, true, false]) {
+                await page.evaluate(hidden =>
+                    document.getElementById('game-container').classList.toggle('pseudo-fullscreen', hidden),
+                fullscreenHidden);
+                for (const viewport of [
+                    { width: 568, height: 240 }, { width: 568, height: 280 },
+                    { width: 568, height: 300 }, { width: 568, height: 320 },
+                    { width: 568, height: 400 }, { width: 568, height: 320 },
+                    { width: 568, height: 300 }, { width: 568, height: 280 },
+                    { width: 360, height: 800 }, { width: 568, height: 240 },
+                ]) {
+                    await page.setViewportSize(viewport);
+                    const geometry = await page.evaluate(async () => {
+                        const list = sessionPicker.listEl;
+                        const content = document.getElementById('start-screen-content');
+                        const settle = async () => {
+                            for (let frame = 0; frame < 8; frame++) await new Promise(requestAnimationFrame);
+                        };
+                        const measure = () => ({
+                            list: list.getBoundingClientRect().height, content: content.scrollHeight,
+                        });
+                        await settle();
+                        const actual = measure();
+                        await settle();
+                        const settled = measure();
+                        content.scrollTop = content.scrollHeight;
+                        fitSessionListToViewport();
+                        await settle();
+                        const scrolled = measure();
+                        content.scrollTop = 0;
+                        const previous = list.style.getPropertyValue('--session-list-available');
+                        try {
+                            list.style.removeProperty('--session-list-available');
+                            const nominal = measure();
+                            list.style.setProperty('--session-list-available', `${actual.list + 2}px`);
+                            const expanded = measure();
+                            list.style.setProperty('--session-list-available', '0px');
+                            return { actual, settled, scrolled, nominal, expanded, minimum: measure() };
+                        } finally {
+                            list.style.setProperty('--session-list-available', previous);
+                        }
+                    });
+                    const label = `${viewport.width}x${viewport.height}, regions=${multiRegion ? 2 : 1}, fullscreenHidden=${fullscreenHidden}`;
+                    const { actual, settled, scrolled, nominal, expanded, minimum } = geometry;
+                    expect(settled, `${label}: layout settles without repeated shrinkage`).toEqual(actual);
+                    expect(scrolled, `${label}: scrolled-out headings still reserve their space`).toEqual(actual);
+                    expect(actual.content, `${label}: only fixed controls may force outer-menu scrolling`)
+                        .toBeLessThanOrEqual(Math.max(viewport.height, minimum.content) + 1);
+                    if (nominal.content <= viewport.height) {
+                        expect(actual.list, `${label}: the full list stays full when the menu fits`)
+                            .toBeCloseTo(nominal.list, 1);
+                    } else if (actual.list < nominal.list - 2) {
+                        expect(expanded.content, `${label}: any further list growth would require more scrolling`)
+                            .toBeGreaterThan(Math.max(viewport.height, minimum.content));
+                    }
+                    if (seen.has(label)) {
+                        expect(actual, `${label}: returning to a size restores exactly the same layout`)
+                            .toEqual(seen.get(label));
+                    }
+                    seen.set(label, actual);
+                }
+            }
+        }
+    } finally {
+        await page.evaluate(async () => {
+            document.getElementById('game-container').classList.remove('pseudo-fullscreen');
+            const btnLeaveCreate = sessionPicker.btnLeaveCreate;
+            Object.assign(sessionPicker, menuResizeSaved, { btnLeaveCreate });
+            delete window.menuResizeSaved;
+            await activateSessionPickerUpdates();
+        });
+    }
+});
+
 for (const viewport of [
+    { width: 360, height: 800 },
     { width: 568, height: 320 }, { width: 400, height: 300 },
     { width: 360, height: 480 }, { width: 320, height: 320 },
 ]) {
     test(`session list touch scrolling stays bounded at ${viewport.width}x${viewport.height}`, async ({ players }) => {
         const { page } = await players.open({ viewport, hasTouch: true, isMobile: true });
         await expect(page.locator('#btn-leave-create')).toBeEnabled();
+        const nominalListHeight = await page.locator('#menu-columns').evaluate(element => {
+            const style = getComputedStyle(element);
+            return 2 * parseFloat(style.getPropertyValue('--menu-button-height'))
+                + parseFloat(style.getPropertyValue('--menu-row-gap'));
+        });
         const cdp = await page.context().newCDPSession(page);
         await page.evaluate(async () => {
             window.menuLayoutSaved = { ...sessionPicker };
@@ -716,13 +866,34 @@ for (const viewport of [
                     renderCreateRegionSelector();
                     renderSessionList();
                     updatePickerButtons();
+                    const list = sessionPicker.listEl;
+                    const available = list.style.getPropertyValue('--session-list-available');
+                    list.style.removeProperty('--session-list-available');
+                    const unfittedListHeight = list.getBoundingClientRect().height;
+                    if (available) list.style.setProperty('--session-list-available', available);
                     // Let layout observation and its queued fitting frame finish.
                     await new Promise(resolve => requestAnimationFrame(() =>
                         requestAnimationFrame(() => requestAnimationFrame(resolve))));
-                    const list = sessionPicker.listEl;
                     const content = document.getElementById('start-screen-content');
                     const box = id => document.getElementById(id).getBoundingClientRect();
+                    const select = sessionPicker.createRegionSelectEl;
+                    const originalDisabled = select.disabled;
+                    const regionSizes = [];
+                    try {
+                        if (multiRegion) for (const disabled of [false, true]) {
+                            select.disabled = disabled;
+                            const rect = select.getBoundingClientRect();
+                            regionSizes.push({ disabled, width: rect.width, height: rect.height });
+                        }
+                    } finally {
+                        select.disabled = originalDisabled;
+                    }
                     return {
+                        unfittedListHeight,
+                        available: parseFloat(list.style.getPropertyValue('--session-list-available')),
+                        buttonHeight: box('btn-solo').height,
+                        buttonWidth: box('btn-solo').width,
+                        regionSizes,
                         listHeight: box('session-list').height,
                         scrollable: list.scrollHeight > list.clientHeight,
                         listFits: list.scrollWidth <= list.clientWidth
@@ -743,7 +914,31 @@ for (const viewport of [
                     };
                 }, { count, multiRegion });
                 const label = `${count} sessions, ${multiRegion ? 2 : 1} regions`;
-                expect(geometry.listHeight, label).toBeLessThanOrEqual(Math.min(135, viewport.height / 4));
+                expect(geometry.unfittedListHeight, `${label}: baseline does not depend on content or a fitting budget`)
+                    .toBeCloseTo(nominalListHeight, 1);
+                expect(geometry.available, `${label}: the layout observer still supplies a fitting budget`)
+                    .toBeGreaterThanOrEqual(0);
+                expect(geometry.listHeight, `${label}: fitting preserves a one-button minimum`)
+                    .toBeCloseTo(Math.max(geometry.buttonHeight,
+                        Math.min(nominalListHeight, geometry.available)), 1);
+                for (const region of geometry.regionSizes) {
+                    const state = `${label}, region disabled=${region.disabled}`;
+                    expect(region.width, `${state}: matches full button width`).toBeCloseTo(geometry.buttonWidth, 1);
+                    expect(region.height, `${state}: matches button height`).toBeCloseTo(geometry.buttonHeight, 1);
+                }
+                if (multiRegion) {
+                    const select = page.getByRole('combobox', { name: 'Host region', exact: true });
+                    await expect(select).toHaveAccessibleName('Host region');
+                    await expect(page.getByText('Host region', { exact: true })).toHaveCount(0);
+                    if (count === 0) {
+                        const selected = await select.inputValue();
+                        await select.selectOption('layout-secondary');
+                        await expect(select).toHaveValue('layout-secondary');
+                        expect(await page.evaluate(() => sessionPicker.selectedCreateRegion)).toBe('layout-secondary');
+                        await select.selectOption(selected);
+                    }
+                }
+                expect(geometry.listHeight, label).toBeLessThanOrEqual(nominalListHeight);
                 expect(geometry.listFits && geometry.rootFits, `${label}: no horizontal spill`).toBe(true);
                 expect(geometry.actionsBelow && geometry.groupsSeparate, `${label}: groups never overlap`).toBe(true);
                 if (count === 0) emptyMenus.set(multiRegion, geometry.needsMenuScroll);
@@ -793,7 +988,8 @@ for (const viewport of [
             console.info(`Touch ${viewport.width}x${viewport.height}: list ${before} -> ${afterUp} -> ${afterDown}; menu ${outer}`);
             await page.setViewportSize({ width: viewport.width, height: 800 });
             await expect.poll(() => list.evaluate(element => element.getBoundingClientRect().height),
-                { message: 'A taller viewport restores the full list height instead of retaining a stale cap' }).toBe(135);
+                { message: 'A taller viewport restores the nominal two-row height instead of retaining a stale cap' })
+                .toBeCloseTo(nominalListHeight, 1);
             await page.setViewportSize(viewport);
             await expect.poll(() => list.evaluate((element, previous) =>
                 Math.abs(element.getBoundingClientRect().height - previous), rect.height),

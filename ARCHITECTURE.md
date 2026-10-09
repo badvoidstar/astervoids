@@ -427,12 +427,26 @@ controller mode stays independently selectable. Neither adds reload persistence.
 Existing URL/debug factors outside the presets remain intact and display
 `Custom`, with the numeric factor in the accessible label and tooltip; the next
 enabled click selects Shifter. The wider debug tuning range is unchanged.
-The session list shrinks to the space left by fixed-size menu controls and
-scrolls independently, with long names ellipsized instead of widening landscape
-columns. Its minimum row height shares the button-height variable. Visible menu
-content retains native touch scrolling, including the outer menu on very short
-screens, without acquiring gameplay touch controls. A layout observer recomputes
-only the list's height budget as viewport and menu content sizes change.
+The native host-region dropdown matches a full-width menu button, including
+while disabled; it has no visible caption and retains the accessible name
+`Host region`. All main-menu buttons share padding that accommodates two
+centered lines without changing their height. Create uses the same wrapping as
+the other actions: the selected region remains visible in the dropdown and in
+Create's accessible name and tooltip, not a separate third line inside the button.
+The session list's nominal height is two buttons plus their
+shared vertical gap (2 × 32px + 11.2px = 75.2px), independent of row count.
+In landscape this spans the first two visible utility rows. Fitting reserves
+the measured headings, padding, and fixed-size controls, not the list's previous
+height or a percentage of the viewport. Landscape also preserves the utility
+column's intrinsic minimum, so shortening the list never just creates an equal
+amount of empty space above the play controls. Portrait reserves the stacked
+utility rows instead. The list can shrink to one button row; if the fixed
+controls still cannot fit, the outer menu scrolls without collapsing it further.
+It scrolls independently, with long names ellipsized instead of widening
+landscape columns. Visible menu content retains native touch scrolling,
+including the outer menu on very short screens, without acquiring gameplay
+touch controls. A layout observer recomputes
+only the list's height budget as viewport, action rows, and utility groups change.
 Identity resolution first shows a wait-only dialog explaining player-identity
 determination and service warm-up. Its heading receives focus; guest, invitation,
 and submit actions are hidden while resolution is pending. Existing verified-binding,

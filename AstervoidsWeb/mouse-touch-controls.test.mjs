@@ -117,13 +117,13 @@ test('picker provides a polar-default analog mode toggle instead of a config sel
     assert.doesNotMatch(gameConfig, /\bANALOG_CONTROL_SCHEME\b/);
 });
 
-test('picker labels multiplayer creation consistently', () => {
+test('picker keeps creation text separate from its accessible region destination', () => {
     assert.match(
         html,
         /id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer<\/button>/);
-    assert.match(html, /Create Multiplayer in \$\{regionName\}/);
     assert.match(html, /btnLeaveCreate\.textContent = 'Create Multiplayer';/);
-    assert.match(html, /regionLabel\.textContent = ` in \$\{regionName\}`;/);
+    assert.match(html,
+        /btnLeaveCreate\.setAttribute\('aria-label', `Create Multiplayer in \$\{regionName\}`\);/);
 });
 
 test('right touch and mouse use held firing without an analog anchor', () => {

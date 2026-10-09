@@ -577,6 +577,7 @@
 
         #menu-columns {
             --menu-button-height: 32px;
+            --menu-row-gap: 11.2px;
             display: grid;
             grid-template-columns: minmax(0, 1fr);
             row-gap: 9.6px;
@@ -597,19 +598,8 @@
             height: var(--menu-button-height);
             font-size: 11px;
             line-height: 12px;
-            padding-inline: min(18px, 2vw);
+            padding: 2px min(8px, 1vw);
             transition-property: background-color, border-color, color, opacity;
-        }
-
-        #menu-columns .picker-btn.regional-create {
-            padding-block: 2px;
-        }
-
-        #menu-columns .create-region-label {
-            display: block;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
         }
 
         #menu-columns .picker-btn:not(:disabled) {
@@ -636,12 +626,12 @@
             #picker-buttons { margin-top: auto; }
             #menu-utilities {
                 justify-content: space-between;
-                gap: 11.2px;
+                gap: var(--menu-row-gap);
             }
             .menu-utility-group {
                 display: flex;
                 flex-direction: column;
-                gap: 11.2px;
+                gap: var(--menu-row-gap);
             }
             #menu-utilities .picker-btn.solo { margin-top: 0; }
         }
@@ -780,8 +770,9 @@
 
         #session-list {
             width: 100%;
+            height: calc(2 * var(--menu-button-height) + var(--menu-row-gap));
             min-height: var(--menu-button-height);
-            max-height: min(135px, 25dvh, var(--session-list-available, 100dvh));
+            max-height: var(--session-list-available, 100dvh);
             overflow-x: hidden;
             overflow-y: auto;
             overscroll-behavior: contain;
@@ -938,29 +929,16 @@
             text-overflow: ellipsis;
         }
 
-        /* Region selector for Create. Native <select> so mobile gets the
-           OS-native wheel/sheet — best touch UX possible and zero JS to
-           build a custom dropdown. 44px min-height is the WCAG 2.5.5 /
-           Apple HIG minimum tap target. The selector lives in its own
-           row above the Create button on touch viewports; the surrounding
-           layout already accommodates a vertical stack so there's no
-           desktop-vs-mobile branching at the markup level. */
+        /* Match the menu buttons while retaining the native region dropdown. */
         .region-select-row {
             width: 100%;
             display: flex;
             flex-direction: column;
             align-items: stretch;
-            gap: 4px;
             margin-bottom: 5.6px;
         }
-        .region-select-row label {
-            font-size: 11px;
-            color: #a8b3c7;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
         #create-region-select {
-            min-height: 44px;
+            height: var(--menu-button-height);
             width: 100%;
             background: rgba(10, 16, 30, 0.92);
             border: 1px solid #56698f;
@@ -1058,10 +1036,6 @@
         #menu-columns .button-row .picker-btn {
             flex: 1;
             min-width: 0;
-        }
-
-        #menu-utilities .button-row .picker-btn {
-            padding: 2px min(8px, 1vw);
         }
 
         #btn-control-mode,
@@ -1213,8 +1187,7 @@
                         <div id="session-list"></div>
                         <div id="picker-buttons">
                         <div class="region-select-row" id="create-region-row" style="display: none;">
-                            <label for="create-region-select">Host region</label>
-                            <select id="create-region-select"></select>
+                            <select id="create-region-select" aria-label="Host region"></select>
                         </div>
                         <div class="button-row">
                             <button id="btn-leave-create" class="picker-btn" disabled>Create Multiplayer</button>
@@ -11185,10 +11158,29 @@
     function fitSessionListToViewport() {
         if (!isSessionPickerVisible()) return;
         const content = document.getElementById('start-screen-content');
+        const columns = document.getElementById('menu-columns');
+        const actions = document.getElementById('picker-buttons');
+        const utilities = document.getElementById('menu-utilities');
         const list = sessionPicker.listEl;
-        const available = Math.max(0, Math.floor(startScreen.clientHeight
-            - content.scrollHeight + list.getBoundingClientRect().height));
-        const height = `${available}px`;
+        const headingSpace = columns.getBoundingClientRect().top
+            - content.getBoundingClientRect().top + content.scrollTop;
+        const columnBudget = startScreen.clientHeight - headingSpace
+            - parseFloat(getComputedStyle(content).paddingBottom);
+        const actionSpace = actions.getBoundingClientRect().height
+            + parseFloat(getComputedStyle(list).marginBottom);
+        let available;
+        if (matchMedia('(orientation: landscape)').matches) {
+            // The utility column imposes a minimum; shrinking below it saves no space.
+            const groups = [...utilities.children];
+            const utilityMinimum = groups.reduce((sum, group) =>
+                sum + group.getBoundingClientRect().height, 0)
+                + parseFloat(getComputedStyle(utilities).rowGap) * (groups.length - 1);
+            available = Math.max(columnBudget, utilityMinimum) - actionSpace;
+        } else {
+            available = columnBudget - actionSpace - utilities.getBoundingClientRect().height
+                - parseFloat(getComputedStyle(columns).rowGap);
+        }
+        const height = `${Math.max(0, available)}px`;
         if (list.style.getPropertyValue('--session-list-available') !== height) {
             list.style.setProperty('--session-list-available', height);
         }
@@ -11206,7 +11198,11 @@
                 fitSessionListToViewport();
             });
         });
-        for (const element of [startScreen, content, ...content.children]) observer.observe(element);
+        for (const element of [
+            startScreen, content, ...content.children,
+            document.getElementById('picker-buttons'),
+            ...document.getElementById('menu-utilities').children
+        ]) observer.observe(element);
     }
 
     function beginPickerOperation() {
@@ -11600,7 +11596,6 @@
             sessionPicker.btnLeaveCreate = fresh;
             fresh.addEventListener('click', handleLeaveCreateButton);
         } else {
-            // Keep the destination visible on touch without changing button dimensions.
             const createEligibility = getCreateEligibility();
             const regionName = getCreateRegionDisplayName(createEligibility.regionId);
             const multiRegion = sessionPicker.regions.length > 1;
@@ -11608,11 +11603,6 @@
             btnLeaveCreate.disabled = sessionPicker.operationPending === true || !createEligibility.canCreateNow;
             btnLeaveCreate.className = 'picker-btn';
             if (regionName && multiRegion) {
-                const regionLabel = document.createElement('span');
-                regionLabel.className = 'create-region-label';
-                regionLabel.textContent = ` in ${regionName}`;
-                btnLeaveCreate.appendChild(regionLabel);
-                btnLeaveCreate.classList.add('regional-create');
                 btnLeaveCreate.setAttribute('aria-label', `Create Multiplayer in ${regionName}`);
             }
             if (!canCreate) {
