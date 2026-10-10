@@ -379,7 +379,8 @@ for (const viewport of [
     });
 }
 
-test('identity failure and busy states keep their actions accessible in a reduced-height viewport', async ({ identities }) => {
+const localFaultTest = Object.hasOwn(process.env, 'BROWSER_SMOKE_BASE_URL') ? test.skip : test;
+localFaultTest('identity failure and busy states keep their actions accessible in a reduced-height viewport', async ({ identities }) => {
     const player = await identities.open();
     await player.page.setViewportSize({ width: 360, height: 300 });
     let failedAttempts = 0;

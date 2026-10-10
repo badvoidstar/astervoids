@@ -20,7 +20,7 @@
  *   - the tab is hidden (`document.hidden === true`)
  * every spectator connection is closed. This is critical for scale-to-zero:
  * an always-on spectator connection per visitor would defeat the
- * `cooldownPeriod: 60s` on every Container App.
+ * configured scale-to-zero cooldown on every Container App.
  *
  * On `visibilitychange`-back, spectator connections re-open. On Leave (back
  * to picker), they re-open.

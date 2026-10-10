@@ -115,7 +115,7 @@ jobs:
         run: npm run test:browser:helpers
 
       - name: Install Chromium
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps --only-shell chromium
 
       - name: Real-browser local playability smoke
         timeout-minutes: 5
@@ -519,7 +519,7 @@ jobs:
         if: steps.vars.outputs.is_production != 'true'
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps --only-shell chromium
 
       - name: Real-browser branch-preview playability smoke
         if: steps.vars.outputs.is_production != 'true'

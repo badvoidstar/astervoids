@@ -26,12 +26,9 @@
 //
 // `/api/regions` is just as cheap (returns a small JSON document, no service
 // work) but it's an endpoint we already need for the picker bootstrap, so we
-// get free production traffic into it. More importantly, the probe interval
-// (default 30 s, raised to 60 s here) acts as a floor on how often regions
-// can scale to zero — if probes were too frequent they would defeat the
-// scale-to-zero requirement. 60 s probes leave a 60 s window where a region
-// can be fully cold; combined with the Container App `cooldownPeriod: 60s`
-// that means a truly idle region can scale to zero between probes.
+// get free production traffic into it. These probes count as request activity
+// and can keep regions warm rather than letting the configured scale-to-zero
+// cooldown expire. This legacy module is not invoked by the current main.bicep.
 // =============================================================================
 
 @description('Name of the Traffic Manager profile (must be globally unique within trafficmanager.net).')
