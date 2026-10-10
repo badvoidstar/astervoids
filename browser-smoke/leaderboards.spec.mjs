@@ -147,7 +147,7 @@ test('leaderboard labels fit one line without changing button height at narrow a
             .toEqual(typography[0]);
     }
     await openBoard(page);
-    for (const width of [180, 240, 280, 320, 480, 539, 540, 600, 720, 768, 960]) {
+    for (const width of [180, 240, 280, 320, 480, 539, 540, 600, 695, 696, 697, 720, 768, 960]) {
         await page.setViewportSize({ width, height: 568 });
         const failures = await page.evaluate(() => {
             const failures = [];
@@ -183,6 +183,116 @@ test('leaderboard labels fit one line without changing button height at narrow a
     await page.setViewportSize({ width: 960, height: 720 });
     await expect(page.locator('#leaderboard-aspect')).toHaveCSS('font-size', '13px');
     await page.locator('#leaderboard-back').click();
+});
+
+test('leaderboard filters switch together at their measured row limit and stay stable on resize', async ({ boards }) => {
+    const player = await boards.open({ guest: true, viewport: { width: 960, height: 900 } });
+    const { page } = player;
+    await openBoard(page);
+    await clickFilter(page, 'team', 'Team Size : 1', 'teamSize', 1);
+    await clickFilter(page, 'aspect', 'Aspect Ratio : Portrait', 'aspect', 'portrait');
+    await clickFilter(page, 'aspect', 'Aspect Ratio : Landscape', 'aspect', 'landscape');
+    for (const [label, value] of [['Shifter', 0.2], ['Dancer', 0.35], ['Raver', 0.5], ['Survivor', 0.65]]) {
+        await clickFilter(page, 'difficulty', `Difficulty : ${label}`, 'difficulty', value);
+    }
+
+    const geometry = () => page.locator('#leaderboard-filters').evaluate(group => {
+        const buttons = [...group.querySelectorAll('button')];
+        const boxes = buttons.map(button => button.getBoundingClientRect());
+        const bounds = group.getBoundingClientRect();
+        const row = boxes.every(box => Math.abs(box.top - boxes[0].top) < 0.5);
+        const stack = boxes.every(box => Math.abs(box.left - boxes[0].left) < 0.5);
+        const screen = document.getElementById('leaderboard-screen');
+        return {
+            mode: row ? 'row' : stack ? 'stack' : 'mixed',
+            labels: buttons.map(button => button.textContent),
+            fonts: buttons.map(button => parseFloat(getComputedStyle(button).fontSize)),
+            heights: boxes.map(box => box.height),
+            separated: boxes.slice(1).every((box, index) =>
+                row ? box.left >= boxes[index].right : box.top >= boxes[index].bottom),
+            fits: buttons.every((button, index) => {
+                const box = boxes[index];
+                const style = getComputedStyle(button);
+                const range = document.createRange();
+                range.selectNodeContents(button);
+                const text = range.getBoundingClientRect();
+                const left = box.left + button.clientLeft + parseFloat(style.paddingLeft);
+                const right = box.left + button.clientLeft + button.clientWidth - parseFloat(style.paddingRight);
+                return range.getClientRects().length === 1 && text.width > 0
+                    && text.left >= left - 0.5 && text.right <= right + 0.5
+                    && text.top >= box.top + 2 && text.bottom <= box.bottom - 2
+                    && box.left >= bounds.left - 0.5 && box.right <= bounds.right + 0.5
+                    && style.transform === 'none' && style.textOverflow !== 'ellipsis';
+            }),
+            screenFits: screen.scrollWidth <= screen.clientWidth,
+            nativeGroup: getComputedStyle(group).transform === 'none',
+        };
+    });
+    const settle = () => page.evaluate(() => new Promise(resolve =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const resize = async (width, height = 900) => {
+        await page.setViewportSize({ width, height });
+        await settle();
+        return geometry();
+    };
+
+    let lower = 180;
+    let upper = 960;
+    expect((await resize(lower)).mode).toBe('stack');
+    expect((await resize(upper)).mode).toBe('row');
+    while (upper - lower > 1) {
+        const width = Math.floor((lower + upper) / 2);
+        if ((await resize(width)).mode === 'row') upper = width;
+        else lower = width;
+    }
+    expect((await resize(lower)).mode,
+        `All filters stack immediately below the measured ${upper}px row threshold at 900px height`)
+        .toBe('stack');
+    expect(upper, 'Measured full-row boundary at 900px height (220px buttons, gaps and panel insets)')
+        .toBe(696);
+    expect((await resize(720)).mode, 'The full row fits narrower than the previous 756px row limit')
+        .toBe('row');
+
+    const labels = ['Team Size : 1', 'Aspect Ratio : Landscape', 'Difficulty : Survivor'];
+    for (const [width, height] of [
+        ...[upper + 1, upper, lower, upper, lower, 640, 510, 320, 240, 180,
+            240, 320, 640, lower, upper, upper + 1, 960].map(width => [width, 900]),
+        [320, 568], [568, 320], [900, 320], [lower, 480], [upper, 900],
+    ]) {
+        await resize(width, height);
+        for (let frame = 0; frame < 3; frame++) {
+            await settle();
+            const actual = await geometry();
+            const location = `${width}x${height}, settled frame ${frame}`;
+            expect(actual.mode, `Atomic layout at ${location}`).toBe(width >= upper ? 'row' : 'stack');
+            expect(actual.labels, `Resize preserves selected filters at ${location}`).toEqual(labels);
+            expect(actual.heights, `Fixed button heights at ${location}`).toEqual([36, 36, 36]);
+            expect(actual.separated, `Buttons never overlap at ${location}`).toBe(true);
+            expect(actual.fits, `Full single-line labels stay inside their buttons at ${location}`).toBe(true);
+            expect(actual.screenFits, `No horizontal screen overflow at ${location}`).toBe(true);
+            expect(actual.nativeGroup, `Text containers are not scaled at ${location}`).toBe(true);
+            if (actual.mode === 'row') {
+                expect(actual.fonts, `The tighter row retains native 13px labels at ${location}`)
+                    .toEqual([13, 13, 13]);
+            }
+        }
+    }
+    await resize(320);
+    await clickFilter(page, 'aspect', 'Aspect Ratio : Rectangle', 'aspect', 'square');
+    expect((await geometry()).mode).toBe('stack');
+    await resize(upper);
+    await expect(page.locator('#leaderboard-aspect')).toHaveText('Aspect Ratio : Rectangle');
+    await clickFilter(page, 'aspect', 'Aspect Ratio : Any', 'aspect', null);
+    expect((await geometry()).mode).toBe('row');
+    await page.locator('#leaderboard-back').click();
+    await page.setViewportSize({ width: 320, height: 568 });
+    await openBoard(page);
+    expect((await geometry()).mode, 'Reopening after a hidden resize recalculates the stack').toBe('stack');
+    await page.locator('#leaderboard-back').click();
+    await page.setViewportSize({ width: 960, height: 900 });
+    await openBoard(page);
+    expect((await geometry()).mode, 'Reopening after a hidden resize restores the row').toBe('row');
+    expect(player.scoreRequests(), 'Layout and filter checks never submit scores').toBe(0);
 });
 
 test('leaderboard columns have balanced gutters and readable headings at mobile and desktop widths', async ({ boards }) => {

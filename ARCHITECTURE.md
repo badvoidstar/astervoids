@@ -714,9 +714,13 @@ names, scores, and the Difficulty heading without shrinking the native font.
 Wave is saved with that score's run checkpoint, not the player's highest wave
 from another run; its heading tooltip makes that association explicit.
 Loading/error/empty states are distinct; query generations suppress stale results.
-Filter controls reflow into columns with enough label space and retain a fixed
-single-line height. Native font sizes fit the measured content width on very
-narrow layouts; neither labels nor their containers are transform-scaled.
+Filter controls use either one row of all buttons or one vertical stack, retaining
+a fixed single-line height. The row fits when the measured group width accommodates
+each button's 220px width allowance plus the CSS column gaps; this leaves room for
+the full labels at their normal 13px font. Resize observation recalculates the mode
+from the group width, not the previous layout or viewport orientation. Native font
+sizes fit the measured content width on very narrow layouts; neither labels nor
+their containers are transform-scaled.
 The table has its own focusable scroller with mouse/touch pointer capture and
 decaying post-release inertia; wheel, keyboard, cancellation, boundaries, and
 reduced-motion preference stop inertia. Text is not canvas-scaled. Screen input

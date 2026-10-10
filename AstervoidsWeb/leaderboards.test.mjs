@@ -410,7 +410,7 @@ test('malformed and unavailable queries show errors, not a success-shaped empty 
     assert.equal(changes.at(-1).code, 'leaderboard_unavailable');
 });
 
-test('leaderboard buttons keep a fixed single-line height and reflow into columns that fit', () => {
+test('leaderboard buttons keep a fixed single-line height with a single-column fallback', () => {
     const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
         .replace(/\r\n/g, '\n');
     const style = source.match(/#leaderboard-screen \.picker-btn \{([^}]+)\}/)?.[1];
@@ -419,8 +419,55 @@ test('leaderboard buttons keep a fixed single-line height and reflow into column
     assert.match(style, /min-width: 0;/);
     assert.match(style, /white-space: nowrap;/);
     assert.match(style, /transition-property: background-color, border-color, color, opacity;/);
-    assert.match(source, /#leaderboard-filters \{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 240px\), 1fr\)\);/);
+    assert.match(source, /#leaderboard-filters \{[^}]*grid-template-columns: minmax\(0, 1fr\);/);
     assert.match(source, /#btn-leaderboards \{[^}]*white-space: nowrap;/);
+});
+
+test('filter layout fits all columns together using the CSS width allowance and measured gap', () => {
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    const style = source.match(/#leaderboard-filters \{([^}]+)\}/)?.[1];
+    const minimum = Number(style.match(/--leaderboard-filter-min-width: (\d+)px;/)?.[1]);
+    const gap = Number(style.match(/\bgap: (\d+)px;/)?.[1]);
+    assert.equal(minimum, 220, 'Trim the old 240px allowance without shrinking normal label fonts');
+    assert.ok(gap > 0);
+    let width = 0;
+    const group = {
+        children: [{}, {}, {}], style: {},
+        getBoundingClientRect: () => ({ width }),
+    };
+    const environment = {
+        getComputedStyle(element) {
+            assert.equal(element, group);
+            return {
+                columnGap: `${gap}px`,
+                getPropertyValue(property) {
+                    assert.equal(property, '--leaderboard-filter-min-width');
+                    return `${minimum}px`;
+                },
+            };
+        },
+    };
+    const rowMinimum = group.children.length * minimum + (group.children.length - 1) * gap;
+    for (const [available, columns] of [
+        [rowMinimum + 1, 3], [rowMinimum, 3], [rowMinimum - 0.25, 1],
+        [rowMinimum - 1, 1], [2 * minimum + gap, 1], [156, 1],
+        [rowMinimum, 3], [rowMinimum - 1, 1], [rowMinimum + 1, 3],
+    ]) {
+        width = available;
+        Leaderboards.fitFilterLayout(group, environment);
+        assert.equal(group.style.gridTemplateColumns, `repeat(${columns}, minmax(0, 1fr))`,
+            `All three filters share the mode at ${width}px, independent of the previous layout`);
+    }
+    width = 0;
+    Leaderboards.fitFilterLayout(group, {
+        getComputedStyle() { assert.fail('Hidden groups must not be measured'); },
+    });
+    assert.equal(group.style.gridTemplateColumns, 'repeat(3, minmax(0, 1fr))');
+    width = 156;
+    Leaderboards.fitFilterLayout(group, environment);
+    assert.equal(group.style.gridTemplateColumns, 'repeat(1, minmax(0, 1fr))',
+        'Reopening at a narrower size recalculates the layout');
 });
 
 test('the menu inherits shared button typography and numeric table headers align with their values', () => {

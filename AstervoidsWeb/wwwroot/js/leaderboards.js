@@ -279,6 +279,17 @@ const Leaderboards = (function () {
         return Object.freeze({ enqueue, flush, refresh });
     }
 
+    function fitFilterLayout(group, environment = globalThis) {
+        const width = group.getBoundingClientRect().width;
+        if (width <= 0) return;
+        const style = environment.getComputedStyle(group);
+        const minimum = parseFloat(style.getPropertyValue('--leaderboard-filter-min-width'));
+        const gap = parseFloat(style.columnGap);
+        const count = group.children.length;
+        const columns = width >= count * minimum + (count - 1) * gap ? count : 1;
+        group.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    }
+
     function fitButtonLabels(buttons, environment = globalThis) {
         for (const button of buttons) {
             if (button.clientWidth <= 0) continue;
@@ -376,7 +387,7 @@ const Leaderboards = (function () {
 
     return Object.freeze({
         STORAGE_KEY, MAX_PENDING, ASPECTS, normalizeSnapshot, sameSnapshot, mergeSnapshots,
-        difficultyLabel, nextFilter, validateView, createQuery, createOutbox, fitButtonLabels, attachDragScroll,
+        difficultyLabel, nextFilter, validateView, createQuery, createOutbox, fitFilterLayout, fitButtonLabels, attachDragScroll,
     });
 })();
 
