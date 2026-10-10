@@ -16,135 +16,258 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 permissions:
-  id-token: write  # Required for OIDC authentication
   contents: read
 
-env:
-  DOTNET_VERSION: '10.0.x'
-  # Shared resource naming conventions
-  PRODUCTION_RG: 'rg-production'
-  CONTAINER_ENV_NAME: 'cae-production'
-  CONTAINER_APP_PREFIX: 'ca-web'
-  # ── Multi-region rollout ──────────────────────────────────────────────────
-  # Source of truth: the GitHub repository variable REGIONS_JSON
-  # (Settings → Secrets and variables → Actions → Variables tab).
-  # Empty string preserves the legacy single-region production deploy
-  # (everything in westus2 under cae-production). To roll out multi-region,
-  # set the REGIONS_JSON repo variable to a JSON array of region objects:
-  #
-  #   [
-  #     {"name":"westus2","location":"westus2","displayName":"US West"},
-  #     {"name":"northeurope","location":"northeurope","displayName":"Europe"},
-  #     {"name":"japaneast","location":"japaneast","displayName":"Asia"}
-  #   ]
-  #
-  # The first entry is the "primary" region — it owns the shared ACR and
-  # branch deployments target its CAE. Only applied when deploying main;
-  # branches always go single-region into the primary region's CAE.
-  REGIONS_JSON: ${{ vars.REGIONS_JSON }}
-  # ── BYO TLS certificate (optional) ────────────────────────────────────────
-  # When all three are set, bicep binds <subdomain>.<domain> on every region
-  # (and every branch deploy) to a Key Vault-stored certificate — no per-app
-  # DigiCert managed-cert provisioning runs. Recommended path for multi-region
-  # where per-region ACA hostnames are bound with one shared wildcard cert.
-  # See ARCHITECTURE.md "BYO wildcard cert for regional hostnames".
-  #
-  # Single-region production and branch previews fall back to the legacy
-  # DigiCert managed-cert flow when the BYO values are empty. Multi-region
-  # production requires the BYO URL/name pair and is rejected before Azure
-  # resources are created when it is absent.
-  #
-  # Set via repo secrets (Settings → Secrets and variables → Actions → Secrets):
-  # Certificate metadata can reveal the private hostname by correlation.
-  # Variables are not log-masked; keep these values out of public outputs too.
-  #   CERT_KEY_VAULT_SECRET_URL    e.g. https://example.vault.azure.net/secrets/wildcard-example-com
-  #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-example-com (stable name for the CAE cert resource)
-  #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
-  #                                 'Key Vault Certificate User' role on the KV holding the cert.
-  #                                 OPTIONAL in production when bicep's manageAcmebotPermissions=true
-  #                                 (the default — bicep creates id-acme-cert-reader and uses its
-  #                                 output for the CAE cert binding). STILL REQUIRED for branch deploys
-  #                                 (the bootstrap step needs the ID to attach the identity to the
-  #                                 shared CAE before creating the cert resource).
-  CERT_KEY_VAULT_SECRET_URL: ${{ secrets.CERT_KEY_VAULT_SECRET_URL }}
-  CERT_KEY_VAULT_CERT_NAME: ${{ secrets.CERT_KEY_VAULT_CERT_NAME }}
-  CERT_READER_IDENTITY_ID: ${{ secrets.CERT_READER_IDENTITY_ID }}
-  # Optional. Defaults to true when unset, but is consulted only by a
-  # production BYO deployment that omits CERT_READER_IDENTITY_ID.
-  MANAGE_ACMEBOT_PERMISSIONS: ${{ vars.MANAGE_ACMEBOT_PERMISSIONS }}
-  # Optional boolean, defaults to true. Controls root onboarding only;
-  # every deployed app always uses its environment's durable identity table.
-  IDENTITY_PROMPT_ON_ROOT: ${{ vars.IDENTITY_PROMPT_ON_ROOT }}
-
 jobs:
+  validation_plan:
+    name: Plan PR validation reuse
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      group: ${{ steps.plan.outputs.group }}
+      source_id: ${{ steps.plan.outputs.source_id }}
+    steps:
+      - name: Checkout immutable event commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Plan one-way reuse
+        id: plan
+        run: node .github/scripts/validation-reuse.mjs plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
     name: Build Application
+    needs: validation_plan
+    # A failed/skipped planner must still produce a real Build result.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      # PR-first and unknown/queued sources get a unique, full-validation group.
+      group: ${{ github.event_name == 'push' && github.run_attempt == 1 && github.ref != 'refs/heads/main' && format('astervoids-validation-v1-{0}-{1}', github.repository_id, github.sha) || github.event_name == 'pull_request' && github.run_attempt == 1 && needs.validation_plan.outputs.group || format('astervoids-validation-v1-full-{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: false
+      queue: max
+    defaults:
+      run:
+        working-directory: validation
+        shell: node .github/scripts/validation-reuse.mjs exec -- bash --noprofile --norc -e -o pipefail {0}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Checkout event commit
+        id: event_checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: event
+          persist-credentials: false
+
+      - name: Select validation source
+        id: source
+        shell: bash
+        working-directory: event
+        run: node .github/scripts/validation-reuse.mjs select
+        env:
+          VALIDATION_SOURCE_ID: ${{ needs.validation_plan.outputs.source_id }}
+
+      - name: Checkout validation commit
+        id: validation_checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          path: validation
+          persist-credentials: false
+
+      - name: Verify validation checkout
+        id: checkout
+        shell: bash
+        run: node .github/scripts/validation-reuse.mjs checkout
+        env:
+          VALIDATION_SHA: ${{ steps.source.outputs.sha }}
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+        id: dotnet
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Restore dependencies
-        run: dotnet restore astervoids.sln
-
-      - name: Build solution
-        run: dotnet build astervoids.sln --configuration Release --no-restore
-
-      - name: Run tests
-        run: dotnet test astervoids.sln --configuration Release --no-build --verbosity normal
+          dotnet-version: '10.0.x'
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        id: node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: validation/package-lock.json
+
+      - name: Restore dependencies
+        id: restore
+        run: dotnet restore astervoids.sln
 
       - name: Install browser smoke tooling
+        id: npm
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Install Chromium
+        id: chromium
+        run: npx playwright install --with-deps --only-shell chromium
+
+      # Keep setup/restore and Bicep compilation on both paths. Their effective
+      # versions, packages and browser/system dependencies enter the fingerprint.
+      - name: Bicep build (template smoke check)
+        id: bicep
+        run: |
+          mkdir -p test-results
+          az bicep build --file infra/main.bicep --outfile test-results/main.compiled.json
+          test -s test-results/main.compiled.json
+          echo "✅ infra/main.bicep compiles"
+
+      - name: Capture validation inputs
+        id: inputs
+        shell: bash
+        run: node .github/scripts/validation-reuse.mjs capture
+        env:
+          VALIDATION_SHA: ${{ steps.source.outputs.sha }}
+
+      - name: Verify push validation proof
+        id: reuse
+        shell: bash
+        run: node .github/scripts/validation-reuse.mjs verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_SOURCE_ID: ${{ needs.validation_plan.outputs.source_id }}
+
+      - name: Build solution
+        id: compile
+        if: steps.reuse.outputs.hit != 'true'
+        run: dotnet build astervoids.sln --configuration Release --no-restore
+
+      - name: Run tests
+        id: csharp
+        if: steps.reuse.outputs.hit != 'true'
+        run: dotnet test astervoids.sln --configuration Release --no-build --verbosity normal
+
       - name: Run JavaScript tests
+        id: javascript
+        if: steps.reuse.outputs.hit != 'true'
         run: node --test AstervoidsWeb/*.test.mjs
 
       - name: Validate browser smoke helpers
+        id: browser_helpers
+        if: steps.reuse.outputs.hit != 'true'
         run: npm run test:browser:helpers
 
-      - name: Install Chromium
-        run: npx playwright install --with-deps --only-shell chromium
-
       - name: Real-browser local playability smoke
+        id: browser
+        if: steps.reuse.outputs.hit != 'true'
         timeout-minutes: 5
         run: npm run test:browser
         env:
           BROWSER_SMOKE_NO_BUILD: '1'
 
       - name: Validate Squad setup
+        id: squad
+        if: steps.reuse.outputs.hit != 'true'
         run: node --test .github/scripts/squad-setup.test.mjs
 
       - name: Validate workflow helpers
+        id: workflow_helpers
+        if: steps.reuse.outputs.hit != 'true'
         run: bash .github/scripts/workflow-helpers.test.sh
 
-      # Bicep smoke check — fail fast on template syntax errors before any
-      # Azure deploy is attempted. Runs in the build job so a malformed
-      # bicep change blocks the deploy job from even running.
-      - name: Bicep build (template smoke check)
-        run: |
-          # az is preinstalled on ubuntu-latest runners; bicep CLI auto-installs on first use.
-          mkdir -p test-results
-          az bicep build --file infra/main.bicep --outfile test-results/main.compiled.json
-          test -s test-results/main.compiled.json
-          echo "✅ infra/main.bicep compiles"
+      - name: Write validation proof
+        id: proof
+        if: github.event_name == 'push' && github.run_attempt == 1 && github.ref != 'refs/heads/main' && steps.inputs.outputs.eligible == 'true' && steps.reuse.outputs.hit == 'false'
+        continue-on-error: true
+        shell: bash
+        run: node .github/scripts/validation-reuse.mjs publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_STEPS: ${{ toJSON(steps) }}
+
+      - name: Publish validation proof
+        if: steps.proof.outputs.publish == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: astervoids-validation-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validation/test-results/validation-proof/proof.json
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
   deploy:
     name: Deploy to Azure
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Override implicit success(): the PR-only planner is skipped on push/manual runs.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    permissions:
+      id-token: write  # Required for OIDC authentication
+      contents: read
+    env:
+      DOTNET_VERSION: '10.0.x'
+      # Shared resource naming conventions
+      PRODUCTION_RG: 'rg-production'
+      CONTAINER_ENV_NAME: 'cae-production'
+      CONTAINER_APP_PREFIX: 'ca-web'
+      # ── Multi-region rollout ──────────────────────────────────────────────────
+      # Source of truth: the GitHub repository variable REGIONS_JSON
+      # (Settings → Secrets and variables → Actions → Variables tab).
+      # Empty string preserves the legacy single-region production deploy
+      # (everything in westus2 under cae-production). To roll out multi-region,
+      # set the REGIONS_JSON repo variable to a JSON array of region objects:
+      #
+      #   [
+      #     {"name":"westus2","location":"westus2","displayName":"US West"},
+      #     {"name":"northeurope","location":"northeurope","displayName":"Europe"},
+      #     {"name":"japaneast","location":"japaneast","displayName":"Asia"}
+      #   ]
+      #
+      # The first entry is the "primary" region — it owns the shared ACR and
+      # branch deployments target its CAE. Only applied when deploying main;
+      # branches always go single-region into the primary region's CAE.
+      REGIONS_JSON: ${{ vars.REGIONS_JSON }}
+      # ── BYO TLS certificate (optional) ────────────────────────────────────────
+      # When all three are set, bicep binds <subdomain>.<domain> on every region
+      # (and every branch deploy) to a Key Vault-stored certificate — no per-app
+      # DigiCert managed-cert provisioning runs. Recommended path for multi-region
+      # where per-region ACA hostnames are bound with one shared wildcard cert.
+      # See ARCHITECTURE.md "BYO wildcard cert for regional hostnames".
+      #
+      # Single-region production and branch previews fall back to the legacy
+      # DigiCert managed-cert flow when the BYO values are empty. Multi-region
+      # production requires the BYO URL/name pair and is rejected before Azure
+      # resources are created when it is absent.
+      #
+      # Set via repo secrets (Settings → Secrets and variables → Actions → Secrets):
+      # Certificate metadata can reveal the private hostname by correlation.
+      # Variables are not log-masked; keep these values out of public outputs too.
+      #   CERT_KEY_VAULT_SECRET_URL    e.g. https://example.vault.azure.net/secrets/wildcard-example-com
+      #   CERT_KEY_VAULT_CERT_NAME     e.g. wildcard-example-com (stable name for the CAE cert resource)
+      #   CERT_READER_IDENTITY_ID      resource ID of a user-assigned managed identity that has
+      #                                 'Key Vault Certificate User' role on the KV holding the cert.
+      #                                 OPTIONAL in production when bicep's manageAcmebotPermissions=true
+      #                                 (the default — bicep creates id-acme-cert-reader and uses its
+      #                                 output for the CAE cert binding). STILL REQUIRED for branch deploys
+      #                                 (the bootstrap step needs the ID to attach the identity to the
+      #                                 shared CAE before creating the cert resource).
+      CERT_KEY_VAULT_SECRET_URL: ${{ secrets.CERT_KEY_VAULT_SECRET_URL }}
+      CERT_KEY_VAULT_CERT_NAME: ${{ secrets.CERT_KEY_VAULT_CERT_NAME }}
+      CERT_READER_IDENTITY_ID: ${{ secrets.CERT_READER_IDENTITY_ID }}
+      # Optional. Defaults to true when unset, but is consulted only by a
+      # production BYO deployment that omits CERT_READER_IDENTITY_ID.
+      MANAGE_ACMEBOT_PERMISSIONS: ${{ vars.MANAGE_ACMEBOT_PERMISSIONS }}
+      # Optional boolean, defaults to true. Controls root onboarding only;
+      # every deployed app always uses its environment's durable identity table.
+      IDENTITY_PROMPT_ON_ROOT: ${{ vars.IDENTITY_PROMPT_ON_ROOT }}
     # Cleanup must not retire an account between provisioning it and its app.
     concurrency:
       group: astervoids-azure-resource-mutations

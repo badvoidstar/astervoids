@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "$SCRIPT_DIR/easy-auth-monitor.test.sh"
 node --test "$SCRIPT_DIR/orphan-cleanup.test.mjs"
+node --test "$SCRIPT_DIR/validation-reuse.test.mjs"
 . "$SCRIPT_DIR/deployment-helpers.sh"
 . "$SCRIPT_DIR/orphan-safety.sh"
 
@@ -24,7 +25,7 @@ assert_equal() {
 
 WORKFLOW_SOURCE=$(tr -d '\r' < "$SCRIPT_DIR/../workflows/azure-deploy.yml")
 for certificate_input in CERT_KEY_VAULT_SECRET_URL CERT_KEY_VAULT_CERT_NAME CERT_READER_IDENTITY_ID; do
-  grep -Fxq "  $certificate_input: "'${{ secrets.'"$certificate_input"' }}' <<< "$WORKFLOW_SOURCE" \
+  grep -Fxq "      $certificate_input: "'${{ secrets.'"$certificate_input"' }}' <<< "$WORKFLOW_SOURCE" \
     || fail "workflow must source $certificate_input only from a repository secret"
   if grep -Fq "vars.$certificate_input" <<< "$WORKFLOW_SOURCE"; then
     fail "workflow must not read the unmasked $certificate_input repository variable"

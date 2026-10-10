@@ -290,7 +290,9 @@ for CI behavior and the manual checks that remain necessary.
 ## Continuous Integration/Deployment (CI/CD)
 
 This project includes a GitHub Actions workflow that automatically:
-- builds/tests, including actual Chromium playability, on pull requests to `main`
+- validates pull requests to `main` with full build/tests (including actual
+  Chromium playability), or a verified identical-tree push proof during the
+  [guarded one-way reuse trial](CICD_SETUP.md#guarded-push-to-pr-validation-reuse)
 - deploys on pushes to any branch (`main` production, non-`main` branch previews)
 - checks deployed branch previews through their default Azure hostname before
   reporting deployment success

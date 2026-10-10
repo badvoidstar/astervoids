@@ -5,7 +5,8 @@ This document explains how to configure the GitHub Actions workflow for automati
 ## Overview
 
 The CI/CD pipeline automatically:
-- **Builds** the .NET application on every push and pull request
+- **Validates** every push and pull request with a full build/test run or the
+  narrowly guarded push-to-PR proof described below
 - **Tests** the application to ensure code quality
 - **Exercises real Chromium gameplay** locally before deployment and against
   the default Azure hostname after a branch-preview deployment
@@ -366,11 +367,115 @@ ready. The app remains available through its default Azure hostname; review
 the custom-domain step and rerun after DNS propagation instead of treating the
 app deployment as failed.
 
+### Guarded push-to-PR validation reuse
+
+**Delivery trial, not a permanent optimization policy.** The goal is less
+duplicate hosted-runner occupancy, not billing savings (these public hosted
+runners are free). Push/PR builds already overlap, so faster deployment
+wall time is not guaranteed. Real source-first hits and fallback trials must
+be reviewed before deciding whether to retain this policy.
+
+`Build Application` still owns the validation result, and deploy still
+`needs: build`. Deploy explicitly checks cancellation, Build success, and the
+push/manual event instead of inheriting Actions' implicit `success()` gate:
+the skipped PR-only planner must not block a successful push/manual Build
+from deploying. Failed, cancelled, skipped or missing Build results and PR
+events cannot deploy.
+A failed or missing **Plan PR validation reuse** result cannot
+skip Build or replace it with an early-green planner. Build attempts on pushes,
+production, manual runs, forks and reruns always run the full suite. GitHub's
+rerun-failed-jobs mode may retain a previously successful planner's outputs;
+a rerun Build ignores that earlier scheduling group and proof hint.
+
+Only a same-repository, first-attempt PR can reuse a first-attempt,
+nonproduction **push** Build. The planner checks out the immutable event
+`github.sha`, fetches the immutable head object, and compares the **whole Git
+tree**, not just the run's head SHA. A different or unverifiable tree keeps
+full validation of the event merge. A qualified source hint and equal trees
+allow a separate, fresh, detached head checkout for validation only. This
+canonicalizes .NET's embedded Git revision/Source Link metadata; equal trees
+alone would not make two differently stamped builds equivalent. Missing
+planner output keeps the event checkout. A later proof/input miss on an
+already verified identical-tree head runs the full suite at that exact head.
+An inability to establish the selected checkout fails Build.
+Deployment checkout and orchestration `GITHUB_SHA` are unchanged.
+
+Eligible pushes use `astervoids-validation-v1-<repository-id>-<head-sha>`.
+A PR joins that scheduling group only if its planner sees an already-running
+eligible push **Build**, or a successfully completed Build with a candidate
+proof artifact. `cancel-in-progress: false` and `queue: max` queue jobs on
+GitHub, before runner allocation. PR-first, absent-source and merely-queued
+source cases get a unique full-validation group; they cannot block the source.
+There is no polling/wait loop. The group is coordination, **never evidence**.
+
+Both paths retain the pinned action setup, NuGet restore, `npm ci`, unchanged
+Chromium/system-dependency installation, and Bicep compile. Before omitting
+the expensive build/test steps, `.github/scripts/validation-reuse.mjs`
+compares the effective hosted image/architecture, kernel/CPU/memory, tool
+versions, installed system packages, actual headless browser binary digest,
+restored dependency manifests/integrities, and controlled subprocess
+environment. Unknown or mismatched inputs run fully. The clean validation
+shell retains `CI=true` and `BROWSER_SMOKE_NO_BUILD=1`, **omits**
+`BROWSER_SMOKE_BASE_URL`, strips event/ref/token/deployment inputs, and puts
+scratch files and the browser's isolated local file identity store under
+the validation checkout. Deployment-only settings/secrets now belong to
+deploy, with their existing values and behavior.
+
+After every full push gate succeeds, Build may publish the immutable
+one-day artifact **`astervoids-validation-v1-<run-id>-1`**, containing only
+**`proof.json`**. It records public repository/workflow/run/attempt and
+checkout identities, workflow/helper blobs, the non-secret input digest,
+`mode: full`, and creation time—no binaries, environment dump, tokens,
+deployment hostname or application payloads. Publication failure only loses
+reuse; it cannot bypass a failed validation gate. PRs never publish proofs.
+
+The consumer independently checks source repository/workflow identity,
+attempt 1, actual SHA/tree and executed policy blobs, input fingerprint,
+artifact ownership/schema/age/size, and the downloaded ZIP's SHA-256 digest.
+It uses the existing pinned Playwright tooling's bounded ZIP reader rather
+than trusting an artifact-download digest **warning**. Attempt-specific jobs
+must show terminal **Build success** and every validation/publication step
+completed successfully, never skipped; deployment may still be running.
+The consumer refreshes the source job, artifact and run before declaring a
+hit. Self-reuse, chains, reruns, missing/expired/deleted/corrupt proofs and
+API failures all miss. No checks-write permission or repository setting is
+needed or changed.
+
+Logs and step summaries use `validation-reuse <phase>: <reason>` plus
+public numeric source/artifact IDs. Useful trial outcomes are:
+
+| Phase | Reason | Meaning |
+|---|---|---|
+| plan | `source-running` / `source-proof-ready` | Candidate; not yet a hit |
+| select | `identical-tree-head` | Canonical validation checkout established next |
+| verify | `verified-push-proof` | Completed, independently verified reuse |
+| plan/select | `different-tree` | Full immutable event-merge validation |
+| plan | `no-source` / `source-not-running` | Full path, independent scheduling |
+| plan/capture | `rerun` / `fork` / `production-or-nonbranch` | Ineligible; full path |
+| verify | `proof-unavailable` / `artifact-stale` / `artifact-digest-mismatch` | Full path |
+| verify | `source-attempt` / `source-step-not-successful` / `api-unavailable` | Full path |
+| capture/verify | `tool-inputs-unknown` / `inputs-unavailable` / `proof-inputs-or-provenance` | Full path |
+| publish | `full-push-proof-written` | Candidate artifact; not terminal Build evidence |
+
+Run `node --test .github/scripts/validation-reuse.test.mjs` for real Git
+equal/divergent-tree fixtures, API/ZIP failure cases, the actual YAML
+contract and production-code/workflow mutations, including deployment status,
+Build-success and event restrictions. This suite is also
+wired into `bash .github/scripts/workflow-helpers.test.sh`. It uses existing
+Node/Playwright tooling and cleans its named checkout-local fixtures.
+The publication trial must still demonstrate a real source-first
+same-tree hit, a **genuinely divergent** merge-tree full run, and
+rerun/proof-unavailable full runs. Inspect source Build steps, artifact IDs,
+consumer reasons and allocated job durations; unit tests do not establish
+GitHub queue behavior, runner occupancy reduction or branch playability.
+The shared Azure resource-mutation interlock and post-lock remote branch-head
+verification remain unchanged.
+
 ### Real-browser smoke gates
 
 `package.json` and `package-lock.json` pin the dev-only Playwright test runner.
 This tooling does not bundle, transpile, or change the shipped game. The build
-job installs Chromium and runs `npm run test:browser` against an owned local
+job installs Chromium and, on full validation, runs `npm run test:browser` against an owned local
 Release server **after** the .NET build (`BROWSER_SMOKE_NO_BUILD=1`). Browser
 failure blocks deployment just like a C# or JavaScript test failure.
 
