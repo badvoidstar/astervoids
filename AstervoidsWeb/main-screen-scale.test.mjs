@@ -179,6 +179,13 @@ test('landscape aligns the play and utility groups without reserving hidden butt
     assert.equal(source.match(/class="menu-utility-group"/g)?.length, 2);
 });
 
+test('session and region pickers share the standard menu row spacing', () => {
+    const listStyle = source.match(/#session-list \{([^}]+)\}/)?.[1];
+    assert.ok(listStyle);
+    assert.match(source, /#menu-columns \{[^}]*--menu-row-gap: 11\.2px;/);
+    assert.match(listStyle, /margin-bottom: var\(--menu-row-gap\);/);
+});
+
 test('the native region picker shares button dimensions without a visible caption', () => {
     const selectStyle = source.match(/#create-region-select \{([^}]+)\}/)?.[1];
     const buttonStyle = source.match(/#menu-columns \.picker-btn \{([^}]+)\}/)?.[1];
@@ -240,9 +247,6 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         /#start-screen h1 \{[\s\S]*?font-size: clamp\(24px, 5vmin, 38px\);[\s\S]*?margin-bottom: clamp\(11\.2px, 2\.16vmin, 21\.6px\);/);
     assert.match(
         source,
-        /#session-list \{[\s\S]*?max-height: var\(--session-list-available, 100dvh\);[\s\S]*?margin-bottom: 14\.4px;/);
-    assert.match(
-        source,
         /\.picker-btn \{[\s\S]*?font-size: 14px;[\s\S]*?padding: 8px 18px;/);
     for (const [selector, property, previous] of [
         ['#menu-columns', 'row-gap', 12],
@@ -250,7 +254,6 @@ test('main-screen vertical spacing is compressed without reducing font sizes', (
         ['#menu-columns .picker-btn.solo', 'margin-top', 7],
         ['#identity-status', 'margin-bottom', 10],
         ['#session-picker .picker-status', 'margin-bottom', 14],
-        ['#session-list', 'margin-bottom', 18],
         ['#region-banner', 'margin-bottom', 9],
         ['.region-select-row', 'margin-bottom', 7],
         ['#picker-buttons', 'gap', 7],

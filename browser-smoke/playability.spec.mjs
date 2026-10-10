@@ -448,6 +448,9 @@ test('main-menu buttons share size and brightness with compact spacing in portra
                         - utilityButtons[index - 1].getBoundingClientRect().top) > 0.05);
                 const utilities = utilityRows.map(button => button.getBoundingClientRect());
                 return {
+                    menuRowGap: parseFloat(getComputedStyle(document.querySelector('#menu-columns'))
+                        .getPropertyValue('--menu-row-gap')),
+                    sessionMargin: parseFloat(getComputedStyle(document.querySelector('#session-list')).marginBottom),
                     title: box('#identity-status').top - box('#start-screen h1').bottom,
                     identity: box('#picker-status').top - box('#identity-status').bottom,
                     status: statusNext.top - box('#picker-status').bottom,
@@ -495,14 +498,17 @@ test('main-menu buttons share size and brightness with compact spacing in portra
             ]) {
                 expect(spacing[name], `${name} gap is 20% smaller`).toBeCloseTo(previous * 0.8, 1);
             }
+            expect(spacing.sessionMargin, 'Session list margin matches the standard menu row spacing')
+                .toBeCloseTo(spacing.menuRowGap, 1);
             if (landscape) {
                 expect(spacing.sessions, 'Extra space aligns the play actions at the bottom')
-                    .toBeGreaterThanOrEqual(18 * 0.8 - 0.05);
+                    .toBeGreaterThanOrEqual(spacing.menuRowGap - 0.05);
                 for (const name of ['topAlignment', 'bottomAlignment', 'inviteAlignment']) {
                     expect(spacing[name], name).toBeCloseTo(0, 1);
                 }
             } else {
-                expect(spacing.sessions, 'Portrait session gap stays compact').toBeCloseTo(18 * 0.8, 1);
+                expect(spacing.sessions, 'Portrait session gap matches the standard menu row spacing')
+                    .toBeCloseTo(spacing.menuRowGap, 1);
             }
             for (const { gap, sharedGroup } of spacing.utilities) {
                 if (landscape && !sharedGroup) {
