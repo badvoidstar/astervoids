@@ -1775,8 +1775,12 @@ The repository's Traffic Manager module is not invoked by the current
 Each app uses a single active revision and zero-to-one replicas, with HTTPS
 ingress to port 8080. This avoids pretending multiple independent in-memory
 replicas share a session; it does not make session state durable. Current
-deployment defaults include 1 vCPU/2 GiB, a 60-second scale-down cooldown,
+deployment defaults include 1 vCPU/2 GiB, a 600-second (10-minute) scale-down cooldown,
 30-second termination grace, and per-CAE Log Analytics retention of 30 days.
+Production, regional, branch-preview and standalone apps inherit the shared
+cooldown. Identity APIs run in those same apps, not separately scaled containers.
+The 60-second empty-session retention remains independent and is not extended
+by keeping a container warm longer; Azure evaluates the actual scale-down timing.
 Source: [container app](infra/core/host/container-app.bicep) and
 [environment](infra/core/host/container-apps.bicep).
 

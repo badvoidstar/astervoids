@@ -70,8 +70,8 @@ param apexHostname string = ''
 @description('Additional exact origins allowed to call regional APIs, including the public Static Web App default host. Does not replace the custom apex or peer-region manifest.')
 param additionalAllowedOrigins array = []
 
-@description('Scale-down cooldown in seconds. Container Apps waits this long after the last connection closes before scaling to zero. The plan target is 60s — short enough that idle regions return to zero quickly between picker bursts, long enough to absorb a single missed keep-alive without flapping replicas.\n\nIMPORTANT — implicit coupling with SessionSettings.EmptyTimeoutSeconds (appsettings.json, default 60s):\n  When the last member leaves a session, SessionService keeps the session in memory for EmptyTimeoutSeconds so a returning member can rejoin. The container scale-down also runs in parallel using this `cooldownPeriodSeconds` timer. If `cooldownPeriodSeconds < EmptyTimeoutSeconds`, the container scales to zero BEFORE the empty session would have expired — annihilating the in-memory session and silently breaking the rejoin window. Keep cooldownPeriodSeconds >= EmptyTimeoutSeconds. Today both default to 60s, so they expire together (returning rejoin past 60s gets "session not found" either way).')
-param cooldownPeriodSeconds int = 60
+@description('Scale-to-zero cooldown in seconds. Defaults to 600s (10 minutes) to keep the app warm between visits while retaining idle scale-to-zero. Keep this at least as long as SessionSettings.EmptyTimeoutSeconds (60s in appsettings.json). Empty-session retention is independent: a longer container cooldown does not extend the session rejoin window.')
+param cooldownPeriodSeconds int = 600
 
 @description('Grace period for in-flight requests when a replica is being terminated. SignalR connections drain cleanly via the existing LeaveSession path during this window — 30s is comfortable for that and matches the plan.')
 param terminationGracePeriodSeconds int = 30
@@ -242,9 +242,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
       scale: {
         minReplicas: minReplicas
         maxReplicas: maxReplicas
-        // Aggressive cooldown so regions return to zero shortly after the
-        // last picker visitor leaves, satisfying the scale-to-zero
-        // requirement without sacrificing in-session warmth.
         cooldownPeriod: cooldownPeriodSeconds
         rules: [
           {

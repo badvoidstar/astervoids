@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { remoteBaseURL, assertSingleOriginRegions, waitForPreview } from './target.mjs';
 import SafeReporter from './safe-reporter.mjs';
 import { allowedGuardOrigins } from './origin-guard.mjs';
+import { menuLayoutCases } from './menu-layout-cases.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
@@ -180,6 +183,114 @@ test('resize readiness requires the canvas backing size and game viewport, not C
     }
 });
 
+test('local menu layout selection preserves every ordered projection and resize revisit', () => {
+    const local = menuLayoutCases({});
+    const states = [];
+    for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen'])
+    for (const multiRegion of [false, true])
+    for (const sessionCount of [0, 2, 6])
+    for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
+    for (const unavailable of [false, true]) {
+        states.push({ mode, multiRegion, sessionCount, role, unavailable });
+    }
+    assert.deepEqual(local.landscape, [
+        { width: 1280, height: 900 }, { width: 900, height: 550 },
+        { width: 568, height: 320 }, { width: 400, height: 300 },
+        { width: 360, height: 300 }, { width: 320, height: 240 },
+    ].map(viewport => ({ viewport, states })));
+    const viewports = [
+        { width: 568, height: 240 }, { width: 568, height: 280 },
+        { width: 568, height: 300 }, { width: 568, height: 320 },
+        { width: 568, height: 400 }, { width: 568, height: 320 },
+        { width: 568, height: 300 }, { width: 568, height: 280 },
+        { width: 360, height: 800 }, { width: 568, height: 240 },
+    ];
+    assert.deepEqual(local.resize, [false, true].map(multiRegion => ({
+        multiRegion,
+        transitions: [false, true, false].map(fullscreenHidden => ({ fullscreenHidden, viewports })),
+    })));
+    assert.equal(local.landscape.reduce((count, layout) => count + layout.states.length, 0), 1_152);
+    assert.deepEqual(menuLayoutCases({ CI: 'true', BROWSER_SMOKE_NO_BUILD: '1' }), local,
+        'Neither CI nor the build shortcut may reduce local coverage');
+});
+
+test('preview landscape selection covers boundary viewports and interacting display states', () => {
+    const local = menuLayoutCases({});
+    const preview = menuLayoutCases({ BROWSER_SMOKE_BASE_URL: 'https://preview.azurecontainerapps.io' });
+    assert.deepEqual(preview.landscape.map(layout => layout.viewport), local.landscape.map(layout => layout.viewport));
+    const fullStates = new Set(local.landscape[0].states.map(state => JSON.stringify(state)));
+    for (const { viewport, states } of preview.landscape) {
+        const label = `${viewport.width}x${viewport.height}`;
+        assert.equal(states.length, 17, `${label}: an explicitly bounded preview, not the exhaustive matrix`);
+        assert.equal(new Set(states.map(state => JSON.stringify(state))).size, states.length,
+            `${label}: representatives must not be duplicates`);
+        assert.ok(states.every(state => fullStates.has(JSON.stringify(state))), `${label}: only original states are selected`);
+        for (const multiRegion of [false, true])
+        for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
+        for (const unavailable of [false, true]) {
+            assert.ok(states.some(state => state.multiRegion === multiRegion
+                && state.role === role && state.unavailable === unavailable),
+            `${label}: regions=${multiRegion ? 2 : 1} ${role} unavailable=${unavailable}`);
+        }
+        for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen']) {
+            for (const role of ['outside', 'host', 'waiting-member', 'running-member']) {
+                assert.ok(states.some(state => state.mode === mode && state.role === role),
+                    `${label}: ${mode || 'windowed'} ${role}`);
+            }
+            for (const sessionCount of [0, 2, 6]) {
+                assert.ok(states.some(state => state.mode === mode && state.sessionCount === sessionCount),
+                    `${label}: ${mode || 'windowed'} sessions=${sessionCount}`);
+            }
+            for (const multiRegion of [false, true])
+            for (const unavailable of [false, true]) {
+                assert.ok(states.some(state => state.mode === mode
+                    && state.multiRegion === multiRegion && state.unavailable === unavailable),
+                `${label}: ${mode || 'windowed'} regions=${multiRegion ? 2 : 1} unavailable=${unavailable}`);
+            }
+        }
+        assert.ok(states.some(state => state.mode === '' && state.multiRegion && state.sessionCount === 6
+            && state.role === 'outside' && !state.unavailable),
+        `${label}: long destination, full list and every control visible together`);
+    }
+});
+
+test('preview resize selection keeps the full initial sweep and fullscreen boundary returns', () => {
+    const local = menuLayoutCases({});
+    const preview = menuLayoutCases({ BROWSER_SMOKE_BASE_URL: 'https://preview.azurecontainerapps.io' });
+    const boundaries = [
+        { width: 568, height: 240 }, { width: 568, height: 400 },
+        { width: 360, height: 800 }, { width: 568, height: 240 },
+    ];
+    assert.deepEqual(preview.resize, [false, true].map(multiRegion => ({
+        multiRegion,
+        transitions: [
+            { fullscreenHidden: false, viewports: local.resize[0].transitions[0].viewports },
+            { fullscreenHidden: true, viewports: boundaries },
+            { fullscreenHidden: false, viewports: boundaries },
+        ],
+    })));
+    assert.equal(preview.resize.flatMap(layout => layout.transitions)
+        .reduce((count, transition) => count + transition.viewports.length, 0), 36);
+});
+
+test('menu layout selection defaults to the same remote-mode presence gate as the runner', () => {
+    for (const remote of [false, true]) {
+        const env = { ...process.env };
+        if (remote) env.BROWSER_SMOKE_BASE_URL = 'https://preview.azurecontainerapps.io';
+        else delete env.BROWSER_SMOKE_BASE_URL;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+            "import { menuLayoutCases } from './browser-smoke/menu-layout-cases.mjs'; console.log(JSON.stringify(menuLayoutCases()));",
+        ], { encoding: 'utf8', env, timeout: 10_000 });
+        assert.equal(result.status, 0);
+        assert.deepEqual(JSON.parse(result.stdout), menuLayoutCases(env));
+    }
+    assert.deepEqual(menuLayoutCases({ BROWSER_SMOKE_BASE_URL: '' }),
+        menuLayoutCases({ BROWSER_SMOKE_BASE_URL: 'https://preview.azurecontainerapps.io' }),
+        'An invalid remote value still selects remote mode; target validation, not this selector, rejects it');
+    assert.deepEqual(menuLayoutCases(Object.create({ BROWSER_SMOKE_BASE_URL: 'https://preview.azurecontainerapps.io' })),
+        menuLayoutCases({}), 'Only an own environment property selects remote mode');
+});
+
 test('only a default single-region ACA origin is accepted remotely', () => {
     assert.equal(remoteBaseURL('https://preview.cluster.azurecontainerapps.io/'),
         'https://preview.cluster.azurecontainerapps.io');
@@ -212,15 +323,88 @@ test('remote command cannot silently fall back to starting a local server', () =
     assert.match(result.stderr, /requires a root HTTPS URL/);
 });
 
-test('remote configuration excludes owned loopback guard regressions and the local app server', () => {
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
-        "import config from './playwright.config.mjs'; console.log(JSON.stringify({ ignore: config.testIgnore, localServer: !!config.webServer }));",
-    ], {
-        encoding: 'utf8',
-        env: { ...process.env, BROWSER_SMOKE_BASE_URL: 'https://preview.azurecontainerapps.io' },
-    });
-    assert.equal(result.status, 0);
-    assert.deepEqual(JSON.parse(result.stdout), { ignore: '**/origin-guard.spec.mjs', localServer: false });
+test('local and remote configurations use the installed headless shell and keep their server boundaries', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'astervoids-smoke-config-'));
+    try {
+        for (const remote of [false, true]) {
+            const env = { ...process.env, TEMP: directory, TMP: directory, TMPDIR: directory };
+            if (remote) env.BROWSER_SMOKE_BASE_URL = 'https://preview.azurecontainerapps.io';
+            else delete env.BROWSER_SMOKE_BASE_URL;
+            const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+                `import config from './playwright.config.mjs';
+                console.log(JSON.stringify({
+                    ignore: config.testIgnore, localServer: !!config.webServer,
+                    browserName: config.use.browserName, headless: config.use.headless,
+                    channel: config.use.channel ?? null, launchOptions: config.use.launchOptions ?? {},
+                    projects: config.projects ?? [],
+                }));`,
+            ], { encoding: 'utf8', env, timeout: 10_000 });
+            assert.equal(result.status, 0);
+            assert.deepEqual(JSON.parse(result.stdout), {
+                ignore: remote ? '**/origin-guard.spec.mjs' : [], localServer: !remote,
+                browserName: 'chromium', headless: true, channel: null, launchOptions: {}, projects: [],
+            }, 'Neither mode may require full Chromium through a channel, executable or project override');
+        }
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test('actual Playwright discovery keeps local coverage, bounds preview layouts and skips only the injected identity failure', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'astervoids-smoke-discovery-'));
+    try {
+        const inventories = [];
+        for (const remote of [false, true]) {
+            const env = { ...process.env, TEMP: directory, TMP: directory, TMPDIR: directory };
+            if (remote) env.BROWSER_SMOKE_BASE_URL = 'https://preview.azurecontainerapps.io';
+            else delete env.BROWSER_SMOKE_BASE_URL;
+            const result = spawnSync(process.execPath, [
+                createRequire(import.meta.url).resolve('@playwright/test/cli'),
+                'test', '--list', '--reporter=json',
+            ], { encoding: 'utf8', env, timeout: 30_000 });
+            assert.equal(result.status, 0, 'Actual smoke discovery succeeds without a server or remote requests');
+            const inventory = [];
+            const layouts = [];
+            function collect(suite) {
+                for (const spec of suite.specs ?? []) {
+                    for (const scenario of spec.tests) {
+                        inventory.push({ file: spec.file, title: spec.title, expectedStatus: scenario.expectedStatus });
+                        for (const annotation of scenario.annotations ?? []) {
+                            if (annotation.type === 'menu-layout-cases') {
+                                layouts.push({ title: spec.title, count: annotation.description });
+                            }
+                        }
+                    }
+                }
+                for (const child of suite.suites ?? []) collect(child);
+            }
+            collect(JSON.parse(result.stdout));
+            assert.deepEqual(layouts, [
+                {
+                    title: 'landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states',
+                    count: remote ? '102' : '1152',
+                },
+                {
+                    title: 'menu fitting is resize-order independent and only shrinks space the layout can reclaim',
+                    count: remote ? '36' : '60',
+                },
+            ], 'The actual specs select their layout inventory from runner mode, not an always-reduced override');
+            inventories.push(inventory);
+        }
+        const [local, remote] = inventories;
+        assert.equal(local.length, 68);
+        assert.ok(local.every(scenario => scenario.expectedStatus === 'passed'));
+        assert.equal(local.filter(scenario => scenario.file === 'origin-guard.spec.mjs').length, 22);
+        const faultTitle = 'identity failure and busy states keep their actions accessible in a reduced-height viewport';
+        assert.equal(local.filter(scenario => scenario.title === faultTitle).length, 1);
+        assert.equal(remote.length, 46);
+        assert.deepEqual(remote, local
+            .filter(scenario => scenario.file !== 'origin-guard.spec.mjs')
+            .map(scenario => scenario.title === faultTitle
+                ? { ...scenario, expectedStatus: 'skipped' } : scenario));
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
 });
 
 test('remote manifest refuses private routing and multi-region production without echoing hostnames', () => {
@@ -276,37 +460,74 @@ test('readiness never follows a redirect to a private hostname', async () => {
     });
 });
 
-test('remote reporter emits only authored test names and outcomes', () => {
+test('remote reporter emits only authored names, outcomes and finite numeric durations', () => {
     const output = [];
     const originalLog = console.log;
     const originalError = console.error;
-    console.log = console.error = value => output.push(value);
+    console.log = console.error = (...values) => output.push(values);
+    const privateData = 'https://private.example.com identity/session/payload';
+    const outcomes = [
+        ['passed', 1234], ['failed', 2345.6], ['timedOut', 90_000],
+        ['skipped', 0], ['interrupted', 12.4],
+    ];
+    const invalidDurations = [
+        undefined, null, -1, NaN, Infinity, -Infinity, privateData,
+        { toString() { throw new Error('A duration must never be coerced from runtime data'); } },
+    ];
     try {
         const reporter = new SafeReporter();
-        reporter.onError(new Error('https://private.example.com session/payload'));
+        const scenario = {
+            title: 'authored smoke scenario',
+            location: { file: privateData, line: 1, column: 1 },
+            titlePath: () => [privateData, 'authored smoke scenario'],
+            annotations: [{ type: 'skip', description: privateData }],
+        };
+        reporter.onError(new Error(privateData));
         reporter.onStepEnd(null, null, {
-            category: 'expect', title: 'https://private.example.com session/payload', error: {},
+            category: 'expect', title: privateData, error: new Error(privateData),
         });
         reporter.onStepEnd(null, null, {
-            category: 'test.step', title: 'authored smoke step', error: {},
+            category: 'test.step', title: 'authored smoke step', error: new Error(privateData),
         });
-        reporter.onTestEnd({ title: 'authored smoke scenario' }, {
-            status: 'failed',
-            errors: [new Error('https://private.example.com session/payload')],
-        });
+        for (const [status, duration] of outcomes) {
+            const result = {
+                status, duration, error: new Error(privateData), errors: [new Error(privateData)],
+                attachments: [{ name: privateData, path: privateData, body: Buffer.from(privateData) }],
+                stdout: [privateData], stderr: [Buffer.from(privateData)],
+            };
+            reporter.onStdOut?.(privateData, scenario, result);
+            reporter.onStdErr?.(Buffer.from(privateData), scenario, result);
+            reporter.onTestEnd(scenario, result);
+        }
+        for (const duration of invalidDurations) {
+            reporter.onTestEnd(scenario, { status: 'failed', duration });
+        }
         reporter.onEnd({ status: 'failed' });
     } finally {
         console.log = originalLog;
         console.error = originalError;
     }
-    assert.match(output.join('\n'), /FAILED: authored smoke scenario/);
-    assert.match(output.join('\n'), /FAILED STEP: authored smoke step/);
-    assert.doesNotMatch(output.join('\n'), /private\.example\.com|session\/payload/);
+    assert.deepEqual(output, [
+        ['Browser smoke setup/runner failed. Target may be unavailable or unsupported; inspect privately.'],
+        ['FAILED STEP: authored smoke step'],
+        ['PASSED: authored smoke scenario (1234 ms)'],
+        ['FAILED: authored smoke scenario (2346 ms)'],
+        ['TIMEDOUT: authored smoke scenario (90000 ms)'],
+        ['SKIPPED: authored smoke scenario (0 ms)'],
+        ['INTERRUPTED: authored smoke scenario (12 ms)'],
+        ...invalidDurations.map(() => ['FAILED: authored smoke scenario']),
+        ['Browser smoke: failed'],
+    ]);
+    assert.doesNotMatch(output.flat().join('\n'), /private\.example\.com|identity\/session\/payload/);
 });
 
 test('workflow gates build locally and previews only through the safe deployment output', async () => {
     const workflow = (await readFile(new URL('../.github/workflows/azure-deploy.yml', import.meta.url), 'utf8'))
         .replace(/\r\n/g, '\n');
+    assert.deepEqual([...workflow.matchAll(/^[ \t]+(?:run: )?(npx playwright install[^\n]*)$/gm)].map(match => match[1]), [
+        'npx playwright install --with-deps --only-shell chromium',
+        'npx playwright install --with-deps --only-shell chromium',
+    ], 'Both CI installs include the headless shell and its Linux system dependencies');
     const local = workflow.split('      - name: Real-browser local playability smoke\n')[1]?.split('\n      - name:')[0];
     assert.ok(local);
     assert.match(local, /run: npm run test:browser\n/);

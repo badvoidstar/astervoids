@@ -237,6 +237,26 @@ claim live Azure performance or multiplayer playability for those fixtures.
 Run it with `npm run test:browser -- identity.spec.mjs --grep "static multiregion cold startup"`.
 Node startup regressions also cover request timeouts, retry/Retry-After budgets,
 permanent errors, supersession and hidden/solo cancellation.
+The full local suite also keeps the reduced-height identity failure/busy-state
+regression, including its deliberately exhausted startup retries and accessible
+Retry controls. Preview smoke skips only that injected-failure scenario in
+addition to the existing local-only fixtures: replaying synthetic retry delays
+does not measure deployment cold starts. Real identity recovery/invitation flows
+and independent-client multiplayer checks still run against the preview.
+Local menu-layout coverage remains exhaustive: 1,152 landscape projections and
+60 resize configurations, including their original ordering and repeated visits.
+The same two preview scenarios use representative selections instead: 17 display
+states at all six landscape viewports (102 projections), covering every
+region/role/availability combination, every fullscreen-mode/role pair, empty and
+populated lists, and the long-region-label Create state with all controls visible.
+Resize previews retain the full initial ten-visit sweep for each region
+configuration, then short landscape → tall landscape → portrait → short landscape
+after hiding and again restoring the fullscreen control (36 configurations).
+The complete display-state cross-product and intermediate-height sweeps after
+fullscreen changes remain local-only, not exhaustive preview coverage.
+Every selected state uses the same assertions; real fullscreen entry/exit, the
+independent shared-spacing regression, native text, touch/scroll and other layout
+checks are unchanged. No reduced-local-coverage switch is provided.
 Leaderboard scenarios cover personal solo/multiplayer checkpoints, reload
 durability, guest exclusion, filter cycles, the configured row limit, and
 mouse/touch inertia. Scripted score-seeding fixtures run only against isolated
@@ -260,6 +280,10 @@ Remote mode never starts a local server and fails if the target is unavailable.
 Only root HTTPS `*.azurecontainerapps.io` origins are accepted; custom domains,
 credentials, and multi-region/static-apex production targets are rejected.
 No screenshots, traces, videos, or raw browser errors are published by this gate.
+Its reporter emits authored scenario names, outcomes, and finite nonnegative
+per-test durations rounded to milliseconds (including skips and failures).
+Unavailable or invalid durations are omitted rather than reported as zero;
+readiness and runner overhead are not part of these per-test measurements.
 See [browser-smoke coverage and limitations](CICD_SETUP.md#real-browser-smoke-gates)
 for CI behavior and the manual checks that remain necessary.
 

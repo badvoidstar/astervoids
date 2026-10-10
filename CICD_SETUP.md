@@ -383,8 +383,11 @@ npm run test:browser:helpers
 npm run test:browser
 ```
 
-Linux runners use `npx playwright install --with-deps chromium`. Local smoke
-builds the app unless `BROWSER_SMOKE_NO_BUILD=1` is set, starts it on
+Linux runners use `npx playwright install --with-deps --only-shell chromium`.
+Both CI gates use default headless Chromium, without a channel override, so
+they need the headless shell and OS dependencies but not the full headed
+browser. The local install command above retains headed debugging support.
+Local smoke builds the app unless `BROWSER_SMOKE_NO_BUILD=1` is set, starts it on
 `http://127.0.0.1:5189`, refuses an occupied port, and tears it down afterwards.
 It requires no separately running development server. Do not set the no-build
 flag unless the current sources have already been built in Release.

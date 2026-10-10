@@ -12,6 +12,28 @@ const stores = deployments.filter(deployment =>
 const apps = deployments.filter(deployment =>
   resources(deployment.properties.template, 'Microsoft.App/containerApps').length > 0);
 
+test('all app paths retain scale-to-zero with a ten-minute cooldown and unchanged session retention', () => {
+  const settings = JSON.parse(readFileSync(new URL('../../AstervoidsWeb/appsettings.json', import.meta.url), 'utf8'));
+  assert.equal(settings.Session.EmptyTimeoutSeconds, 60);
+  assert.equal(apps.length, 4, 'single production, regional production, branch, standalone');
+  for (const deployment of apps) {
+    const module = deployment.properties.template;
+    const cooldown = module.parameters.cooldownPeriodSeconds.defaultValue;
+    assert.equal(cooldown, 600);
+    assert.equal(deployment.properties.parameters.cooldownPeriodSeconds?.value ?? cooldown, cooldown,
+      'every deployment inherits the shared cooldown');
+    assert.ok(cooldown >= settings.Session.EmptyTimeoutSeconds);
+    assert.equal(deployment.properties.parameters.minReplicas.value, 0);
+    assert.equal(deployment.properties.parameters.maxReplicas.value, 1);
+    const [app] = resources(module, 'Microsoft.App/containerApps');
+    assert.equal(app.properties.template.scale.cooldownPeriod, "[parameters('cooldownPeriodSeconds')]");
+    assert.equal(app.properties.template.scale.minReplicas, "[parameters('minReplicas')]");
+    assert.equal(app.properties.template.scale.maxReplicas, "[parameters('maxReplicas')]");
+    assert.equal(module.parameters.terminationGracePeriodSeconds.defaultValue, 30);
+    assert.equal(app.properties.template.terminationGracePeriodSeconds, "[parameters('terminationGracePeriodSeconds')]");
+  }
+});
+
 test('one environment-keyed store survives app revisions and is shared by all production regions', () => {
   assert.equal(stores.length, 1);
   const store = stores[0];

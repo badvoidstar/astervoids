@@ -2,9 +2,12 @@ import { test as base, expect } from '@playwright/test';
 import { installOriginGuard } from './origin-guard.mjs';
 import { configureAutomatedIdentities } from './automated-identities.mjs';
 import { maximumLengthTag, provisionPlayer } from './identity-helpers.mjs';
+import { menuLayoutCases } from './menu-layout-cases.mjs';
 import {
     rankedPersonalResults, personalRows, personalHudScores, personalScoreGeometry, personalViewResizeState,
 } from './personal-scores.mjs';
+
+const menuLayouts = menuLayoutCases();
 
 const test = base.extend({
     players: async ({ browser, baseURL }, use) => {
@@ -542,17 +545,18 @@ test('main-menu buttons share size and brightness with compact spacing in portra
     await expectMatchingButtons(false);
 });
 
-test('landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states', async ({ players }) => {
+test('landscape menu stays balanced across deployment, fullscreen and multiplayer visibility states', {
+    annotation: {
+        type: 'menu-layout-cases',
+        description: String(menuLayouts.landscape.reduce((count, layout) => count + layout.states.length, 0)),
+    },
+}, async ({ players }) => {
     const { page } = await players.open();
     await expect(page.locator('#btn-leave-create')).toBeEnabled();
     await page.locator('#btn-control-mode').click();
-    for (const viewport of [
-        { width: 1280, height: 900 }, { width: 900, height: 550 },
-        { width: 568, height: 320 }, { width: 400, height: 300 },
-        { width: 360, height: 300 }, { width: 320, height: 240 },
-    ]) {
+    for (const { viewport, states } of menuLayouts.landscape) {
         await page.setViewportSize(viewport);
-        const cases = await page.evaluate(() => {
+        const cases = await page.evaluate(states => {
             const saved = { ...sessionPicker };
             const list = sessionPicker.listEl;
             const available = list.style.getPropertyValue('--session-list-available');
@@ -569,11 +573,7 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
             try {
                 // Measure the default footprint before any viewport-fitting calculations.
                 list.style.removeProperty('--session-list-available');
-                for (const mode of ['', 'fullscreen-active', 'standalone-mode', 'pseudo-fullscreen'])
-                for (const multiRegion of [false, true])
-                for (const sessionCount of [0, 2, 6])
-                for (const role of ['outside', 'host', 'waiting-member', 'running-member'])
-                for (const unavailable of [false, true]) {
+                for (const { mode, multiRegion, sessionCount, role, unavailable } of states) {
                     container.className = `${originalClass} ${mode}`;
                     Object.assign(sessionPicker, {
                         regions: multiRegion ? [
@@ -667,8 +667,11 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
                 else list.style.removeProperty('--session-list-available');
             }
             return cases;
-        });
-        expect(cases).toHaveLength(192);
+        }, states);
+        expect(cases).toHaveLength(states.length);
+        expect(cases.map(({ mode, multiRegion, sessionCount, role, unavailable }) =>
+            ({ mode, multiRegion, sessionCount, role, unavailable })),
+        'Every selected projection is measured in order').toEqual(states);
         for (const state of cases) {
             const label = `${viewport.width}x${viewport.height} ${state.mode || 'windowed'}`
                 + ` regions=${state.multiRegion ? 2 : 1} sessions=${state.sessionCount}`
@@ -732,7 +735,13 @@ test('landscape menu stays balanced across deployment, fullscreen and multiplaye
     await expect(page.locator('#btn-fullscreen')).toBeVisible();
 });
 
-test('menu fitting is resize-order independent and only shrinks space the layout can reclaim', async ({ players }) => {
+test('menu fitting is resize-order independent and only shrinks space the layout can reclaim', {
+    annotation: {
+        type: 'menu-layout-cases',
+        description: String(menuLayouts.resize.flatMap(layout => layout.transitions)
+            .reduce((count, transition) => count + transition.viewports.length, 0)),
+    },
+}, async ({ players }) => {
     const { page } = await players.open();
     await expect(page.locator('#btn-leave-create')).toBeEnabled();
     await page.evaluate(async () => {
@@ -740,7 +749,7 @@ test('menu fitting is resize-order independent and only shrinks space the layout
         await teardownMultiRegionPicker();
     });
     try {
-        for (const multiRegion of [false, true]) {
+        for (const { multiRegion, transitions } of menuLayouts.resize) {
             await page.evaluate(multiRegion => {
                 const region = menuResizeSaved.regions.find(candidate => candidate.id === getCreateRegionId());
                 if (!region) throw new Error('Resize coverage requires an assessed create region');
@@ -753,17 +762,11 @@ test('menu fitting is resize-order independent and only shrinks space the layout
                 updatePickerButtons();
             }, multiRegion);
             const seen = new Map();
-            for (const fullscreenHidden of [false, true, false]) {
+            for (const { fullscreenHidden, viewports } of transitions) {
                 await page.evaluate(hidden =>
                     document.getElementById('game-container').classList.toggle('pseudo-fullscreen', hidden),
                 fullscreenHidden);
-                for (const viewport of [
-                    { width: 568, height: 240 }, { width: 568, height: 280 },
-                    { width: 568, height: 300 }, { width: 568, height: 320 },
-                    { width: 568, height: 400 }, { width: 568, height: 320 },
-                    { width: 568, height: 300 }, { width: 568, height: 280 },
-                    { width: 360, height: 800 }, { width: 568, height: 240 },
-                ]) {
+                for (const viewport of viewports) {
                     await page.setViewportSize(viewport);
                     const geometry = await page.evaluate(async () => {
                         const list = sessionPicker.listEl;

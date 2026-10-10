@@ -1,5 +1,5 @@
 // Remote failures can contain service URLs, session identities, or payloads.
-// Emit only authored scenario names and outcomes; never serialize browser errors.
+// Emit only authored names, outcomes and numeric durations; never serialize browser errors.
 export default class SafeReporter {
     onStepEnd(_test, _result, step) {
         if (step.category === 'test.step' && step.error) {
@@ -8,7 +8,9 @@ export default class SafeReporter {
     }
 
     onTestEnd(test, result) {
-        console.log(`${result.status.toUpperCase()}: ${test.title}`);
+        const duration = Number.isFinite(result.duration) && result.duration >= 0
+            ? ` (${Math.round(result.duration)} ms)` : '';
+        console.log(`${result.status.toUpperCase()}: ${test.title}${duration}`);
     }
 
     onError() {
