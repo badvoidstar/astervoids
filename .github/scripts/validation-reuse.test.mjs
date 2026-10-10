@@ -690,9 +690,32 @@ function parsedWorkflow(source = workflowSource) {
 }
 function expression(value, github, needs, status = {}) {
     const source = value.replace(/^\$\{\{\s*|\s*\}\}$/g, '');
-    return Function('github', 'needs', 'format', 'cancelled', 'success', `return (${source});`)(
+    return Function('github', 'needs', 'format', 'cancelled', 'success', 'always', 'failure', `return (${source});`)(
         github, needs, (template, ...args) => template.replace(/\{(\d+)\}/g, (_, index) => args[index]),
-        () => status.cancelled ?? false, () => status.success ?? false);
+        () => status.cancelled ?? false, () => status.success ?? false, () => true, () => status.failure ?? false);
+}
+function jobRuns(workflow, jobId, github, results, cancelled = false) {
+    const dependencies = id => [workflow.jobs[id].needs ?? []].flat();
+    const ancestors = new Set();
+    const visit = id => {
+        for (const dependency of dependencies(id)) {
+            if (ancestors.has(dependency)) continue;
+            ancestors.add(dependency);
+            visit(dependency);
+        }
+    };
+    visit(jobId);
+    const needs = Object.fromEntries(dependencies(jobId).map(id => [id, { result: results[id] }]));
+    const status = {
+        cancelled,
+        success: !cancelled && [...ancestors].every(id => results[id] === 'success'),
+        failure: [...ancestors].some(id => results[id] === 'failure'),
+    };
+    const condition = workflow.jobs[jobId].if ?? 'true';
+    // Actions adds success() when no status function is explicit. A skipped
+    // transitive planner can therefore block deploy even after Build succeeds.
+    const explicitStatus = /\b(?:always|cancelled|failure|success)\s*\(/.test(condition);
+    return (explicitStatus || status.success) && Boolean(expression(condition, github, needs, status));
 }
 
 test('actual YAML contract preserves the Build gate, full fallback, validation commands and deployment interlock', () => {
@@ -704,7 +727,6 @@ test('actual YAML contract preserves the Build gate, full fallback, validation c
     assert.equal(expression(build.if, {}, {}, { success: false }), true, 'Planner failure still runs Build');
     assert.equal(expression(build.if, {}, {}, { success: false, cancelled: true }), false);
     assert.equal(deploy.needs, 'build');
-    assert.equal(deploy.if, "github.event_name == 'push' || github.event_name == 'workflow_dispatch'");
     assert.deepEqual(deploy.concurrency, { group: 'astervoids-azure-resource-mutations', 'cancel-in-progress': false });
     assert.ok(deploy.steps.findIndex(step => step.run?.includes('--verify-deployment-ref'))
         < deploy.steps.findIndex(step => step.id === 'vars'));
@@ -781,6 +803,37 @@ test('actual YAML contract preserves the Build gate, full fallback, validation c
     assert.doesNotMatch(JSON.stringify([planner, build]), /secrets\.|CUSTOM_DOMAIN|checks.*write|BROWSER_SMOKE_BASE_URL|workflow_run/);
 });
 
+test('actual YAML deploy condition requires successful Build and allows skipped planner ancestors', () => {
+    const workflow = parsedWorkflow();
+    const push = { event_name: 'push', ref: 'refs/heads/feature' };
+    const results = { validation_plan: 'skipped', build: 'success' };
+    assert.equal(workflow.jobs.build.needs, 'validation_plan');
+    assert.equal(workflow.jobs.deploy.needs, 'build');
+    assert.equal(jobRuns(workflow, 'build', push, results), true);
+    const oldWorkflow = structuredClone(workflow);
+    oldWorkflow.jobs.deploy.if = "github.event_name == 'push' || github.event_name == 'workflow_dispatch'";
+    assert.equal(jobRuns(oldWorkflow, 'deploy', push, results), false,
+        'Reproduce the live defect: implicit success() rejects the skipped transitive planner');
+    assert.equal(jobRuns(workflow, 'deploy', push, results), true,
+        'A successful push Build must deploy despite the skipped planner ancestor');
+
+    for (const github of [
+        push,
+        { event_name: 'push', ref: 'refs/heads/main' },
+        { event_name: 'workflow_dispatch', ref: 'refs/heads/main' },
+        { event_name: 'workflow_dispatch', ref: 'refs/heads/feature' },
+        { event_name: 'pull_request', ref: 'refs/pull/42/merge' },
+    ])
+    for (const build of ['success', 'failure', 'cancelled', 'skipped', undefined])
+    for (const planner of ['success', 'skipped', 'failure'])
+    for (const cancelled of [false, true]) {
+        const expected = !cancelled && build === 'success'
+            && ['push', 'workflow_dispatch'].includes(github.event_name);
+        assert.equal(jobRuns(workflow, 'deploy', github, { build, validation_plan: planner }, cancelled), expected,
+            `${github.event_name} ${github.ref}; Build=${build}; planner=${planner}; cancelled=${cancelled}`);
+    }
+});
+
 test('actual YAML scheduling expression isolates production/reruns/manual/PR-first/planner failures', () => {
     const group = parsedWorkflow().jobs.build.concurrency.group;
     const github = { event_name: 'push', run_attempt: 1, ref: 'refs/heads/feature',
@@ -809,21 +862,7 @@ test('actual YAML scheduling expression isolates production/reruns/manual/PR-fir
     }
 });
 
-test('critical mutations of production helper/YAML are rejected by the unchanged contract tests', {
-    skip: process.env.REUSE_MUTATION_CHILD === '1',
-}, () => {
-    const mutations = [
-        ['tree', 'helper', "check(eventGit.identity(context.eventSha).checkoutTree === source.checkoutTree, 'different-tree');",
-            "check(true, 'different-tree');", 'tree gate rejects'],
-        ['skipped', 'helper', "matches[0].conclusion === 'success'",
-            "['success', 'skipped'].includes(matches[0].conclusion)", 'source gate: skipped validation step'],
-        ['attempt', 'helper', 'run.id !== c.runId && run.run_attempt === 1',
-            'run.id !== c.runId', 'source gate: source rerun attempt'],
-        ['api-hit', 'helper', "return { ...fallback, reason: miss(error, 'verification-unavailable') };",
-            "return { ...fallback, hit: 'true', reason: miss(error, 'verification-unavailable') };", 'API error cannot become a hit'],
-        ['deploy-dependency', 'workflow', '    needs: build\n', '    needs: validation_plan\n', 'actual YAML contract'],
-        ['planner-green', 'workflow', '    if: ${{ !cancelled() }}\n', '    if: ${{ success() }}\n', 'actual YAML contract'],
-    ];
+function assertMutationsRejected(mutations) {
     for (const [label, kind, beforeText, afterText, pattern] of mutations) {
         const source = kind === 'helper' ? helperSource : workflowSource;
         assert.equal(source.split(beforeText).length, 2, `${label}: uniquely mutate actual production bytes`);
@@ -841,4 +880,37 @@ test('critical mutations of production helper/YAML are rejected by the unchanged
             assert.match(child.stdout, /AssertionError|ERR_ASSERTION/, `${label}: must fail an assertion, not tooling/setup`);
         } finally { rmSync(path, { force: true }); }
     }
+}
+
+test('critical mutations of production helper/YAML are rejected by the unchanged contract tests', {
+    skip: process.env.REUSE_MUTATION_CHILD === '1',
+}, () => {
+    assertMutationsRejected([
+        ['tree', 'helper', "check(eventGit.identity(context.eventSha).checkoutTree === source.checkoutTree, 'different-tree');",
+            "check(true, 'different-tree');", 'tree gate rejects'],
+        ['skipped', 'helper', "matches[0].conclusion === 'success'",
+            "['success', 'skipped'].includes(matches[0].conclusion)", 'source gate: skipped validation step'],
+        ['attempt', 'helper', 'run.id !== c.runId && run.run_attempt === 1',
+            'run.id !== c.runId', 'source gate: source rerun attempt'],
+        ['api-hit', 'helper', "return { ...fallback, reason: miss(error, 'verification-unavailable') };",
+            "return { ...fallback, hit: 'true', reason: miss(error, 'verification-unavailable') };", 'API error cannot become a hit'],
+        ['deploy-dependency', 'workflow', '    needs: build\n', '    needs: validation_plan\n', 'actual YAML contract'],
+        ['planner-green', 'workflow', '    if: ${{ !cancelled() }}\n', '    if: ${{ success() }}\n', 'actual YAML contract'],
+    ]);
+});
+
+test('deployment gate mutations are rejected by the behavioral actual-YAML regression', {
+    skip: process.env.REUSE_MUTATION_CHILD === '1',
+}, () => {
+    const condition = parsedWorkflow().jobs.deploy.if;
+    const variants = [
+        ['deploy-implicit-status', condition.replace('!cancelled() && ', '')],
+        ['deploy-without-build-success', condition.replace("needs.build.result == 'success' && ", '')],
+        ['deploy-ignores-cancellation', condition.replace('!cancelled()', 'always()')],
+        ['deploy-all-events', condition.replace("(github.event_name == 'push' || github.event_name == 'workflow_dispatch')", 'true')],
+        ['deploy-unconditional-always', '${{ always() }}'],
+    ];
+    assertMutationsRejected(variants.map(([name, mutated]) => [
+        name, 'workflow', `    if: ${condition}\n`, `    if: ${mutated}\n`, 'actual YAML deploy condition',
+    ]));
 });

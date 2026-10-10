@@ -376,7 +376,12 @@ wall time is not guaranteed. Real source-first hits and fallback trials must
 be reviewed before deciding whether to retain this policy.
 
 `Build Application` still owns the validation result, and deploy still
-`needs: build`. A failed or missing **Plan PR validation reuse** result cannot
+`needs: build`. Deploy explicitly checks cancellation, Build success, and the
+push/manual event instead of inheriting Actions' implicit `success()` gate:
+the skipped PR-only planner must not block a successful push/manual Build
+from deploying. Failed, cancelled, skipped or missing Build results and PR
+events cannot deploy.
+A failed or missing **Plan PR validation reuse** result cannot
 skip Build or replace it with an early-green planner. Build attempts on pushes,
 production, manual runs, forks and reruns always run the full suite. GitHub's
 rerun-failed-jobs mode may retain a previously successful planner's outputs;
@@ -454,7 +459,8 @@ public numeric source/artifact IDs. Useful trial outcomes are:
 
 Run `node --test .github/scripts/validation-reuse.test.mjs` for real Git
 equal/divergent-tree fixtures, API/ZIP failure cases, the actual YAML
-contract and six production-code/workflow mutations. This suite is also
+contract and production-code/workflow mutations, including deployment status,
+Build-success and event restrictions. This suite is also
 wired into `bash .github/scripts/workflow-helpers.test.sh`. It uses existing
 Node/Playwright tooling and cleans its named checkout-local fixtures.
 The publication trial must still demonstrate a real source-first

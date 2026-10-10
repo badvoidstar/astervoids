@@ -207,7 +207,8 @@ jobs:
     name: Deploy to Azure
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Override implicit success(): the PR-only planner is skipped on push/manual runs.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     permissions:
       id-token: write  # Required for OIDC authentication
       contents: read
