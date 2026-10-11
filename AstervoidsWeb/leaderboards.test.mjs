@@ -546,8 +546,8 @@ function dragHarness(reduced = false) {
                 preventDefault() {}, ...overrides,
             });
         },
-        frame() {
-            time += 16;
+        frame(advance = 16) {
+            time += advance;
             const callbacks = [...frames.values()];
             frames.clear();
             callbacks.forEach(callback => callback(time));
@@ -574,6 +574,35 @@ for (const pointerType of ['mouse', 'touch']) {
         assert.ok(h.element.scrollTop > release);
         assert.ok(h.element.scrollTop <= h.element.scrollHeight - h.element.clientHeight);
         assert.equal(h.classes.has('dragging'), false);
+    });
+
+    test(`${pointerType} inertia preserves fractional travel when native scroll positions are rounded`, () => {
+        for (const direction of [-1, 1]) {
+            const h = dragHarness();
+            let scrollTop = 500;
+            Object.defineProperty(h.element, 'scrollTop', {
+                get: () => scrollTop,
+                set: value => { scrollTop = Math.round(value); },
+            });
+            const y = 250 - direction * 32;
+            h.event('pointerdown', 250, 16, { pointerType });
+            h.event('pointermove', y, 16, { pointerType });
+            h.event('pointerup', y, 1, { pointerType });
+            const released = h.element.scrollTop;
+
+            h.frame(0.1);
+            assert.equal(h.element.scrollTop, released, 'A subpixel frame has not visibly moved yet');
+            assert.equal(h.frames.size, 1, 'Rounding inside the scroll range must not stop inertia');
+            for (let frame = 0; frame < 4; frame++) h.frame(0.1);
+            assert.equal(h.element.scrollTop, released + direction, 'Fractional travel accumulates across frames');
+            h.frame();
+            assert.ok((h.element.scrollTop - released) * direction > 1, 'Coasting continues in the release direction');
+            const boundary = direction < 0 ? 0 : h.element.scrollHeight - h.element.clientHeight;
+            h.element.scrollTop = boundary;
+            h.frame(0.1);
+            assert.equal(h.element.scrollTop, boundary);
+            assert.equal(h.frames.size, 0, 'An actual boundary still stops inertia, even on a subpixel frame');
+        }
     });
 }
 

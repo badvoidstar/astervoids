@@ -723,7 +723,10 @@ sizes fit the measured content width on very narrow layouts; neither labels nor
 their containers are transform-scaled.
 The table has its own focusable scroller with mouse/touch pointer capture and
 decaying post-release inertia; wheel, keyboard, cancellation, boundaries, and
-reduced-motion preference stop inertia. Text is not canvas-scaled. Screen input
+reduced-motion preference stop inertia. Fractional coast travel carries across
+frames so native scroll-position rounding cannot cancel a valid release.
+Boundary detection uses the actual scroll limit in the direction of travel,
+not a zero-distance frame. Text is not canvas-scaled. Screen input
 does not acquire gameplay controls; Back to Main/Escape restores menu focus and
 regional picker activity.
 

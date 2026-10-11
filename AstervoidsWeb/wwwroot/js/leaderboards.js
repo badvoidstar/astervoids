@@ -312,12 +312,14 @@ const Leaderboards = (function () {
         let pointer = null;
         let frame = null;
         let velocity = 0;
+        let remainder = 0;
         let previousTime = 0;
 
         function stopInertia() {
             if (frame !== null) environment.cancelAnimationFrame(frame);
             frame = null;
             velocity = 0;
+            remainder = 0;
         }
 
         function move(distance) {
@@ -331,11 +333,14 @@ const Leaderboards = (function () {
             const dt = Math.max(0, Math.min(time - previousTime, 64));
             previousTime = time;
             const decay = Math.exp(-dt / 325);
-            const distance = velocity * 325 * (1 - decay);
+            const distance = remainder + velocity * 325 * (1 - decay);
             const moved = move(distance);
+            remainder = distance - moved;
             velocity *= decay;
+            const atBoundary = velocity < 0 ? element.scrollTop <= 0
+                : element.scrollTop >= Math.max(0, element.scrollHeight - element.clientHeight);
             if (reducedMotion.matches || Math.abs(velocity) < 0.015
-                || (dt > 0 && Math.abs(moved) < 0.01)) {
+                || atBoundary) {
                 stopInertia();
             } else {
                 frame = environment.requestAnimationFrame(coast);
