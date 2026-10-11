@@ -410,7 +410,7 @@ test('malformed and unavailable queries show errors, not a success-shaped empty 
     assert.equal(changes.at(-1).code, 'leaderboard_unavailable');
 });
 
-test('leaderboard buttons keep a fixed single-line height and reflow into columns that fit', () => {
+test('leaderboard buttons keep a fixed single-line height with a single-column fallback', () => {
     const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
         .replace(/\r\n/g, '\n');
     const style = source.match(/#leaderboard-screen \.picker-btn \{([^}]+)\}/)?.[1];
@@ -419,8 +419,55 @@ test('leaderboard buttons keep a fixed single-line height and reflow into column
     assert.match(style, /min-width: 0;/);
     assert.match(style, /white-space: nowrap;/);
     assert.match(style, /transition-property: background-color, border-color, color, opacity;/);
-    assert.match(source, /#leaderboard-filters \{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 240px\), 1fr\)\);/);
+    assert.match(source, /#leaderboard-filters \{[^}]*grid-template-columns: minmax\(0, 1fr\);/);
     assert.match(source, /#btn-leaderboards \{[^}]*white-space: nowrap;/);
+});
+
+test('filter layout fits all columns together using the CSS width allowance and measured gap', () => {
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    const style = source.match(/#leaderboard-filters \{([^}]+)\}/)?.[1];
+    const minimum = Number(style.match(/--leaderboard-filter-min-width: (\d+)px;/)?.[1]);
+    const gap = Number(style.match(/\bgap: (\d+)px;/)?.[1]);
+    assert.equal(minimum, 220, 'Trim the old 240px allowance without shrinking normal label fonts');
+    assert.ok(gap > 0);
+    let width = 0;
+    const group = {
+        children: [{}, {}, {}], style: {},
+        getBoundingClientRect: () => ({ width }),
+    };
+    const environment = {
+        getComputedStyle(element) {
+            assert.equal(element, group);
+            return {
+                columnGap: `${gap}px`,
+                getPropertyValue(property) {
+                    assert.equal(property, '--leaderboard-filter-min-width');
+                    return `${minimum}px`;
+                },
+            };
+        },
+    };
+    const rowMinimum = group.children.length * minimum + (group.children.length - 1) * gap;
+    for (const [available, columns] of [
+        [rowMinimum + 1, 3], [rowMinimum, 3], [rowMinimum - 0.25, 1],
+        [rowMinimum - 1, 1], [2 * minimum + gap, 1], [156, 1],
+        [rowMinimum, 3], [rowMinimum - 1, 1], [rowMinimum + 1, 3],
+    ]) {
+        width = available;
+        Leaderboards.fitFilterLayout(group, environment);
+        assert.equal(group.style.gridTemplateColumns, `repeat(${columns}, minmax(0, 1fr))`,
+            `All three filters share the mode at ${width}px, independent of the previous layout`);
+    }
+    width = 0;
+    Leaderboards.fitFilterLayout(group, {
+        getComputedStyle() { assert.fail('Hidden groups must not be measured'); },
+    });
+    assert.equal(group.style.gridTemplateColumns, 'repeat(3, minmax(0, 1fr))');
+    width = 156;
+    Leaderboards.fitFilterLayout(group, environment);
+    assert.equal(group.style.gridTemplateColumns, 'repeat(1, minmax(0, 1fr))',
+        'Reopening at a narrower size recalculates the layout');
 });
 
 test('the menu inherits shared button typography and numeric table headers align with their values', () => {
@@ -499,8 +546,8 @@ function dragHarness(reduced = false) {
                 preventDefault() {}, ...overrides,
             });
         },
-        frame() {
-            time += 16;
+        frame(advance = 16) {
+            time += advance;
             const callbacks = [...frames.values()];
             frames.clear();
             callbacks.forEach(callback => callback(time));
@@ -527,6 +574,35 @@ for (const pointerType of ['mouse', 'touch']) {
         assert.ok(h.element.scrollTop > release);
         assert.ok(h.element.scrollTop <= h.element.scrollHeight - h.element.clientHeight);
         assert.equal(h.classes.has('dragging'), false);
+    });
+
+    test(`${pointerType} inertia preserves fractional travel when native scroll positions are rounded`, () => {
+        for (const direction of [-1, 1]) {
+            const h = dragHarness();
+            let scrollTop = 500;
+            Object.defineProperty(h.element, 'scrollTop', {
+                get: () => scrollTop,
+                set: value => { scrollTop = Math.round(value); },
+            });
+            const y = 250 - direction * 32;
+            h.event('pointerdown', 250, 16, { pointerType });
+            h.event('pointermove', y, 16, { pointerType });
+            h.event('pointerup', y, 1, { pointerType });
+            const released = h.element.scrollTop;
+
+            h.frame(0.1);
+            assert.equal(h.element.scrollTop, released, 'A subpixel frame has not visibly moved yet');
+            assert.equal(h.frames.size, 1, 'Rounding inside the scroll range must not stop inertia');
+            for (let frame = 0; frame < 4; frame++) h.frame(0.1);
+            assert.equal(h.element.scrollTop, released + direction, 'Fractional travel accumulates across frames');
+            h.frame();
+            assert.ok((h.element.scrollTop - released) * direction > 1, 'Coasting continues in the release direction');
+            const boundary = direction < 0 ? 0 : h.element.scrollHeight - h.element.clientHeight;
+            h.element.scrollTop = boundary;
+            h.frame(0.1);
+            assert.equal(h.element.scrollTop, boundary);
+            assert.equal(h.frames.size, 0, 'An actual boundary still stops inertia, even on a subpixel frame');
+        }
     });
 }
 

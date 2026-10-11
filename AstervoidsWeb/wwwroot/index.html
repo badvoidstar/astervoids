@@ -454,8 +454,9 @@
         }
 
         #leaderboard-filters {
+            --leaderboard-filter-min-width: 220px;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+            grid-template-columns: minmax(0, 1fr);
             gap: 6px;
             flex-shrink: 0;
         }
@@ -10243,7 +10244,14 @@
     const leaderboardButtons = [
         document.getElementById('btn-leaderboards'), ...leaderboardScreen.querySelectorAll('.picker-btn'),
     ];
-    const leaderboardButtonObserver = new ResizeObserver(() => Leaderboards.fitButtonLabels(leaderboardButtons));
+    const leaderboardFilterGroup = document.getElementById('leaderboard-filters');
+    function fitLeaderboardButtons() {
+        Leaderboards.fitFilterLayout(leaderboardFilterGroup);
+        Leaderboards.fitButtonLabels(leaderboardButtons);
+    }
+    // Changing columns also resizes observed elements; fit outside observer delivery.
+    const leaderboardButtonObserver = new ResizeObserver(() => requestAnimationFrame(fitLeaderboardButtons));
+    leaderboardButtonObserver.observe(leaderboardFilterGroup);
     for (const button of leaderboardButtons) leaderboardButtonObserver.observe(button);
     const leaderboardFilters = { teamSize: null, aspect: null, difficulty: null };
     let leaderboardMaxTeamSize = null;
@@ -10396,7 +10404,7 @@
         document.getElementById('leaderboard-difficulty').textContent = `Difficulty : ${
             leaderboardFilters.difficulty === null ? 'Any'
                 : Leaderboards.difficultyLabel(leaderboardFilters.difficulty, AstervoidsConfig.ASTEROID_DIFFICULTY_PRESETS)}`;
-        Leaderboards.fitButtonLabels(leaderboardButtons);
+        fitLeaderboardButtons();
     }
 
     function renderLeaderboardView(view) {

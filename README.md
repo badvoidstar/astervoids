@@ -123,8 +123,10 @@ The three filter buttons advance once per click/tap and wrap back to **Any**:
 | Aspect Ratio | Portrait, Landscape, Rectangle |
 | Difficulty | Shifter, Dancer, Raver, Survivor |
 
-Button labels remain on one line at a fixed height. Narrow layouts reflow the
-controls and fit native text sizes rather than wrapping or scaling rendered text.
+All three filters share one compact row while it fits, then switch together to a
+vertical stack; there is no two-plus-one layout. Button labels remain on one line
+at a fixed height. Very narrow layouts fit native text sizes rather than wrapping
+or scaling rendered text.
 
 Team Size is the peak simultaneous session membership observed while the player
 participates, including guest and spectator members; solo games use 1. Aspect
