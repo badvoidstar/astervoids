@@ -720,24 +720,29 @@ function jobRuns(workflow, jobId, github, results, cancelled = false) {
 
 test('actual YAML contract preserves the Build gate, full fallback, validation commands and deployment interlock', () => {
     const workflow = parsedWorkflow();
-    const { validation_plan: planner, build, deploy } = workflow.jobs;
+    const { validation_plan: planner, build, deploy, deploy_preview: preview } = workflow.jobs;
     assert.equal(build.name, 'Build Application');
     assert.equal(build.needs, 'validation_plan');
     assert.equal(build.if, '${{ !cancelled() }}');
     assert.equal(expression(build.if, {}, {}, { success: false }), true, 'Planner failure still runs Build');
     assert.equal(expression(build.if, {}, {}, { success: false, cancelled: true }), false);
-    assert.equal(deploy.needs, 'build');
-    assert.deepEqual(deploy.concurrency, { group: 'astervoids-azure-resource-mutations', 'cancel-in-progress': false });
-    assert.ok(deploy.steps.findIndex(step => step.run?.includes('--verify-deployment-ref'))
-        < deploy.steps.findIndex(step => step.id === 'vars'));
-    assert.deepEqual(deploy.steps[0], { name: 'Checkout code', uses: 'actions/checkout@v5' });
+    for (const job of [deploy, preview]) {
+        assert.equal(job.needs, 'build');
+        assert.deepEqual(job.concurrency, { group: 'astervoids-azure-resource-mutations', 'cancel-in-progress': false });
+        assert.ok(job.steps.findIndex(step => step.run?.includes('--verify-deployment-ref'))
+            < job.steps.findIndex(step => step.id === 'vars'));
+        assert.deepEqual(job.steps[0], { name: 'Checkout code', uses: 'actions/checkout@v5' });
+        assert.deepEqual(job.permissions, { 'id-token': 'write', contents: 'read' });
+        assert.deepEqual(job.environment, { name: 'production', url: '${{ steps.deploy.outputs.url }}' });
+        for (const name of ['CERT_KEY_VAULT_SECRET_URL', 'CERT_KEY_VAULT_CERT_NAME', 'CERT_READER_IDENTITY_ID'])
+            assert.equal(job.env[name], `\${{ secrets.${name} }}`);
+        assert.equal(job.env.DOTNET_VERSION, '10.0.x');
+    }
     assert.equal(workflow.env, undefined);
     assert.deepEqual(workflow.permissions, { contents: 'read' });
     for (const job of [planner, build]) assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' });
-    assert.deepEqual(deploy.permissions, { 'id-token': 'write', contents: 'read' });
-    for (const name of ['CERT_KEY_VAULT_SECRET_URL', 'CERT_KEY_VAULT_CERT_NAME', 'CERT_READER_IDENTITY_ID'])
-        assert.equal(deploy.env[name], `\${{ secrets.${name} }}`);
-    assert.equal(deploy.env.DOTNET_VERSION, '10.0.x');
+    assert.deepEqual(preview.env, deploy.env);
+    assert.deepEqual(preview.outputs, deploy.outputs);
     assert.equal(planner.if, "github.event_name == 'pull_request'");
     assert.equal(planner.steps[0].with.ref, '${{ github.sha }}');
     assert.equal(build.concurrency['cancel-in-progress'], false);
@@ -803,6 +808,39 @@ test('actual YAML contract preserves the Build gate, full fallback, validation c
     assert.doesNotMatch(JSON.stringify([planner, build]), /secrets\.|CUSTOM_DOMAIN|checks.*write|BROWSER_SMOKE_BASE_URL|workflow_run/);
 });
 
+test('actual YAML preview job shares the full deployment transaction but never prepares static publishing', () => {
+    const { deploy, deploy_preview: preview } = parsedWorkflow().jobs;
+    const staticSteps = [
+        'Get static apex deploy token (multi-region)',
+        'Publish static apex payload (multi-region)',
+        'Bind static apex custom hostname (multi-region)',
+    ];
+    assert.deepEqual(preview.steps, deploy.steps.filter(step => !staticSteps.includes(step.name)),
+        'Preview keeps all shared setup, deployment, custom-domain, smoke and summary steps in order');
+    assert.ok(preview.steps.every(step => !step.uses?.toLowerCase().startsWith('azure/static-web-apps-deploy@')),
+        'A step-level condition would still prepare the Docker action on a preview runner');
+    const publisher = deploy.steps.find(step => step.name === staticSteps[1]);
+    assert.equal(publisher.uses, 'Azure/static-web-apps-deploy@v1');
+    assert.equal(publisher.if,
+        "steps.vars.outputs.is_production == 'true' && env.IS_MULTI_REGION == 'true' && env.STATIC_WEB_APP_NAME != ''");
+    assert.deepEqual(publisher.with, {
+        action: 'upload', app_location: '${{ steps.deploy.outputs.static_deploy_dir }}',
+        skip_app_build: true, azure_static_web_apps_api_token: '${{ steps.swa_publish.outputs.api_token }}',
+    });
+    const names = deploy.steps.map(step => step.name);
+    assert.ok(names.indexOf('Provision and Deploy to Azure') < names.indexOf(staticSteps[0]));
+    assert.deepEqual(names.slice(names.indexOf(staticSteps[0]), names.indexOf(staticSteps[2]) + 1), staticSteps);
+    for (const job of [deploy, preview]) {
+        assert.equal(job.steps.at(-1).name, 'Deployment Summary');
+        assert.equal(job.steps.at(-1).if, undefined, 'A failed deployment cannot emit a success summary');
+        for (const name of ['Provision and Deploy to Azure', ...staticSteps,
+            'Real-browser branch-preview playability smoke']) {
+            const step = job.steps.find(candidate => candidate.name === name);
+            if (step) assert.equal(step['continue-on-error'], undefined, `${name} must propagate failure`);
+        }
+    }
+});
+
 test('actual YAML deploy condition requires successful Build and allows skipped planner ancestors', () => {
     const workflow = parsedWorkflow();
     const push = { event_name: 'push', ref: 'refs/heads/feature' };
@@ -814,7 +852,7 @@ test('actual YAML deploy condition requires successful Build and allows skipped 
     oldWorkflow.jobs.deploy.if = "github.event_name == 'push' || github.event_name == 'workflow_dispatch'";
     assert.equal(jobRuns(oldWorkflow, 'deploy', push, results), false,
         'Reproduce the live defect: implicit success() rejects the skipped transitive planner');
-    assert.equal(jobRuns(workflow, 'deploy', push, results), true,
+    assert.equal(jobRuns(workflow, 'deploy_preview', push, results), true,
         'A successful push Build must deploy despite the skipped planner ancestor');
 
     for (const github of [
@@ -823,14 +861,18 @@ test('actual YAML deploy condition requires successful Build and allows skipped 
         { event_name: 'workflow_dispatch', ref: 'refs/heads/main' },
         { event_name: 'workflow_dispatch', ref: 'refs/heads/feature' },
         { event_name: 'pull_request', ref: 'refs/pull/42/merge' },
+        { event_name: 'workflow_run', ref: 'refs/heads/main' },
+        { event_name: 'workflow_run', ref: 'refs/heads/feature' },
     ])
     for (const build of ['success', 'failure', 'cancelled', 'skipped', undefined])
     for (const planner of ['success', 'skipped', 'failure'])
     for (const cancelled of [false, true]) {
         const expected = !cancelled && build === 'success'
             && ['push', 'workflow_dispatch'].includes(github.event_name);
-        assert.equal(jobRuns(workflow, 'deploy', github, { build, validation_plan: planner }, cancelled), expected,
-            `${github.event_name} ${github.ref}; Build=${build}; planner=${planner}; cancelled=${cancelled}`);
+        const actual = ['deploy', 'deploy_preview'].filter(id =>
+            jobRuns(workflow, id, github, { build, validation_plan: planner }, cancelled));
+        assert.deepEqual(actual, expected ? [github.ref === 'refs/heads/main' ? 'deploy' : 'deploy_preview'] : [],
+            `Exactly the correct deployment job runs: ${github.event_name} ${github.ref}; Build=${build}; planner=${planner}; cancelled=${cancelled}`);
     }
 });
 
@@ -894,15 +936,19 @@ test('critical mutations of production helper/YAML are rejected by the unchanged
             'run.id !== c.runId', 'source gate: source rerun attempt'],
         ['api-hit', 'helper', "return { ...fallback, reason: miss(error, 'verification-unavailable') };",
             "return { ...fallback, hit: 'true', reason: miss(error, 'verification-unavailable') };", 'API error cannot become a hit'],
-        ['deploy-dependency', 'workflow', '    needs: build\n', '    needs: validation_plan\n', 'actual YAML contract'],
+        ['deploy-dependency', 'workflow', '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: build\n',
+            '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: validation_plan\n', 'actual YAML contract'],
         ['planner-green', 'workflow', '    if: ${{ !cancelled() }}\n', '    if: ${{ success() }}\n', 'actual YAML contract'],
+        ['preview-publisher', 'workflow', '      - *deploy_summary\n',
+            '      - *deploy_summary\n      - uses: Azure/static-web-apps-deploy@v1\n', 'actual YAML preview job'],
     ]);
 });
 
 test('deployment gate mutations are rejected by the behavioral actual-YAML regression', {
     skip: process.env.REUSE_MUTATION_CHILD === '1',
 }, () => {
-    const condition = parsedWorkflow().jobs.deploy.if;
+    const { deploy, deploy_preview: preview } = parsedWorkflow().jobs;
+    const condition = deploy.if;
     const variants = [
         ['deploy-implicit-status', condition.replace('!cancelled() && ', '')],
         ['deploy-without-build-success', condition.replace("needs.build.result == 'success' && ", '')],
@@ -910,7 +956,14 @@ test('deployment gate mutations are rejected by the behavioral actual-YAML regre
         ['deploy-all-events', condition.replace("(github.event_name == 'push' || github.event_name == 'workflow_dispatch')", 'true')],
         ['deploy-unconditional-always', '${{ always() }}'],
     ];
-    assertMutationsRejected(variants.map(([name, mutated]) => [
+    const mutations = variants.map(([name, mutated]) => [
         name, 'workflow', `    if: ${condition}\n`, `    if: ${mutated}\n`, 'actual YAML deploy condition',
-    ]));
+    ]);
+    for (const [name, mutated] of [
+        ['preview-without-build-success', preview.if.replace("needs.build.result == 'success' && ", '')],
+        ['preview-all-refs', preview.if.replace("github.ref != 'refs/heads/main'", 'true')],
+    ]) {
+        mutations.push([name, 'workflow', `    if: ${preview.if}\n`, `    if: ${mutated}\n`, 'actual YAML deploy condition']);
+    }
+    assertMutationsRejected(mutations);
 });

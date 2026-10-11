@@ -311,6 +311,16 @@ Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
 remains the infrastructure source of truth. The multi-region first-deploy retry
 changes only the domain verification ID.
 
+Production and previews use mutually exclusive complete deployment jobs,
+`deploy` and `deploy_preview`, with shared steps and environment declarations
+reused through YAML anchors. Both require successful Build validation and hold
+the same resource-mutation interlock until their final summary. Only the
+production job contains the Static Web Apps publisher: GitHub prepares Docker
+actions before evaluating step conditions, so a conditional publish step in a
+shared job still costs previews an unnecessary image build. Static publication,
+hostname binding, and preview smoke retain their existing ordering and failure
+gates. No private deployment state is transferred between jobs.
+
 Region entries require unique `name` and `location` values; `name` is a
 lowercase alphanumeric deployment ID of at most 14 characters, while
 `location` is the lowercase Azure location identifier. Use a short ID such as
@@ -375,8 +385,8 @@ runners are free). Push/PR builds already overlap, so faster deployment
 wall time is not guaranteed. Real source-first hits and fallback trials must
 be reviewed before deciding whether to retain this policy.
 
-`Build Application` still owns the validation result, and deploy still
-`needs: build`. Deploy explicitly checks cancellation, Build success, and the
+`Build Application` still owns the validation result, and both deployment jobs
+retain `needs: build`. Each explicitly checks cancellation, Build success, and the
 push/manual event instead of inheriting Actions' implicit `success()` gate:
 the skipped PR-only planner must not block a successful push/manual Build
 from deploying. Failed, cancelled, skipped or missing Build results and PR
@@ -926,6 +936,15 @@ After step 7, the next deploy of `main` will:
 
 Same wildcard cert covers every branch deploy too (e.g. `astervoids-mybranch.<domain>` matches `*.<domain>`), so branch deploys also skip the cert provisioning wait — typically saving 5-7 minutes per branch deploy.
 
+Branch bootstrap reads the shared CAE identity map and certificate configuration
+before changing either. An already-assigned reader and valid, successfully
+provisioned certificate with the requested Key Vault URL and reader identity
+require no writes. A missing reader is attached without replacing other
+identities; a missing, mismatched, failed, or invalid certificate is reconciled
+through the existing certificate PUT. Unreadable or malformed state fails the
+deployment rather than being treated as an empty environment. This read-only
+fast path does not replace the production certificate-rotation procedure below.
+
 #### Cert rotation
 
 ACMEbot rotates the cert in KV every ~60 days. Container Apps doesn't
@@ -976,7 +995,7 @@ deletes fail the run rather than becoming evidence of absence. Missing ownership
 tags, ambiguous store ownership and live references retain the store with a safe
 skip. Raw inventories, resource IDs and custom hostnames are not published.
 
-Cleanup and Azure CICD's **deploy job** share the non-cancelling
+Cleanup and both Azure CICD **deployment jobs** share the non-cancelling
 `astervoids-azure-resource-mutations` concurrency group; builds/tests remain
 parallel. Queued deploys must still match the remote branch head after acquiring
 the interlock. GitHub can supersede pending jobs in a concurrency group; rerun a

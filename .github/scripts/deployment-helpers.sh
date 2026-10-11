@@ -478,19 +478,50 @@ deploy_shared_infra_branch() {
 bootstrap_shared_certificate() {
   local resource_group="$1" environment_name="$2" subscription_id="$3"
   local secret_url="$4" cert_name="$5" identity_id="$6"
-  local existing location body uri
-  if ! az containerapp env show --resource-group "$resource_group" --name "$environment_name" &>/dev/null; then
-    echo "::error::Shared CAE not found. Deploy production first." >&2
+  local environment existing location identity_assigned certificate_matches body uri
+  if ! environment=$(az containerapp env show --resource-group "$resource_group" \
+    --name "$environment_name" --output json); then
+    echo "::error::Cannot read the shared CAE. Verify production exists and the deployment has read access." >&2
     return 1
   fi
-  az containerapp env identity assign --resource-group "$resource_group" \
-    --name "$environment_name" --user-assigned "$identity_id" --output none || return
+  if ! location=$(jq -er '.location | select(type == "string" and length > 0)' <<< "$environment" 2>/dev/null) ||
+    ! identity_assigned=$(jq -sr --arg identity "$identity_id" '
+      if length != 1 then error("Invalid environment response") else .[0].identity.userAssignedIdentities end |
+      if . == null then {} else . end |
+      if type != "object" then error("Invalid identity map")
+      else keys | any(ascii_downcase == ($identity | ascii_downcase)) end
+    ' <<< "$environment" 2>/dev/null); then
+    echo "::error::Shared CAE returned invalid location or identity configuration." >&2
+    return 1
+  fi
   existing=$(az containerapp env certificate list --resource-group "$resource_group" \
-    --name "$environment_name" --query "[?name=='$cert_name'].name" -o tsv) || return
-  existing="${existing%$'\r'}"
-  [ -z "$existing" ] || return 0
-  location=$(az containerapp env show --resource-group "$resource_group" \
-    --name "$environment_name" --query location -o tsv) || return
+    --name "$environment_name" --output json) || return
+  if ! certificate_matches=$(jq -sr --arg name "$cert_name" --arg identity "$identity_id" --arg url "$secret_url" '
+    if length != 1 then error("Invalid certificate response") else .[0] end |
+    if type != "array" then error("Invalid certificate list")
+    elif any(.[]; type != "object" or (.name | type) != "string") then error("Invalid certificate entry")
+    else
+      map(select((.name | ascii_downcase) == ($name | ascii_downcase))) |
+      if length > 1 then error("Duplicate certificate")
+      elif length == 0 then false
+      elif (.[0].properties | type) != "object" then error("Invalid certificate properties")
+      else .[0].properties |
+        .provisioningState == "Succeeded" and .valid == true and
+        ((.certificateKeyVaultProperties.identity // "" | ascii_downcase) == ($identity | ascii_downcase)) and
+        .certificateKeyVaultProperties.keyVaultUrl == $url
+      end
+    end
+  ' <<< "$existing" 2>/dev/null); then
+    echo "::error::Shared CAE returned invalid certificate configuration." >&2
+    return 1
+  fi
+  identity_assigned="${identity_assigned%$'\r'}"
+  certificate_matches="${certificate_matches%$'\r'}"
+  if [ "$identity_assigned" != true ]; then
+    az containerapp env identity assign --resource-group "$resource_group" \
+      --name "$environment_name" --user-assigned "$identity_id" --output none || return
+  fi
+  [ "$certificate_matches" != true ] || return 0
   location="${location%$'\r'}"
   body=$(jq -n --arg loc "$location" --arg identity "$identity_id" --arg kvurl "$secret_url" \
     '{location: $loc, properties: {certificateKeyVaultProperties: {identity: $identity, keyVaultUrl: $kvurl}}}') || return
