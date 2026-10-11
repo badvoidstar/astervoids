@@ -605,18 +605,24 @@ test('top-50 view cycles every filter, fits narrow screens and supports mouse/to
     expect(await page.evaluate(() => game.state === 'start' && !game.ship && !Object.values(keys).some(Boolean))).toBe(true);
 
     await page.setViewportSize({ width: 320, height: 568 });
-    const geometry = await page.locator('#leaderboard-screen').evaluate(screen => {
+    await expect.poll(() => page.locator('#leaderboard-screen').evaluate(screen => {
         const scroll = document.getElementById('leaderboard-scroll');
         const back = document.getElementById('leaderboard-back').getBoundingClientRect();
+        const filters = [...document.querySelectorAll('#leaderboard-filters button')]
+            .map(button => button.getBoundingClientRect());
         return {
+            filtersStacked: filters.length === 3 && filters.every((box, index) =>
+                Math.abs(box.left - filters[0].left) < 0.5
+                && (index === 0 || box.top >= filters[index - 1].bottom)),
             noHorizontalOverflow: screen.scrollWidth <= screen.clientWidth + 1
                 && scroll.scrollWidth <= scroll.clientWidth + 1,
             rowsScroll: scroll.scrollHeight > scroll.clientHeight,
             backVisible: back.top >= 0 && back.bottom <= innerHeight,
             nativeText: getComputedStyle(document.getElementById('leaderboard-table')).transform === 'none',
         };
+    }), { message: 'Resized leaderboard settles into a stacked, overflow-free layout' }).toEqual({
+        filtersStacked: true, noHorizontalOverflow: true, rowsScroll: true, backVisible: true, nativeText: true,
     });
-    expect(geometry).toEqual({ noHorizontalOverflow: true, rowsScroll: true, backVisible: true, nativeText: true });
     const cdp = await page.context().newCDPSession(page);
     const box = await scroller.boundingBox();
     const x = Math.round(box.x + box.width / 2);
