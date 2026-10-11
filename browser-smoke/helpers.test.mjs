@@ -532,12 +532,14 @@ test('workflow gates build locally and previews only through the safe deployment
     assert.ok(local);
     assert.match(local, /run: npm run test:browser\n/);
     assert.match(local, /BROWSER_SMOKE_NO_BUILD: '1'/);
-    const remote = workflow.split('      - name: Real-browser branch-preview playability smoke\n')[1]?.split('\n      - name:')[0];
+    const { yaml } = createRequire(import.meta.url)('playwright-core/lib/utilsBundle');
+    const preview = yaml.parse(workflow).jobs.deploy_preview;
+    const remote = preview.steps.find(step => step.name === 'Real-browser branch-preview playability smoke');
     assert.ok(remote);
-    assert.match(remote, /if: steps\.vars\.outputs\.is_production != 'true'/);
-    assert.match(remote, /run: npm run test:browser:remote/);
-    assert.match(remote, /BROWSER_SMOKE_BASE_URL: \$\{\{ steps\.deploy\.outputs\.url \}\}/);
-    assert.doesNotMatch(remote, /CUSTOM_|continue-on-error|always\(\)/);
-    assert.ok(workflow.indexOf('name: Real-browser branch-preview playability smoke')
-        < workflow.indexOf('name: Deployment Summary'));
+    assert.equal(remote.if, "steps.vars.outputs.is_production != 'true'");
+    assert.equal(remote.run, 'npm run test:browser:remote');
+    assert.deepEqual(remote.env, { BROWSER_SMOKE_BASE_URL: '${{ steps.deploy.outputs.url }}' });
+    assert.doesNotMatch(JSON.stringify(remote), /CUSTOM_|continue-on-error|always\(\)/);
+    assert.ok(preview.steps.indexOf(remote)
+        < preview.steps.findIndex(step => step.name === 'Deployment Summary'));
 });

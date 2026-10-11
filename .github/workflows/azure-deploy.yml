@@ -204,15 +204,15 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: Deploy to Azure
+    name: Deploy to Azure (production)
     runs-on: ubuntu-latest
     needs: build
     # Override implicit success(): the PR-only planner is skipped on push/manual runs.
-    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
     permissions:
       id-token: write  # Required for OIDC authentication
       contents: read
-    env:
+    env: &deployment_env
       DOTNET_VERSION: '10.0.x'
       # Shared resource naming conventions
       PRODUCTION_RG: 'rg-production'
@@ -280,18 +280,22 @@ jobs:
       custom_url_template: ${{ steps.vars.outputs.custom_url_template }}
 
     steps:
-      - name: Checkout code
+      - &deploy_checkout
+        name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Setup Node.js
+      - &deploy_node
+        name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: 22
 
-      - name: Verify deployment branch after acquiring the resource interlock
+      - &deploy_verify_ref
+        name: Verify deployment branch after acquiring the resource interlock
         run: node .github/scripts/cleanup-orphans.mjs --verify-deployment-ref
 
-      - name: Set deployment variables
+      - &deploy_variables
+        name: Set deployment variables
         id: vars
         run: |
           BRANCH_NAME="${GITHUB_REF#refs/heads/}"
@@ -325,7 +329,8 @@ jobs:
           echo "custom_subdomain_suffix=$CUSTOM_SUBDOMAIN_SUFFIX" >> "$GITHUB_OUTPUT"
           echo "custom_url_template=$CUSTOM_URL_TEMPLATE" >> "$GITHUB_OUTPUT"
 
-      - name: Report custom-domain format
+      - &deploy_domain_format
+        name: Report custom-domain format
         env:
           CUSTOM_SUBDOMAIN_SUFFIX: ${{ steps.vars.outputs.custom_subdomain_suffix }}
           CUSTOM_URL_TEMPLATE: ${{ steps.vars.outputs.custom_url_template }}
@@ -340,31 +345,36 @@ jobs:
           echo "**Custom URL format:** \`$CUSTOM_URL_TEMPLATE\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Replace the two literal placeholder tokens only in a private administrative environment; this is not a live endpoint." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install Azure Developer CLI
+      - &deploy_install_azd
+        name: Install Azure Developer CLI
         run: |
           curl -fsSL https://aka.ms/install-azd.sh | bash
 
-      - name: Log in to Azure using OIDC
+      - &deploy_login
+        name: Log in to Azure using OIDC
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Register required Azure providers
+      - &deploy_providers
+        name: Register required Azure providers
         run: |
           # Register Microsoft.App provider (required for Container Apps)
           az provider register -n Microsoft.App --wait || true
           az provider register -n Microsoft.OperationalInsights --wait || true
           az provider register -n Microsoft.Storage --wait
 
-      - name: Authenticate azd with federated credentials
+      - &deploy_azd_login
+        name: Authenticate azd with federated credentials
         run: |
           azd auth login --client-id "${{ secrets.AZURE_CLIENT_ID }}" \
                          --federated-credential-provider github \
                          --tenant-id "${{ secrets.AZURE_TENANT_ID }}"
 
-      - name: Check production infrastructure (for branch deployments)
+      - &deploy_check_production
+        name: Check production infrastructure (for branch deployments)
         if: steps.vars.outputs.is_production != 'true'
         run: |
           if ! az group show --name "${{ env.PRODUCTION_RG }}" &>/dev/null; then
@@ -372,7 +382,8 @@ jobs:
             exit 1
           fi
 
-      - name: Set up azd environment
+      - &deploy_environment
+        name: Set up azd environment
         env:
           CUSTOM_DOMAIN_NAME: ${{ secrets.CUSTOM_DOMAIN_NAME }}
           CUSTOM_SUBDOMAIN: ${{ secrets.CUSTOM_SUBDOMAIN }}
@@ -499,7 +510,8 @@ jobs:
           azd env set CERT_READER_IDENTITY_ID "$CERT_READER_IDENTITY_ID"
           azd env set MANAGE_ACMEBOT_PERMISSIONS "${MANAGE_ACMEBOT_PERMISSIONS:-true}"
 
-      - name: Bootstrap BYO cert on shared CAE (branches only)
+      - &deploy_bootstrap_certificate
+        name: Bootstrap BYO cert on shared CAE (branches only)
         # Production owns the CAE in Bicep. Branches reference it as existing,
         # so attach the identity and ensure its KV-backed certificate separately.
         if: steps.vars.outputs.is_production != 'true' && env.HAS_CUSTOM_DOMAIN == 'true' && env.CERT_KEY_VAULT_SECRET_URL != '' && env.CERT_KEY_VAULT_CERT_NAME != '' && env.CERT_READER_IDENTITY_ID != ''
@@ -511,7 +523,8 @@ jobs:
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Provision and Deploy to Azure
+      - &deploy_provision
+        name: Provision and Deploy to Azure
         id: deploy
         shell: bash
         run: |
@@ -596,7 +609,8 @@ jobs:
           echo "::error::Static apex hostname did not reach Ready. Final status: $final_status"
           exit 1
 
-      - name: Configure Custom Domain (if enabled)
+      - &deploy_managed_domain
+        name: Configure Custom Domain (if enabled)
         id: managed_domain
         # Runs ONLY for single-region production WITHOUT BYO cert secrets.
         # All other cases are handled in-band by bicep + the bootstrap step:
@@ -619,7 +633,8 @@ jobs:
         env:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Report managed custom-domain activation
+      - &deploy_managed_domain_status
+        name: Report managed custom-domain activation
         if: always() && env.CUSTOM_DOMAIN != '' && env.IS_MULTI_REGION != 'true' && env.CERT_KEY_VAULT_SECRET_URL == ''
         run: |
           if [ "${{ steps.managed_domain.outputs.custom_domain_ready }}" != "true" ]; then
@@ -631,27 +646,31 @@ jobs:
 
       # Branch previews are single-region ACA apps even when production uses
       # a multi-region static apex. Never feed a custom hostname to this gate.
-      - name: Setup Node.js for preview smoke
+      - &deploy_preview_node
+        name: Setup Node.js for preview smoke
         if: steps.vars.outputs.is_production != 'true'
         uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
 
-      - name: Install preview smoke tooling
+      - &deploy_preview_tooling
+        name: Install preview smoke tooling
         if: steps.vars.outputs.is_production != 'true'
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npx playwright install --with-deps --only-shell chromium
 
-      - name: Real-browser branch-preview playability smoke
+      - &deploy_preview_smoke
+        name: Real-browser branch-preview playability smoke
         if: steps.vars.outputs.is_production != 'true'
         timeout-minutes: 6
         run: npm run test:browser:remote
         env:
           BROWSER_SMOKE_BASE_URL: ${{ steps.deploy.outputs.url }}
 
-      - name: Deployment Summary
+      - &deploy_summary
+        name: Deployment Summary
         run: |
           echo "### 🚀 Deployment Successful!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -690,3 +709,45 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "View your deployment in the [Azure Portal](https://portal.azure.com)" >> $GITHUB_STEP_SUMMARY
+
+  # Docker actions are prepared before step conditions are evaluated. A separate
+  # complete preview job avoids the production publisher's image build while
+  # keeping the resource interlock through smoke and the success summary.
+  deploy_preview:
+    name: Deploy to Azure (preview)
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/main' }}
+    permissions:
+      id-token: write
+      contents: read
+    env: *deployment_env
+    concurrency:
+      group: astervoids-azure-resource-mutations
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      custom_subdomain_suffix: ${{ steps.vars.outputs.custom_subdomain_suffix }}
+      custom_url_template: ${{ steps.vars.outputs.custom_url_template }}
+    steps:
+      - *deploy_checkout
+      - *deploy_node
+      - *deploy_verify_ref
+      - *deploy_variables
+      - *deploy_domain_format
+      - *deploy_install_azd
+      - *deploy_login
+      - *deploy_providers
+      - *deploy_azd_login
+      - *deploy_check_production
+      - *deploy_environment
+      - *deploy_bootstrap_certificate
+      - *deploy_provision
+      - *deploy_managed_domain
+      - *deploy_managed_domain_status
+      - *deploy_preview_node
+      - *deploy_preview_tooling
+      - *deploy_preview_smoke
+      - *deploy_summary

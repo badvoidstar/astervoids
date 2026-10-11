@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -458,11 +459,19 @@ test('cleanup and deploy share a non-cancelling job interlock; validation uses t
   const read = path => readFileSync(new URL(path, import.meta.url), 'utf8').replace(/\r/g, '');
   const deploy = read('../workflows/azure-deploy.yml');
   const cleanup = read('../workflows/cleanup-orphans.yml');
-  for (const workflow of [deploy, cleanup]) {
-    assert.match(workflow, /    concurrency:\n      group: astervoids-azure-resource-mutations\n      cancel-in-progress: false/);
+  const { yaml } = createRequire(import.meta.url)('playwright-core/lib/utilsBundle');
+  const deploymentJobs = yaml.parse(deploy).jobs;
+  for (const job of [deploymentJobs.deploy, deploymentJobs.deploy_preview, yaml.parse(cleanup).jobs.cleanup]) {
+    assert.deepEqual(job.concurrency, {
+      group: 'astervoids-azure-resource-mutations', 'cancel-in-progress': false,
+    });
   }
-  assert.match(deploy, /run: node \.github\/scripts\/cleanup-orphans\.mjs --verify-deployment-ref/);
-  assert.ok(deploy.indexOf('--verify-deployment-ref') < deploy.indexOf('- name: Set deployment variables'));
+  for (const job of [deploymentJobs.deploy, deploymentJobs.deploy_preview]) {
+    const verify = job.steps.findIndex(step =>
+      step.run === 'node .github/scripts/cleanup-orphans.mjs --verify-deployment-ref');
+    assert.ok(verify >= 0, 'Every deployment rechecks its branch after acquiring the interlock');
+    assert.ok(verify < job.steps.findIndex(step => step.id === 'vars'));
+  }
   assert.match(cleanup, /run: node \.github\/scripts\/cleanup-orphans\.mjs\n/);
   assert.match(cleanup, /CUSTOM_DOMAIN_NAME: \$\{\{ secrets.CUSTOM_DOMAIN_NAME \}\}/);
   assert.match(cleanup, /--ago 14d --untagged --keep 1/);

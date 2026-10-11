@@ -293,6 +293,8 @@ az() {
         elif [ "$(call_count az deployment sub create)" -gt 0 ]; then
           printf '%s\n' "$RETRY_VERIFICATION_ID"
         fi
+      else
+        printf '%s\n' "$CAE_JSON"
       fi
       ;;
     'containerapp env identity') return "$IDENTITY_RC" ;;
@@ -323,7 +325,8 @@ reset_deployment() {
   : > "$CALL_LOG"
   AZD_READ_RC=0 AZD_WRITE_RC=0 AZD_UP_RC=0 AZD_PROVISION_RC=0 BICEP_FAILURES=0 UPDATE_FAILURE_AT=0
   ACR_LOGIN_RC=0 DOCKER_BUILD_RC=0 DOCKER_PUSH_RC=0
-  APP_STATE=present CAE_EXISTS=true EXISTING_CERT='' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
+  APP_STATE=present CAE_EXISTS=true EXISTING_CERT='[]' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
+  CAE_JSON='{"location":"northeurope","identity":{"type":"UserAssigned","userAssignedIdentities":{}}}'
   SUPPORTED_LOCATIONS=$'northeurope\nwestus2'
   VERIFICATION_SOURCE=ca-web-production-north EXISTING_VERIFICATION_ID=existing-verification RETRY_VERIFICATION_ID=''
   MOCK_AZD_VALUES=$(jq -cn --arg regions "$REGIONS" '{
@@ -417,8 +420,8 @@ done
 validate_preview_environment_name feature-production
 
 # Execute the actual workflow certificate setup, including its conditionals.
-certificate_setup=$(sed -n '/^          # BYO TLS cert (optional)/,/^      - name: Bootstrap BYO cert/{
-  /^      - name: Bootstrap BYO cert/d
+certificate_setup=$(sed -n '/^          # BYO TLS cert (optional)/,/^      - \&deploy_bootstrap_certificate/{
+  /^      - \&deploy_bootstrap_certificate/d
   s/^          //
   p
 }' "$SCRIPT_DIR/../workflows/azure-deploy.yml")
@@ -721,12 +724,79 @@ assert_equal "$(jq -r '.properties.certificateKeyVaultProperties.identity' <<< "
 assert_equal "$(jq -r '.properties.certificateKeyVaultProperties.keyVaultUrl' <<< "$CERT_BODY")" \
   https://example.vault.azure.net/secrets/wildcard-example-com
 
-reset_deployment
-EXISTING_CERT=wildcard-example-com
-bootstrap_shared_certificate rg-production cae-production example-subscription \
-  https://example.vault.azure.net/secrets/wildcard-example-com wildcard-example-com example-identity
-assert_calls 1 az containerapp env identity assign
-assert_calls 0 az rest
+MATCHING_CERTIFICATES='[{
+  "name":"wildcard-example-com",
+  "properties":{
+    "provisioningState":"Succeeded","valid":true,
+    "certificateKeyVaultProperties":{
+      "identity":"example-identity",
+      "keyVaultUrl":"https://example.vault.azure.net/secrets/wildcard-example-com"
+    }
+  }
+}]'
+for identity_present in true false null; do
+  reset_deployment
+  EXISTING_CERT="$MATCHING_CERTIFICATES"
+  if [ "$identity_present" = true ]; then
+    CAE_JSON=$(jq '.identity.userAssignedIdentities = {"EXAMPLE-IDENTITY":{}, "unrelated-identity":{}}' <<< "$CAE_JSON")
+    EXISTING_CERT=$(jq '.[0].name |= ascii_upcase | .[0].properties.certificateKeyVaultProperties.identity |= ascii_upcase' <<< "$EXISTING_CERT")
+  elif [ "$identity_present" = null ]; then
+    CAE_JSON=$(jq '.identity = null' <<< "$CAE_JSON")
+  fi
+  bootstrap_shared_certificate rg-production cae-production example-subscription \
+    https://example.vault.azure.net/secrets/wildcard-example-com wildcard-example-com example-identity
+  assert_calls 1 az containerapp env show
+  assert_calls 1 az containerapp env certificate list
+  if [ "$identity_present" = true ]; then
+    assert_calls 0 az containerapp env identity assign
+  else
+    assert_calls 1 az containerapp env identity assign
+    assert_call_argument example-identity az containerapp env identity assign
+  fi
+  assert_calls 0 az rest
+done
+
+for drift in missing url reader failed invalid uploaded; do
+  reset_deployment
+  CAE_JSON=$(jq '.identity.userAssignedIdentities = {"example-identity":{}}' <<< "$CAE_JSON")
+  EXISTING_CERT="$MATCHING_CERTIFICATES"
+  case "$drift" in
+    missing) EXISTING_CERT='[]' ;;
+    url) EXISTING_CERT=$(jq '.[0].properties.certificateKeyVaultProperties.keyVaultUrl += "/old-version"' <<< "$EXISTING_CERT") ;;
+    reader) EXISTING_CERT=$(jq '.[0].properties.certificateKeyVaultProperties.identity = "old-identity"' <<< "$EXISTING_CERT") ;;
+    failed) EXISTING_CERT=$(jq '.[0].properties.provisioningState = "Failed"' <<< "$EXISTING_CERT") ;;
+    invalid) EXISTING_CERT=$(jq '.[0].properties.valid = false' <<< "$EXISTING_CERT") ;;
+    uploaded) EXISTING_CERT=$(jq 'del(.[0].properties.certificateKeyVaultProperties)' <<< "$EXISTING_CERT") ;;
+  esac
+  bootstrap_shared_certificate rg-production cae-production example-subscription \
+    https://example.vault.azure.net/secrets/wildcard-example-com wildcard-example-com example-identity
+  assert_calls 0 az containerapp env identity assign
+  assert_calls 1 az rest
+  CERT_BODY=$(jq -sr '.[] | select(.[0:2] == ["az","rest"]) | .[index("--body")+1]' "$CALL_LOG")
+  assert_equal "$(jq -c '.properties.certificateKeyVaultProperties' <<< "$CERT_BODY")" \
+    "$(jq -c '.[0].properties.certificateKeyVaultProperties' <<< "$MATCHING_CERTIFICATES")"
+done
+
+for invalid in location environments identity-map identity-boolean certificates empty-certificates certificate-responses certificate-list entry duplicate properties; do
+  reset_deployment
+  case "$invalid" in
+    location) CAE_JSON='{"location":null}' ;;
+    environments) CAE_JSON="$CAE_JSON $CAE_JSON" ;;
+    identity-map) CAE_JSON='{"location":"northeurope","identity":{"userAssignedIdentities":[]}}' ;;
+    identity-boolean) CAE_JSON='{"location":"northeurope","identity":{"userAssignedIdentities":false}}' ;;
+    certificates) EXISTING_CERT='not-json' ;;
+    empty-certificates) EXISTING_CERT='' ;;
+    certificate-responses) EXISTING_CERT='[] []' ;;
+    certificate-list) EXISTING_CERT='{}' ;;
+    entry) EXISTING_CERT='[{"name":false}]' ;;
+    duplicate) EXISTING_CERT=$(jq '. + .' <<< "$MATCHING_CERTIFICATES") ;;
+    properties) EXISTING_CERT=$(jq '.[0].properties = null' <<< "$MATCHING_CERTIFICATES") ;;
+  esac
+  expect_failure 1 bootstrap_shared_certificate rg-production cae-production example-subscription \
+    https://example.vault.azure.net/secrets/wildcard-example-com wildcard-example-com example-identity
+  assert_calls 0 az containerapp env identity assign
+  assert_calls 0 az rest
+done
 
 for failure_case in environment identity list put; do
   reset_deployment
@@ -740,6 +810,9 @@ for failure_case in environment identity list put; do
   expect_failure "$expected" bootstrap_shared_certificate rg-production cae-production example-subscription \
     https://example.vault.azure.net/secrets/wildcard-example-com wildcard-example-com example-identity
   if [ "$failure_case" != put ]; then assert_calls 0 az rest; fi
+  if [ "$failure_case" = environment ] || [ "$failure_case" = list ]; then
+    assert_calls 0 az containerapp env identity assign
+  fi
 done
 
 echo "Workflow helper tests passed"

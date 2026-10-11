@@ -1882,6 +1882,13 @@ azd, while multi-region/branch paths use shared deployment helpers for provision
 build/push, and rollout. Static entry publication is a separate output of the
 multi-region path.
 
+Production and branch previews run in mutually exclusive deployment jobs with
+shared YAML-anchored steps. Each keeps the resource-mutation interlock for the
+whole deployment; only production prepares the Static Web Apps Docker action.
+The preview certificate bootstrap is read-only when its reader assignment and
+valid certificate configuration already match, and reconciles missing or
+changed configuration without discarding other CAE identities.
+
 The [Dockerfile](AstervoidsWeb/Dockerfile) builds with the .NET Alpine SDK and
 ships the ASP.NET Alpine runtime. Federated Azure authentication avoids putting
 credentials in the repository.
