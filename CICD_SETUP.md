@@ -423,7 +423,7 @@ already verified identical-tree head runs the full suite at that exact head.
 An inability to establish the selected checkout fails Build.
 Deployment checkout and orchestration `GITHUB_SHA` are unchanged.
 
-Eligible pushes use `astervoids-validation-v1-<repository-id>-<head-sha>`.
+Eligible pushes use `astervoids-validation-v2-<repository-id>-<head-sha>`.
 A PR joins that scheduling group only if its planner sees an already-running
 eligible push **Build**, or a successfully completed Build with a candidate
 proof artifact. `cancel-in-progress: false` and `queue: max` queue jobs on
@@ -434,7 +434,7 @@ There is no polling/wait loop. The group is coordination, **never evidence**.
 Both paths retain the pinned action setup, NuGet restore, `npm ci`, unchanged
 Chromium/system-dependency installation, and Bicep compile. Before omitting
 the expensive build/test steps, `.github/scripts/validation-reuse.mjs`
-compares the effective hosted image/architecture, kernel/CPU/memory, tool
+compares the effective hosted image/architecture, kernel and CPU/memory capacity, tool
 versions, installed system packages, actual headless browser binary digest,
 restored dependency manifests/integrities, and controlled subprocess
 environment. Unknown or mismatched inputs run fully. The clean validation
@@ -444,13 +444,26 @@ scratch files and the browser's isolated local file identity store under
 the validation checkout. Deployment-only settings/secrets now belong to
 deploy, with their existing values and behavior.
 
+Policy v2 compares logical CPU count, available parallelism, and reported memory
+rounded **down** to whole-GiB capacity buckets, rather than CPU brand/model strings
+and boot-specific RAM byte counts. The same standard hosted-runner class can
+receive different physical processors and OS-reserved memory; these are not a
+CPU-model-specific validation matrix. Architecture, kernel, software versions,
+packages, browser bytes, dependency bytes, and controlled environment remain
+exact. Different CPU capacity, affinity/parallelism, or memory buckets still miss;
+unknown hardware remains ineligible. The versioned scheduling/artifact namespace
+prevents old-policy proofs from satisfying the changed equivalence contract.
+
 After every full push gate succeeds, Build may publish the immutable
-one-day artifact **`astervoids-validation-v1-<run-id>-1`**, containing only
+one-day artifact **`astervoids-validation-v2-<run-id>-1`**, containing only
 **`proof.json`**. It records public repository/workflow/run/attempt and
 checkout identities, workflow/helper blobs, the non-secret input digest,
-allowlisted per-component digests, `mode: full`, and creation time—no binaries,
-environment dump, tokens, deployment hostname or application payloads. Publication failure only loses
-reuse; it cannot bypass a failed validation gate. PRs never publish proofs.
+allowlisted per-component digests, diagnostic-only hashes of CPU models and
+exact reported RAM, `mode: full`, and creation time—no binaries, environment
+dump, tokens, deployment hostname or application payloads. The raw-hardware
+observation hashes are excluded from eligibility but covered by artifact integrity.
+Publication failure only loses reuse; it cannot bypass a failed validation gate.
+PRs never publish proofs.
 
 The consumer independently checks source repository/workflow identity,
 attempt 1, actual SHA/tree and executed policy blobs, input fingerprint,
@@ -470,6 +483,9 @@ fixed differing component names, such as `memory` or `dependencies-npm`, never
 their values or digests. The aggregate binds the complete component map;
 missing, unknown, malformed, inconsistent, or legacy digest-only maps cannot
 reuse validation. Provenance failures remain separate from input differences.
+A successful hit can report `Equivalent hardware: memory, cpu` when those raw
+observations differ but capacity and every other eligibility component match;
+this also exposes only fixed component names, not observations or digests.
 Useful trial outcomes are:
 
 | Phase | Reason | Meaning |

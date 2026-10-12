@@ -53,7 +53,7 @@ jobs:
       actions: read
     concurrency:
       # PR-first and unknown/queued sources get a unique, full-validation group.
-      group: ${{ github.event_name == 'push' && github.run_attempt == 1 && github.ref != 'refs/heads/main' && format('astervoids-validation-v1-{0}-{1}', github.repository_id, github.sha) || github.event_name == 'pull_request' && github.run_attempt == 1 && needs.validation_plan.outputs.group || format('astervoids-validation-v1-full-{0}-{1}', github.run_id, github.run_attempt) }}
+      group: ${{ github.event_name == 'push' && github.run_attempt == 1 && github.ref != 'refs/heads/main' && format('astervoids-validation-v2-{0}-{1}', github.repository_id, github.sha) || github.event_name == 'pull_request' && github.run_attempt == 1 && needs.validation_plan.outputs.group || format('astervoids-validation-v2-full-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
       queue: max
     defaults:
@@ -197,7 +197,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: astervoids-validation-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          name: astervoids-validation-v2-${{ github.run_id }}-${{ github.run_attempt }}
           path: validation/test-results/validation-proof/proof.json
           retention-days: 1
           compression-level: 0

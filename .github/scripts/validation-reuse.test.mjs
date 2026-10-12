@@ -16,7 +16,7 @@ const helperSource = readFileSync(helperPath, 'utf8');
 const workflowSource = readFileSync(process.env.REUSE_MUTANT_WORKFLOW || workflowPath, 'utf8').replace(/\r\n/g, '\n');
 const reuse = await import(pathToFileURL(process.env.REUSE_MUTANT_HELPER || helperPath).href);
 const {
-    POLICY, WORKFLOW, INPUT_COMPONENTS, VALIDATION_STEPS, Git, CheckoutError, artifactName, plan,
+    POLICY, WORKFLOW, INPUT_COMPONENTS, MEMORY_CAPACITY_UNIT_BYTES, VALIDATION_STEPS, Git, CheckoutError, artifactName, plan,
     selectCheckout, capture, makeProof, verify, validationEnvironment, effectiveInputs, readProofArchive,
     githubApi, report,
 } = reuse;
@@ -122,9 +122,10 @@ async function zipBytes(value, options = {}) {
         zip.end();
     });
 }
-function fingerprintedInputs(components = Object.fromEntries(INPUT_COMPONENTS.map(key => [key, 'a'.repeat(64)]))) {
+function fingerprintedInputs(components = Object.fromEntries(INPUT_COMPONENTS.map(key => [key, 'a'.repeat(64)])),
+    observedHardware = { memory: 'a'.repeat(64), cpu: 'a'.repeat(64) }) {
     const ordered = Object.fromEntries(Object.keys(components).sort().map(key => [key, components[key]]));
-    return { fingerprint: digest(JSON.stringify(ordered)), components };
+    return { fingerprint: digest(JSON.stringify(ordered)), components, observedHardware };
 }
 async function scenario() {
     gitAt(eventGit.cwd, 'checkout', '--quiet', '--detach', commits.equal);
@@ -503,8 +504,33 @@ test('component fingerprint schema rejects omitted, unknown, malformed and incon
     assert.deepEqual(inputs, { eligible: 'false', reason: 'inputs-unknown' });
 });
 
-test('fingerprint uses real restored files and every effective runner/tool input without event metadata', async () => {
-    const cwd = join(root, 'input-probe');
+test('equivalent raw hardware differences can hit only with identical capacity and other input components', async () => {
+    const f = await scenario();
+    f.inputs.observedHardware = { memory: 'b'.repeat(64), cpu: 'c'.repeat(64) };
+    assert.deepEqual(await f.verify(), {
+        hit: 'true', reason: 'verified-push-proof', source_id: String(sourceId), artifact_id: '654',
+        normalizedInputs: ['memory', 'cpu'],
+    });
+    Object.assign(f.inputs, fingerprintedInputs({ ...f.inputs.components, memory: 'd'.repeat(64) },
+        f.inputs.observedHardware));
+    assert.deepEqual(await f.verify(), {
+        hit: 'false', reason: 'inputs-fingerprint-mismatch', mismatches: ['memory'],
+    }, 'Diagnostic observations cannot override a capacity mismatch');
+    for (const observedHardware of [
+        undefined, {}, [], { memory: 'b'.repeat(64), cpu: 'private-model-sentinel' },
+        { ...f.proof.observedHardware, 'private-field-sentinel': 'd'.repeat(64) },
+    ]) {
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+        f.inputs.observedHardware = observedHardware;
+        assert.deepEqual(await f.verify(), { hit: 'false', reason: 'inputs-unavailable' });
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+        await f.repack({ ...f.proof, observedHardware });
+        assert.equal((await f.verify()).hit, 'false', 'Unknown observation payloads cannot enter a proof');
+    }
+});
+
+function inputProbeFixture(name) {
+    const cwd = join(root, name);
     const files = [
         'AstervoidsWeb/obj/project.assets.json', 'AstervoidsWeb.Tests/obj/project.assets.json',
         'node_modules/.package-lock.json', 'node_modules/playwright-core/browsers.json',
@@ -521,8 +547,9 @@ test('fingerprint uses real restored files and every effective runner/tool input
     };
     const host = {
         release: () => '6.11.0-fixture',
-        totalmem: () => 16 * 1024 ** 3,
+        totalmem: () => 15.625 * MEMORY_CAPACITY_UNIT_BYTES,
         cpus: () => [{ model: 'fixture-cpu' }, { model: 'fixture-cpu' }],
+        availableParallelism: () => 2,
     };
     const commands = new Map([
         ['dotnet --info', '.NET SDK:\n Version: 10.0.100\n.NET runtime 10.0.0'],
@@ -546,6 +573,11 @@ test('fingerprint uses real restored files and every effective runner/tool input
         assert.notEqual(value, undefined, 'All executed input probes are known');
         return value;
     };
+    return { cwd, files, env, host, commands, execute };
+}
+
+test('fingerprint uses real restored files and every effective runner/tool input without event metadata', async () => {
+    const { cwd, files, env, host, commands, execute } = inputProbeFixture('input-probe');
     const first = await effectiveInputs(env, cwd, execute, host);
     assert.match(first.fingerprint, /^[a-f0-9]{64}$/);
     assert.deepEqual(Object.keys(first.components).sort(), [
@@ -554,7 +586,8 @@ test('fingerprint uses real restored files and every effective runner/tool input
         'azure', 'bicep', 'packages', 'browser',
         'dependencies-app', 'dependencies-tests', 'dependencies-npm', 'dependencies-browser',
     ].sort(), 'The actual collector covers every declared input, including each restored file');
-    assert.deepEqual(first, fingerprintedInputs(first.components), 'The aggregate binds all component digests');
+    assert.deepEqual(first, fingerprintedInputs(first.components, first.observedHardware),
+        'The aggregate binds every eligibility component; raw hardware is diagnostic only');
     assert.deepEqual(await effectiveInputs({ ...env, GITHUB_SHA: 'other-event', CI: 'false' }, cwd, execute, host), first);
     for (const path of files) {
         const absolute = join(cwd, path);
@@ -573,9 +606,8 @@ test('fingerprint uses real restored files and every effective runner/tool input
         assert.notEqual((await effectiveInputs({ ...env, ...patch }, cwd, execute, host)).fingerprint, first.fingerprint);
     for (const [key, patch] of [
         ['kernel', { release: () => '6.12.0-fixture' }],
-        ['memory', { totalmem: () => host.totalmem() - 4096 }],
-        ['cpu', { cpus: () => [{ model: 'different-cpu' }, { model: 'different-cpu' }] }],
-        ['cpu', { cpus: () => [{ model: 'fixture-cpu' }] }],
+        ['memory', { totalmem: () => 8 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['cpu', { cpus: () => [{ model: 'fixture-cpu' }], availableParallelism: () => 1 }],
     ]) {
         const changed = await effectiveInputs(env, cwd, execute, { ...host, ...patch });
         assert.notEqual(changed.fingerprint, first.fingerprint);
@@ -591,6 +623,50 @@ test('fingerprint uses real restored files and every effective runner/tool input
         await assert.rejects(effectiveInputs(env, cwd, (file, args, options) =>
             file === fileName ? invalid : execute(file, args, options), host), /tool-inputs-unknown/);
     }
+});
+
+test('hosted hardware fingerprint ignores VM identity but preserves capacity and memory bucket boundaries', async () => {
+    const { cwd, env, host, execute } = inputProbeFixture('hardware-probe');
+    const probe = patch => effectiveInputs(env, cwd, execute, { ...host, ...patch });
+    const first = await probe({});
+    assert.equal(first.components.memory, digest(JSON.stringify(15)),
+        'Memory is the minimum reported whole-GiB capacity, never rounded upward');
+    for (const memory of [
+        host.totalmem() - 4096, host.totalmem() + 4096,
+        15 * MEMORY_CAPACITY_UNIT_BYTES, 16 * MEMORY_CAPACITY_UNIT_BYTES - 1,
+    ]) {
+        const equivalent = await probe({
+            totalmem: () => memory,
+            cpus: () => [{ model: 'another-CPU-vendor' }, { model: 'another-CPU-vendor' }],
+        });
+        assert.equal(equivalent.fingerprint, first.fingerprint,
+            'Equivalent hosted capacity survives CPU branding and OS-reserved page differences');
+        assert.deepEqual(equivalent.components, first.components);
+        assert.notEqual(equivalent.observedHardware.memory, first.observedHardware.memory);
+        assert.notEqual(equivalent.observedHardware.cpu, first.observedHardware.cpu);
+    }
+    for (const [key, patch] of [
+        ['memory', { totalmem: () => 15 * MEMORY_CAPACITY_UNIT_BYTES - 1 }],
+        ['memory', { totalmem: () => 16 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['memory', { totalmem: () => 8 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['cpu', { cpus: () => Array.from({ length: 3 }, () => ({ model: 'fixture-cpu' })) }],
+        ['cpu', { availableParallelism: () => 1 }],
+        ['kernel', { release: () => '6.12.0-fixture' }],
+    ]) {
+        const changed = await probe(patch);
+        assert.notEqual(changed.fingerprint, first.fingerprint);
+        assert.deepEqual(INPUT_COMPONENTS.filter(name => changed.components[name] !== first.components[name]), [key]);
+    }
+    for (const patch of [
+        { totalmem: () => 0 }, { totalmem: () => NaN }, { totalmem: () => Infinity },
+        { totalmem: () => MEMORY_CAPACITY_UNIT_BYTES - 1 },
+        { totalmem: () => host.totalmem() + 0.5 },
+        { cpus: () => [] }, { cpus: () => [{ model: '' }] },
+        { availableParallelism: () => 0 }, { availableParallelism: () => 0.5 },
+        { availableParallelism: () => 3 },
+    ]) await assert.rejects(probe(patch), /runner-inputs-unknown/);
+    await assert.rejects(effectiveInputs({ ...env, RUNNER_ARCH: 'ARM64' }, cwd, execute, host),
+        /runner-inputs-unknown/, 'A different architecture cannot reuse an x64 validation');
 });
 
 test('real gh adapter bounds JSON/archive reads and never surfaces API error bodies', () => {
@@ -777,6 +853,15 @@ test('component diagnostics emit only allowlisted names, never input values or d
     for (const mismatches of [[], 'memory', ['memory', 'memory'], ['private-component-sentinel']])
         assert.throws(() => report('verify', { ...result, mismatches }, env), /diagnostics-invalid/);
     assert.equal(lines.length, 1, 'Invalid diagnostics fail before emitting any output');
+    const hit = { hit: 'true', reason: 'verified-push-proof', normalizedInputs: ['memory', 'cpu'],
+        observedHardware: { cpu: 'private-model-sentinel' } };
+    report('verify', hit, env);
+    assert.equal(lines[1], 'validation-reuse verify: verified-push-proof. Equivalent hardware: memory, cpu.');
+    for (const normalizedInputs of [[], 'cpu', ['cpu', 'cpu'], ['node'], ['private-model-sentinel']])
+        assert.throws(() => report('verify', { ...hit, normalizedInputs }, env), /diagnostics-invalid/);
+    assert.equal(lines.length, 2);
+    assert.doesNotMatch(lines.join('') + readFileSync(output, 'utf8') + readFileSync(summary, 'utf8'),
+        /private-|a{64}/);
 });
 
 function parsedWorkflow(source = workflowSource) {
@@ -1034,6 +1119,14 @@ test('critical mutations of production helper/YAML are rejected by the unchanged
             "return { ...fallback, hit: 'true', reason: miss(error, 'verification-unavailable') };", 'API error cannot become a hit'],
         ['fingerprint-hit', 'helper', 'if (proof.fingerprint !== inputs.fingerprint) {',
             'if (false) {', 'component fingerprints reject every changed input'],
+        ['raw-memory', 'helper', 'memory: Math.floor(memoryBytes / MEMORY_CAPACITY_UNIT_BYTES),',
+            'memory: memoryBytes,', 'hosted hardware fingerprint'],
+        ['cpu-brand', 'helper', 'logicalProcessors: processors.length',
+            'logicalProcessors: processors.map(processor => processor.model)', 'hosted hardware fingerprint'],
+        ['ignore-memory', 'helper', 'memory: Math.floor(memoryBytes / MEMORY_CAPACITY_UNIT_BYTES),',
+            'memory: 15,', 'hosted hardware fingerprint'],
+        ['ignore-cpu-count', 'helper', 'logicalProcessors: processors.length',
+            'logicalProcessors: 1', 'hosted hardware fingerprint'],
         ['deploy-dependency', 'workflow', '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: build\n',
             '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: validation_plan\n', 'actual YAML contract'],
         ['planner-green', 'workflow', '    if: ${{ !cancelled() }}\n', '    if: ${{ success() }}\n', 'actual YAML contract'],
