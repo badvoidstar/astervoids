@@ -282,10 +282,16 @@ Remote mode never starts a local server and fails if the target is unavailable.
 Only root HTTPS `*.azurecontainerapps.io` origins are accepted; custom domains,
 credentials, and multi-region/static-apex production targets are rejected.
 No screenshots, traces, videos, or raw browser errors are published by this gate.
-Its reporter emits authored scenario names, outcomes, and finite nonnegative
-per-test durations rounded to milliseconds (including skips and failures).
+Its reporter emits authored scenario/phase names, outcomes, and finite
+nonnegative per-test and explicit `test.step` durations rounded to milliseconds.
+`STEP`/`FAILED STEP` lines identify both the scenario and phase, including
+browser/identity readiness and the personal-score/migration phases; automatic
+API/locator steps and their metadata are excluded. Scenario totals still
+include skips and failures.
 Unavailable or invalid durations are omitted rather than reported as zero;
-readiness and runner overhead are not part of these per-test measurements.
+global readiness and runner overhead are not part of these per-test measurements.
+Phase times are inclusive, may overlap if nested, and do not cover every fixture
+operation, so do not sum them as an end-to-end total.
 See [browser-smoke coverage and limitations](CICD_SETUP.md#real-browser-smoke-gates)
 for CI behavior and the manual checks that remain necessary.
 

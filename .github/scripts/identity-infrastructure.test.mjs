@@ -34,6 +34,18 @@ test('all app paths retain scale-to-zero with a ten-minute cooldown and unchange
   }
 });
 
+test('all app paths use the requested image tag and reserve the placeholder for bootstrap', () => {
+  assert.equal(template.parameters.webImageTag.defaultValue, '');
+  assert.equal(apps.length, 4);
+  for (const deployment of apps) {
+    assert.equal(deployment.properties.parameters.imageName,
+      "[if(not(empty(parameters('webImageTag'))), createObject('value', format('astervoids-web:{0}', parameters('webImageTag'))), createObject('value', ''))]");
+    const [app] = resources(deployment.properties.template, 'Microsoft.App/containerApps');
+    assert.equal(app.properties.template.containers[0].image,
+      "[if(not(empty(parameters('imageName'))), format('{0}/{1}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, parameters('imageName')), 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest')]");
+  }
+});
+
 test('one environment-keyed store survives app revisions and is shared by all production regions', () => {
   assert.equal(stores.length, 1);
   const store = stores[0];

@@ -1499,8 +1499,11 @@ for (const { mode, layout } of ['deterministic', 'buffered']
         const mobile = {
             path, hasTouch: true, isMobile: true,
         };
-        const host = await players.open({ ...mobile, viewport: layout.creator });
-        const guest = await players.open({ ...mobile, viewport: layout.guest });
+        const { host, guest } = await test.step('open independent browsers and complete identity readiness', async () => {
+            const host = await players.open({ ...mobile, viewport: layout.creator });
+            const guest = await players.open({ ...mobile, viewport: layout.guest });
+            return { host, guest };
+        });
         const creatorAspect = layout.creator.width / layout.creator.height;
         const participants = [];
         let sessionId;

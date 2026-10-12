@@ -270,6 +270,14 @@ az() {
     'account list-locations --query')
       printf '%s\n' "$SUPPORTED_LOCATIONS"
       ;;
+    'group exists --name')
+      [ "$GROUP_READ_RC" -eq 0 ] || return "$GROUP_READ_RC"
+      printf '%s\n' "$GROUP_EXISTS"
+      ;;
+    'acr list --resource-group')
+      [ "$REGISTRY_LIST_RC" -eq 0 ] || return "$REGISTRY_LIST_RC"
+      printf '%s\n' "$REGISTRY_INVENTORY"
+      ;;
     'deployment sub create')
       if [ "$(call_count az deployment sub create)" -le "$BICEP_FAILURES" ]; then return 42; fi
       ;;
@@ -325,6 +333,7 @@ reset_deployment() {
   : > "$CALL_LOG"
   AZD_READ_RC=0 AZD_WRITE_RC=0 AZD_UP_RC=0 AZD_PROVISION_RC=0 BICEP_FAILURES=0 UPDATE_FAILURE_AT=0
   ACR_LOGIN_RC=0 DOCKER_BUILD_RC=0 DOCKER_PUSH_RC=0
+  GROUP_READ_RC=0 REGISTRY_LIST_RC=0 GROUP_EXISTS=true REGISTRY_INVENTORY='[]'
   APP_STATE=present CAE_EXISTS=true EXISTING_CERT='[]' IDENTITY_RC=0 CERT_LIST_RC=0 CERT_PUT_RC=0
   CAE_JSON='{"location":"northeurope","identity":{"type":"UserAssigned","userAssignedIdentities":{}}}'
   SUPPORTED_LOCATIONS=$'northeurope\nwestus2'
@@ -512,6 +521,13 @@ assert_calls 1 az deployment sub show
 assert_calls 1 docker build
 assert_calls 1 docker push
 assert_calls 2 az containerapp update
+assert_calls 1 az acr list --resource-group rg-production
+jq -se '([to_entries[] | select(.value[0:4] == ["az","deployment","sub","create"])][0].key) <
+  ([to_entries[] | select(.value[0:2] == ["docker","push"])][0].key)' "$CALL_LOG" >/dev/null \
+  || fail "a first deployment must provision its registry before publishing the image"
+if jq -se 'any(.[][]; startswith("webImageTag="))' "$CALL_LOG" >/dev/null; then
+  fail "a first deployment cannot reference an image that has not been published"
+fi
 assert_call_argument environmentName=production az deployment sub create
 assert_call_argument location=northeurope az deployment sub create
 assert_call_argument useSharedInfra=false az deployment sub create
@@ -582,6 +598,105 @@ outputs[WEB_URI]=https://north.azurecontainerapps.io
 outputs[STATIC_WEB_APP_DEFAULT_HOSTNAME]=app.example.com
 expect_failure 1 write_deployment_outputs outputs "$TEST_DIR/rejected" "$TEST_DIR/rejected-env"
 test ! -e "$TEST_DIR/rejected" || fail "unsafe static hostname was written"
+
+PRODUCTION_REGISTRIES='[{
+  "name":"armregistry","loginServer":"armregistry.azurecr.io","provisioningState":"Succeeded",
+  "tags":{"azd-env-name":"production"}
+}]'
+reset_deployment
+REGISTRY_INVENTORY=$(jq '. + [{name:"unrelatedregistry",tags:{"azd-env-name":"other"}}]' <<< "$PRODUCTION_REGISTRIES")
+deploy_multi_region_production deployment outputs >/dev/null
+assert_calls 1 az group exists --name rg-production
+assert_calls 1 az acr list --resource-group rg-production
+assert_calls 1 az acr login --name armregistry
+assert_calls 1 docker build
+assert_calls 1 docker push
+assert_calls 1 az deployment sub create
+assert_calls 0 az containerapp update
+assert_call_argument webImageTag=test-sha az deployment sub create
+assert_call_argument armregistry.azurecr.io/astervoids-web:test-sha docker push
+jq -se '([to_entries[] | select(.value[0:2] == ["docker","push"])][0].key) <
+  ([to_entries[] | select(.value[0:4] == ["az","deployment","sub","create"])][0].key)' "$CALL_LOG" >/dev/null \
+  || fail "a routine deployment must publish the intended image before Bicep rolls out regional apps"
+assert_equal "${outputs[IS_MULTI_REGION]}" true
+test -f "$TEST_DIR/static/region-bootstrap.js" || fail "routine deployment did not prepare its static payload"
+
+for absence in group owned-registry; do
+  reset_deployment
+  case "$absence" in
+    group) GROUP_EXISTS=false ;;
+    owned-registry) REGISTRY_INVENTORY='[{"name":"otherregistry","tags":{"azd-env-name":"other"}},{"name":"untaggedregistry"}]' ;;
+  esac
+  deploy_multi_region_production deployment outputs >/dev/null
+  assert_calls 1 az deployment sub create
+  assert_calls 1 docker push
+  assert_calls 2 az containerapp update
+  if [ "$absence" = group ]; then assert_calls 0 az acr list; fi
+  if jq -se 'any(.[][]; startswith("webImageTag="))' "$CALL_LOG" >/dev/null; then
+    fail "missing production ownership must retain first-deploy ordering"
+  fi
+done
+
+for invalid in group-read registry-read group-state empty multiple-json not-array entry tags duplicate name endpoint pending; do
+  reset_deployment
+  REGISTRY_INVENTORY="$PRODUCTION_REGISTRIES"
+  expected=1
+  case "$invalid" in
+    group-read) GROUP_READ_RC=6; expected=6 ;;
+    registry-read) REGISTRY_LIST_RC=7; expected=7 ;;
+    group-state) GROUP_EXISTS=unknown ;;
+    empty) REGISTRY_INVENTORY='' ;;
+    multiple-json) REGISTRY_INVENTORY='[] []' ;;
+    not-array) REGISTRY_INVENTORY='{}' ;;
+    entry) REGISTRY_INVENTORY='[42]' ;;
+    tags) REGISTRY_INVENTORY='[{"name":"registry","tags":[]}]' ;;
+    duplicate) REGISTRY_INVENTORY=$(jq '. + .' <<< "$REGISTRY_INVENTORY") ;;
+    name) REGISTRY_INVENTORY=$(jq '.[0].name = "invalid/name"' <<< "$REGISTRY_INVENTORY") ;;
+    endpoint) REGISTRY_INVENTORY=$(jq '.[0].loginServer = "private.example.com"' <<< "$REGISTRY_INVENTORY") ;;
+    pending) REGISTRY_INVENTORY=$(jq '.[0].provisioningState = "Creating"' <<< "$REGISTRY_INVENTORY") ;;
+  esac
+  expect_failure "$expected" deploy_multi_region_production deployment outputs
+  assert_calls 0 docker
+  assert_calls 0 az deployment
+  assert_calls 0 az containerapp update
+  test ! -d "$TEST_DIR/static" || fail "invalid registry discovery reached static publication"
+done
+
+for failure_case in acr build push provision registry-name registry-endpoint missing-registry; do
+  reset_deployment
+  REGISTRY_INVENTORY="$PRODUCTION_REGISTRIES"
+  expected=8
+  case "$failure_case" in
+    acr) ACR_LOGIN_RC=8 ;;
+    build) DOCKER_BUILD_RC=8 ;;
+    push) DOCKER_PUSH_RC=8 ;;
+    provision) BICEP_FAILURES=1; expected=42 ;;
+    registry-name) ARM_OUTPUTS=$(jq '.azurE_CONTAINER_REGISTRY_NAME.value = "differentregistry"' <<< "$ARM_OUTPUTS"); expected=1 ;;
+    registry-endpoint) ARM_OUTPUTS=$(jq '.azurE_CONTAINER_REGISTRY_ENDPOINT.value = "differentregistry.azurecr.io"' <<< "$ARM_OUTPUTS"); expected=1 ;;
+    missing-registry) ARM_OUTPUTS=$(jq 'del(.azurE_CONTAINER_REGISTRY_NAME)' <<< "$ARM_OUTPUTS"); expected=1 ;;
+  esac
+  expect_failure "$expected" deploy_multi_region_production deployment outputs
+  case "$failure_case" in
+    acr|build|push) assert_calls 0 az deployment ;;
+    *) assert_calls 1 docker push; assert_calls 1 az deployment sub create ;;
+  esac
+  assert_calls 0 az containerapp update
+  assert_calls 0 azd env set
+  test ! -d "$TEST_DIR/static" || fail "failed routine deployment reached static publication"
+done
+
+reset_deployment
+REGISTRY_INVENTORY="$PRODUCTION_REGISTRIES"
+EXISTING_VERIFICATION_ID='' RETRY_VERIFICATION_ID=retry-verification BICEP_FAILURES=1
+deploy_multi_region_production deployment outputs >/dev/null 2>&1
+assert_calls 1 docker build
+assert_calls 1 docker push
+assert_calls 2 az deployment sub create
+assert_calls 0 az containerapp update
+assert_equal "$(jq -sc '[.[] | select(.[0:4] == ["az","deployment","sub","create"]) |
+  map(select(startswith("domainVerificationId=") | not))] | .[0] == .[1]' "$CALL_LOG")" true
+assert_equal "$(jq -sc '[.[] | select(.[0:4] == ["az","deployment","sub","create"]) |
+  index("webImageTag=test-sha") != null] | all' "$CALL_LOG")" true
 
 for source in ca-web-production cae-production-north cae-production; do
   reset_deployment
