@@ -2,12 +2,20 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { cpus, release, totalmem } from 'node:os';
+import { availableParallelism, cpus, release, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const POLICY = 'astervoids-validation-v1';
+export const POLICY = 'astervoids-validation-v2';
 export const WORKFLOW = '.github/workflows/azure-deploy.yml';
+export const MEMORY_CAPACITY_UNIT_BYTES = 1024 ** 3;
+export const INPUT_COMPONENTS = Object.freeze([
+    'environment-path', 'environment-home', 'environment-dotnet', 'environment-settings',
+    'runner-image', 'kernel', 'memory', 'cpu', 'node', 'dotnet', 'npm', 'git', 'bash',
+    'azure', 'bicep', 'packages', 'browser',
+    'dependencies-app', 'dependencies-tests', 'dependencies-npm', 'dependencies-browser',
+]);
+const HARDWARE_COMPONENTS = ['memory', 'cpu'];
 const HELPER = '.github/scripts/validation-reuse.mjs';
 const MAX_AGE = 24 * 60 * 60 * 1000;
 const MAX_ZIP = 64 * 1024;
@@ -61,6 +69,17 @@ function stable(value) {
 }
 function fingerprint(value) {
     return hash(JSON.stringify(stable(value)));
+}
+function validDigests(value, keys) {
+    return value && typeof value === 'object' && !Array.isArray(value)
+        && Object.keys(value).sort().join() === [...keys].sort().join()
+        && keys.every(key => typeof value[key] === 'string' && DIGEST.test(value[key]));
+}
+function validInputFingerprint(value) {
+    return typeof value?.fingerprint === 'string' && DIGEST.test(value.fingerprint)
+        && validDigests(value.components, INPUT_COMPONENTS)
+        && validDigests(value.observedHardware, HARDWARE_COMPONENTS)
+        && fingerprint(value.components) === value.fingerprint;
 }
 function miss(error, fallback) {
     if (error instanceof CheckoutError) throw error;
@@ -312,7 +331,8 @@ function prepareEnvironment(env, cwd) {
     writeFileSync(clean.GIT_CONFIG_GLOBAL, '');
     return clean;
 }
-export async function effectiveInputs(env, cwd, execute = execFileSync) {
+export async function effectiveInputs(env, cwd, execute = execFileSync,
+    host = { release, totalmem, cpus, availableParallelism }) {
     check(env.RUNNER_ENVIRONMENT === 'github-hosted' && env.RUNNER_OS === 'Linux'
         && env.RUNNER_ARCH === 'X64' && /^ubuntu\d+$/.test(env.ImageOS)
         && /^\d{8}\.\d+\.\d+$/.test(env.ImageVersion), 'runner-inputs-unknown');
@@ -329,16 +349,23 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         check(value.length > 0, 'tool-inputs-unknown');
         return value;
     };
-    const files = [
-        'AstervoidsWeb/obj/project.assets.json',
-        'AstervoidsWeb.Tests/obj/project.assets.json',
-        'node_modules/.package-lock.json',
-        'node_modules/playwright-core/browsers.json',
-    ];
+    const processors = host.cpus();
+    const parallelism = host.availableParallelism();
+    const memoryBytes = host.totalmem();
+    check(Array.isArray(processors) && processors.length > 0
+        && processors.every(processor => typeof processor?.model === 'string' && processor.model.length > 0)
+        && Number.isSafeInteger(parallelism) && parallelism > 0 && parallelism <= processors.length
+        && Number.isSafeInteger(memoryBytes) && memoryBytes >= MEMORY_CAPACITY_UNIT_BYTES, 'runner-inputs-unknown');
+    const { PATH, HOME, DOTNET_ROOT, ...settings } = clean;
     const inputs = {
-        environment: clean,
-        image: [env.ImageOS, env.ImageVersion, env.RUNNER_OS, env.RUNNER_ARCH],
-        hardware: [release(), totalmem(), cpus().map(cpu => cpu.model)],
+        'environment-path': PATH,
+        'environment-home': HOME,
+        'environment-dotnet': DOTNET_ROOT,
+        'environment-settings': settings,
+        'runner-image': [env.ImageOS, env.ImageVersion, env.RUNNER_OS, env.RUNNER_ARCH],
+        kernel: host.release(),
+        memory: Math.floor(memoryBytes / MEMORY_CAPACITY_UNIT_BYTES),
+        cpu: { architecture: process.arch, logicalProcessors: processors.length, parallelism },
         node: process.versions,
         dotnet: command('dotnet', ['--info']),
         npm: command('npm', ['--version']),
@@ -349,7 +376,10 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         packages: command('dpkg-query', ['-W', '-f=${binary:Package}=${Version}\n']),
         browser: command('node', ['--input-type=module', '-e',
             "import { chromium } from 'playwright'; import { readFileSync } from 'node:fs'; import { createHash } from 'node:crypto'; const b = await chromium.launchServer(); try { console.log(createHash('sha256').update(readFileSync(b.process().spawnfile)).digest('hex')); } finally { await b.close(); }"]),
-        dependencies: Object.fromEntries(files.map(file => [file, hash(readFileSync(join(cwd, file)))])),
+        'dependencies-app': hash(readFileSync(join(cwd, 'AstervoidsWeb/obj/project.assets.json'))),
+        'dependencies-tests': hash(readFileSync(join(cwd, 'AstervoidsWeb.Tests/obj/project.assets.json'))),
+        'dependencies-npm': hash(readFileSync(join(cwd, 'node_modules/.package-lock.json'))),
+        'dependencies-browser': hash(readFileSync(join(cwd, 'node_modules/playwright-core/browsers.json'))),
     };
     check(/Version:\s+\d+\.\d+\.\d+/.test(inputs.dotnet)
         && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(inputs.npm)
@@ -359,10 +389,14 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         && /^Bicep CLI version \d+\.\d+\.\d+/.test(inputs.bicep)
         && inputs.packages.split('\n').every(line => /^[a-z0-9][a-z0-9+.:_-]*=\S+$/.test(line)),
     'tool-inputs-unknown');
-    check(inputs.hardware[0] && inputs.hardware[1] > 0 && inputs.hardware[2].length > 0
-        && inputs.hardware[2].every(model => typeof model === 'string' && model.length > 0), 'runner-inputs-unknown');
+    check(typeof inputs.kernel === 'string' && inputs.kernel.length > 0, 'runner-inputs-unknown');
     check(DIGEST.test(inputs.browser), 'browser-inputs-unknown');
-    return fingerprint(inputs);
+    const components = Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, fingerprint(value)]));
+    // Raw VM identity is diagnostic only; eligibility uses the capacity components.
+    const observedHardware = { memory: fingerprint(memoryBytes), cpu: fingerprint(processors.map(cpu => cpu.model)) };
+    const result = { fingerprint: fingerprint(components), components, observedHardware };
+    check(validInputFingerprint(result), 'inputs-unknown');
+    return result;
 }
 export async function capture({ context: c, git, eventGit = git, env, cwd, probe = effectiveInputs }) {
     const sha = env.VALIDATION_SHA;
@@ -377,8 +411,10 @@ export async function capture({ context: c, git, eventGit = git, env, cwd, probe
         }
         const identity = git.source(sha, c.repository);
         const value = await probe(env, cwd);
-        check(DIGEST.test(value), 'inputs-unknown');
-        return { eligible: 'true', fingerprint: value, ...identity, reason: 'inputs-captured' };
+        check(validInputFingerprint(value), 'inputs-unknown');
+        return { eligible: 'true', fingerprint: value.fingerprint, components: value.components,
+            observedHardware: value.observedHardware,
+            ...identity, reason: 'inputs-captured' };
     } catch (error) {
         return { eligible: 'false', reason: miss(error, 'inputs-unavailable') };
     }
@@ -424,23 +460,24 @@ export async function readProofArchive(bytes) {
     });
 }
 
-function proofFields(c, identity, workflow, inputFingerprint, runId) {
+function proofFields(c, identity, workflow, inputs, runId) {
     return {
         policy: POLICY, mode: 'full', repository: c.repository, repositoryId: c.repositoryId,
         workflowId: workflow, workflowPath: WORKFLOW, workflowSha: identity.checkoutSha,
-        ...identity, fingerprint: inputFingerprint, runId, runAttempt: 1,
+        ...identity, fingerprint: inputs.fingerprint, components: { ...inputs.components },
+        observedHardware: { ...inputs.observedHardware }, runId, runAttempt: 1,
     };
 }
 export function makeProof({ context: c, git, inputs, workflow, steps, now = Date.now() }) {
     eligible(c, 'push');
     git.assertCheckout(c.eventSha);
-    check(inputs.eligible === 'true' && DIGEST.test(inputs.fingerprint) && integer(workflow), 'inputs-unavailable');
+    check(inputs.eligible === 'true' && validInputFingerprint(inputs) && integer(workflow), 'inputs-unavailable');
     const identity = git.source(c.eventSha, c.repository);
     check(Object.entries(identity).every(([key, value]) => inputs[key] === value), 'checkout-ineligible');
     for (const id of Object.keys(VALIDATION_STEPS))
         check(steps[id]?.outcome === 'success' && steps[id]?.conclusion === 'success', 'validation-not-full');
     check(steps.reuse.outputs?.hit === 'false', 'validation-not-full');
-    return { ...proofFields(c, identity, workflow, inputs.fingerprint, c.runId), createdAt: new Date(now).toISOString() };
+    return { ...proofFields(c, identity, workflow, inputs, c.runId), createdAt: new Date(now).toISOString() };
 }
 
 export async function verify({ context: c, git, eventGit = git, sourceId, inputs, api = githubApi, now, clock = Date.now }) {
@@ -449,7 +486,7 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
         check(inputId(sourceId) && Number(sourceId) !== c.runId, 'no-planned-source');
         const head = equalTree(c, git, eventGit);
         git.assertCheckout(head.sha);
-        check(inputs.eligible === 'true' && DIGEST.test(inputs.fingerprint), 'inputs-unavailable');
+        check(inputs.eligible === 'true' && validInputFingerprint(inputs), 'inputs-unavailable');
         const identity = git.source(head.sha, c.repository);
         check(Object.entries(identity).every(([key, value]) => inputs[key] === value), 'inputs-checkout-mismatch');
         const request = apiFor(api, c);
@@ -463,10 +500,17 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
         check(Buffer.isBuffer(bytes) && bytes.length === artifact.size_in_bytes
             && `sha256:${hash(bytes)}` === artifact.digest, 'artifact-digest-mismatch');
         const proof = await readProofArchive(bytes);
-        const expected = proofFields(c, identity, workflow, inputs.fingerprint, run.id);
+        const expected = proofFields(c, identity, workflow, inputs, run.id);
         check(proof && typeof proof === 'object' && !Array.isArray(proof)
             && Object.keys(proof).sort().join() === [...Object.keys(expected), 'createdAt'].sort().join(), 'proof-schema');
-        check(Object.entries(expected).every(([key, value]) => proof[key] === value), 'proof-inputs-or-provenance');
+        check(Object.entries(expected).filter(([key]) =>
+            key !== 'fingerprint' && key !== 'components' && key !== 'observedHardware')
+            .every(([key, value]) => proof[key] === value), 'proof-inputs-or-provenance');
+        check(validInputFingerprint(proof), 'proof-inputs-or-provenance');
+        if (proof.fingerprint !== inputs.fingerprint) {
+            const mismatches = INPUT_COMPONENTS.filter(key => proof.components[key] !== inputs.components[key]);
+            return { ...fallback, reason: 'inputs-fingerprint-mismatch', mismatches };
+        }
         check(recent(proof.createdAt, now ?? clock()) && Date.parse(proof.createdAt) >= Date.parse(job.started_at)
             && Date.parse(proof.createdAt) <= Date.parse(job.completed_at), 'proof-stale');
         // A deployment may still be running. Only the attempt-specific Build
@@ -482,23 +526,41 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
         sourceRun(finalRun, c, head, workflow, sourceId, finalNow);
         artifactMetadata(finalArtifact, c, finalRun, finalNow);
         check(recent(proof.createdAt, finalNow), 'proof-stale');
-        return { hit: 'true', reason: 'verified-push-proof', source_id: String(run.id), artifact_id: String(artifact.id) };
+        const normalizedInputs = HARDWARE_COMPONENTS.filter(key => proof.observedHardware[key] !== inputs.observedHardware[key]);
+        return { hit: 'true', reason: 'verified-push-proof', source_id: String(run.id), artifact_id: String(artifact.id),
+            ...(normalizedInputs.length ? { normalizedInputs } : {}) };
     } catch (error) {
         return { ...fallback, reason: miss(error, 'verification-unavailable') };
     }
 }
 
-function report(phase, result, env) {
+export function report(phase, result, env) {
+    let differences = '';
+    if (result.mismatches !== undefined) {
+        check(result.reason === 'inputs-fingerprint-mismatch' && Array.isArray(result.mismatches)
+            && result.mismatches.length > 0 && result.mismatches.length <= INPUT_COMPONENTS.length
+            && new Set(result.mismatches).size === result.mismatches.length
+            && result.mismatches.every(key => INPUT_COMPONENTS.includes(key)), 'diagnostics-invalid');
+        differences = ` Differing inputs: ${result.mismatches.join(', ')}.`;
+    }
+    let equivalent = '';
+    if (result.normalizedInputs !== undefined) {
+        check(result.reason === 'verified-push-proof' && Array.isArray(result.normalizedInputs)
+            && result.normalizedInputs.length > 0 && result.normalizedInputs.length <= HARDWARE_COMPONENTS.length
+            && new Set(result.normalizedInputs).size === result.normalizedInputs.length
+            && result.normalizedInputs.every(key => HARDWARE_COMPONENTS.includes(key)), 'diagnostics-invalid');
+        equivalent = ` Equivalent hardware: ${result.normalizedInputs.join(', ')}.`;
+    }
     const identity = `${inputId(result.source_id) ? ` Source run: ${result.source_id}.` : ''}`
         + `${inputId(result.artifact_id) ? ` Artifact: ${result.artifact_id}.` : ''}`;
-    console.log(`validation-reuse ${phase}: ${result.reason}.${identity}`);
+    console.log(`validation-reuse ${phase}: ${result.reason}.${identity}${differences}${equivalent}`);
     if (env.GITHUB_OUTPUT) {
         const allowed = ['group', 'source_id', 'sha', 'eligible', 'hit', 'publish', 'reason', 'artifact_id'];
         for (const key of allowed)
             if (result[key] !== undefined) appendFileSync(env.GITHUB_OUTPUT, `${key}=${result[key]}\n`);
     }
     if (env.GITHUB_STEP_SUMMARY)
-        appendFileSync(env.GITHUB_STEP_SUMMARY, `Validation reuse ${phase}: \`${result.reason}\`.${identity}\n`);
+        appendFileSync(env.GITHUB_STEP_SUMMARY, `Validation reuse ${phase}: \`${result.reason}\`.${identity}${differences}${equivalent}\n`);
 }
 async function main() {
     const [command, ...args] = process.argv.slice(2);

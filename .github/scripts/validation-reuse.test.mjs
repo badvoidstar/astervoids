@@ -16,9 +16,9 @@ const helperSource = readFileSync(helperPath, 'utf8');
 const workflowSource = readFileSync(process.env.REUSE_MUTANT_WORKFLOW || workflowPath, 'utf8').replace(/\r\n/g, '\n');
 const reuse = await import(pathToFileURL(process.env.REUSE_MUTANT_HELPER || helperPath).href);
 const {
-    POLICY, WORKFLOW, VALIDATION_STEPS, Git, CheckoutError, artifactName, plan,
+    POLICY, WORKFLOW, INPUT_COMPONENTS, MEMORY_CAPACITY_UNIT_BYTES, VALIDATION_STEPS, Git, CheckoutError, artifactName, plan,
     selectCheckout, capture, makeProof, verify, validationEnvironment, effectiveInputs, readProofArchive,
-    githubApi,
+    githubApi, report,
 } = reuse;
 const NOW = Date.parse('2026-10-10T18:00:00Z');
 const iso = offset => new Date(NOW + offset).toISOString();
@@ -122,11 +122,16 @@ async function zipBytes(value, options = {}) {
         zip.end();
     });
 }
+function fingerprintedInputs(components = Object.fromEntries(INPUT_COMPONENTS.map(key => [key, 'a'.repeat(64)])),
+    observedHardware = { memory: 'a'.repeat(64), cpu: 'a'.repeat(64) }) {
+    const ordered = Object.fromEntries(Object.keys(components).sort().map(key => [key, components[key]]));
+    return { fingerprint: digest(JSON.stringify(ordered)), components, observedHardware };
+}
 async function scenario() {
     gitAt(eventGit.cwd, 'checkout', '--quiet', '--detach', commits.equal);
     gitAt(headGit.cwd, 'checkout', '--quiet', '--detach', commits.head);
     const c = context();
-    const inputs = { eligible: 'true', fingerprint: 'a'.repeat(64), ...headGit.identity(commits.head) };
+    const inputs = { eligible: 'true', ...fingerprintedInputs(), ...headGit.identity(commits.head) };
     const proof = makeProof({ context: context('push', commits.head), git: headGit,
         inputs, workflow: workflowId, steps: steps(), now: NOW - 120_000 });
     const run = {
@@ -199,7 +204,7 @@ test('real equal-tree commits select the immutable head, with a fresh detached s
     assert.equal(headGit.run('rev-parse', '--is-shallow-repository'), 'true');
     headGit.assertCheckout(commits.head);
     const result = await capture({ context: f.c, git: headGit, eventGit,
-        env: { VALIDATION_SHA: commits.head }, cwd: headGit.cwd, probe: async () => 'a'.repeat(64) });
+        env: { VALIDATION_SHA: commits.head }, cwd: headGit.cwd, probe: async () => fingerprintedInputs() });
     assert.equal(result.eligible, 'true');
     assert.equal(result.checkoutSha, commits.head);
 });
@@ -439,12 +444,14 @@ test('every proof identity/fingerprint field is bound independently, with no ext
 
 test('unknown or mismatching effective inputs cannot hit', async () => {
     const f = await scenario();
+    const original = structuredClone(f.inputs);
     for (const mutate of [
         () => { f.inputs.eligible = 'false'; },
-        () => { f.inputs.eligible = 'true'; f.inputs.fingerprint = ''; },
+        () => { f.inputs.fingerprint = ''; },
         () => { f.inputs.fingerprint = 'b'.repeat(64); },
-        () => { f.inputs.fingerprint = 'a'.repeat(64); f.inputs.checkoutTree = commits.base; },
+        () => { f.inputs.checkoutTree = commits.base; },
     ]) {
+        Object.assign(f.inputs, structuredClone(original));
         mutate();
         assert.equal((await f.verify()).hit, 'false');
     }
@@ -454,8 +461,76 @@ test('unknown or mismatching effective inputs cannot hit', async () => {
     await assert.rejects(effectiveInputs({}, headGit.cwd), /runner-inputs-unknown/);
 });
 
-test('fingerprint uses real restored files and every effective runner/tool input without event metadata', async () => {
-    const cwd = join(root, 'input-probe');
+test('component fingerprints reject every changed input and identify only fixed component names', async () => {
+    const f = await scenario();
+    for (const key of INPUT_COMPONENTS) {
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components, [key]: 'b'.repeat(64) }));
+        assert.deepEqual(await f.verify(), {
+            hit: 'false', reason: 'inputs-fingerprint-mismatch', mismatches: [key],
+        }, key);
+    }
+    Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components,
+        memory: 'b'.repeat(64), 'dependencies-npm': 'c'.repeat(64) }));
+    assert.deepEqual(await f.verify(), {
+        hit: 'false', reason: 'inputs-fingerprint-mismatch', mismatches: ['memory', 'dependencies-npm'],
+    });
+    Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+    assert.equal((await f.verify()).hit, 'true', 'All components and the aggregate must agree for a hit');
+});
+
+test('component fingerprint schema rejects omitted, unknown, malformed and inconsistent digests', async () => {
+    const f = await scenario();
+    const missing = { ...f.proof.components };
+    delete missing.node;
+    for (const components of [
+        missing, [], { ...f.proof.components, node: 'private-value-sentinel' },
+        { ...f.proof.components, 'private-component-sentinel': 'b'.repeat(64) },
+    ]) {
+        Object.assign(f.inputs, fingerprintedInputs(components));
+        assert.deepEqual(await f.verify(), { hit: 'false', reason: 'inputs-unavailable' });
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+        await f.repack({ ...f.proof, ...fingerprintedInputs(components) });
+        assert.deepEqual(await f.verify(), { hit: 'false', reason: 'proof-inputs-or-provenance' });
+    }
+    await f.repack({ ...f.proof, components: { ...f.proof.components, node: 'b'.repeat(64) } });
+    assert.deepEqual(await f.verify(), { hit: 'false', reason: 'proof-inputs-or-provenance' },
+        'Component digests cannot be changed independently of the aggregate');
+    const legacy = { ...f.proof };
+    delete legacy.components;
+    await f.repack(legacy);
+    assert.deepEqual(await f.verify(), { hit: 'false', reason: 'proof-schema' });
+    const inputs = await capture({ context: f.c, git: headGit, eventGit, cwd: headGit.cwd,
+        env: { VALIDATION_SHA: commits.head }, probe: async () => 'a'.repeat(64) });
+    assert.deepEqual(inputs, { eligible: 'false', reason: 'inputs-unknown' });
+});
+
+test('equivalent raw hardware differences can hit only with identical capacity and other input components', async () => {
+    const f = await scenario();
+    f.inputs.observedHardware = { memory: 'b'.repeat(64), cpu: 'c'.repeat(64) };
+    assert.deepEqual(await f.verify(), {
+        hit: 'true', reason: 'verified-push-proof', source_id: String(sourceId), artifact_id: '654',
+        normalizedInputs: ['memory', 'cpu'],
+    });
+    Object.assign(f.inputs, fingerprintedInputs({ ...f.inputs.components, memory: 'd'.repeat(64) },
+        f.inputs.observedHardware));
+    assert.deepEqual(await f.verify(), {
+        hit: 'false', reason: 'inputs-fingerprint-mismatch', mismatches: ['memory'],
+    }, 'Diagnostic observations cannot override a capacity mismatch');
+    for (const observedHardware of [
+        undefined, {}, [], { memory: 'b'.repeat(64), cpu: 'private-model-sentinel' },
+        { ...f.proof.observedHardware, 'private-field-sentinel': 'd'.repeat(64) },
+    ]) {
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+        f.inputs.observedHardware = observedHardware;
+        assert.deepEqual(await f.verify(), { hit: 'false', reason: 'inputs-unavailable' });
+        Object.assign(f.inputs, fingerprintedInputs({ ...f.proof.components }));
+        await f.repack({ ...f.proof, observedHardware });
+        assert.equal((await f.verify()).hit, 'false', 'Unknown observation payloads cannot enter a proof');
+    }
+});
+
+function inputProbeFixture(name) {
+    const cwd = join(root, name);
     const files = [
         'AstervoidsWeb/obj/project.assets.json', 'AstervoidsWeb.Tests/obj/project.assets.json',
         'node_modules/.package-lock.json', 'node_modules/playwright-core/browsers.json',
@@ -469,6 +544,12 @@ test('fingerprint uses real restored files and every effective runner/tool input
         RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64',
         ImageOS: 'ubuntu24', ImageVersion: '20261009.1.0', DOTNET_ROOT: '/usr/share/dotnet',
         HOME: cwd, PATH: process.env.PATH, GITHUB_SHA: 'not-a-validation-input',
+    };
+    const host = {
+        release: () => '6.11.0-fixture',
+        totalmem: () => 15.625 * MEMORY_CAPACITY_UNIT_BYTES,
+        cpus: () => [{ model: 'fixture-cpu' }, { model: 'fixture-cpu' }],
+        availableParallelism: () => 2,
     };
     const commands = new Map([
         ['dotnet --info', '.NET SDK:\n Version: 10.0.100\n.NET runtime 10.0.0'],
@@ -492,33 +573,100 @@ test('fingerprint uses real restored files and every effective runner/tool input
         assert.notEqual(value, undefined, 'All executed input probes are known');
         return value;
     };
-    const first = await effectiveInputs(env, cwd, execute);
-    assert.match(first, /^[a-f0-9]{64}$/);
-    assert.equal(await effectiveInputs({ ...env, GITHUB_SHA: 'other-event', CI: 'false' }, cwd, execute), first);
+    return { cwd, files, env, host, commands, execute };
+}
+
+test('fingerprint uses real restored files and every effective runner/tool input without event metadata', async () => {
+    const { cwd, files, env, host, commands, execute } = inputProbeFixture('input-probe');
+    const first = await effectiveInputs(env, cwd, execute, host);
+    assert.match(first.fingerprint, /^[a-f0-9]{64}$/);
+    assert.deepEqual(Object.keys(first.components).sort(), [
+        'environment-path', 'environment-home', 'environment-dotnet', 'environment-settings',
+        'runner-image', 'kernel', 'memory', 'cpu', 'node', 'dotnet', 'npm', 'git', 'bash',
+        'azure', 'bicep', 'packages', 'browser',
+        'dependencies-app', 'dependencies-tests', 'dependencies-npm', 'dependencies-browser',
+    ].sort(), 'The actual collector covers every declared input, including each restored file');
+    assert.deepEqual(first, fingerprintedInputs(first.components, first.observedHardware),
+        'The aggregate binds every eligibility component; raw hardware is diagnostic only');
+    assert.deepEqual(await effectiveInputs({ ...env, GITHUB_SHA: 'other-event', CI: 'false' }, cwd, execute, host), first);
     for (const path of files) {
         const absolute = join(cwd, path);
         const original = readFileSync(absolute);
         writeFileSync(absolute, '{"version":"changed"}');
-        assert.notEqual(await effectiveInputs(env, cwd, execute), first, path);
+        assert.notEqual((await effectiveInputs(env, cwd, execute, host)).fingerprint, first.fingerprint, path);
         writeFileSync(absolute, original);
     }
     for (const [key, value] of commands) {
         commands.set(key, key.startsWith('az version') ? '{"azure-cli":"2.81.0"}' : `${value}-changed`);
-        assert.notEqual(await effectiveInputs(env, cwd, execute), first, key);
+        assert.notEqual((await effectiveInputs(env, cwd, execute, host)).fingerprint, first.fingerprint, key);
         commands.set(key, value);
     }
     for (const patch of [{ ImageVersion: '20261010.1.0' }, { ImageOS: 'ubuntu26' }, { DOTNET_ROOT: 'other-dotnet' },
         { PATH: `${env.PATH}-changed` }, { HOME: `${cwd}-changed` }])
-        assert.notEqual(await effectiveInputs({ ...env, ...patch }, cwd, execute), first);
-    assert.notEqual(await effectiveInputs(env, cwd, (file, args, options) =>
-        file === 'node' ? 'd'.repeat(64) : execute(file, args, options)), first, 'Actual browser binary hash matters');
-    await assert.rejects(effectiveInputs(env, cwd, () => { throw new Error('private-tool-error'); }), /tool-inputs-unavailable/);
+        assert.notEqual((await effectiveInputs({ ...env, ...patch }, cwd, execute, host)).fingerprint, first.fingerprint);
+    for (const [key, patch] of [
+        ['kernel', { release: () => '6.12.0-fixture' }],
+        ['memory', { totalmem: () => 8 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['cpu', { cpus: () => [{ model: 'fixture-cpu' }], availableParallelism: () => 1 }],
+    ]) {
+        const changed = await effectiveInputs(env, cwd, execute, { ...host, ...patch });
+        assert.notEqual(changed.fingerprint, first.fingerprint);
+        assert.deepEqual(INPUT_COMPONENTS.filter(name => changed.components[name] !== first.components[name]), [key]);
+    }
+    assert.notEqual((await effectiveInputs(env, cwd, (file, args, options) =>
+        file === 'node' ? 'd'.repeat(64) : execute(file, args, options), host)).fingerprint,
+    first.fingerprint, 'Actual browser binary hash matters');
+    await assert.rejects(effectiveInputs(env, cwd, () => { throw new Error('private-tool-error'); }, host), /tool-inputs-unavailable/);
     await assert.rejects(effectiveInputs(env, cwd, (file, args, options) =>
-        file === 'node' ? 'unknown-binary' : execute(file, args, options)), /browser-inputs-unknown/);
+        file === 'node' ? 'unknown-binary' : execute(file, args, options), host), /browser-inputs-unknown/);
     for (const [fileName, invalid] of [['dotnet', ''], ['npm', 'unknown'], ['az', '{}']]) {
         await assert.rejects(effectiveInputs(env, cwd, (file, args, options) =>
-            file === fileName ? invalid : execute(file, args, options)), /tool-inputs-unknown/);
+            file === fileName ? invalid : execute(file, args, options), host), /tool-inputs-unknown/);
     }
+});
+
+test('hosted hardware fingerprint ignores VM identity but preserves capacity and memory bucket boundaries', async () => {
+    const { cwd, env, host, execute } = inputProbeFixture('hardware-probe');
+    const probe = patch => effectiveInputs(env, cwd, execute, { ...host, ...patch });
+    const first = await probe({});
+    assert.equal(first.components.memory, digest(JSON.stringify(15)),
+        'Memory is the minimum reported whole-GiB capacity, never rounded upward');
+    for (const memory of [
+        host.totalmem() - 4096, host.totalmem() + 4096,
+        15 * MEMORY_CAPACITY_UNIT_BYTES, 16 * MEMORY_CAPACITY_UNIT_BYTES - 1,
+    ]) {
+        const equivalent = await probe({
+            totalmem: () => memory,
+            cpus: () => [{ model: 'another-CPU-vendor' }, { model: 'another-CPU-vendor' }],
+        });
+        assert.equal(equivalent.fingerprint, first.fingerprint,
+            'Equivalent hosted capacity survives CPU branding and OS-reserved page differences');
+        assert.deepEqual(equivalent.components, first.components);
+        assert.notEqual(equivalent.observedHardware.memory, first.observedHardware.memory);
+        assert.notEqual(equivalent.observedHardware.cpu, first.observedHardware.cpu);
+    }
+    for (const [key, patch] of [
+        ['memory', { totalmem: () => 15 * MEMORY_CAPACITY_UNIT_BYTES - 1 }],
+        ['memory', { totalmem: () => 16 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['memory', { totalmem: () => 8 * MEMORY_CAPACITY_UNIT_BYTES }],
+        ['cpu', { cpus: () => Array.from({ length: 3 }, () => ({ model: 'fixture-cpu' })) }],
+        ['cpu', { availableParallelism: () => 1 }],
+        ['kernel', { release: () => '6.12.0-fixture' }],
+    ]) {
+        const changed = await probe(patch);
+        assert.notEqual(changed.fingerprint, first.fingerprint);
+        assert.deepEqual(INPUT_COMPONENTS.filter(name => changed.components[name] !== first.components[name]), [key]);
+    }
+    for (const patch of [
+        { totalmem: () => 0 }, { totalmem: () => NaN }, { totalmem: () => Infinity },
+        { totalmem: () => MEMORY_CAPACITY_UNIT_BYTES - 1 },
+        { totalmem: () => host.totalmem() + 0.5 },
+        { cpus: () => [] }, { cpus: () => [{ model: '' }] },
+        { availableParallelism: () => 0 }, { availableParallelism: () => 0.5 },
+        { availableParallelism: () => 3 },
+    ]) await assert.rejects(probe(patch), /runner-inputs-unknown/);
+    await assert.rejects(effectiveInputs({ ...env, RUNNER_ARCH: 'ARM64' }, cwd, execute, host),
+        /runner-inputs-unknown/, 'A different architecture cannot reuse an x64 validation');
 });
 
 test('real gh adapter bounds JSON/archive reads and never surfaces API error bodies', () => {
@@ -681,6 +829,39 @@ test('actual CLI fallback outputs and summaries contain only fixed reasons and p
     }
     assert.match(readFileSync(output, 'utf8'), new RegExp(`sha=${commits.equal}`));
     assert.match(readFileSync(output, 'utf8'), new RegExp(`group=${POLICY}-full-${currentId}-1`));
+});
+
+test('component diagnostics emit only allowlisted names, never input values or digests', t => {
+    const lines = [];
+    t.mock.method(console, 'log', line => lines.push(line));
+    const output = join(root, 'component-output');
+    const summary = join(root, 'component-summary');
+    const result = {
+        hit: 'false', reason: 'inputs-fingerprint-mismatch', mismatches: ['memory', 'dependencies-npm'],
+        components: { memory: 'private-input-sentinel' }, fingerprint: 'a'.repeat(64),
+    };
+    const env = { GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary };
+    report('verify', result, env);
+    assert.deepEqual(lines, [
+        'validation-reuse verify: inputs-fingerprint-mismatch. Differing inputs: memory, dependencies-npm.',
+    ]);
+    assert.equal(readFileSync(output, 'utf8'), 'hit=false\nreason=inputs-fingerprint-mismatch\n');
+    assert.equal(readFileSync(summary, 'utf8'),
+        'Validation reuse verify: `inputs-fingerprint-mismatch`. Differing inputs: memory, dependencies-npm.\n');
+    assert.doesNotMatch(lines.join('') + readFileSync(output, 'utf8') + readFileSync(summary, 'utf8'),
+        /private-|a{64}/);
+    for (const mismatches of [[], 'memory', ['memory', 'memory'], ['private-component-sentinel']])
+        assert.throws(() => report('verify', { ...result, mismatches }, env), /diagnostics-invalid/);
+    assert.equal(lines.length, 1, 'Invalid diagnostics fail before emitting any output');
+    const hit = { hit: 'true', reason: 'verified-push-proof', normalizedInputs: ['memory', 'cpu'],
+        observedHardware: { cpu: 'private-model-sentinel' } };
+    report('verify', hit, env);
+    assert.equal(lines[1], 'validation-reuse verify: verified-push-proof. Equivalent hardware: memory, cpu.');
+    for (const normalizedInputs of [[], 'cpu', ['cpu', 'cpu'], ['node'], ['private-model-sentinel']])
+        assert.throws(() => report('verify', { ...hit, normalizedInputs }, env), /diagnostics-invalid/);
+    assert.equal(lines.length, 2);
+    assert.doesNotMatch(lines.join('') + readFileSync(output, 'utf8') + readFileSync(summary, 'utf8'),
+        /private-|a{64}/);
 });
 
 function parsedWorkflow(source = workflowSource) {
@@ -936,6 +1117,16 @@ test('critical mutations of production helper/YAML are rejected by the unchanged
             'run.id !== c.runId', 'source gate: source rerun attempt'],
         ['api-hit', 'helper', "return { ...fallback, reason: miss(error, 'verification-unavailable') };",
             "return { ...fallback, hit: 'true', reason: miss(error, 'verification-unavailable') };", 'API error cannot become a hit'],
+        ['fingerprint-hit', 'helper', 'if (proof.fingerprint !== inputs.fingerprint) {',
+            'if (false) {', 'component fingerprints reject every changed input'],
+        ['raw-memory', 'helper', 'memory: Math.floor(memoryBytes / MEMORY_CAPACITY_UNIT_BYTES),',
+            'memory: memoryBytes,', 'hosted hardware fingerprint'],
+        ['cpu-brand', 'helper', 'logicalProcessors: processors.length',
+            'logicalProcessors: processors.map(processor => processor.model)', 'hosted hardware fingerprint'],
+        ['ignore-memory', 'helper', 'memory: Math.floor(memoryBytes / MEMORY_CAPACITY_UNIT_BYTES),',
+            'memory: 15,', 'hosted hardware fingerprint'],
+        ['ignore-cpu-count', 'helper', 'logicalProcessors: processors.length',
+            'logicalProcessors: 1', 'hosted hardware fingerprint'],
         ['deploy-dependency', 'workflow', '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: build\n',
             '    name: Deploy to Azure (production)\n    runs-on: ubuntu-latest\n    needs: validation_plan\n', 'actual YAML contract'],
         ['planner-green', 'workflow', '    if: ${{ !cancelled() }}\n', '    if: ${{ success() }}\n', 'actual YAML contract'],
