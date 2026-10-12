@@ -448,8 +448,8 @@ After every full push gate succeeds, Build may publish the immutable
 one-day artifact **`astervoids-validation-v1-<run-id>-1`**, containing only
 **`proof.json`**. It records public repository/workflow/run/attempt and
 checkout identities, workflow/helper blobs, the non-secret input digest,
-`mode: full`, and creation time—no binaries, environment dump, tokens,
-deployment hostname or application payloads. Publication failure only loses
+allowlisted per-component digests, `mode: full`, and creation time—no binaries,
+environment dump, tokens, deployment hostname or application payloads. Publication failure only loses
 reuse; it cannot bypass a failed validation gate. PRs never publish proofs.
 
 The consumer independently checks source repository/workflow identity,
@@ -465,7 +465,12 @@ API failures all miss. No checks-write permission or repository setting is
 needed or changed.
 
 Logs and step summaries use `validation-reuse <phase>: <reason>` plus
-public numeric source/artifact IDs. Useful trial outcomes are:
+public numeric source/artifact IDs. An input mismatch also reports only the
+fixed differing component names, such as `memory` or `dependencies-npm`, never
+their values or digests. The aggregate binds the complete component map;
+missing, unknown, malformed, inconsistent, or legacy digest-only maps cannot
+reuse validation. Provenance failures remain separate from input differences.
+Useful trial outcomes are:
 
 | Phase | Reason | Meaning |
 |---|---|---|
@@ -478,6 +483,7 @@ public numeric source/artifact IDs. Useful trial outcomes are:
 | verify | `proof-unavailable` / `artifact-stale` / `artifact-digest-mismatch` | Full path |
 | verify | `source-attempt` / `source-step-not-successful` / `api-unavailable` | Full path |
 | capture/verify | `tool-inputs-unknown` / `inputs-unavailable` / `proof-inputs-or-provenance` | Full path |
+| verify | `inputs-fingerprint-mismatch` | Full path; fixed component names identify the differing inputs |
 | publish | `full-push-proof-written` | Candidate artifact; not terminal Build evidence |
 
 Run `node --test .github/scripts/validation-reuse.test.mjs` for real Git

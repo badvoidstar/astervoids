@@ -8,6 +8,12 @@ import { fileURLToPath } from 'node:url';
 
 export const POLICY = 'astervoids-validation-v1';
 export const WORKFLOW = '.github/workflows/azure-deploy.yml';
+export const INPUT_COMPONENTS = Object.freeze([
+    'environment-path', 'environment-home', 'environment-dotnet', 'environment-settings',
+    'runner-image', 'kernel', 'memory', 'cpu', 'node', 'dotnet', 'npm', 'git', 'bash',
+    'azure', 'bicep', 'packages', 'browser',
+    'dependencies-app', 'dependencies-tests', 'dependencies-npm', 'dependencies-browser',
+]);
 const HELPER = '.github/scripts/validation-reuse.mjs';
 const MAX_AGE = 24 * 60 * 60 * 1000;
 const MAX_ZIP = 64 * 1024;
@@ -61,6 +67,14 @@ function stable(value) {
 }
 function fingerprint(value) {
     return hash(JSON.stringify(stable(value)));
+}
+function validInputFingerprint(value) {
+    const components = value?.components;
+    return typeof value?.fingerprint === 'string' && DIGEST.test(value.fingerprint)
+        && components && typeof components === 'object' && !Array.isArray(components)
+        && Object.keys(components).sort().join() === [...INPUT_COMPONENTS].sort().join()
+        && INPUT_COMPONENTS.every(key => typeof components[key] === 'string' && DIGEST.test(components[key]))
+        && fingerprint(components) === value.fingerprint;
 }
 function miss(error, fallback) {
     if (error instanceof CheckoutError) throw error;
@@ -312,7 +326,7 @@ function prepareEnvironment(env, cwd) {
     writeFileSync(clean.GIT_CONFIG_GLOBAL, '');
     return clean;
 }
-export async function effectiveInputs(env, cwd, execute = execFileSync) {
+export async function effectiveInputs(env, cwd, execute = execFileSync, host = { release, totalmem, cpus }) {
     check(env.RUNNER_ENVIRONMENT === 'github-hosted' && env.RUNNER_OS === 'Linux'
         && env.RUNNER_ARCH === 'X64' && /^ubuntu\d+$/.test(env.ImageOS)
         && /^\d{8}\.\d+\.\d+$/.test(env.ImageVersion), 'runner-inputs-unknown');
@@ -329,16 +343,16 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         check(value.length > 0, 'tool-inputs-unknown');
         return value;
     };
-    const files = [
-        'AstervoidsWeb/obj/project.assets.json',
-        'AstervoidsWeb.Tests/obj/project.assets.json',
-        'node_modules/.package-lock.json',
-        'node_modules/playwright-core/browsers.json',
-    ];
+    const { PATH, HOME, DOTNET_ROOT, ...settings } = clean;
     const inputs = {
-        environment: clean,
-        image: [env.ImageOS, env.ImageVersion, env.RUNNER_OS, env.RUNNER_ARCH],
-        hardware: [release(), totalmem(), cpus().map(cpu => cpu.model)],
+        'environment-path': PATH,
+        'environment-home': HOME,
+        'environment-dotnet': DOTNET_ROOT,
+        'environment-settings': settings,
+        'runner-image': [env.ImageOS, env.ImageVersion, env.RUNNER_OS, env.RUNNER_ARCH],
+        kernel: host.release(),
+        memory: host.totalmem(),
+        cpu: host.cpus().map(cpu => cpu.model),
         node: process.versions,
         dotnet: command('dotnet', ['--info']),
         npm: command('npm', ['--version']),
@@ -349,7 +363,10 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         packages: command('dpkg-query', ['-W', '-f=${binary:Package}=${Version}\n']),
         browser: command('node', ['--input-type=module', '-e',
             "import { chromium } from 'playwright'; import { readFileSync } from 'node:fs'; import { createHash } from 'node:crypto'; const b = await chromium.launchServer(); try { console.log(createHash('sha256').update(readFileSync(b.process().spawnfile)).digest('hex')); } finally { await b.close(); }"]),
-        dependencies: Object.fromEntries(files.map(file => [file, hash(readFileSync(join(cwd, file)))])),
+        'dependencies-app': hash(readFileSync(join(cwd, 'AstervoidsWeb/obj/project.assets.json'))),
+        'dependencies-tests': hash(readFileSync(join(cwd, 'AstervoidsWeb.Tests/obj/project.assets.json'))),
+        'dependencies-npm': hash(readFileSync(join(cwd, 'node_modules/.package-lock.json'))),
+        'dependencies-browser': hash(readFileSync(join(cwd, 'node_modules/playwright-core/browsers.json'))),
     };
     check(/Version:\s+\d+\.\d+\.\d+/.test(inputs.dotnet)
         && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(inputs.npm)
@@ -359,10 +376,13 @@ export async function effectiveInputs(env, cwd, execute = execFileSync) {
         && /^Bicep CLI version \d+\.\d+\.\d+/.test(inputs.bicep)
         && inputs.packages.split('\n').every(line => /^[a-z0-9][a-z0-9+.:_-]*=\S+$/.test(line)),
     'tool-inputs-unknown');
-    check(inputs.hardware[0] && inputs.hardware[1] > 0 && inputs.hardware[2].length > 0
-        && inputs.hardware[2].every(model => typeof model === 'string' && model.length > 0), 'runner-inputs-unknown');
+    check(inputs.kernel && inputs.memory > 0 && inputs.cpu.length > 0
+        && inputs.cpu.every(model => typeof model === 'string' && model.length > 0), 'runner-inputs-unknown');
     check(DIGEST.test(inputs.browser), 'browser-inputs-unknown');
-    return fingerprint(inputs);
+    const components = Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, fingerprint(value)]));
+    const result = { fingerprint: fingerprint(components), components };
+    check(validInputFingerprint(result), 'inputs-unknown');
+    return result;
 }
 export async function capture({ context: c, git, eventGit = git, env, cwd, probe = effectiveInputs }) {
     const sha = env.VALIDATION_SHA;
@@ -377,8 +397,9 @@ export async function capture({ context: c, git, eventGit = git, env, cwd, probe
         }
         const identity = git.source(sha, c.repository);
         const value = await probe(env, cwd);
-        check(DIGEST.test(value), 'inputs-unknown');
-        return { eligible: 'true', fingerprint: value, ...identity, reason: 'inputs-captured' };
+        check(validInputFingerprint(value), 'inputs-unknown');
+        return { eligible: 'true', fingerprint: value.fingerprint, components: value.components,
+            ...identity, reason: 'inputs-captured' };
     } catch (error) {
         return { eligible: 'false', reason: miss(error, 'inputs-unavailable') };
     }
@@ -424,23 +445,23 @@ export async function readProofArchive(bytes) {
     });
 }
 
-function proofFields(c, identity, workflow, inputFingerprint, runId) {
+function proofFields(c, identity, workflow, inputs, runId) {
     return {
         policy: POLICY, mode: 'full', repository: c.repository, repositoryId: c.repositoryId,
         workflowId: workflow, workflowPath: WORKFLOW, workflowSha: identity.checkoutSha,
-        ...identity, fingerprint: inputFingerprint, runId, runAttempt: 1,
+        ...identity, fingerprint: inputs.fingerprint, components: { ...inputs.components }, runId, runAttempt: 1,
     };
 }
 export function makeProof({ context: c, git, inputs, workflow, steps, now = Date.now() }) {
     eligible(c, 'push');
     git.assertCheckout(c.eventSha);
-    check(inputs.eligible === 'true' && DIGEST.test(inputs.fingerprint) && integer(workflow), 'inputs-unavailable');
+    check(inputs.eligible === 'true' && validInputFingerprint(inputs) && integer(workflow), 'inputs-unavailable');
     const identity = git.source(c.eventSha, c.repository);
     check(Object.entries(identity).every(([key, value]) => inputs[key] === value), 'checkout-ineligible');
     for (const id of Object.keys(VALIDATION_STEPS))
         check(steps[id]?.outcome === 'success' && steps[id]?.conclusion === 'success', 'validation-not-full');
     check(steps.reuse.outputs?.hit === 'false', 'validation-not-full');
-    return { ...proofFields(c, identity, workflow, inputs.fingerprint, c.runId), createdAt: new Date(now).toISOString() };
+    return { ...proofFields(c, identity, workflow, inputs, c.runId), createdAt: new Date(now).toISOString() };
 }
 
 export async function verify({ context: c, git, eventGit = git, sourceId, inputs, api = githubApi, now, clock = Date.now }) {
@@ -449,7 +470,7 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
         check(inputId(sourceId) && Number(sourceId) !== c.runId, 'no-planned-source');
         const head = equalTree(c, git, eventGit);
         git.assertCheckout(head.sha);
-        check(inputs.eligible === 'true' && DIGEST.test(inputs.fingerprint), 'inputs-unavailable');
+        check(inputs.eligible === 'true' && validInputFingerprint(inputs), 'inputs-unavailable');
         const identity = git.source(head.sha, c.repository);
         check(Object.entries(identity).every(([key, value]) => inputs[key] === value), 'inputs-checkout-mismatch');
         const request = apiFor(api, c);
@@ -463,10 +484,16 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
         check(Buffer.isBuffer(bytes) && bytes.length === artifact.size_in_bytes
             && `sha256:${hash(bytes)}` === artifact.digest, 'artifact-digest-mismatch');
         const proof = await readProofArchive(bytes);
-        const expected = proofFields(c, identity, workflow, inputs.fingerprint, run.id);
+        const expected = proofFields(c, identity, workflow, inputs, run.id);
         check(proof && typeof proof === 'object' && !Array.isArray(proof)
             && Object.keys(proof).sort().join() === [...Object.keys(expected), 'createdAt'].sort().join(), 'proof-schema');
-        check(Object.entries(expected).every(([key, value]) => proof[key] === value), 'proof-inputs-or-provenance');
+        check(Object.entries(expected).filter(([key]) => key !== 'fingerprint' && key !== 'components')
+            .every(([key, value]) => proof[key] === value), 'proof-inputs-or-provenance');
+        check(validInputFingerprint(proof), 'proof-inputs-or-provenance');
+        if (proof.fingerprint !== inputs.fingerprint) {
+            const mismatches = INPUT_COMPONENTS.filter(key => proof.components[key] !== inputs.components[key]);
+            return { ...fallback, reason: 'inputs-fingerprint-mismatch', mismatches };
+        }
         check(recent(proof.createdAt, now ?? clock()) && Date.parse(proof.createdAt) >= Date.parse(job.started_at)
             && Date.parse(proof.createdAt) <= Date.parse(job.completed_at), 'proof-stale');
         // A deployment may still be running. Only the attempt-specific Build
@@ -488,17 +515,25 @@ export async function verify({ context: c, git, eventGit = git, sourceId, inputs
     }
 }
 
-function report(phase, result, env) {
+export function report(phase, result, env) {
+    let differences = '';
+    if (result.mismatches !== undefined) {
+        check(result.reason === 'inputs-fingerprint-mismatch' && Array.isArray(result.mismatches)
+            && result.mismatches.length > 0 && result.mismatches.length <= INPUT_COMPONENTS.length
+            && new Set(result.mismatches).size === result.mismatches.length
+            && result.mismatches.every(key => INPUT_COMPONENTS.includes(key)), 'diagnostics-invalid');
+        differences = ` Differing inputs: ${result.mismatches.join(', ')}.`;
+    }
     const identity = `${inputId(result.source_id) ? ` Source run: ${result.source_id}.` : ''}`
         + `${inputId(result.artifact_id) ? ` Artifact: ${result.artifact_id}.` : ''}`;
-    console.log(`validation-reuse ${phase}: ${result.reason}.${identity}`);
+    console.log(`validation-reuse ${phase}: ${result.reason}.${identity}${differences}`);
     if (env.GITHUB_OUTPUT) {
         const allowed = ['group', 'source_id', 'sha', 'eligible', 'hit', 'publish', 'reason', 'artifact_id'];
         for (const key of allowed)
             if (result[key] !== undefined) appendFileSync(env.GITHUB_OUTPUT, `${key}=${result[key]}\n`);
     }
     if (env.GITHUB_STEP_SUMMARY)
-        appendFileSync(env.GITHUB_STEP_SUMMARY, `Validation reuse ${phase}: \`${result.reason}\`.${identity}\n`);
+        appendFileSync(env.GITHUB_STEP_SUMMARY, `Validation reuse ${phase}: \`${result.reason}\`.${identity}${differences}\n`);
 }
 async function main() {
     const [command, ...args] = process.argv.slice(2);
