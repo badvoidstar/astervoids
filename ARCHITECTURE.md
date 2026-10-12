@@ -1882,6 +1882,12 @@ azd, while multi-region/branch paths use shared deployment helpers for provision
 build/push, and rollout. Static entry publication is a separate output of the
 multi-region path.
 
+Routine multi-region production publishes the commit-tagged image into its
+uniquely identified existing production ACR before Bicep, which rolls out that
+image directly through `webImageTag`. The placeholder-plus-regional-update
+sequence is reserved for first-deploy bootstrap when the owned registry is
+absent; discovery failures or ambiguous state stop deployment.
+
 Production and branch previews run in mutually exclusive deployment jobs with
 shared YAML-anchored steps. Each keeps the resource-mutation interlock for the
 whole deployment; only production prepares the Static Web Apps Docker action.
@@ -1895,7 +1901,10 @@ credentials in the repository.
 
 Branch preview browser smoke against a default Azure URL is different evidence
 from local playability. A successful rollout or unvisited URL does not prove a
-playable preview.
+playable preview. Its privacy-safe reporter exposes authored scenario and
+explicit phase timings, including browser/identity readiness and the existing
+score/migration phases, without publishing runtime errors, identities, or
+payloads. Phase timings do not represent the whole deployment cycle.
 
 [Orphan cleanup](.github/workflows/cleanup-orphans.yml) removes branch-ephemeral
 apps, explicitly branch-owned identity/leaderboard stores, and related

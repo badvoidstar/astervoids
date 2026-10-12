@@ -314,13 +314,14 @@ load_deployment_settings() {
 
 deploy_bicep() {
   local -n settings="$1"
-  local deployment_name="$2" verification_id="$3" key
+  local deployment_name="$2" verification_id="$3" image_tag="${4:-}" key
   local -a parameters=()
   for key in environmentName location useSharedInfra identityPromptOnRoot regions customDomainName customSubdomain \
     certKeyVaultSecretUrl certKeyVaultCertName certReaderIdentityId manageAcmebotPermissions; do
     parameters+=("$key=${settings[$key]}")
   done
   parameters+=("domainVerificationId=$verification_id")
+  if [ -n "$image_tag" ]; then parameters+=("webImageTag=$image_tag"); fi
   az deployment sub create \
     --name "$deployment_name" \
     --location "${settings[location]}" \
@@ -375,14 +376,14 @@ deploy_single_region_production() {
 
 provision_multi_region() {
   local -n settings="$1"
-  local deployment_name="$2" primary verification_id deploy_rc
+  local deployment_name="$2" image_tag="${3:-}" primary verification_id deploy_rc
   primary=$(primary_region_name "${settings[regions]}") || return
   verification_id=$(resolve_domain_verification_id \
     "${settings[resourceGroup]}" \
     "${settings[appPrefix]}-production-$primary" "${settings[appPrefix]}-production" \
     -- "${settings[environmentPrefix]}-$primary" "${settings[environmentPrefix]}") || return
 
-  if deploy_bicep "$1" "$deployment_name" "$verification_id"; then
+  if deploy_bicep "$1" "$deployment_name" "$verification_id" "$image_tag"; then
     return 0
   else
     deploy_rc=$?
@@ -397,7 +398,41 @@ provision_multi_region() {
     echo "::error::Retry aborted: no customDomainVerificationId on the primary CAE." >&2
     return "$deploy_rc"
   fi
-  deploy_bicep "$1" "$deployment_name" "$verification_id"
+  deploy_bicep "$1" "$deployment_name" "$verification_id" "$image_tag"
+}
+
+read_existing_production_registry() {
+  local resource_group="$1" exists inventory selected
+  local -n result="$2"
+  result[name]='' result[loginServer]=''
+  exists=$(az group exists --name "$resource_group" --output json) || return
+  case "${exists%$'\r'}" in
+    false) return 0 ;;
+    true) ;;
+    *) echo "::error::Azure returned invalid production resource-group state." >&2; return 1 ;;
+  esac
+  inventory=$(az acr list --resource-group "$resource_group" --output json) || return
+  if ! selected=$(jq -cse '
+    if length != 1 or (.[0] | type) != "array" then error("Invalid registry inventory")
+    else .[0] end |
+    if any(.[]; type != "object" or (.name | type) != "string" or
+      (.tags != null and (.tags | type) != "object")) then error("Invalid registry entry")
+    else map(select(.tags["azd-env-name"] == "production")) end |
+    if length == 0 then {}
+    elif length != 1 then error("Ambiguous production registry")
+    else .[0] |
+      if (.name | test("^[a-zA-Z0-9]{5,50}$")) and
+        (.loginServer | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.azurecr\\.io$")) and
+        .provisioningState == "Succeeded"
+      then {name, loginServer}
+      else error("Invalid or unavailable production registry") end
+    end
+  ' <<< "$inventory" 2>/dev/null); then
+    echo "::error::Production registry discovery is invalid, ambiguous, or not ready. Deployment stopped." >&2
+    return 1
+  fi
+  result[name]=$(jq -r '.name // empty' <<< "$selected" | tr -d '\r') || return
+  result[loginServer]=$(jq -r '.loginServer // empty' <<< "$selected" | tr -d '\r')
 }
 
 prepare_static_apex() {
@@ -415,21 +450,37 @@ prepare_static_apex() {
 
 deploy_multi_region_production() {
   local -n settings="$1" result="$2"
-  local deployment_name="production-multi-${settings[runId]}" region_names region app key
+  local deployment_name="production-multi-${settings[runId]}" image_tag='' region_names region app key
+  local -A registry=()
   validate_multi_region_topology "$1" || return
   # Production Bicep may create the cert-reader identity; an explicit ID is optional.
   settings[location]=$(primary_region_location "${settings[regions]}") || return
-  provision_multi_region "$1" "$deployment_name" || return
+  read_existing_production_registry "${settings[resourceGroup]}" registry || return
+  if [ -n "${registry[name]}" ]; then
+    publish_astervoids_image "${registry[name]}" "${registry[loginServer]}" "${settings[imageTag]}" || return
+    image_tag="${settings[imageTag]}"
+  else
+    echo "No owned production registry found; using the first-deploy bootstrap path."
+  fi
+  provision_multi_region "$1" "$deployment_name" "$image_tag" || return
   read_bicep_deployment_outputs "$deployment_name" "$2" || return
-  publish_astervoids_image "${result[AZURE_CONTAINER_REGISTRY_NAME]}" \
-    "${result[AZURE_CONTAINER_REGISTRY_ENDPOINT]}" "${settings[imageTag]}" || return
-  region_names=$(jq -r '.[].name' <<< "${settings[regions]}") || return
-  while IFS= read -r region; do
-    region="${region%$'\r'}"
-    app="${settings[appPrefix]}-production-$region"
-    az containerapp update --name "$app" --resource-group "${settings[resourceGroup]}" \
-      --image "$PUBLISHED_IMAGE" --output none || return
-  done <<< "$region_names"
+  if [ -n "$image_tag" ]; then
+    if [ "${result[AZURE_CONTAINER_REGISTRY_NAME],,}" != "${registry[name],,}" ] ||
+      [ "${result[AZURE_CONTAINER_REGISTRY_ENDPOINT],,}" != "${registry[loginServer],,}" ]; then
+      echo "::error::Provisioned registry differs from the published image target. Deployment stopped." >&2
+      return 1
+    fi
+  else
+    publish_astervoids_image "${result[AZURE_CONTAINER_REGISTRY_NAME]}" \
+      "${result[AZURE_CONTAINER_REGISTRY_ENDPOINT]}" "${settings[imageTag]}" || return
+    region_names=$(jq -r '.[].name' <<< "${settings[regions]}") || return
+    while IFS= read -r region; do
+      region="${region%$'\r'}"
+      app="${settings[appPrefix]}-production-$region"
+      az containerapp update --name "$app" --resource-group "${settings[resourceGroup]}" \
+        --image "$PUBLISHED_IMAGE" --output none || return
+    done <<< "$region_names"
+  fi
 
   # Direct ARM deployments do not refresh azd's environment outputs. Preserve
   # the private values for subsequent azd commands, independently of public URLs.

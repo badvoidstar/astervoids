@@ -303,13 +303,26 @@ permissions and supported condition templates:
 
 Deployment orchestration lives in `.github/scripts/deployment-helpers.sh`, with
 separate procedures for single-region production (`azd up`), multi-region
-production (Bicep, one image publish, regional updates, static payload), and
+production (one image publish, Bicep-driven rollout, static payload), and
 shared-infrastructure branches (`azd provision`, verified Bicep fallback, app
 update). The workflow selects a procedure rather than implementing those paths.
 The procedures share named settings from the selected azd environment, one
 Bicep parameter builder, and normalized deployment outputs; `infra/main.bicep`
 remains the infrastructure source of truth. The multi-region first-deploy retry
 changes only the domain verification ID.
+
+Routine multi-region production discovers the uniquely owned, successfully
+provisioned ACR tagged `azd-env-name=production` in the production resource
+group. It builds and pushes the commit-tagged image before Bicep, then passes
+`webImageTag` through the shared parameter builder and any verification-ID
+retry. The regional apps deploy that image directly rather than switching to
+the placeholder and then issuing a second round of `az containerapp update`
+calls. ARM outputs must still identify the registry that received the image.
+Unreadable, malformed, ambiguous, or not-ready registry state fails before
+provisioning instead of triggering a fallback. Only a confirmed absent resource
+group or owned registry uses the first-deploy path: provision bootstrap
+infrastructure, publish once, and update the new regional apps. Single-region
+production and branch deployment ordering are unchanged.
 
 Production and previews use mutually exclusive complete deployment jobs,
 `deploy` and `deploy_preview`, with shared steps and environment declarations
@@ -565,8 +578,17 @@ eligible; historical test scores are not guessed from non-unique player names
 or automatically deleted. Local persistence coverage does not certify live
 Azure writes or cross-region consistency.
 
-**Privacy and evidence:** remote output contains only authored scenario names
-and outcomes. Screenshots, videos, traces, raw console messages, object payloads,
+**Privacy and evidence:** remote output contains only authored scenario/phase
+names, outcomes, and finite nonnegative durations rounded to milliseconds.
+Explicit `test.step` completions emit `STEP` or `FAILED STEP` with the scenario
+and phase name; API/locator steps, errors, attachments, and other metadata are
+not serialized. Unavailable/invalid durations are omitted, never replaced with
+zero. The four personal-score/migration scenarios expose browser/identity
+readiness plus their existing gameplay phases without changing waits, retries,
+timeouts, or assertions. Phase times are inclusive, can overlap when nested,
+and do not include all fixture, global-readiness, or runner overhead; they are
+not additive end-to-end deployment timings.
+Screenshots, videos, traces, raw console messages, object payloads,
 and session identities are not uploaded. Generated Playwright output and
 `node_modules` are ignored. Helper tests verify URL rejection, unavailable-target
 failure, redirect refusal, reporter privacy, and the workflow's safe URL wiring;

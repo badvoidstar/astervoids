@@ -482,12 +482,20 @@ test('remote reporter emits only authored names, outcomes and finite numeric dur
             titlePath: () => [privateData, 'authored smoke scenario'],
             annotations: [{ type: 'skip', description: privateData }],
         };
+        const phase = {
+            category: 'test.step', title: 'authored smoke step',
+            location: { file: privateData, line: 1, column: 1 },
+            parent: { title: privateData },
+            attachments: [{ name: privateData, path: privateData }],
+        };
         reporter.onError(new Error(privateData));
         reporter.onStepEnd(null, null, {
             category: 'expect', title: privateData, error: new Error(privateData),
         });
-        reporter.onStepEnd(null, null, {
-            category: 'test.step', title: 'authored smoke step', error: new Error(privateData),
+        reporter.onStepEnd(scenario, null, { ...phase, duration: 0 });
+        reporter.onStepEnd(scenario, null, { ...phase, duration: 2345.6 });
+        reporter.onStepEnd(scenario, null, {
+            ...phase, duration: 1234, error: new Error(privateData),
         });
         for (const [status, duration] of outcomes) {
             const result = {
@@ -501,6 +509,8 @@ test('remote reporter emits only authored names, outcomes and finite numeric dur
         }
         for (const duration of invalidDurations) {
             reporter.onTestEnd(scenario, { status: 'failed', duration });
+            reporter.onStepEnd(scenario, null, { ...phase, duration });
+            reporter.onStepEnd(scenario, null, { ...phase, duration, error: new Error(privateData) });
         }
         reporter.onEnd({ status: 'failed' });
     } finally {
@@ -509,13 +519,19 @@ test('remote reporter emits only authored names, outcomes and finite numeric dur
     }
     assert.deepEqual(output, [
         ['Browser smoke setup/runner failed. Target may be unavailable or unsupported; inspect privately.'],
-        ['FAILED STEP: authored smoke step'],
+        ['STEP: authored smoke scenario > authored smoke step (0 ms)'],
+        ['STEP: authored smoke scenario > authored smoke step (2346 ms)'],
+        ['FAILED STEP: authored smoke scenario > authored smoke step (1234 ms)'],
         ['PASSED: authored smoke scenario (1234 ms)'],
         ['FAILED: authored smoke scenario (2346 ms)'],
         ['TIMEDOUT: authored smoke scenario (90000 ms)'],
         ['SKIPPED: authored smoke scenario (0 ms)'],
         ['INTERRUPTED: authored smoke scenario (12 ms)'],
-        ...invalidDurations.map(() => ['FAILED: authored smoke scenario']),
+        ...invalidDurations.flatMap(() => [
+            ['FAILED: authored smoke scenario'],
+            ['STEP: authored smoke scenario > authored smoke step'],
+            ['FAILED STEP: authored smoke scenario > authored smoke step'],
+        ]),
         ['Browser smoke: failed'],
     ]);
     assert.doesNotMatch(output.flat().join('\n'), /private\.example\.com|identity\/session\/payload/);
