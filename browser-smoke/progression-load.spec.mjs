@@ -91,13 +91,8 @@ localLoadTest('sustained real multiplayer breaks keep receipt state bounded and 
         }))).toEqual({ sameEpoch: true, connected: true, lost: false });
     }
 
-    const level = await owner.page.evaluate(() => {
-        game.ship.angle = 0;
-        return getLocalProgression().level;
-    });
+    const level = await owner.page.evaluate(() => getLocalProgression().level);
     expect(level).toBeGreaterThan(32);
-    expect(await fireOnce(owner.page), 'High progression still fires a complete uncapped real volley')
-        .toHaveLength(level);
     const late = await players.open();
     await joinSession(late.page, sessionId);
     await enterSession(late.page);
@@ -105,13 +100,62 @@ localLoadTest('sustained real multiplayer breaks keep receipt state bounded and 
         AstervoidsWireCodec.unpackXpMap(
             ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE).data.participantXp)[id],
     result.participantId)).toBe(breaks * 10);
+    // Server promotion does not select session-object owners when several members remain.
+    // Complete late-join coverage before arranging one unambiguous migration recipient.
+    await leaveGame(late.page);
+    await expect.poll(() => peer.page.evaluate(() => SessionClient.getCurrentSession()?.members?.length),
+        { message: 'The late joiner has left before the original owner migrates GameState' }).toBe(2);
+    const beforeMigration = await owner.page.evaluate(async () => {
+        const state = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        const snapshot = await SessionClient.getSessionState();
+        const authoritative = snapshot.objects.find(record => record.id === state.id);
+        return {
+            id: authoritative.id, version: authoritative.version,
+            members: snapshot.members.length,
+            ownedByDepartingPlayer: authoritative.ownerMemberId === SessionClient.getCurrentMember()?.id,
+        };
+    });
+    expect(beforeMigration.members).toBe(2);
+    expect(beforeMigration.ownedByDepartingPlayer).toBe(true);
     await leaveGame(owner.page);
-    await expect.poll(() => peer.page.evaluate(() => isGameStateOwner()),
-        { message: 'The surviving player adopts compacted GameState without losing progression' }).toBe(true);
+    await expect.poll(() => peer.page.evaluate(async ({ id, version }) => {
+        const member = SessionClient.getCurrentMember();
+        const state = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        const snapshot = await SessionClient.getSessionState();
+        const authoritative = snapshot.objects.find(record => record.id === id);
+        return {
+            soleSurvivor: snapshot.members.length === 1 && snapshot.members[0].id === member?.id,
+            promotedServer: member?.role === 'Server' && snapshot.members[0]?.role === 'Server',
+            ownsSameGameState: isGameStateOwner() && state?.id === id && state.version > version,
+            serverConfirmsMigration: authoritative?.ownerMemberId === member?.id
+                && authoritative.version > version,
+            sameEpoch: globalThis.loadEpoch === SessionClient.getSessionEpoch(),
+        };
+    }, beforeMigration), {
+        message: 'The sole surviving player adopts the same compacted GameState through real ownership migration',
+    }).toEqual({
+        soleSurvivor: true, promotedServer: true, ownsSameGameState: true,
+        serverConfirmsMigration: true, sameEpoch: true,
+    });
     await expect.poll(() => peer.page.evaluate(id =>
         AstervoidsWireCodec.unpackXpMap(
             ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE).data.participantXp)[id],
     result.participantId)).toBe(breaks * 10);
+    await joinSession(owner.page, sessionId);
+    await enterSession(owner.page);
+    await expect.poll(() => owner.page.evaluate(id =>
+        AstervoidsWireCodec.unpackXpMap(
+            ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE).data.participantXp)[id],
+    result.participantId), { message: 'The earned participant XP also survives the real rejoin' })
+        .toBe(breaks * 10);
+    expect(await owner.page.evaluate(() => {
+        game.ship.angle = 0;
+        return getLocalProgression().level;
+    })).toBe(level);
+    // A live volley can legitimately break the sentinel and earn more XP.
+    // Fire only after exact late-join, migration and rejoin progression checks.
+    expect(await fireOnce(owner.page), 'High progression still fires a complete uncapped real volley')
+        .toHaveLength(level);
     expect(owner.health.maxHubMessageBytes, 'Includes SignalR MessagePack envelope and length prefix')
         .toBeLessThan(32 * 1024);
     expect(owner.health.maxUpdateMessageBytes, 'UpdateObjects stays below the unchanged server boundary')
