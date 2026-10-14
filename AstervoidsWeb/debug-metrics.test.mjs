@@ -5,10 +5,18 @@ import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 
-test('every former HUD publication point explicitly preserves debug metric cadence', () => {
+test('all nine former HUD publications preserve metric cadence; the solo pickup adds only a HUD refresh', () => {
     const calls = [...source.matchAll(/(?<!function )\bupdateHUD\(\);/g)];
-    assert.equal(calls.length, 9);
-    for (const call of calls) {
+    const pickupStart = source.indexOf('    function activateSoloPickup(record) {');
+    const pickupEnd = source.indexOf('    function checkGameEffectContacts()', pickupStart);
+    assert.ok(pickupStart >= 0 && pickupEnd > pickupStart);
+    assert.equal(calls.length, 10);
+    const pickupCalls = calls.filter(call => call.index > pickupStart && call.index < pickupEnd);
+    assert.equal(pickupCalls.length, 1, 'only the new solo activation adds an unpaired UI refresh');
+    assert.doesNotMatch(source.slice(pickupStart, pickupEnd), /\bpublishDebugMetrics\(/);
+    const formerCalls = calls.filter(call => !pickupCalls.includes(call));
+    assert.equal(formerCalls.length, 9);
+    for (const call of formerCalls) {
         assert.match(source.slice(call.index),
             /^updateHUD\(\);\s*publishDebugMetrics\(\);/);
     }
@@ -21,9 +29,12 @@ test('HUD rendering no longer computes or publishes debug metrics', () => {
     const scoreDisplay = {};
     const waveDisplay = {};
     const livesDisplay = {};
-    const { updateHUD } = loadInlineGameFunctions(['updateHUD'], {
+    const xpHud = { hidden: false };
+    let fits = 0;
+    const { updateHUD } = loadInlineGameFunctions(['updateHUD', 'updateProgressionHud'], {
         game, hudCache, scoreDisplay, waveDisplay, livesDisplay,
-        hudDisplay: null,
+        hudDisplay: null, xpHud, levelAnnouncement: {},
+        fitProgressionHud: () => fits++,
         isSessionMode: () => false,
         document: { getElementById: () => null },
         publishDebugMetrics: () => assert.fail('implicit publication'),
@@ -31,6 +42,9 @@ test('HUD rendering no longer computes or publishes debug metrics', () => {
     updateHUD();
     assert.deepEqual([scoreDisplay.textContent, waveDisplay.textContent, livesDisplay.textContent],
         ['Score: 20', 'Wave: 2', 'Lives: 3']);
+    assert.equal(xpHud.hidden, true, 'the real progression renderer hides its bar without a ship');
+    assert.equal(hudCache.xpVisible, false);
+    assert.equal(fits, 1, 'HUD layout still refits without implicitly publishing metrics');
 });
 
 test('debug metrics retain their heartbeat gate, fields, rounding, and per-call freshness', () => {

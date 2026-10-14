@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { loadClassicModule } from './test-support/classic-module.mjs';
+import { CURRENT_GAME_SCHEMAS, LARGE_XP_ENTRY_HEX } from './test-support/game-schema-fixture.mjs';
 import {
     GuidUtils, MsgpackCodec, SchemaCodec, loadSessionClient,
 } from './test-support/session-client-harness.mjs';
@@ -10,9 +11,12 @@ const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 const WireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 const { SCHEMAS, requireCurrentSchemas } = require('./wwwroot/js/game-wire-schemas.js');
-const oldSchemas = slots => SCHEMAS.map(schema => schema.id === 4
-    ? { ...schema, fields: schema.fields.slice(0, slots) }
-    : schema.id === 1 ? { ...schema, fields: schema.fields.slice(0, 27) } : schema);
+const oldSchemas = slots => SCHEMAS.filter(schema => schema.id <= 4).map(schema => ({
+    ...schema,
+    fields: schema.fields.slice(0, ({
+        1: slots === 19 ? 28 : 27, 2: 14, 3: 16, 4: slots,
+    })[schema.id]),
+}));
 
 const SESSION_ID = '00112233-4455-6677-8899-aabbccddeeff';
 const NEXT_SESSION_ID = '10112233-4455-6677-8899-aabbccddeeff';
@@ -165,7 +169,7 @@ test('durable public identity is pinned before snapshot callbacks and changes on
     assert.equal(loaded.client.getParticipantIdentity(), null);
 });
 
-for (const slots of [16, 18]) {
+for (const slots of [16, 18, 19]) {
     for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         test(`${method} rejects the ${slots}-slot game contract before snapshot or queued live decoding`, async t => {
             const loaded = await subject(t);
@@ -189,8 +193,46 @@ for (const slots of [16, 18]) {
             assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
             assert.equal(loaded.client.getCurrentSession(), null);
             assert.equal(loaded.client.getParticipantId(), null);
-            assert.equal(SchemaCodec.get(4).fields.length, 19, 'never install the unsupported layout');
+            assert.equal(SchemaCodec.get(4).fields.length, 21, 'never install the unsupported layout');
             assert.equal(loaded.calls.at(-1).method, 'LeaveSession', 'rejected entry releases its allocated membership');
+            assert.equal(loaded.errors.length, 1);
+            assert.match(loaded.errors[0], /Unsupported Astervoids session schemas/);
+        });
+    }
+}
+
+for (const [label, alter] of [
+    ['missing effect', schemas => schemas.filter(schema => schema.id !== 5)],
+    ['missing claim', schemas => schemas.filter(schema => schema.id !== 6)],
+    ['reordered effect', schemas => schemas.map(schema => schema.id === 5
+        ? { ...schema, fields: [schema.fields[1], schema.fields[0], ...schema.fields.slice(2)] } : schema)],
+    ['reordered claim', schemas => schemas.map(schema => schema.id === 6
+        ? { ...schema, fields: [schema.fields[1], schema.fields[0], ...schema.fields.slice(2)] } : schema)],
+]) {
+    for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
+        test(`${method} rejects ${label} contracts before even a malformed positional payload is decoded`, async t => {
+            const loaded = await subject(t);
+            if (method === 'RejoinSession') {
+                loaded.replies.set('JoinSession', () => joinResponse());
+                await loaded.client.joinSession(SESSION_ID);
+                loaded.client.clearSessionState();
+            }
+            const gate = holdInvoke(loaded, method);
+            const entering = method === 'CreateSession'
+                ? loaded.client.createSession({ schemas: SCHEMAS })
+                : loaded.client.joinSession(SESSION_ID);
+            await gate.invoked;
+            const malformed = objectPacket({ type: 'gameState' });
+            malformed[4] = [5, new Uint8Array([255])];
+            emitCreate(loaded, malformed);
+            gate.resolve(joinResponse({
+                schemas: alter(CURRENT_GAME_SCHEMAS), objects: [malformed],
+            }));
+            await assert.rejects(entering, /Unsupported Astervoids session schemas/);
+            assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
+            assert.equal(loaded.client.getCurrentSession(), null);
+            assert.deepEqual(SchemaCodec.get(5).fields.map(field => [field.name, field.type]),
+                CURRENT_GAME_SCHEMAS[4].fields, 'a rejected entry cannot mutate the installed registry');
             assert.equal(loaded.errors.length, 1);
             assert.match(loaded.errors[0], /Unsupported Astervoids session schemas/);
         });
@@ -273,7 +315,60 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantScores), { [REMOTE_ID]: 30 });
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantNumbers), { [REMOTE_ID]: 1 });
         assert.deepEqual(WireCodec.unpackTagMap(replica.data.participantTags), { [REMOTE_ID]: 'Pilot_1' });
-        assert.equal(SchemaCodec.get(4).fields.length, 19);
+        assert.equal(SchemaCodec.get(4).fields.length, 21);
+        assert.deepEqual(loaded.errors, []);
+    });
+}
+
+for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
+    test(`${method} retains large personal XP and immutable effect deadlines across deferred live packets`, async t => {
+        const loaded = await subject(t);
+        if (method === 'RejoinSession') {
+            loaded.replies.set('JoinSession', () => joinResponse());
+            await loaded.client.joinSession(SESSION_ID);
+            loaded.client.clearSessionState();
+        }
+        const gate = holdInvoke(loaded, method);
+        const entering = method === 'CreateSession'
+            ? loaded.client.createSession({ schemas: SCHEMAS })
+            : loaded.client.joinSession(SESSION_ID);
+        await gate.invoked;
+        const xp = new Uint8Array(Buffer.from(LARGE_XP_ENTRY_HEX, 'hex'));
+        emitCreate(loaded, objectPacket({
+            type: 'gameState', participantXp: new Uint8Array(), processedEffects: new Uint8Array(),
+        }));
+        emitCreate(loaded, objectPacket({
+            type: 'gameEffect', kind: 2, payloadKind: 6, sourceId: OBJECT_ID,
+            startedAt: 1000, armedAt: 1800, expiresAt: 3000,
+            asteroidTargets: GuidUtils.guidToBytes(REMOTE_ID),
+        }, { id: CHILD_ID, handle: CHILD_HANDLE, schemaId: 5 }), 2);
+        emitUpdate(loaded, updatePacket({ participantXp: xp }, { version: 2 }), 3);
+        gate.resolve(joinResponse({ role: method === 'CreateSession' ? 0 : 1 }));
+        assert.ok(await entering);
+        const state = loaded.sync.getObject(OBJECT_ID);
+        assert.deepEqual(state.data.participantXp, xp);
+        assert.deepEqual(state.data.processedEffects, new Uint8Array());
+        assert.equal(new DataView(state.data.participantXp.buffer,
+            state.data.participantXp.byteOffset).getFloat64(16, true), 4_294_967_297);
+        const effect = loaded.sync.getObject(CHILD_ID);
+        assert.equal(effect.data.startedAt, 1000);
+        assert.equal(effect.data.armedAt, 1800);
+        assert.equal(effect.data.expiresAt, 3000);
+        loaded.emit('OnMemberLeft', {
+            memberId: GuidUtils.guidToBytes(REMOTE_ID),
+            deletedObjectIds: [],
+            migratedObjects: [OBJECT_ID, CHILD_ID].map(objectId => ({
+                objectId: GuidUtils.guidToBytes(objectId),
+                newOwnerId: GuidUtils.guidToBytes(MEMBER_ID), newVersion: 3,
+            })),
+        }, GuidUtils.guidToBytes(REMOTE_ID), 4, 5000);
+        assert.equal(state.ownerMemberId, MEMBER_ID);
+        assert.deepEqual(state.data.participantXp, xp, 'ownership metadata does not reset a personal run');
+        assert.equal(effect.ownerMemberId, MEMBER_ID);
+        assert.equal(effect.data.startedAt, 1000);
+        assert.equal(effect.data.armedAt, 1800);
+        assert.equal(effect.data.expiresAt, 3000, 'migration receipt time is never a new lifetime anchor');
+        assert.deepEqual(effect.data.asteroidTargets, GuidUtils.guidToBytes(REMOTE_ID));
         assert.deepEqual(loaded.errors, []);
     });
 }
@@ -293,7 +388,7 @@ test('RejoinSession replaces a stale local registry before current live packets 
     assert.ok(await joining);
     assert.equal(loaded.sync.getObject(OBJECT_ID).data.groupScore, 30);
     assert.equal(loaded.sync.getObject(OBJECT_ID).version, 2);
-    assert.equal(SchemaCodec.get(4).fields.length, 19);
+    assert.equal(SchemaCodec.get(4).fields.length, 21);
 });
 
 for (const compact of [false, true]) {
@@ -428,7 +523,7 @@ test('snapshot seeds and received membership/object callbacks expose coherent en
         assert.equal(loaded.client.getCurrentMember().id, MEMBER_ID);
         assert.equal(loaded.client.getLastSessionId(), SESSION_ID);
         assert.equal(loaded.client.getParticipantId(), MEMBER_ID);
-        assert.equal(SchemaCodec.get(4).fields.length, 19);
+        assert.equal(SchemaCodec.get(4).fields.length, 21);
     };
     loaded.sync.on('onObjectCreated', obj => {
         assertIdentity();
@@ -668,7 +763,7 @@ for (const failure of ['null response', 'invoke rejection', 'missing credential'
             { id: CHILD_ID, handle: HANDLE, schemas: SCHEMAS }));
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 70);
-        assert.equal(SchemaCodec.get(4).fields.length, 19);
+        assert.equal(SchemaCodec.get(4).fields.length, 21);
     });
 }
 
@@ -740,7 +835,7 @@ for (const outcome of ['success', 'rejection']) {
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 80);
         assert.equal(loaded.sync.getObject(CHILD_ID).version, 2);
-        assert.equal(SchemaCodec.get(4).fields.length, 19);
+        assert.equal(SchemaCodec.get(4).fields.length, 21);
         assert.deepEqual(loaded.errors, []);
     });
 }

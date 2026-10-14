@@ -45,6 +45,7 @@ public class SyncPayloadCodecRegistryTests : TestBase
             new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
             new PositionalSchemaCodec.FieldSpec("participantTag", "str"),
+            new PositionalSchemaCodec.FieldSpec("handledHazards", "bytes"),
         });
 
     private static Dictionary<string, object?> ShipCreateDict() => new()
@@ -356,5 +357,92 @@ public class SyncPayloadCodecRegistryTests : TestBase
         children!.Should().HaveCount(2);
         children[0].SchemaId.Should().Be(1);
         children[1].SchemaId.Should().Be(0);
+    }
+
+    [Fact]
+    public void ObjectService_ProgressionAndEffectsRemainOpaqueThroughUpdateAndSnapshot()
+    {
+        var (session, creator) = CreateTestSession();
+        var registry = new SyncSchemaRegistry();
+        registry.SetSessionSchemas(session.Id,
+            [ShipSchema(), GameStateSchemaFixture.Current, RewardHazardSchemaFixture.Effect, RewardHazardSchemaFixture.Claim]);
+        var cases = new[]
+        {
+            (ShipSchema(), new Dictionary<string, object?>
+            {
+                ["type"] = "ship", ["handledHazards"] = new byte[] { 1, 2, 3 }
+            }),
+            (GameStateSchemaFixture.Current, new Dictionary<string, object?>
+            {
+                ["type"] = "gameState",
+                ["participantXp"] = Convert.FromHexString(GameStateSchemaFixture.LargeXpEntry),
+                ["processedEffects"] = new byte[] { 4, 5, 6 }
+            }),
+            (RewardHazardSchemaFixture.Effect, new Dictionary<string, object?>
+            {
+                ["type"] = "gameEffect", ["kind"] = 2, ["payloadKind"] = 6,
+                ["sourceId"] = "00112233-4455-6677-8899-aabbccddeeff",
+                ["startedAt"] = 1000d, ["armedAt"] = 1800d, ["expiresAt"] = 3000d,
+                ["damageReceipts"] = new byte[] { 7, 8 },
+                ["asteroidTargets"] = new byte[] { 9 }, ["hazardTargets"] = new byte[] { 10 },
+            }),
+            (RewardHazardSchemaFixture.Claim, new Dictionary<string, object?>
+            {
+                ["type"] = "gameClaim", ["targetId"] = "00112233-4455-6677-8899-aabbccddeeff",
+                ["shipId"] = "11223344-5566-7788-99aa-bbccddeeff00",
+                ["participantId"] = "22334455-6677-8899-aabb-ccddeeff0011",
+                ["participantTag"] = "Pilot_1", ["claimedAt"] = 1000d,
+                ["invulnerabilityRevision"] = uint.MaxValue
+            }),
+        };
+
+        foreach (var (schema, data) in cases)
+        {
+            var obj = ObjectService.CreateObject(
+                session.Id, creator.Id, ObjectScope.Session, data, schemaId: schema.Id)!;
+            var update = new Dictionary<string, object?> { ["x"] = 0.5d, ["y"] = 0.25d };
+            obj = ObjectService.UpdateObject(session.Id, obj.Id, creator.Id, update)!;
+            var payload = SyncPayloadCodec.EncodeDict(obj.SchemaId, obj.Data, registry, session.Id);
+            payload.SchemaId.Should().Be(schema.Id);
+            var decoded = SyncPayloadCodec.DecodeDict(payload, session.Id, registry);
+            foreach (var (key, value) in data)
+            {
+                if (value is byte[] bytes)
+                    decoded[key].Should().BeOfType<byte[]>().Which.Should().Equal(bytes);
+                else if (value is int or uint)
+                    Convert.ToUInt64(decoded[key]).Should().Be(Convert.ToUInt64(value));
+                else
+                    decoded[key].Should().Be(value);
+            }
+            SyncPayloadCodec.EncodeDict(schema.Id, decoded, registry, session.Id).Data.Should().Equal(payload.Data);
+        }
+    }
+
+    [Fact]
+    public void ObjectService_AtomicReplacementKeepsReceiptAndPayloadWithSameSessionOwner()
+    {
+        var (session, creator) = CreateTestSession();
+        var parent = ObjectService.CreateObject(
+            session.Id, creator.Id, ObjectScope.Session,
+            new Dictionary<string, object?> { ["type"] = "asteroid" }, schemaId: 2)!;
+        var replacements = new[]
+        {
+            new ReplacementObjectSpec(ObjectScope.Session,
+                new Dictionary<string, object?> { ["type"] = "asteroid", ["maxHits"] = 1, ["payloadKind"] = 0 },
+                creator.Id, SchemaId: 2),
+            new ReplacementObjectSpec(ObjectScope.Session,
+                new Dictionary<string, object?> { ["type"] = "gameEffect", ["kind"] = 1 },
+                creator.Id, SchemaId: 5),
+            new ReplacementObjectSpec(ObjectScope.Session,
+                new Dictionary<string, object?> { ["type"] = "gameEffect", ["kind"] = 2 },
+                creator.Id, SchemaId: 5),
+        };
+        var children = ObjectService.ReplaceObject(session.Id, parent.Id, creator.Id, replacements);
+        children.Should().NotBeNull().And.HaveCount(3);
+        children!.Select(child => child.SchemaId).Should().Equal(2, 5, 5);
+        children.Should().OnlyContain(child =>
+            child.Scope == ObjectScope.Session && child.OwnerMemberId == creator.Id);
+        ObjectService.ReplaceObject(session.Id, parent.Id, creator.Id, replacements).Should().BeNull(
+            "competing breakers cannot replace the same parent twice");
     }
 }

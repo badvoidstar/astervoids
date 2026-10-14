@@ -7,6 +7,7 @@ import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
 const MsgpackCodec = require('./wwwroot/js/msgpack-codec.js');
+const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
 const { SCHEMAS } = require('./wwwroot/js/game-wire-schemas.js');
 const { SHARED_DEFAULTS } = require('./wwwroot/js/game-config.js');
@@ -98,7 +99,7 @@ async function simulate({ deterministic, deltaEncoding, scoreFrames }) {
         'getDeterministicIngestBaselinePerf', 'getDeterministicJoinBaselinePerf',
         'createKinematicPresentation', 'applyShipReplicaData'
     ], {
-        CONFIG: config, game, ObjectSync: receiver.sync,
+        CONFIG: config, game, ObjectSync: receiver.sync, AstervoidsWireCodec,
         DeadReckon: dead, RemoteObjects: remote, ReplicationPresentation,
         performance: { now: () => now },
         isDeterministicMode: () => deterministic,

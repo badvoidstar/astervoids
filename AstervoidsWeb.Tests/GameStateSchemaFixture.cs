@@ -25,6 +25,8 @@ internal static class GameStateSchemaFixture
         new("participantScores", "bytes"),
         new("participantNumbers", "bytes"),
         new("participantTags", "bytes"),
+        new("participantXp", "bytes"),
+        new("processedEffects", "bytes"),
     ]);
 
     internal const string ScoreEntries =
@@ -40,4 +42,9 @@ internal static class GameStateSchemaFixture
 
     internal const string TagEntries =
         "33221100554477668899aabbccddeeff07" + "50696c6f745f31";
+
+    internal const string LargeXpEntry =
+        "33221100554477668899aabbccddeeff" + "000010000000f041";
+
+    internal const string LargeXpHex = "00000818000000" + LargeXpEntry;
 }

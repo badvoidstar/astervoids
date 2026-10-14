@@ -37,7 +37,7 @@ public class SchemaCrossWireFixturesTests
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
         ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"),
-        ("participantId", "guid"), ("participantTag", "str"));
+        ("participantId", "guid"), ("participantTag", "str"), ("handledHazards", "bytes"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
@@ -45,7 +45,8 @@ public class SchemaCrossWireFixturesTests
         ("velocityX", "f32"), ("velocityY", "f32"), ("rotationSpeed", "f32"),
         ("seed", "f64"), ("vertices", "bytes"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
-        ("terminalY", "f64"), ("terminalAngle", "f64"));
+        ("terminalY", "f64"), ("terminalAngle", "f64"),
+        ("maxHits", "u8"), ("hitsRemaining", "u8"), ("payloadKind", "u8"), ("processedDamage", "bytes"));
 
     private static PositionalSchemaCodec.Schema BulletSchema() => Schema(3,
         ("type", "str"),
@@ -55,7 +56,8 @@ public class SchemaCrossWireFixturesTests
         ("pendingHit", "bool"), ("hitTargetId", "nullable-guid"),
         ("hitImpactTorque", "q16s"), ("hitBulletAngle", "q16_2pi"),
         ("hitOffsetN", "q16s"), ("terminalEpoch", "f64"),
-        ("terminalX", "f64"), ("terminalY", "f64"));
+        ("terminalX", "f64"), ("terminalY", "f64"),
+        ("damageId", "guid"), ("participantId", "guid"), ("shipId", "nullable-guid"), ("participantTag", "str"));
 
     [Fact]
     public void Fixture_AsteroidUpdate_AllFields()
@@ -67,7 +69,7 @@ public class SchemaCrossWireFixturesTests
             ["y"] = 0.25,
             ["angle"] = 1.5707963267948966 // pi/2
         });
-        Hex(bytes).Should().Be("0e00" + "0080" + "0060" + "0040");
+        Hex(bytes).Should().Be("0e0000" + "0080" + "0060" + "0040");
     }
 
     [Fact]
@@ -78,7 +80,7 @@ public class SchemaCrossWireFixturesTests
         {
             ["angle"] = 0.0
         });
-        Hex(bytes).Should().Be("0800" + "0000");
+        Hex(bytes).Should().Be("080000" + "0000");
     }
 
     [Fact]
@@ -136,7 +138,7 @@ public class SchemaCrossWireFixturesTests
             ["ownerMemberId"] = memberId
         });
         Hex(bytes).Should().Be(
-            "8600" +
+            "860000" +
             "0080" +
             "0080" +
             "443322116655887799aabbccddeeff00");
@@ -243,7 +245,7 @@ public class SchemaCrossWireFixturesTests
             "03000000" + "00000000" +
             "33221100554477668899aabbccddeeff";
 
-        GameStateSchemaFixture.Current.Fields.Should().HaveCount(19);
+        GameStateSchemaFixture.Current.Fields.Should().HaveCount(21);
         GameStateSchemaFixture.Current.BitmaskBytes.Should().Be(3);
         GameStateSchemaFixture.Current.Fields[16].Should().Be(
             new PositionalSchemaCodec.FieldSpec("participantScores", "bytes"));
@@ -302,6 +304,8 @@ public class SchemaCrossWireFixturesTests
     [InlineData("participantScores", "00000100000000")]
     [InlineData("participantNumbers", "00000200000000")]
     [InlineData("participantTags", "00000400000000")]
+    [InlineData("participantXp", "00000800000000")]
+    [InlineData("processedEffects", "00001000000000")]
     public void Fixture_GameState_PersonalMapSlots_AreIndependentlyOptional(string field, string hex)
     {
         var encoded = PositionalSchemaCodec.Encode(GameStateSchemaFixture.Current,
@@ -405,5 +409,80 @@ public class SchemaCrossWireFixturesTests
         Convert.ToUInt32(SyncPayloadCodec.DecodeDict(counter, counterSession, registry)["value"])
             .Should().Be(30);
         SyncPayloadCodec.DecodeDict(label, labelSession, registry)["label"].Should().Be("widget");
+    }
+
+    [Fact]
+    public void Fixture_ProgressionSlots_PreserveSparseMasksAndLargeXpBytes()
+    {
+        var cases = new[]
+        {
+            (ShipSchema(), new Dictionary<string, object?> { ["handledHazards"] = Array.Empty<byte>() },
+                "0000001000000000"),
+            (AsteroidSchema(), new Dictionary<string, object?>
+            {
+                ["maxHits"] = 3, ["hitsRemaining"] = 2, ["payloadKind"] = 6,
+                ["processedDamage"] = Array.Empty<byte>()
+            }, "00c00303020600000000"),
+            (BulletSchema(), new Dictionary<string, object?>
+            {
+                ["damageId"] = "00112233-4455-6677-8899-aabbccddeeff",
+                ["participantId"] = "11223344-5566-7788-99aa-bbccddeeff00",
+                ["shipId"] = null, ["participantTag"] = "Pilot_1"
+            }, "00000f" + "33221100554477668899aabbccddeeff"
+                + "443322116655887799aabbccddeeff00" + "00" + "070050696c6f745f31"),
+            (GameStateSchemaFixture.Current, new Dictionary<string, object?>
+            {
+                ["participantXp"] = Convert.FromHexString(GameStateSchemaFixture.LargeXpEntry)
+            }, GameStateSchemaFixture.LargeXpHex),
+            (GameStateSchemaFixture.Current, new Dictionary<string, object?>
+            {
+                ["processedEffects"] = Array.Empty<byte>()
+            }, "00001000000000"),
+        };
+        foreach (var (schema, data, hex) in cases)
+        {
+            var encoded = PositionalSchemaCodec.Encode(schema, data);
+            Hex(encoded).Should().Be(hex);
+            PositionalSchemaCodec.Decode(schema, encoded).Should().BeEquivalentTo(data);
+            PositionalSchemaCodec.Encode(schema, PositionalSchemaCodec.Decode(schema, encoded))
+                .Should().Equal(encoded);
+        }
+        BitConverter.ToDouble(Convert.FromHexString(GameStateSchemaFixture.LargeXpEntry), 16)
+            .Should().Be(4_294_967_297d);
+    }
+
+    [Fact]
+    public void Fixture_GameEffect_DeadlinesAndStartingTargetListsRemainExact()
+    {
+        var data = new Dictionary<string, object?>
+        {
+            ["claimId"] = null, ["participantId"] = null, ["shipId"] = null,
+            ["velocityX"] = 0.75, ["velocityY"] = -0.5,
+            ["startedAt"] = 1000d, ["armedAt"] = 1800d, ["expiresAt"] = 3000d,
+            ["damageReceipts"] = Array.Empty<byte>(),
+            ["asteroidTargets"] = new byte[] { 1, 2 }, ["hazardTargets"] = new byte[] { 3 },
+        };
+        const string hex = "b0ec0e" + "000000" + "0000403f000000bf"
+            + "0000000000408f40" + "0000000000209c40" + "000000000070a740"
+            + "00000000" + "020000000102" + "0100000003";
+        var encoded = PositionalSchemaCodec.Encode(RewardHazardSchemaFixture.Effect, data);
+        Hex(encoded).Should().Be(hex);
+        var decoded = PositionalSchemaCodec.Decode(RewardHazardSchemaFixture.Effect, encoded);
+        decoded.Should().BeEquivalentTo(data);
+        PositionalSchemaCodec.Encode(RewardHazardSchemaFixture.Effect, decoded).Should().Equal(encoded);
+    }
+
+    [Fact]
+    public void Fixture_GameClaim_TimeAndShipRevisionAreIndependentExactSlots()
+    {
+        var data = new Dictionary<string, object?>
+        {
+            ["claimedAt"] = 1000d, ["invulnerabilityRevision"] = uint.MaxValue
+        };
+        var encoded = PositionalSchemaCodec.Encode(RewardHazardSchemaFixture.Claim, data);
+        Hex(encoded).Should().Be("0003" + "0000000000408f40" + "ffffffff");
+        var decoded = PositionalSchemaCodec.Decode(RewardHazardSchemaFixture.Claim, encoded);
+        decoded["claimedAt"].Should().Be(1000d);
+        Convert.ToUInt32(decoded["invulnerabilityRevision"]).Should().Be(uint.MaxValue);
     }
 }

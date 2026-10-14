@@ -1,25 +1,43 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const require = createRequire(import.meta.url);
 const AuthoritativeObject = require('./wwwroot/js/authoritative-object.js');
+const GuidUtils = require('./wwwroot/js/guid-utils.js');
+const OWNER_ID = '11111111-1111-4111-8111-111111111111';
+const BULLET_ID = '22222222-2222-4222-8222-222222222222';
+const TARGET_ID = '33333333-3333-4333-8333-333333333333';
+const PARTICIPANT_ID = '44444444-4444-4444-8444-444444444444';
+const SHIP_ID = '55555555-5555-4555-8555-555555555555';
 
-function bulletHarness({ deltaEncoding = true } = {}) {
+async function bulletHarness({ deltaEncoding = true, attributed = true, joinSnapshot = true } = {}) {
     const handlers = {};
+    const creates = [];
     const requests = [];
     let accept = true;
     const SessionClient = {
         on: (event, callback) => { handlers[event] = callback; },
         isInSession: () => true,
-        getCurrentMember: () => ({ id: 'owner' }),
+        getCurrentMember: () => ({ id: OWNER_ID }),
+        createObject: async (data, scope, ownerMemberId, validAt, schemaId) => {
+            creates.push({ data: structuredClone(data), scope, ownerMemberId, schemaId });
+            return {
+                objectInfo: {
+                    id: BULLET_ID, data: structuredClone(data), version: 1, schemaId,
+                    ownerMemberId: OWNER_ID, creatorMemberId: OWNER_ID, scope,
+                },
+                validAt: 1000, memberSequence: 1,
+            };
+        },
         updateObjects: async updates => {
             requests.push(structuredClone(updates));
             return {
-                versions: accept ? { bullet: requests.length + 1 } : {},
-                memberSequence: requests.length,
+                versions: accept ? { [BULLET_ID]: requests.length + 1 } : {},
+                memberSequence: requests.length + 1,
             };
         },
     };
@@ -27,12 +45,12 @@ function bulletHarness({ deltaEncoding = true } = {}) {
         { SessionClient, AuthoritativeObject, window: {} });
     ObjectSync.init();
     ObjectSync.configure({ deltaEncoding });
-    const { Bullet, syncLocalBullets, updateLocalBullet } = loadInlineGameFunctions(
-        ['Bullet', 'assignDefined', 'syncLocalBullets', 'updateLocalBullet'], {
+    const game = { bullets: [] };
+    const { Bullet, createSyncedBullet, syncLocalBullets, updateLocalBullet } = loadInlineGameFunctions(
+        ['Bullet', 'assignDefined', 'createSyncedBullet', 'syncLocalBullets', 'updateLocalBullet'], {
             CONFIG: { BULLET_LIFETIME: 60, BULLET_RADIUS: 0.0033 },
             OBJECT_TYPES: { BULLET: 'bullet' },
-            SessionClient, ObjectSync,
-            game: { get bullets() { return [bullet]; } },
+            SessionClient, ObjectSync, crypto: { randomUUID }, game,
             isSessionMode: () => true,
             SendGate: { shouldSend: () => false },
             velocityToNormalizedDeltaX: value => value / 60,
@@ -40,64 +58,131 @@ function bulletHarness({ deltaEncoding = true } = {}) {
             wrapMarginX: () => 0.0033, wrapMarginY: () => 0.0033,
             wrapNormalized: value => value,
             deleteSyncedBullet: value => deleted.push(value.syncObjectId),
+            _error: (...args) => assert.fail(args.join(' ')),
         });
-    const bullet = new Bullet(0.2, 0.3, 0.1, 0, 0, 'owner');
-    bullet.syncObjectId = 'bullet';
+    const bullet = new Bullet(0.2, 0.3, 0.1, 0, 0, OWNER_ID, attributed ? {
+        participantId: PARTICIPANT_ID, participantTag: 'Pilot_1', shipId: SHIP_ID,
+    } : null);
+    game.bullets.push(bullet);
     const deleted = [];
-    handlers.onSessionJoined({
-        objects: [{
-            id: 'bullet', data: bullet.toSyncData(), version: 1,
-            ownerMemberId: 'owner', creatorMemberId: 'owner', scope: 'Member',
-        }],
-    });
+    handlers.onSessionJoined({ objects: [] });
+    await createSyncedBullet(bullet);
+    if (joinSnapshot) {
+        handlers.onSessionJoined({
+            objects: [{
+                id: BULLET_ID, data: structuredClone(creates[0].data), version: 1, schemaId: 0,
+                ownerMemberId: OWNER_ID, creatorMemberId: OWNER_ID, scope: 'Member',
+            }],
+        });
+    }
     return {
-        bullet, ObjectSync, syncLocalBullets, updateLocalBullet, requests, deleted,
+        bullet, ObjectSync, syncLocalBullets, updateLocalBullet, creates, requests, deleted, attributed, joinSnapshot,
         reject: () => { accept = false; },
         accept: () => { accept = true; },
     };
 }
 
+function assertBulletCreation(h) {
+    assert.ok(GuidUtils.isGuid(h.bullet.damageId));
+    assert.equal(h.bullet.syncObjectId, BULLET_ID, 'the real create path assigns the accepted object ID');
+    assert.deepEqual(h.creates, [{
+        data: {
+            type: 'bullet', x: 0.2, y: 0.3, velocityX: 0.1, velocityY: 0,
+            lifetime: 60, colorIndex: 0, ownerMemberId: OWNER_ID, damageId: h.bullet.damageId,
+            ...(h.attributed ? { participantId: PARTICIPANT_ID } : {}),
+            participantTag: h.attributed ? 'Pilot_1' : '', shipId: h.attributed ? SHIP_ID : null,
+        },
+        scope: 'Member', ownerMemberId: null, schemaId: 0,
+    }], 'attribution is durably present in the full creation before any claim delta');
+    assert.deepEqual(h.ObjectSync.getObject(BULLET_ID).data, h.creates[0].data);
+    assert.equal(h.ObjectSync.isDataConfirmed(BULLET_ID, h.creates[0].data), h.joinSnapshot,
+        'a joined snapshot supplies a full delta baseline; fresh creation registers canonical data only');
+}
+
+function pendingClaim(h) {
+    Object.assign(h.bullet, {
+        pendingHit: true, hitTargetId: TARGET_ID,
+        hitImpactTorque: 0.25, hitBulletAngle: 0.5, hitOffsetN: -0.1,
+    });
+    return {
+        pendingHit: true, hitTargetId: TARGET_ID,
+        hitImpactTorque: 0.25, hitBulletAngle: 0.5, hitOffsetN: -0.1,
+    };
+}
+
+function fullClaim(h, rareFields) {
+    return {
+        ...rareFields, damageId: h.bullet.damageId,
+        ...(h.attributed ? { participantId: PARTICIPANT_ID } : {}),
+        participantTag: h.attributed ? 'Pilot_1' : '', shipId: h.attributed ? SHIP_ID : null,
+    };
+}
+
 for (const deltaEncoding of [true, false]) {
-    test(`pending claims stop motion traffic after confirmation (delta=${deltaEncoding})`, async () => {
-        const h = bulletHarness({ deltaEncoding });
-        h.bullet.pendingHit = true;
-        h.bullet.hitTargetId = 'target';
-        for (let frame = 0; frame < 60; frame++) {
+    for (const joinSnapshot of [true, false]) {
+        for (const attributed of [true, false]) {
+            test(`pending claims stop motion traffic after confirmation (delta=${deltaEncoding}, snapshot=${joinSnapshot}, attributed=${attributed})`, async () => {
+                const h = await bulletHarness({ deltaEncoding, attributed, joinSnapshot });
+                assertBulletCreation(h);
+                const rareFields = pendingClaim(h);
+                const claim = fullClaim(h, rareFields);
+                for (let frame = 0; frame < 60; frame++) {
+                    h.syncLocalBullets();
+                    await h.ObjectSync.flushUpdates();
+                    h.updateLocalBullet(h.bullet, 1, OWNER_ID);
+                }
+                assert.equal(h.requests.length, 1, 'one accepted claim, not 60 changing poses');
+                assert.deepEqual(h.requests[0], [{
+                    objectId: BULLET_ID, schemaId: 0,
+                    data: deltaEncoding && joinSnapshot ? rareFields : { x: 0.2, y: 0.3, lifetime: 60, ...claim },
+                }]);
+                assert.deepEqual({ ...h.creates[0].data, ...h.requests[0][0].data },
+                    { ...h.creates[0].data, ...claim }, 'claim deltas retain all original attribution');
+                assert.equal(h.ObjectSync.isDataConfirmed(BULLET_ID, claim), true);
+                assert.ok(h.bullet.x > 0.2, 'local motion continues without publishing hidden-bullet poses');
+                assert.equal(h.bullet.lifetime, 0);
+                assert.deepEqual(h.deleted, [BULLET_ID], 'local expiration still retires the object');
+            });
+        }
+    }
+}
+
+for (const deltaEncoding of [true, false]) {
+    test(`unconfirmed pending claims retry exact claim data with current pose, then stop (delta=${deltaEncoding})`, async () => {
+        const h = await bulletHarness({ deltaEncoding });
+        assertBulletCreation(h);
+        const rareFields = pendingClaim(h);
+        const claim = fullClaim(h, rareFields);
+        h.reject();
+        for (let frame = 0; frame < 3; frame++) {
+            const pose = { x: h.bullet.x, y: h.bullet.y, lifetime: h.bullet.lifetime };
             h.syncLocalBullets();
             await h.ObjectSync.flushUpdates();
-            h.updateLocalBullet(h.bullet, 1, 'owner');
+            assert.deepEqual(h.requests[frame], [{
+                objectId: BULLET_ID, schemaId: 0,
+                data: !deltaEncoding ? { ...pose, ...claim }
+                    : frame === 0 ? rareFields : { x: pose.x, lifetime: pose.lifetime, ...rareFields },
+            }], 'only unconfirmed fields retry; current pose anchors each retry version');
+            assert.equal(h.ObjectSync.isDataConfirmed(BULLET_ID, claim), false);
+            h.updateLocalBullet(h.bullet, 1, OWNER_ID);
         }
-        assert.equal(h.requests.length, 1, 'one accepted claim, not 60 changing poses');
-        assert.deepEqual(h.requests[0][0].data, h.bullet.toHitData());
-        assert.equal(h.bullet.lifetime, 0);
-        assert.deepEqual(h.deleted, ['bullet'], 'local expiration still retires the object');
+        assert.equal(h.requests.length, 3);
+        h.accept();
+        const pose = { x: h.bullet.x, y: h.bullet.y, lifetime: h.bullet.lifetime };
+        h.syncLocalBullets();
+        await h.ObjectSync.flushUpdates();
+        assert.deepEqual(h.requests[3][0].data, deltaEncoding
+            ? { x: pose.x, lifetime: pose.lifetime, ...rareFields } : { ...pose, ...claim });
+        assert.equal(h.ObjectSync.isDataConfirmed(BULLET_ID, claim), true);
+        h.updateLocalBullet(h.bullet, 1, OWNER_ID);
+        h.syncLocalBullets();
+        await h.ObjectSync.flushUpdates();
+        assert.equal(h.requests.length, 4);
     });
 }
 
-test('unconfirmed pending claims retry and never include later motion', async () => {
-    const h = bulletHarness();
-    h.bullet.pendingHit = true;
-    h.bullet.hitTargetId = 'target';
-    h.reject();
-    for (let frame = 0; frame < 3; frame++) {
-        h.syncLocalBullets();
-        await h.ObjectSync.flushUpdates();
-        h.updateLocalBullet(h.bullet, 1, 'owner');
-    }
-    assert.equal(h.requests.length, 3);
-    for (const request of h.requests) {
-        assert.deepEqual(request[0].data, h.bullet.toHitData());
-    }
-    h.accept();
-    h.syncLocalBullets();
-    await h.ObjectSync.flushUpdates();
-    h.syncLocalBullets();
-    await h.ObjectSync.flushUpdates();
-    assert.equal(h.requests.length, 4);
-});
-
 test('non-pending bullets still respect their motion gate', async () => {
-    const h = bulletHarness();
+    const h = await bulletHarness();
     h.syncLocalBullets();
     await h.ObjectSync.flushUpdates();
     assert.equal(h.requests.length, 0);

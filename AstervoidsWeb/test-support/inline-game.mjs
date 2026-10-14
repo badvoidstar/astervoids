@@ -40,3 +40,32 @@ export function loadInlineGameFunctions(names, globals = {}) {
         { filename }
     )(...Object.values(globals));
 }
+
+function constantSource(name) {
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+        throw new TypeError(`Invalid constant name: ${name}`);
+    }
+    const escapedName = name.replace(/\$/g, '\\$');
+    const match = new RegExp(`^\\s*const\\s+${escapedName}\\s*=`, 'm').exec(source);
+    if (!match) throw new Error(`Missing inline game constant: ${name}`);
+    for (let end = source.indexOf(';', match.index); end !== -1;
+        end = source.indexOf(';', end + 1)) {
+        const candidate = source.slice(match.index, end + 1);
+        try {
+            new Script(candidate, { filename });
+            return candidate;
+        } catch (error) {
+            if (!(error instanceof SyntaxError)) throw error;
+        }
+    }
+    throw new Error(`Incomplete inline game constant: ${name}`);
+}
+
+export function loadInlineGameConstants(names, globals = {}) {
+    const declarations = names.map(constantSource).join('\n');
+    return compileFunction(
+        `${declarations}\nreturn { ${names.join(', ')} };`,
+        Object.keys(globals),
+        { filename }
+    )(...Object.values(globals));
+}

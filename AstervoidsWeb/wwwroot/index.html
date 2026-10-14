@@ -77,6 +77,57 @@
             color: #fff;
             font-size: 36px;
             pointer-events: none;
+            gap: 0.5em;
+        }
+
+        #hud:not(.multiplayer) {
+            flex-wrap: wrap;
+        }
+
+        #xp-hud {
+            position: absolute;
+            display: grid;
+            gap: 4px;
+            color: #fff;
+            pointer-events: none;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #xp-hud[hidden] { display: none; }
+
+        #xp-caption {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5em;
+            white-space: nowrap;
+        }
+
+        #xp-level { flex-shrink: 0; }
+
+        #xp-fraction {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        #xp-bar {
+            height: 6px;
+            border: 1px solid #fff;
+        }
+
+        #xp-fill {
+            height: 100%;
+            width: 0;
+            background: #fff;
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            overflow: hidden;
+            clip-path: inset(50%);
+            white-space: nowrap;
         }
 
         #hud.multiplayer {
@@ -172,6 +223,13 @@
             50%, 100% {
                 color: #fff;
                 text-shadow: none;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            #lives.life-award {
+                animation: none;
+                text-decoration: underline double;
             }
         }
 
@@ -1159,6 +1217,16 @@
             <span id="wave">Wave: 1</span>
             <span id="lives">Lives: 3</span>
         </div>
+        <div id="xp-hud" hidden>
+            <div id="xp-caption" aria-hidden="true">
+                <span id="xp-level">L1</span><span id="xp-fraction">0/20 XP</span>
+            </div>
+            <div id="xp-bar" role="progressbar" aria-label="Level 1 experience"
+                aria-valuemin="0" aria-valuemax="20" aria-valuenow="0">
+                <div id="xp-fill"></div>
+            </div>
+        </div>
+        <div id="level-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
         
         <!-- Instructions: control hints -->
         <div id="instructions">
@@ -2751,8 +2819,82 @@
         SHIP: 'ship',
         ASTEROID: 'asteroid',
         BULLET: 'bullet',
-        GAME_STATE: 'gameState'
+        GAME_STATE: 'gameState',
+        GAME_EFFECT: 'gameEffect',
+        GAME_CLAIM: 'gameClaim'
     };
+
+    const PROGRESSION = Object.freeze({
+        XP_PER_ASTEROID: 10,
+        PICKUP_RADIUS: 0.018,
+        PICKUP_LIFETIME_MS: 12000,
+        MINE_RADIUS: 0.012,
+        MINE_ARM_MS: 1000,
+        MINE_LIFETIME_MS: 8000,
+        SPRAY_TELEGRAPH_MS: 800,
+        SPRAY_FLIGHT_MS: 2000,
+        SPRAY_LANES: 12,
+        SPRAY_SPEED_SCALE: 0.4,
+        NUKE_RADIUS: 0.25,
+        CLAIM_TIMEOUT_MS: 16000,
+        CLAIM_CLOCK_TOLERANCE_MS: 2000,
+        RECEIPT_FEEDBACK_MS: 500
+    });
+    const PAYLOAD_KIND = Object.freeze({
+        NONE: 0, NUKE: 1, LEVELUP: 2, EXTRA_LIFE: 3, SMART_BOMB: 4, MINE: 5, SPRAY: 6
+    });
+    const GAME_EFFECT_KIND = Object.freeze({
+        BREAK_RECEIPT: 1, PICKUP: 2, ACTIVATION_RECEIPT: 3,
+        MINE: 4, SPRAY: 5, HOSTILE_BULLET: 6
+    });
+    function getLevelXpThreshold(level) {
+        if (!Number.isSafeInteger(level) || level < 1) {
+            throw new RangeError('Level must be a positive safe integer');
+        }
+        return PROGRESSION.XP_PER_ASTEROID * level * (level - 1);
+    }
+
+    function getLevelForXp(xp) {
+        if (!Number.isSafeInteger(xp) || xp < 0) {
+            throw new RangeError('XP must be a nonnegative safe integer');
+        }
+        let level = Math.max(1, Math.floor((1 + Math.sqrt(1 + 4 * xp / PROGRESSION.XP_PER_ASTEROID)) / 2));
+        while (getLevelXpThreshold(level) > xp) level--;
+        while (getLevelXpThreshold(level + 1) <= xp) level++;
+        return level;
+    }
+
+    function getProgressionForXp(xp) {
+        const level = getLevelForXp(xp);
+        const start = getLevelXpThreshold(level);
+        const requiredXp = 2 * PROGRESSION.XP_PER_ASTEROID * level;
+        const currentXp = xp - start;
+        return { xp, level, currentXp, requiredXp,
+            nextLevelXp: start + requiredXp, fraction: currentXp / requiredXp };
+    }
+
+    function buildVolleyPattern(level) {
+        if (!Number.isSafeInteger(level) || level < 1) {
+            throw new RangeError('Volley level must be a positive safe integer');
+        }
+        const spread = Math.min(90, 24 + 8 * (level - 4)) * Math.PI / 180;
+        return Array.from({ length: level }, (_, index) => level <= 3
+            ? { angleOffset: 0, lateralOffset: index - (level - 1) / 2 }
+            : { angleOffset: spread * (index / (level - 1) - 0.5), lateralOffset: 0 });
+    }
+
+    function chooseAsteroidLoadout(level, armorRoll, payloadRoll) {
+        const maxHits = level < 4 ? 1
+            : level < 7 ? (armorRoll < 0.8 ? 1 : 2)
+                : armorRoll < 0.7 ? 1 : armorRoll < 0.9 ? 2 : 3;
+        const payloadKind = maxHits === 1 ? PAYLOAD_KIND.NONE
+            : payloadRoll < 0.2 ? PAYLOAD_KIND.NUKE
+                : payloadRoll < 0.4 ? PAYLOAD_KIND.LEVELUP
+                    : payloadRoll < 0.6 ? PAYLOAD_KIND.EXTRA_LIFE
+                        : payloadRoll < 0.8 ? PAYLOAD_KIND.SMART_BOMB
+                            : payloadRoll < 0.9 ? PAYLOAD_KIND.MINE : PAYLOAD_KIND.SPRAY;
+        return { maxHits, hitsRemaining: maxHits, payloadKind };
+    }
 
     // Phase 2.1: per-object event channel kinds. Both peers must register
     // the same name ↔ byte mapping (done at ObjectSync.init time).
@@ -3592,13 +3734,12 @@
             const padding = Math.round(vp.height * 0.015);
             const horizontalPadding = isSessionMode()
                 ? Math.min(padding, Math.round(vp.width * 0.015)) : padding;
-            hud.style.top = `${vp.y + padding}px`;
-            hud.style.left = `${vp.x + horizontalPadding}px`;
+            hud.style.top = `max(${vp.y + padding}px, env(safe-area-inset-top, 0px))`;
+            hud.style.left = `max(${vp.x + horizontalPadding}px, env(safe-area-inset-left, 0px))`;
             hud.style.right = `${(newWidth - vp.x - vp.width) + horizontalPadding}px`;
             const baseSize = Math.min(vp.width, vp.height) * 0.035;
             hud.style.fontSize = `${isSessionMode()
                 ? Math.max(10, Math.round(baseSize * 0.9)) : Math.round(baseSize)}px`;
-            fitSessionHud();
         }
         
         const vpRef = Math.min(game.viewport.width, game.viewport.height);
@@ -3611,6 +3752,7 @@
             el.style.width = `${game.viewport.width}px`;
             el.style.height = `${game.viewport.height}px`;
         });
+        fitProgressionHud();
 
         // No need to scale entity positions - they use normalized coordinates (0-1)
         // The conversion functions (fromNormalizedX, etc.) handle the mapping to pixels
@@ -3636,11 +3778,80 @@
         const gap = fontSize * 0.5;
         const compact = scoreWidth + waveWidth + livesWidth + gap * 2 > hud.clientWidth;
         hud.classList.toggle('compact', compact);
-        const availableHeight = vp.y + vp.height - parseFloat(hud.style.top);
+        const availableHeight = vp.y + vp.height - hud.offsetTop;
         const scale = Math.min(1, hud.clientWidth / scoreWidth,
             compact ? (hud.clientWidth - gap) / (2 * Math.max(waveWidth, livesWidth)) : 1,
             availableHeight / hud.getBoundingClientRect().height);
         if (scale < 1) hud.style.fontSize = `${Math.max(1, Math.floor(fontSize * scale * 10) / 10)}px`;
+    }
+
+    function fitProgressionHud() {
+        const vp = game.viewport;
+        const padding = Math.max(4, Math.round(Math.min(vp.width, vp.height) * 0.015));
+        const right = canvas.width - vp.x - vp.width + padding;
+        const width = Math.min(190, Math.max(90, vp.width * 0.28), vp.width * 0.45);
+        xpHud.style.top = `max(${vp.y + padding}px, env(safe-area-inset-top, 0px))`;
+        xpHud.style.right = `max(${right}px, env(safe-area-inset-right, 0px))`;
+        xpHud.style.width = `${width}px`;
+        xpHud.style.fontSize = `${Math.max(10, Math.round(Math.min(vp.width, vp.height) * 0.025))}px`;
+        hudDisplay.style.right =
+            `max(${right + (xpHud.hidden ? 0 : width + padding)}px, env(safe-area-inset-right, 0px))`;
+        fitSessionHud();
+        const controlsTop = Math.max(vp.y + 50, hudDisplay.offsetTop + hudDisplay.offsetHeight + 8,
+            xpHud.hidden ? 0 : xpHud.offsetTop + xpHud.offsetHeight + 8);
+        for (const id of ['touch-pause', 'touch-restart', 'touch-fullscreen']) {
+            const button = document.getElementById(id);
+            if (!button) continue;
+            button.style.top = `${controlsTop}px`;
+            if (id === 'touch-fullscreen') {
+                button.style.left = `max(${vp.x + padding}px, env(safe-area-inset-left, 0px))`;
+            } else {
+                button.style.right = `max(${right}px, env(safe-area-inset-right, 0px))`;
+            }
+        }
+    }
+
+    function updateProgressionHud(refit = true) {
+        const show = !!game.ship && !game.identityChanging && !game.connectionLost && !isGameOver()
+            && (game.state === 'playing' || game.state === 'waveDelay');
+        const visibilityChanged = hudCache.xpVisible !== show;
+        if (visibilityChanged) {
+            xpHud.hidden = !show;
+            hudCache.xpVisible = show;
+            if (!show) levelAnnouncement.textContent = '';
+            if (refit) fitProgressionHud();
+        }
+        if (!show) return visibilityChanged;
+        const progression = getLocalProgression();
+        if (!progression) {
+            if (hudCache.xp !== 'unavailable') {
+                xpLevel.textContent = 'L—';
+                xpFraction.textContent = 'XP unavailable';
+                xpFill.style.width = '0%';
+                xpBar.setAttribute('aria-label', 'Experience unavailable');
+                xpBar.removeAttribute('aria-valuenow');
+                xpBar.removeAttribute('aria-valuemax');
+                xpBar.setAttribute('aria-valuetext', 'Experience unavailable');
+                hudCache.xp = 'unavailable';
+                hudCache.xpLevel = null;
+            }
+            return visibilityChanged;
+        }
+        if (hudCache.xp === progression.xp) return visibilityChanged;
+        const { level, currentXp, requiredXp, fraction } = progression;
+        xpLevel.textContent = `L${level}`;
+        xpFraction.textContent = `${currentXp}/${requiredXp} XP`;
+        xpBar.setAttribute('aria-label', `Level ${level} experience`);
+        xpBar.setAttribute('aria-valuenow', currentXp);
+        xpBar.setAttribute('aria-valuemax', requiredXp);
+        xpBar.setAttribute('aria-valuetext', `Level ${level}, ${currentXp} of ${requiredXp} XP`);
+        xpFill.style.width = `${fraction * 100}%`;
+        if (hudCache.xpLevel != null && level > hudCache.xpLevel) {
+            levelAnnouncement.textContent = `Level ${level}. ${level} shots per volley.`;
+        }
+        hudCache.xp = progression.xp;
+        hudCache.xpLevel = level;
+        return visibilityChanged;
     }
 
     /**
@@ -4326,6 +4537,7 @@
             this.participantTag = '';
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
+            this.handledHazards = {};
             // Local-only predicted-fatal hold: { hitCount, startedAtMs } while
             // this ship coasts, uncontrolled, awaiting the authority's verdict.
             // Deliberately absent from SYNC_FIELDS and the wire payloads — peers
@@ -4391,7 +4603,8 @@
                 participantId: this.participantId,
                 participantTag: this.participantTag,
                 score: this.score || 0,
-                hitCount: this.hitCount || 0
+                hitCount: this.hitCount || 0,
+                handledHazards: AstervoidsWireCodec.packCounterMap(this.handledHazards)
             };
         }
 
@@ -4440,6 +4653,9 @@
             // score / hitCount come via 'ship-state-changed' events (Phase 2.3)
             // but reconciliation snapshots include them in data, so apply when present.
             assignDefined(this, data, Ship.SYNC_FIELDS);
+            if (data.handledHazards !== undefined) {
+                this.handledHazards = AstervoidsWireCodec.unpackCounterMap(data.handledHazards);
+            }
             // Fields below need validation or renaming, so they stay explicit.
             this.invulnerability.applySnapshot(data);
             if (data.turnControlMode !== undefined) {
@@ -4675,30 +4891,28 @@
         }
 
         /**
-         * Fire a bullet from the ship's nose
-         * @returns {Bullet|null} New bullet or null if on cooldown
+         * Fire a complete level-sized volley, with one cooldown and sound.
+         * @returns {Bullet[]|null} New bullets or null if on cooldown
          */
-        shoot() {
+        shoot(level = 1) {
             if (this.shootCooldown > 0) return null;
-            
+            const pattern = buildVolleyPattern(level);
             this.shootCooldown = CONFIG.SHOOT_COOLDOWN;
-            
-            // Play fire sound
             AudioSystem.playFire();
-            
-            // Get nose position in normalized coords
-            // Use aspect-ratio-aware conversion for the offset
             const noseX = this.x + Math.cos(this.angle) * sizeToNormalizedX(CONFIG.SHIP_SIZE);
             const noseY = this.y + Math.sin(this.angle) * sizeToNormalizedY(CONFIG.SHIP_SIZE);
-            
-            return new Bullet(
-                noseX,
-                noseY,
-                Math.cos(this.angle) * CONFIG.BULLET_SPEED,
-                Math.sin(this.angle) * CONFIG.BULLET_SPEED,
-                this.colorIndex,    // Inherit ship's color
-                this.memberId       // Track owner for scoring
-            );
+            return pattern.map(({ angleOffset, lateralOffset }) => {
+                const lane = lateralOffset * CONFIG.SHIP_SIZE * 0.65;
+                const angle = this.angle + angleOffset;
+                return new Bullet(
+                    noseX - Math.sin(this.angle) * sizeToNormalizedX(lane),
+                    noseY + Math.cos(this.angle) * sizeToNormalizedY(lane),
+                    Math.cos(angle) * CONFIG.BULLET_SPEED,
+                    Math.sin(angle) * CONFIG.BULLET_SPEED,
+                    this.colorIndex, this.memberId,
+                    { participantId: this.participantId, participantTag: this.participantTag,
+                        shipId: this.syncObjectId });
+            });
         }
 
         /**
@@ -4755,6 +4969,12 @@
             // area but large linear extent. Cache the actual maximum.
             this.rebuildShapeCache();
             this.syncObjectId = null;      // ObjectSync ID when in session
+            this.maxHits = 1;
+            this.hitsRemaining = 1;
+            this.payloadKind = 0;
+            this.processedDamage = {};
+            this._processedDamageBytes = new Uint8Array();
+            this.replacementInFlight = false;
         }
 
         /**
@@ -4772,6 +4992,7 @@
                 angle: this.angle,
                 rotationSpeed: this.rotationSpeed,
                 seed: this.seed,
+                ...this.toDamageData()
             };
             // Seed-generated shapes are reproducible from radius+seed. Fracture
             // children carry q16 angle/distance pairs (4 bytes per vertex).
@@ -4798,12 +5019,29 @@
             };
         }
 
+        toDamageData() {
+            return {
+                maxHits: this.maxHits, hitsRemaining: this.hitsRemaining,
+                payloadKind: this.payloadKind, processedDamage: this._processedDamageBytes
+            };
+        }
+
+        fromGameplayData(data) {
+            assignDefined(this, data, ['maxHits', 'hitsRemaining', 'payloadKind']);
+            if (data.processedDamage !== undefined
+                && !AstervoidsWireCodec.bytesEqual(data.processedDamage, this._processedDamageBytes)) {
+                this.processedDamage = AstervoidsWireCodec.unpackCounterMap(data.processedDamage);
+                this._processedDamageBytes = new Uint8Array(data.processedDamage);
+            }
+        }
+
         /**
          * Update asteroid from sync data (for remote astervoids)
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
             assignDefined(this, data, Asteroid.SYNC_FIELDS);
+            this.fromGameplayData(data);
         }
 
         /**
@@ -4824,6 +5062,7 @@
             );
             asteroid.angle = data.angle || 0;
             asteroid.rotationSpeed = data.rotationSpeed || 0;
+            asteroid.fromGameplayData(data);
             return asteroid;
         }
 
@@ -4971,6 +5210,7 @@
             
             ctx.closePath();
             ctx.stroke();
+            if (this.maxHits > 1) drawAsteroidArmor(ctx, this);
         }
 
         /**
@@ -4995,10 +5235,10 @@
         static SYNC_FIELDS = [
             'x', 'y', 'velocityX', 'velocityY', 'lifetime', 'colorIndex',
             'pendingHit', 'hitTargetId', 'hitImpactTorque', 'hitBulletAngle',
-            'hitOffsetN'
+            'hitOffsetN', 'damageId', 'participantId', 'participantTag', 'shipId'
         ];
 
-        constructor(x, y, velocityX, velocityY, colorIndex = 0, ownerMemberId = null) {
+        constructor(x, y, velocityX, velocityY, colorIndex = 0, ownerMemberId = null, attribution = null) {
             this.x = x;                    // Normalized X position (0-1)
             this.y = y;                    // Normalized Y position (0-1)
             this._collisionPrevX = x;      // Previous simulation-step position
@@ -5009,6 +5249,10 @@
             this.colorIndex = colorIndex;  // Owner's color index for multiplayer
             this.ownerMemberId = ownerMemberId;  // Member ID who fired this bullet
             this.syncObjectId = null;      // ObjectSync ID when in session
+            this.damageId = crypto.randomUUID();
+            this.participantId = attribution?.participantId || null;
+            this.participantTag = attribution?.participantTag || '';
+            this.shipId = attribution?.shipId || null;
             this.pendingHit = false;       // True when awaiting hit confirmation from asteroid owner
             this.hitImpactTorque = 0;      // Impact torque for angular momentum transfer on split
             // Compact split-geometry transmission (computed at hit time, used by asteroid owner):
@@ -5030,6 +5274,10 @@
                 lifetime: this.lifetime,
                 colorIndex: this.colorIndex,
                 ownerMemberId: this.ownerMemberId,
+                damageId: this.damageId,
+                ...(this.participantId ? { participantId: this.participantId } : {}),
+                participantTag: this.participantTag,
+                shipId: this.shipId,
             };
             if (this.pendingHit) Object.assign(data, this.toHitData());
             return data;
@@ -5056,7 +5304,11 @@
                 hitTargetId: this.hitTargetId || null,
                 hitImpactTorque: this.hitImpactTorque || 0,
                 hitBulletAngle: this.hitBulletAngle || 0,
-                hitOffsetN: this.hitOffsetN || 0
+                hitOffsetN: this.hitOffsetN || 0,
+                damageId: this.damageId,
+                ...(this.participantId ? { participantId: this.participantId } : {}),
+                participantTag: this.participantTag,
+                shipId: this.shipId
             };
         }
 
@@ -5151,6 +5403,15 @@
     const playerIndicatorDisplay = document.getElementById('player-indicator');
     const waveDisplay = document.getElementById('wave');
     const livesDisplay = document.getElementById('lives');
+    const xpHud = document.getElementById('xp-hud');
+    const xpLevel = document.getElementById('xp-level');
+    const xpFraction = document.getElementById('xp-fraction');
+    const xpBar = document.getElementById('xp-bar');
+    const xpFill = document.getElementById('xp-fill');
+    const levelAnnouncement = document.getElementById('level-announcement');
+    const gameplayMotionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let reducedGameplayMotion = gameplayMotionPreference.matches;
+    gameplayMotionPreference.addEventListener('change', event => { reducedGameplayMotion = event.matches; });
 
     // HUD last-rendered values — avoid redundant DOM textContent writes every frame.
     // Score/wave/lives change at most on discrete events, so rewriting at 60 Hz is wasted work.
@@ -5240,6 +5501,11 @@
         ship: null,           // Player ship instance (local player's ship)
         astervoids: [],        // Active astervoids
         bullets: [],          // Active bullets
+        effects: [],          // Solo effect records; sessions use ObjectSync's type index
+        soloXp: 0,
+        simulationTimeMs: 0,
+        effectContactNowMs: null,
+        effectContactPreviousMs: null,
         score: 0,             // Current score
         lives: 0,             // Remaining lives
         wave: 0,              // Current wave number
@@ -5269,7 +5535,10 @@
             collisionEffects: new Map(), // Render-only collision cues, keyed by hit identity
             seenPendingBulletIds: new Set(), // Prevent a long pending hit from replaying its cue
             seenShipHitCounts: new Map(), // objectId -> highest hitCount already cued
-            observedScoreLifeAwardCount: null
+            observedScoreLifeAwardCount: null,
+            contactClaims: new Map(),
+            effectMutations: new Set(),
+            effectAnchors: new Map()
             // Join-snapshot tracking (which orphans/replicas should skip spawn
             // projection or seed onto the delayed timeline) now lives inside
             // replicationRuntime (facts.joinSnapshot), consumed one-shot per id.
@@ -5798,6 +6067,20 @@
         }
     }
 
+    function syncLocalShipHazards(immediate = false) {
+        if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId
+            || Object.keys(game.ship.handledHazards).length === 0) return;
+        const payload = {
+            handledHazards: AstervoidsWireCodec.packCounterMap(game.ship.handledHazards),
+            hitCount: game.ship.hitCount || 0
+        };
+        if (!ObjectSync.isDataConfirmed(game.multiplayer.myShipObjectId, payload)) {
+            ObjectSync.updateObject(game.multiplayer.myShipObjectId, {
+                ...game.ship.toUpdateData(), ...payload
+            }, immediate);
+        }
+    }
+
     // Events keep zero-wait local feedback; only the counter update below is
     // durable across snapshots, late join, and GameState ownership migration.
     function emitShipStateChanged(hitPose = null) {
@@ -6132,7 +6415,10 @@
         adoptOwned(record, instance, facts, context) {
             // Already tracked locally (e.g. ownership just migrated to us) —
             // local physics keeps driving it; nothing left to project.
-            if (instance) return instance;
+            if (instance) {
+                instance.fromGameplayData(record.data);
+                return instance;
+            }
             // Adopt a locally-owned child we don't have yet (created on our
             // behalf, e.g. an OnObjectReplaced split we just shot).
             const asteroid = Asteroid.fromSyncData(record.data);
@@ -6165,8 +6451,10 @@
             context?.instances?.set(record.id, asteroid);
             return seedReplicaAtTerminalTarget(asteroid, record);
         },
-        apply(instance, data) {
+        apply(instance, data, facts) {
             instance.fromSyncData(data);
+            const raw = ObjectSync.getObject(facts.objectId)?.data;
+            if (raw) instance.fromGameplayData(raw);
         },
         remove(instance, reason, facts, context) {
             const id = facts.objectId;
@@ -6233,6 +6521,7 @@
             instance.hitImpactTorque = raw.hitImpactTorque || 0;
             instance.hitBulletAngle = raw.hitBulletAngle || 0;
             instance.hitOffsetN = raw.hitOffsetN || 0;
+            assignDefined(instance, raw, ['damageId', 'participantId', 'participantTag', 'shipId']);
             if (raw.pendingHit) {
                 CollisionEffects.startAsteroidHit({
                     ...raw,
@@ -6435,12 +6724,21 @@
         game.multiplayer.isAuthority = false;
         game.multiplayer.observedScoreLifeAwardCount = null;
         game.multiplayer.processedPendingBullets.clear();
+        game.multiplayer.contactClaims.clear();
+        game.multiplayer.effectMutations.clear();
+        game.multiplayer.effectAnchors.clear();
+        game.effectContactNowMs = null;
+        game.effectContactPreviousMs = null;
+        sessionXpViewCache = null;
         resetGameStateSyncCache();
         gameStateScoreViewCache = null;
         clearExtraLifeAwardFeedback();
         CollisionEffects.clear();
         game.astervoids = [];
         game.bullets = [];
+        game.effects = [];
+        hudCache.xp = null;
+        hudCache.xpLevel = null;
         RemoteObjects.clear();
         DeadReckon.clear();
         SendGate.clear();
@@ -6494,6 +6792,8 @@
                 if (syncObj && syncObj.ownerMemberId === myMemberId) {
                     // Capture exactly the limited kinematics the owner will simulate.
                     asteroid.clampMotion();
+                    const damage = asteroid.toDamageData();
+                    const unconfirmedDamage = !ObjectSync.isDataConfirmed(asteroid.syncObjectId, damage);
                     // Send-on-change: remotes predict a ballistic asteroid from
                     // its transmitted constant kinematics, so deterministic mode
                     // suppresses redundant per-frame re-anchors. Buffered mode remains
@@ -6501,8 +6801,10 @@
                     if (SendGate.shouldSend(
                             asteroid.syncObjectId, asteroid.x, asteroid.y,
                             asteroid.angle, asteroid.velocityX, asteroid.velocityY,
-                            asteroid.rotationSpeed)) {
-                        ObjectSync.updateObject(asteroid.syncObjectId, asteroid.toUpdateData());
+                            asteroid.rotationSpeed) || unconfirmedDamage) {
+                        ObjectSync.updateObject(asteroid.syncObjectId, {
+                            ...asteroid.toUpdateData(), ...(unconfirmedDamage ? damage : {})
+                        });
                     }
                 }
             }
@@ -6567,11 +6869,11 @@
             // Only sync our own bullets
             if (bullet.ownerMemberId === myMemberId && bullet.syncObjectId) {
                 if (bullet.pendingHit) {
-                    // Hidden claims no longer need motion updates. Retry until
-                    // server-confirmed; local simulation still owns expiration.
+                    // Retry the rare claim outside the motion gate, retaining
+                    // the current pose for the new data version's validAt.
                     const claim = bullet.toHitData();
                     if (!ObjectSync.isDataConfirmed(bullet.syncObjectId, claim)) {
-                        ObjectSync.updateObject(bullet.syncObjectId, claim);
+                        ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData());
                     }
                     continue;
                 }
@@ -6748,7 +7050,9 @@
                 scoreLifeAwardCount: 0,
                 participantScores: AstervoidsWireCodec.packCounterMap({}),
                 participantNumbers: AstervoidsWireCodec.packCounterMap({}),
-                participantTags: AstervoidsWireCodec.packTagMap({})
+                participantTags: AstervoidsWireCodec.packTagMap({}),
+                participantXp: AstervoidsWireCodec.packXpMap({}),
+                processedEffects: AstervoidsWireCodec.packCounterMap({})
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -6763,9 +7067,619 @@
         }
     }
 
-    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold) {
+    let sessionXpViewCache = null;
+
+    function getSessionXpLedger() {
+        const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        if (!record) return {};
+        try {
+            if (record.data?.participantXp == null) throw new Error('Progression history is missing');
+            const previous = sessionXpViewCache?.record === record ? sessionXpViewCache.entry : null;
+            const entry = readGameStateLedger(record.data.participantXp, previous, null, 'xp');
+            sessionXpViewCache = { record, entry };
+            return entry.counters;
+        } catch (error) {
+            reportMalformedGameStateLedgers(record, error);
+            return null;
+        }
+    }
+
+    function getLocalProgression() {
+        if (!isSessionMode()) return getProgressionForXp(game.soloXp);
+        const xp = getSessionXpLedger();
+        if (!xp) return null;
+        const id = SessionClient.getParticipantId()?.toLowerCase();
+        return getProgressionForXp(xp[id] ?? 0);
+    }
+
+    function getRunHighestLevel() {
+        if (!isSessionMode()) return getLevelForXp(game.soloXp);
+        const xp = getSessionXpLedger();
+        return xp ? Object.values(xp).reduce((level, value) => Math.max(level, getLevelForXp(value)), 1) : null;
+    }
+
+    function getAsteroidObjectId(asteroid) {
+        return asteroid.syncObjectId || (asteroid.localObjectId ??= crypto.randomUUID());
+    }
+
+    function getGameEffectObjects() {
+        return isSessionMode() ? ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT) : game.effects;
+    }
+
+    function getGameEffectNow() {
+        return isSessionMode()
+            ? RemoteObjects.isClockOffsetInitialized() ? RemoteObjects.serverNowMs() : null
+            : game.simulationTimeMs;
+    }
+
+    function createGameEffectData(kind, payloadKind, sourceId, attribution = null, x = 0, y = 0) {
+        return {
+            type: OBJECT_TYPES.GAME_EFFECT, kind, payloadKind, sourceId,
+            claimId: attribution?.damageId || attribution?.claimId || null,
+            participantId: attribution?.participantId?.toLowerCase() || null,
+            participantTag: attribution?.participantTag || '',
+            shipId: attribution?.shipId || null,
+            x, y, velocityX: 0, velocityY: 0, angle: 0,
+            startedAt: 0, armedAt: 0, expiresAt: 0, points: 0,
+            damageReceipts: new Uint8Array(),
+            asteroidTargets: new Uint8Array(), hazardTargets: new Uint8Array()
+        };
+    }
+
+    function getGameEffectTiming(kind) {
+        if (kind === GAME_EFFECT_KIND.PICKUP) {
+            return { armDelayMs: 0, lifetimeMs: PROGRESSION.PICKUP_LIFETIME_MS };
+        }
+        if (kind === GAME_EFFECT_KIND.MINE) {
+            return { armDelayMs: PROGRESSION.MINE_ARM_MS, lifetimeMs: PROGRESSION.MINE_LIFETIME_MS };
+        }
+        if (kind === GAME_EFFECT_KIND.SPRAY) {
+            return { armDelayMs: PROGRESSION.SPRAY_TELEGRAPH_MS,
+                lifetimeMs: PROGRESSION.SPRAY_TELEGRAPH_MS + PROGRESSION.SPRAY_FLIGHT_MS };
+        }
+        if (kind === GAME_EFFECT_KIND.HOSTILE_BULLET) {
+            return { armDelayMs: 0, lifetimeMs: PROGRESSION.SPRAY_FLIGHT_MS };
+        }
+        return { armDelayMs: 0, lifetimeMs: 0 };
+    }
+
+    function anchorGameEffectData(data, validAt) {
+        if (data.startedAt !== 0) {
+            return Number.isFinite(data.startedAt) && data.startedAt > 0
+                && Number.isFinite(data.armedAt) && data.armedAt >= data.startedAt
+                && Number.isFinite(data.expiresAt) && data.expiresAt >= data.armedAt ? data : null;
+        }
+        if (data.armedAt !== 0 || data.expiresAt !== 0) return null;
+        if (!Number.isFinite(validAt) || validAt <= 0) return null;
+        const timing = getGameEffectTiming(data.kind);
+        return { ...data, startedAt: validAt, armedAt: validAt + timing.armDelayMs,
+            expiresAt: validAt + timing.lifetimeMs };
+    }
+
+    function getGameEffectTimerData(data) {
+        return { startedAt: data.startedAt, armedAt: data.armedAt, expiresAt: data.expiresAt };
+    }
+
+    function ensureOwnedGameEffectAnchor(record) {
+        if (!isSessionMode()) return true;
+        let anchor = game.multiplayer.effectAnchors.get(record.id);
+        if (!anchor) {
+            const anchored = anchorGameEffectData(record.data, record.validAt);
+            if (!anchored) return false;
+            anchor = getGameEffectTimerData(anchored);
+            game.multiplayer.effectAnchors.set(record.id, anchor);
+        }
+        if (!ObjectSync.isDataConfirmed(record.id, anchor)) {
+            ObjectSync.updateObject(record.id, anchor);
+            return false;
+        }
+        return true;
+    }
+
+    function isGameEffectReady(record) {
+        const data = record.data;
+        if (!isSessionMode()) return true;
+        if (!Number.isFinite(data.startedAt) || !(data.startedAt > 0)
+            || !Number.isFinite(data.armedAt) || data.armedAt < data.startedAt
+            || !Number.isFinite(data.expiresAt) || data.expiresAt < data.armedAt) return false;
+        return record.ownerMemberId !== SessionClient.getCurrentMember()?.id
+            || ObjectSync.isDataConfirmed(record.id, getGameEffectTimerData(data));
+    }
+
+    function addSoloGameEffect(data) {
+        const timing = getGameEffectTiming(data.kind);
+        const start = game.simulationTimeMs;
+        const record = { id: crypto.randomUUID(), data: {
+            ...data, startedAt: start, armedAt: start + timing.armDelayMs,
+            expiresAt: start + timing.lifetimeMs
+        } };
+        game.effects.push(record);
+        return record;
+    }
+
+    function buildAsteroidBreakEffects(asteroid, damage) {
+        const sourceId = getAsteroidObjectId(asteroid);
+        const receipt = createGameEffectData(
+            GAME_EFFECT_KIND.BREAK_RECEIPT, PAYLOAD_KIND.NONE, sourceId, damage, asteroid.x, asteroid.y);
+        receipt.points = asteroid.getPoints();
+        receipt.damageReceipts = AstervoidsWireCodec.packCounterMap({
+            ...asteroid.processedDamage, [damage.damageId.toLowerCase()]: 1
+        });
+        const effects = [receipt];
+        if (asteroid.payloadKind !== PAYLOAD_KIND.NONE) {
+            const kind = asteroid.payloadKind === PAYLOAD_KIND.MINE ? GAME_EFFECT_KIND.MINE
+                : asteroid.payloadKind === PAYLOAD_KIND.SPRAY ? GAME_EFFECT_KIND.SPRAY : GAME_EFFECT_KIND.PICKUP;
+            effects.push(createGameEffectData(kind, asteroid.payloadKind, sourceId, null, asteroid.x, asteroid.y));
+        }
+        return effects;
+    }
+
+    function getProcessedGameEffects() {
+        const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        if (!record?.data?.processedEffects) return null;
+        let processed;
+        try {
+            processed = AstervoidsWireCodec.unpackCounterMap(record.data.processedEffects);
+        } catch (error) {
+            reportMalformedGameStateLedgers(record, error);
+            return null;
+        }
+        if (record.ownerMemberId === SessionClient.getCurrentMember()?.id
+            && !ObjectSync.isDataConfirmed(record.id, {
+                processedEffects: record.data.processedEffects,
+                participantXp: record.data.participantXp,
+                participantScores: record.data.participantScores,
+                groupScore: record.data.groupScore, lives: record.data.lives
+            })) return null;
+        return processed;
+    }
+
+    function collectBlastTargets(data, asteroids, hazards) {
+        const asteroidTargets = {};
+        const hazardTargets = {};
+        for (const record of asteroids) {
+            if (data.payloadKind === PAYLOAD_KIND.SMART_BOMB
+                || normalizedDistance(data.x, data.y, record.data.x, record.data.y) <= PROGRESSION.NUKE_RADIUS) {
+                asteroidTargets[record.id.toLowerCase()] = 1;
+            }
+        }
+        if (data.payloadKind === PAYLOAD_KIND.SMART_BOMB) {
+            for (const record of hazards) {
+                if (isHostileGameEffect(record.data.kind)) hazardTargets[record.id.toLowerCase()] = 1;
+            }
+        }
+        return {
+            asteroidTargets: AstervoidsWireCodec.packCounterMap(asteroidTargets),
+            hazardTargets: AstervoidsWireCodec.packCounterMap(hazardTargets)
+        };
+    }
+
+    function isHostileGameEffect(kind) {
+        return kind === GAME_EFFECT_KIND.MINE || kind === GAME_EFFECT_KIND.SPRAY
+            || kind === GAME_EFFECT_KIND.HOSTILE_BULLET;
+    }
+
+    function getGameEffectPose(data, nowMs) {
+        const elapsed = data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET
+            ? Math.max(0, nowMs - data.startedAt) * CONFIG.TARGET_FPS / 1000 : 0;
+        return {
+            x: data.x + velocityToNormalizedDeltaX(data.velocityX) * elapsed,
+            y: data.y + velocityToNormalizedDeltaY(data.velocityY) * elapsed
+        };
+    }
+
+    function buildSprayProjectiles(record) {
+        const data = record.data;
+        return Array.from({ length: PROGRESSION.SPRAY_LANES }, (_, lane) => {
+            const angle = lane * Math.PI * 2 / PROGRESSION.SPRAY_LANES;
+            const bullet = createGameEffectData(
+                GAME_EFFECT_KIND.HOSTILE_BULLET, PAYLOAD_KIND.SPRAY, record.id, null, data.x, data.y);
+            bullet.velocityX = Math.cos(angle) * CONFIG.BULLET_SPEED * PROGRESSION.SPRAY_SPEED_SCALE;
+            bullet.velocityY = Math.sin(angle) * CONFIG.BULLET_SPEED * PROGRESSION.SPRAY_SPEED_SCALE;
+            bullet.angle = angle;
+            // A throttled/migrated owner launches on the original deadline, not now.
+            bullet.startedAt = data.armedAt;
+            bullet.armedAt = data.armedAt;
+            bullet.expiresAt = data.armedAt + PROGRESSION.SPRAY_FLIGHT_MS;
+            return bullet;
+        });
+    }
+
+    async function replaceGameEffect(record, replacements) {
+        if (game.multiplayer.effectMutations.has(record.id)) return null;
+        game.multiplayer.effectMutations.add(record.id);
+        const epoch = SessionClient.getSessionEpoch();
+        try {
+            return await ObjectSync.replaceObject(record.id, replacements, 'Session');
+        } catch (error) {
+            _error('[Multiplayer] Failed to replace game effect:', error);
+            return null;
+        } finally {
+            if (epoch === SessionClient.getSessionEpoch()) game.multiplayer.effectMutations.delete(record.id);
+        }
+    }
+
+    function getShipHullVerticesAt(pose) {
+        const x = fromNormalizedX(pose.x), y = fromNormalizedY(pose.y);
+        const size = fromNormalizedSize(CONFIG.SHIP_SIZE);
+        return [0, Math.PI * 0.8, -Math.PI * 0.8].map((offset, index) => ({
+            x: x + Math.cos(pose.angle + offset) * size * (index === 0 ? 1 : 0.7),
+            y: y + Math.sin(pose.angle + offset) * size * (index === 0 ? 1 : 0.7)
+        }));
+    }
+
+    function polygonsTouch(left, right) {
+        if (left.some(vertex => pointInPolygon(vertex, right))
+            || right.some(vertex => pointInPolygon(vertex, left))) return true;
+        const tangentTolerancePx = 1e-6;
+        for (let i = 0; i < left.length; i++) {
+            if (AstervoidsCollision.sweptCirclePolygonCollision(
+                { ...left[i], radius: tangentTolerancePx }, left[(i + 1) % left.length], right)) return true;
+        }
+        return false;
+    }
+
+    function gameEffectTouchesShip(data, ship, nowMs, previousMs = nowMs, tolerancePx = 0) {
+        const hull = typeof ship.getVertices === 'function' ? ship.getVertices() : getShipHullVerticesAt(ship);
+        const pose = getGameEffectPose(data, nowMs);
+        const x = fromNormalizedX(pose.x), y = fromNormalizedY(pose.y);
+        if (data.kind === GAME_EFFECT_KIND.PICKUP) {
+            const radius = fromNormalizedSize(PROGRESSION.PICKUP_RADIUS) + tolerancePx;
+            return polygonsTouch(hull, [
+                { x, y: y - radius }, { x: x + radius, y },
+                { x, y: y + radius }, { x: x - radius, y }
+            ]);
+        }
+        const radius = fromNormalizedSize(data.kind === GAME_EFFECT_KIND.MINE
+            ? PROGRESSION.MINE_RADIUS : CONFIG.BULLET_RADIUS) + tolerancePx;
+        const start = getGameEffectPose(data, Math.max(data.startedAt, previousMs));
+        return AstervoidsCollision.sweptCirclePolygonCollision(
+            { x: fromNormalizedX(start.x), y: fromNormalizedY(start.y), radius },
+            { x, y, radius }, hull);
+    }
+
+    function findGameEffectContactTime(data, ship, previousMs, nowMs) {
+        let start = Math.max(data.armedAt, previousMs), end = nowMs;
+        if (gameEffectTouchesShip(data, ship, start)) return start;
+        for (let i = 0; i < 24; i++) {
+            const middle = (start + end) / 2;
+            if (gameEffectTouchesShip(data, ship, middle, previousMs)) end = middle;
+            else start = middle;
+        }
+        return end;
+    }
+
+    function buildGameContactClaim(record, ship, nowMs) {
+        return {
+            type: OBJECT_TYPES.GAME_CLAIM, targetId: record.id,
+            shipId: ship.syncObjectId, participantId: ship.participantId,
+            participantTag: ship.participantTag || '',
+            x: ship.x, y: ship.y, angle: ship.angle,
+            claimedAt: nowMs, invulnerabilityRevision: ship.invulnerabilityRevision
+        };
+    }
+
+    async function createGameContactClaim(record, ship, nowMs) {
+        if (!ship.syncObjectId || !GuidUtils.isGuid(ship.participantId)
+            || game.multiplayer.contactClaims.has(record.id)) return;
+        const epoch = SessionClient.getSessionEpoch();
+        const entry = { id: null, data: buildGameContactClaim(record, ship, nowMs), epoch };
+        game.multiplayer.contactClaims.set(record.id, entry);
+        try {
+            const object = await ObjectSync.createObject(entry.data, 'Member', null, () =>
+                epoch === SessionClient.getSessionEpoch()
+                && game.multiplayer.contactClaims.get(record.id) === entry
+                && game.multiplayer.myShipObjectId === entry.data.shipId);
+            if (object && epoch === SessionClient.getSessionEpoch()) entry.id = object.id;
+            else if (game.multiplayer.contactClaims.get(record.id) === entry) {
+                game.multiplayer.contactClaims.delete(record.id);
+            }
+        } catch (error) {
+            if (epoch === SessionClient.getSessionEpoch()
+                && game.multiplayer.contactClaims.get(record.id) === entry) {
+                game.multiplayer.contactClaims.delete(record.id);
+            }
+            _error('[Multiplayer] Failed to claim game contact:', error);
+        }
+    }
+
+    function isGameContactClaimEligible(record, claim, shipRecord, nowMs) {
+        const data = record.data, contact = claim.data;
+        if (!shipRecord || shipRecord.data?.type !== OBJECT_TYPES.SHIP
+            || claim.ownerMemberId !== shipRecord.ownerMemberId
+            || contact.targetId !== record.id || contact.shipId !== shipRecord.id
+            || !GuidUtils.isGuid(contact.participantId)
+            || shipRecord.data.participantId?.toLowerCase() !== contact.participantId.toLowerCase()
+            || !Number.isFinite(contact.claimedAt)
+            || contact.claimedAt < data.startedAt || contact.claimedAt >= data.expiresAt
+            || contact.claimedAt > nowMs + PROGRESSION.CLAIM_CLOCK_TOLERANCE_MS) return false;
+        if (isHostileGameEffect(data.kind)
+            && (contact.claimedAt < data.armedAt
+                || contact.invulnerabilityRevision !== shipRecord.data.invulnerabilityRevision)) return false;
+        // Contact was tested against the real local hull. Account only for the
+        // two q16w position round-trips when verifying that durable claim.
+        return gameEffectTouchesShip(data, contact, contact.claimedAt, contact.claimedAt,
+            (getGameWidth() + getGameHeight()) / 32767);
+    }
+
+    function chooseGameContactClaim(record, claims, nowMs) {
+        return claims.filter(claim => claim.data?.targetId === record.id
+            && isGameContactClaimEligible(record, claim, ObjectSync.getObject(claim.data.shipId), nowMs))
+            .sort((left, right) => left.data.claimedAt - right.data.claimedAt
+                || left.id.localeCompare(right.id))[0] || null;
+    }
+
+    function buildActivationReceipt(record, claim, asteroids, hazards, nowMs = getGameEffectNow()) {
+        const contact = claim.data;
+        const receipt = createGameEffectData(
+            GAME_EFFECT_KIND.ACTIVATION_RECEIPT, record.data.payloadKind, record.id,
+            { ...contact, claimId: claim.id }, record.data.x, record.data.y);
+        receipt.damageReceipts = AstervoidsWireCodec.packCounterMap({
+            [claim.id.toLowerCase()]: contact.invulnerabilityRevision
+        });
+        if (receipt.payloadKind === PAYLOAD_KIND.NUKE || receipt.payloadKind === PAYLOAD_KIND.SMART_BOMB) {
+            if (receipt.payloadKind === PAYLOAD_KIND.NUKE) {
+                // Freeze this gameplay pivot's poses, not send-gated network anchors.
+                const context = buildReplicationContext(OBJECT_TYPES.ASTEROID);
+                asteroids = asteroids.map(asteroid => ({
+                    id: asteroid.id,
+                    data: context.instances.has(asteroid.id)
+                        ? currentKinematicData(OBJECT_TYPES.ASTEROID, asteroid.id, asteroid, context)
+                        : projectSpawnData(asteroid.data, computeSpawnStaleness(nowMs, asteroid.validAt))
+                }));
+            }
+            Object.assign(receipt, collectBlastTargets(receipt, asteroids, hazards));
+        }
+        return receipt;
+    }
+
+    function applyHazardReceipt(record, terminalOnly = false) {
+        const data = record.data, ship = game.ship;
+        if (data.kind !== GAME_EFFECT_KIND.ACTIVATION_RECEIPT
+            || (data.payloadKind !== PAYLOAD_KIND.MINE && data.payloadKind !== PAYLOAD_KIND.SPRAY)
+            || !ship || data.shipId !== game.multiplayer.myShipObjectId
+            || data.participantId !== ship.participantId?.toLowerCase()) return;
+        const hazardId = data.sourceId.toLowerCase();
+        if (Object.hasOwn(ship.handledHazards, hazardId)) return;
+        const revisions = AstervoidsWireCodec.unpackCounterMap(data.damageReceipts);
+        const revision = revisions[data.claimId?.toLowerCase()];
+        // Consume even an obsolete receipt, but never replay it onto a respawn.
+        ship.handledHazards = { ...ship.handledHazards, [hazardId]: 1 };
+        if (!terminalOnly && !isGameOver() && !ship.deathHold && ship.invulnerable <= 0
+            && revision === ship.invulnerabilityRevision) handleShipHit(ship);
+        syncLocalShipHazards(true);
+    }
+
+    function isHazardReceiptHandled(data) {
+        const ship = ObjectSync.getObject(data.shipId);
+        if (!ship) return true;
+        const handled = AstervoidsWireCodec.unpackCounterMap(ship.data.handledHazards);
+        if (!Object.hasOwn(handled, data.sourceId.toLowerCase())) return false;
+        return ship.ownerMemberId !== SessionClient.getCurrentMember()?.id
+            || ObjectSync.isDataConfirmed(ship.id, {
+                handledHazards: ship.data.handledHazards, hitCount: ship.data.hitCount
+            });
+    }
+
+    function applyOwnedBlastCommand(record) {
+        const data = record.data;
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const targets = AstervoidsWireCodec.unpackCounterMap(data.asteroidTargets);
+        for (const id of Object.keys(targets)) {
+            const target = ObjectSync.getObject(id);
+            if (!target || target.ownerMemberId !== myMemberId) continue;
+            const asteroid = game.astervoids.find(value => value.syncObjectId === id);
+            if (!asteroid) continue;
+            const collector = ObjectSync.getObject(data.shipId);
+            const impact = { bulletAngle: Math.atan2(asteroid.y - data.y, asteroid.x - data.x),
+                offsetN: 0, impactTorque: 0 };
+            applyOwnedAsteroidDamage(asteroid, {
+                damageId: record.id, participantId: data.participantId,
+                participantTag: data.participantTag, shipId: data.shipId
+            }, impact, collector?.ownerMemberId, getShipByMemberId(collector?.ownerMemberId),
+            data.payloadKind === PAYLOAD_KIND.NUKE);
+        }
+        for (const id of Object.keys(AstervoidsWireCodec.unpackCounterMap(data.hazardTargets))) {
+            const target = ObjectSync.getObject(id);
+            if (target && target.ownerMemberId === myMemberId && isHostileGameEffect(target.data.kind)) {
+                replaceGameEffect(target, []);
+            }
+        }
+    }
+
+    function isBlastCommandComplete(record) {
+        const data = record.data;
+        for (const id of Object.keys(AstervoidsWireCodec.unpackCounterMap(data.asteroidTargets))) {
+            const asteroid = ObjectSync.getObject(id);
+            if (!asteroid) continue;
+            const processed = AstervoidsWireCodec.unpackCounterMap(asteroid.data.processedDamage);
+            if (!Object.hasOwn(processed, record.id.toLowerCase())) return false;
+            if (asteroid.ownerMemberId === SessionClient.getCurrentMember()?.id
+                && !ObjectSync.isDataConfirmed(id, {
+                    hitsRemaining: asteroid.data.hitsRemaining, processedDamage: asteroid.data.processedDamage
+                })) return false;
+        }
+        return Object.keys(AstervoidsWireCodec.unpackCounterMap(data.hazardTargets))
+            .every(id => !ObjectSync.getObject(id));
+    }
+
+    function activateSoloPickup(record) {
+        game.effects = game.effects.filter(effect => effect !== record);
+        if (isGameOver()) return;
+        const data = record.data;
+        if (data.payloadKind === PAYLOAD_KIND.LEVELUP) {
+            const xp = getProgressionForXp(game.soloXp).nextLevelXp;
+            getLevelForXp(xp);
+            game.soloXp = xp;
+        } else if (data.payloadKind === PAYLOAD_KIND.EXTRA_LIFE) {
+            game.lives++;
+            announceExtraLifeAward();
+        } else {
+            const asteroids = game.astervoids.map(asteroid => ({
+                id: getAsteroidObjectId(asteroid), data: { x: asteroid.x, y: asteroid.y }
+            }));
+            const frozen = collectBlastTargets(data, asteroids, game.effects);
+            const targets = AstervoidsWireCodec.unpackCounterMap(frozen.asteroidTargets);
+            const hazards = AstervoidsWireCodec.unpackCounterMap(frozen.hazardTargets);
+            for (const id of Object.keys(targets)) {
+                const asteroid = game.astervoids.find(value => getAsteroidObjectId(value) === id);
+                if (!asteroid) continue;
+                applySoloAsteroidDamage(asteroid, { damageId: record.id }, {
+                    bulletAngle: Math.atan2(asteroid.y - data.y, asteroid.x - data.x),
+                    offsetN: 0, impactTorque: 0
+                }, game.ship, data.payloadKind === PAYLOAD_KIND.NUKE);
+            }
+            game.effects = game.effects.filter(effect => !Object.hasOwn(hazards, effect.id));
+        }
+        updateHUD();
+    }
+
+    function checkGameEffectContacts() {
+        const ship = game.ship, nowMs = game.effectContactNowMs;
+        if (!ship || ship.deathHold || isGameOver() || nowMs == null || game.connectionLost
+            || game.identityChanging || (game.state !== 'playing' && game.state !== 'waveDelay')) return;
+        for (const record of getGameEffectObjects()) {
+            const data = record.data;
+            const positive = data.kind === GAME_EFFECT_KIND.PICKUP;
+            if ((!positive && data.kind !== GAME_EFFECT_KIND.MINE && data.kind !== GAME_EFFECT_KIND.HOSTILE_BULLET)
+                || !isGameEffectReady(record) || nowMs < data.armedAt || nowMs >= data.expiresAt
+                || (!positive && ship.invulnerable > 0)
+                || !gameEffectTouchesShip(data, ship, nowMs, game.effectContactPreviousMs ?? nowMs)) continue;
+            if (isSessionMode()) {
+                const contactAt = data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET
+                    ? findGameEffectContactTime(data, ship, game.effectContactPreviousMs ?? nowMs, nowMs) : nowMs;
+                createGameContactClaim(record, ship, contactAt);
+            } else if (positive) {
+                activateSoloPickup(record);
+            } else {
+                game.effects = game.effects.filter(effect => effect !== record);
+                if (handleShipHit(ship)) break;
+            }
+        }
+    }
+
+    function cleanupGameContactClaims(nowMs) {
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        for (const claim of ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_CLAIM)) {
+            if (claim.ownerMemberId !== myMemberId) continue;
+            const data = claim.data;
+            const target = ObjectSync.getObject(data.targetId);
+            if (!target
+                || data.shipId !== game.multiplayer.myShipObjectId
+                || (isHostileGameEffect(target.data.kind)
+                    && data.invulnerabilityRevision !== game.ship?.invulnerabilityRevision)
+                || (nowMs != null && nowMs - data.claimedAt >= PROGRESSION.CLAIM_TIMEOUT_MS)) {
+                deleteSyncedObject(claim.id, 'game contact claim');
+                if (game.multiplayer.contactClaims.get(data.targetId)?.id === claim.id) {
+                    game.multiplayer.contactClaims.delete(data.targetId);
+                }
+            } else if (!game.multiplayer.contactClaims.has(data.targetId)) {
+                game.multiplayer.contactClaims.set(data.targetId, {
+                    id: claim.id, data, epoch: SessionClient.getSessionEpoch()
+                });
+            }
+        }
+        for (const [targetId, claim] of game.multiplayer.contactClaims) {
+            const target = ObjectSync.getObject(targetId);
+            if (!target || claim.data.shipId !== game.multiplayer.myShipObjectId
+                || (isHostileGameEffect(target.data.kind)
+                    && claim.data.invulnerabilityRevision !== game.ship?.invulnerabilityRevision)
+                || (nowMs != null && nowMs - claim.data.claimedAt >= PROGRESSION.CLAIM_TIMEOUT_MS)) {
+                game.multiplayer.contactClaims.delete(targetId);
+            }
+        }
+        for (const id of game.multiplayer.effectAnchors.keys()) {
+            if (!ObjectSync.getObject(id)) game.multiplayer.effectAnchors.delete(id);
+        }
+    }
+
+    function updateGameEffects(dt, terminalOnly = false) {
+        terminalOnly = terminalOnly || isGameOver();
+        if (!isSessionMode()) {
+            if (terminalOnly) {
+                if (game.effects.length) game.effects = [];
+                return;
+            }
+            game.simulationTimeMs += dt * 1000 / CONFIG.TARGET_FPS;
+        }
+        const nowMs = getGameEffectNow();
+        game.effectContactPreviousMs = game.effectContactNowMs;
+        game.effectContactNowMs = nowMs;
+        const effects = getGameEffectObjects();
+        if (!isSessionMode()) {
+            for (const record of [...effects]) {
+                if (nowMs >= record.data.expiresAt) {
+                    game.effects = game.effects.filter(effect => effect !== record);
+                } else if (record.data.kind === GAME_EFFECT_KIND.SPRAY && nowMs >= record.data.armedAt) {
+                    game.effects = game.effects.filter(effect => effect !== record);
+                    for (const data of buildSprayProjectiles(record)) {
+                        game.effects.push({ id: crypto.randomUUID(), data });
+                    }
+                }
+            }
+            return;
+        }
+
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const claims = ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_CLAIM);
+        const processed = getProcessedGameEffects();
+        for (const record of effects) {
+            const data = record.data;
+            if (data.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT
+                && (terminalOnly || (nowMs != null && isGameEffectReady(record)))) {
+                applyHazardReceipt(record, terminalOnly);
+                if (!terminalOnly && processed?.[record.id.toLowerCase()] === 1
+                    && (data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB)) {
+                    applyOwnedBlastCommand(record);
+                }
+            }
+            if (record.ownerMemberId !== myMemberId || game.multiplayer.effectMutations.has(record.id)
+                || !ensureOwnedGameEffectAnchor(record) || nowMs == null) continue;
+
+            if (data.kind === GAME_EFFECT_KIND.BREAK_RECEIPT) {
+                if (processed?.[record.id.toLowerCase()]) replaceGameEffect(record, []);
+                continue;
+            }
+            if (data.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT) {
+                if (!processed?.[record.id.toLowerCase()]) continue;
+                const hazard = data.payloadKind === PAYLOAD_KIND.MINE || data.payloadKind === PAYLOAD_KIND.SPRAY;
+                const blast = data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB;
+                const complete = hazard ? isHazardReceiptHandled(data)
+                    : !blast || terminalOnly || processed[record.id.toLowerCase()] === 2 || isBlastCommandComplete(record);
+                if (complete && (terminalOnly || nowMs - data.startedAt >= PROGRESSION.RECEIPT_FEEDBACK_MS)) {
+                    replaceGameEffect(record, []);
+                }
+                continue;
+            }
+
+            if (!terminalOnly && (data.kind === GAME_EFFECT_KIND.PICKUP
+                || data.kind === GAME_EFFECT_KIND.MINE || data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET)) {
+                const claim = chooseGameContactClaim(record, claims, nowMs);
+                if (claim) {
+                    const receipt = buildActivationReceipt(record, claim,
+                        ObjectSync.getObjectsByType(OBJECT_TYPES.ASTEROID), effects, nowMs);
+                    replaceGameEffect(record, [receipt]);
+                    continue;
+                }
+            }
+            if (nowMs >= data.expiresAt) {
+                replaceGameEffect(record, []);
+            } else if (!terminalOnly && data.kind === GAME_EFFECT_KIND.SPRAY && nowMs >= data.armedAt) {
+                replaceGameEffect(record, buildSprayProjectiles(record));
+            }
+        }
+        cleanupGameContactClaims(nowMs);
+    }
+
+    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold, effectObjects = []) {
         const processedHits = { ...ledgers.processedHits };
         const processedScores = { ...ledgers.processedScores };
+        const participantXp = { ...ledgers.participantXp };
+        const processedEffects = { ...ledgers.processedEffects };
+        const receipts = effectObjects.filter(record =>
+            record.data?.kind === GAME_EFFECT_KIND.BREAK_RECEIPT
+            || record.data?.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT)
+            .slice().sort((left, right) => left.id.toLowerCase().localeCompare(right.id.toLowerCase()));
         const hasPersonalHistory = ledgers.participantScores != null
             && ledgers.participantNumbers != null;
         // Local fatal-hit prediction needs only the shared ledgers. Publication
@@ -6779,15 +7693,16 @@
             for (const number of Object.values(participantNumbers)) {
                 lastNumber = Math.max(lastNumber, number);
             }
-            for (const ship of shipObjects) {
-                const participantId = ship.data?.participantId;
+            for (const record of [...shipObjects, ...receipts]) {
+                const participantId = record.data?.participantId;
                 if (!GuidUtils.isGuid(participantId)) continue;
                 const id = participantId.toLowerCase();
                 if (!Object.hasOwn(participantNumbers, id)) unseen.add(id);
                 if (participantTags && !Object.hasOwn(participantTags, id)
-                    && AstervoidsWireCodec.isParticipantTag(ship.data?.participantTag)) {
-                    participantTags[id] = ship.data.participantTag;
+                    && AstervoidsWireCodec.isParticipantTag(record.data?.participantTag)) {
+                    participantTags[id] = record.data.participantTag;
                 }
+                if (!Object.hasOwn(participantXp, id)) participantXp[id] = 0;
             }
             // Registration is independent of entry lives, including fatal and
             // departure pivots. Only the owner assigns these durable ordinals.
@@ -6820,7 +7735,8 @@
         // so that they are always from the same sync point. Using game.lives would
         // be stale if a remote delta arrived between the last updateGameStateFromSync()
         // and an ownership migration — causing incorrect lives on the new owner.
-        let lives = (persisted?.lives ?? local.lives) + pendingScoreLifeAwards;
+        const alreadyTerminal = persisted?.gameOverAt != null || persisted?.lives <= 0;
+        let lives = (persisted?.lives ?? local.lives) + (alreadyTerminal ? 0 : pendingScoreLifeAwards);
         
         // Accumulate score deltas from all ships (survives member departure)
         for (const ship of shipObjects) {
@@ -6843,6 +7759,47 @@
             }
         }
 
+        let announcePowerupLifeAward = false;
+        for (const receipt of receipts) {
+            if (!GuidUtils.isGuid(receipt.id)) throw new TypeError('Invalid effect receipt ID');
+            const effectId = receipt.id.toLowerCase();
+            if (Object.hasOwn(processedEffects, effectId)) continue;
+            const data = receipt.data;
+            if (!GuidUtils.isGuid(data.participantId)) {
+                throw new TypeError('Effect receipt is missing participant attribution');
+            }
+            const participantId = data.participantId.toLowerCase();
+            participantXp[participantId] ??= 0;
+            if (data.kind === GAME_EFFECT_KIND.BREAK_RECEIPT) {
+                if (!Number.isInteger(data.points) || data.points < 0 || data.points > 0xffffffff) {
+                    throw new RangeError('Invalid break receipt points');
+                }
+                participantXp[participantId] += PROGRESSION.XP_PER_ASTEROID;
+                groupScore += data.points;
+                if (hasPersonalHistory) participantScores[participantId] += data.points;
+                processedEffects[effectId] = 1;
+            } else {
+                // Terminal receipts remain bookkeeping, never a new command or revival.
+                const live = !alreadyTerminal && lives > 0;
+                processedEffects[effectId] = live ? 1 : 2;
+                if (live && data.payloadKind === PAYLOAD_KIND.LEVELUP) {
+                    participantXp[participantId] =
+                        getProgressionForXp(participantXp[participantId]).nextLevelXp;
+                } else if (live && data.payloadKind === PAYLOAD_KIND.EXTRA_LIFE) {
+                    lives++;
+                    announcePowerupLifeAward = true;
+                }
+            }
+            if (!Number.isSafeInteger(participantXp[participantId]) || participantXp[participantId] < 0) {
+                throw new RangeError('Participant XP exceeds the safe integer range');
+            }
+            if (!Number.isInteger(groupScore) || groupScore < 0 || groupScore > 0xffffffff
+                || (hasPersonalHistory && (!Number.isInteger(participantScores[participantId])
+                    || participantScores[participantId] < 0 || participantScores[participantId] > 0xffffffff))) {
+                throw new RangeError('Receipt score exceeds the wire range');
+            }
+        }
+
         // Score-based lives are derived from the authoritative shared total.
         // The persisted count makes the award idempotent across ownership migration.
         const eligibleScoreLifeAwards = countExtraLivesForScore(
@@ -6850,7 +7807,7 @@
         const newScoreLifeAwards = Math.max(
             0, eligibleScoreLifeAwards - scoreLifeAwardCount);
         let announceScoreLifeAward = false;
-        if (newScoreLifeAwards > 0 && lives > 0) {
+        if (newScoreLifeAwards > 0 && lives > 0 && !alreadyTerminal) {
             lives += newScoreLifeAwards;
             scoreLifeAwardCount += newScoreLifeAwards;
             observedScoreLifeAwardCount = scoreLifeAwardCount;
@@ -6898,7 +7855,7 @@
         let countedParticipantCount = Object.keys(countedParticipants).length;
         // Prediction can receive partial ledgers; never lower the paid high-water mark.
         let peakShipCount = Math.max(persisted?.peakShipCount || 0, countedParticipantCount);
-        if (lives > 0) {
+        if (lives > 0 && !alreadyTerminal) {
             for (const ship of shipObjects) {
                 // Only an explicit participantId is reconnect-safe. Falling back
                 // to the owning member would re-count the same player after every
@@ -6936,10 +7893,13 @@
             participantScores,
             participantNumbers,
             ...(participantTags ? { participantTags } : {}),
+            participantXp,
+            processedEffects,
             peakShipCount,
             scoreLifeAwardCount,
             observedScoreLifeAwardCount,
             announceScoreLifeAward,
+            announcePowerupLifeAward,
             beatStopCount,
             terminalShipId,
             // A spectator inheriting ownership must not publish lobby as game state.
@@ -6969,7 +7929,7 @@
         game.score = next.groupScore;
         game.multiplayer.observedScoreLifeAwardCount = next.observedScoreLifeAwardCount;
         if (applyEffects) {
-            if (next.announceScoreLifeAward) announceExtraLifeAward();
+            if (next.announceScoreLifeAward || next.announcePowerupLifeAward) announceExtraLifeAward();
             for (let i = 0; i < next.beatStopCount; i++) AudioSystem.beat.stop();
         }
         game.lives = next.lives;
@@ -6977,9 +7937,10 @@
 
     function serializeGameState(next, terminal, packedLedgers = null) {
         const { processedHits, processedScores, countedParticipants,
-            participantScores, participantNumbers, participantTags } = next;
-        if (participantScores == null || participantNumbers == null || participantTags == null) {
-            throw new Error('Cannot publish GameState without participant history');
+            participantScores, participantNumbers, participantTags, participantXp, processedEffects } = next;
+        if (participantScores == null || participantNumbers == null || participantTags == null
+            || participantXp == null || processedEffects == null) {
+            throw new Error('Cannot publish GameState without participant and progression history');
         }
         const ledgers = packedLedgers ?? {
             processedHits: AstervoidsWireCodec.packCounterMap(processedHits),
@@ -6987,7 +7948,9 @@
             countedParticipants: AstervoidsWireCodec.packCounterMap(countedParticipants),
             participantScores: AstervoidsWireCodec.packCounterMap(participantScores),
             participantNumbers: AstervoidsWireCodec.packCounterMap(participantNumbers),
-            participantTags: AstervoidsWireCodec.packTagMap(participantTags)
+            participantTags: AstervoidsWireCodec.packTagMap(participantTags),
+            participantXp: AstervoidsWireCodec.packXpMap(participantXp),
+            processedEffects: AstervoidsWireCodec.packCounterMap(processedEffects)
         };
         return {
             type: OBJECT_TYPES.GAME_STATE,
@@ -7004,6 +7967,8 @@
             participantScores: ledgers.participantScores,
             participantNumbers: ledgers.participantNumbers,
             participantTags: ledgers.participantTags,
+            participantXp: ledgers.participantXp,
+            processedEffects: ledgers.processedEffects,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -7082,9 +8047,10 @@
     function readGameStateLedger(value, previous, packed, minimum = null) {
         if (gameStateLedgerMatches(value, packed)) return packed;
         if (gameStateLedgerMatches(value, previous)) return previous;
-        const decoded = minimum === 'tag' ? AstervoidsWireCodec.unpackTagMap(value)
+        const decoded = minimum === 'xp' ? AstervoidsWireCodec.unpackXpMap(value)
+            : minimum === 'tag' ? AstervoidsWireCodec.unpackTagMap(value)
             : AstervoidsWireCodec.unpackCounterMap(value);
-        const counters = minimum === null || minimum === 'tag' ? decoded
+        const counters = minimum === null || minimum === 'tag' || minimum === 'xp' ? decoded
             : normalizeParticipantLedger(decoded, value, minimum);
         return {
             counters,
@@ -7202,11 +8168,13 @@
         return { counters, bytes, snapshot: new Uint8Array(bytes) };
     }
 
-    function gameStateCalculationInputs(data, hits, scores, counted, ships, history = null) {
+    function gameStateCalculationInputs(data, hits, scores, counted, ships, history = null,
+        xp = null, effects = null, effectObjects = []) {
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
             data?.peakShipCount, data?.state, hits, scores, counted,
             history?.scores, history?.numbers, history?.tags,
+            xp, effects, data?.gameOverAt,
             data?.terminalShipId,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
             CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
@@ -7216,6 +8184,11 @@
         for (const ship of ships) {
             inputs.push(ship.id, ship.ownerMemberId, ship.data?.participantId,
                 ship.data?.score, ship.data?.hitCount, ship.data?.participantTag);
+        }
+        for (const effect of effectObjects) {
+            inputs.push(effect.id, effect.ownerMemberId, effect.data?.kind,
+                effect.data?.payloadKind, effect.data?.participantId, effect.data?.participantTag,
+                effect.data?.points);
         }
         return inputs;
     }
@@ -7269,14 +8242,24 @@
             }
             cache.history = readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory);
             if (!cache.history) throw new Error('Participant score history is missing');
+            if (gsObj.data?.participantXp == null || gsObj.data?.processedEffects == null) {
+                throw new Error('Participant progression history is missing');
+            }
+            cache.xp = readGameStateLedger(gsObj.data.participantXp, cache.xp, cache.packedXp, 'xp');
+            cache.effects = readGameStateLedger(
+                gsObj.data.processedEffects, cache.effects, cache.packedEffects);
         } catch (error) {
             reportMalformedGameStateLedgers(gsObj, error);
             return;
         }
 
         const ships = shipInputs ?? ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
+        const effectObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT).filter(record =>
+            (record.data?.kind !== GAME_EFFECT_KIND.BREAK_RECEIPT
+                && record.data?.kind !== GAME_EFFECT_KIND.ACTIVATION_RECEIPT) || isGameEffectReady(record));
         const inputs = gameStateCalculationInputs(
-            gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history);
+            gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
+            cache.xp, cache.effects, effectObjects);
         const changed = !gameStateInputsEqual(inputs, cache.inputs);
         if (changed) {
             try {
@@ -7288,7 +8271,9 @@
                         countedParticipants: cache.counted.counters,
                         participantScores: cache.history.scores.counters,
                         participantNumbers: cache.history.numbers.counters,
-                        participantTags: cache.history.tags.counters
+                        participantTags: cache.history.tags.counters,
+                        participantXp: cache.xp.counters,
+                        processedEffects: cache.effects.counters
                     },
                     ships,
                     {
@@ -7296,9 +8281,8 @@
                         state: game.state,
                         observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
                     },
-                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD);
+                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, effectObjects);
             } catch (error) {
-                if (!(error instanceof RangeError)) throw error;
                 reportMalformedGameStateLedgers(gsObj, error);
                 return;
             }
@@ -7329,6 +8313,8 @@
         const numbers = packGameStateLedger(next.participantNumbers, cache.packedHistory?.numbers);
         const tags = packGameStateLedger(
             next.participantTags, cache.packedHistory?.tags, AstervoidsWireCodec.packTagMap);
+        const packedXp = packGameStateLedger(next.participantXp, cache.packedXp, AstervoidsWireCodec.packXpMap);
+        const packedEffects = packGameStateLedger(next.processedEffects, cache.packedEffects);
         const packedHistory = scores === cache.packedHistory?.scores
             && numbers === cache.packedHistory?.numbers && tags === cache.packedHistory?.tags
             ? cache.packedHistory : { scores, numbers, tags };
@@ -7336,22 +8322,28 @@
             || packedCounted !== cache.packedCounted
             || packedHistory?.scores !== cache.packedHistory?.scores
             || packedHistory?.numbers !== cache.packedHistory?.numbers
-            || packedHistory?.tags !== cache.packedHistory?.tags;
+            || packedHistory?.tags !== cache.packedHistory?.tags
+            || packedXp !== cache.packedXp || packedEffects !== cache.packedEffects;
         cache.packedHits = packedHits;
         cache.packedScores = packedScores;
         cache.packedCounted = packedCounted;
         cache.packedHistory = packedHistory;
+        cache.packedXp = packedXp;
+        cache.packedEffects = packedEffects;
         const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores
             || cache.counted !== packedCounted
             || cache.history?.scores !== packedHistory?.scores
             || cache.history?.numbers !== packedHistory?.numbers
-            || cache.history?.tags !== packedHistory?.tags;
+            || cache.history?.tags !== packedHistory?.tags
+            || cache.xp !== packedXp || cache.effects !== packedEffects;
         const gameStateData = serializeGameState(next, terminal, {
             processedHits: packedHits.bytes, processedScores: packedScores.bytes,
             countedParticipants: packedCounted.bytes,
             participantScores: packedHistory.scores.bytes,
             participantNumbers: packedHistory.numbers.bytes,
-            participantTags: packedHistory.tags.bytes
+            participantTags: packedHistory.tags.bytes,
+            participantXp: packedXp.bytes,
+            processedEffects: packedEffects.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
             'peakShipCount', 'state', 'terminalShipId'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
@@ -7367,11 +8359,14 @@
             cache.counted = readGameStateLedger(
                 gsObj.data?.countedParticipants, cache.counted, packedCounted);
             cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory);
+            cache.xp = readGameStateLedger(gsObj.data.participantXp, cache.xp, packedXp, 'xp');
+            cache.effects = readGameStateLedger(gsObj.data.processedEffects, cache.effects, packedEffects);
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
             // the attempted payload (updateObject can fail).
             cache.inputs = gameStateCalculationInputs(
-                gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history);
+                gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
+                cache.xp, cache.effects, effectObjects);
         }
     }
 
@@ -7459,6 +8454,9 @@
                 game.bullets = [];
                 game.score = 0;
                 game.wave = 0;
+                game.effects = [];
+                game.effectContactNowMs = null;
+                game.effectContactPreviousMs = null;
             } else if (terminalSession) {
                 // Apply terminal GameState before any kinematic record. Records
                 // without their owner-authored target remain unbound until the
@@ -7550,6 +8548,11 @@
             game.bullets = [];
             game.score = 0;
             game.wave = 0;
+            game.soloXp = 0;
+            game.simulationTimeMs = 0;
+            game.effects = [];
+            game.effectContactNowMs = null;
+            game.effectContactPreviousMs = null;
         }
         
         // Only set initial defaults for fresh game starts (authority starting new game
@@ -7558,6 +8561,8 @@
         if (freshGameStart) {
             game.state = 'playing';
             game.speedMultiplier = 1;
+            hudCache.xp = null;
+            hudCache.xpLevel = null;
         }
         
         // Hide start screen
@@ -7680,6 +8685,11 @@
             asteroid.angle = simRandom() * Math.PI * 2;
             asteroid.rotationSpeed = simRandomRange(-0.02, 0.02);
         }
+        const highestLevel = getRunHighestLevel();
+        if (highestLevel === null) return null;
+        const armorRoll = highestLevel >= 4 ? simRandom() : 0;
+        const payloadRoll = highestLevel >= 4 ? simRandom() : 0;
+        Object.assign(asteroid, chooseAsteroidLoadout(highestLevel, armorRoll, payloadRoll));
         
         // In session mode, let OnObjectCreated → updateAstervoidsFromSync handle local state
         // In solo mode, push directly to game state
@@ -7856,15 +8866,9 @@
      * @param {{bulletAngle:number, offsetN:number, impactTorque:number}|null} impact
      * @param {Ship|null} shooterShip ship that fired the destroying shot; null skips deflection
      */
-    function splitAsteroid(asteroid, childOwnerMemberId = null, impact = null, shooterShip = null) {
+    function splitAsteroid(asteroid, childOwnerMemberId = null, impact = null, shooterShip = null, damage = null) {
         const splitScales = getEffectiveAsteroidAspectScales();
         const effectiveMinRadius = CONFIG.MIN_ASTEROID_RADIUS * splitScales.radiusScale;
-        if (asteroid.radius <= effectiveMinRadius) {
-            if (isSessionMode() && asteroid.syncObjectId) {
-                deleteSyncedAsteroid(asteroid);
-            }
-            return;
-        }
 
         // Build a config view with aspect-scaled physics values so that
         // DEFLECTION_KICK, SEPARATION_ENERGY, and radius thresholds are already
@@ -7877,8 +8881,8 @@
             MIN_ASTEROID_RADIUS: effectiveMinRadius,
             INITIAL_ASTEROID_RADIUS: CONFIG.INITIAL_ASTEROID_RADIUS * splitScales.radiusScale,
         });
-        const { children } = AstervoidsFracture.calculateAsteroidFragments(
-            asteroid, impact, fractureConfig);
+        const children = asteroid.radius <= effectiveMinRadius ? []
+            : AstervoidsFracture.calculateAsteroidFragments(asteroid, impact, fractureConfig).children;
 
         // ─── Shooter-deflection (linear-only) ──────────────────────────────
         // After fragment kinematics are settled, nudge any surviving child off a
@@ -7941,11 +8945,16 @@
         });
 
         if (isSessionMode() && asteroid.syncObjectId) {
-            replaceSyncedAsteroid(asteroid, newAsteroids, childOwnerMemberId);
+            const effects = damage ? buildAsteroidBreakEffects(asteroid, damage) : [];
+            return replaceSyncedAsteroid(asteroid, newAsteroids, childOwnerMemberId, effects);
         } else {
             const idx = game.astervoids.indexOf(asteroid);
             if (idx >= 0) game.astervoids.splice(idx, 1);
             game.astervoids.push(...newAsteroids);
+            if (damage && asteroid.payloadKind !== PAYLOAD_KIND.NONE) {
+                const payload = buildAsteroidBreakEffects(asteroid, damage)[1];
+                if (payload) addSoloGameEffect(payload);
+            }
         }
 
         updateHUD();
@@ -7956,7 +8965,7 @@
      * Atomically replace a synced asteroid with child asteroids.
      * Deletes parent and creates children in a single broadcast to all members.
      */
-    async function replaceSyncedAsteroid(parentAsteroid, childAsteroids, ownerMemberId = null) {
+    async function replaceSyncedAsteroid(parentAsteroid, childAsteroids, ownerMemberId = null, effects = []) {
         if (!isSessionMode() || !parentAsteroid.syncObjectId) return;
         const replacementStartedPerf = performance.now();
         parentAsteroid.replacementStartedPerf = replacementStartedPerf;
@@ -7965,13 +8974,14 @@
                 child.clampMotion();
                 return child.toSyncData();
             });
-            await ObjectSync.replaceObject(
-                parentAsteroid.syncObjectId, replacements, 'Session', ownerMemberId);
+            return await ObjectSync.replaceObject(
+                parentAsteroid.syncObjectId, [...replacements, ...effects], 'Session', ownerMemberId);
         } catch (err) {
             if (parentAsteroid.replacementStartedPerf === replacementStartedPerf) {
                 delete parentAsteroid.replacementStartedPerf;
             }
             _error('[Multiplayer] Failed to replace asteroid:', err);
+            return null;
         }
     }
 
@@ -8128,17 +9138,15 @@
             AudioSystem.thrustSound.stop();
         }
         
-        // Shoot — only count local player's active (non-pending) bullets toward the cap
+        // Reserve the whole volley; the old active-bullet budget scales with level.
         const myBulletCount = game.bullets.filter(b => b.ownerMemberId === game.ship.memberId && !b.pendingHit).length;
-        if (input.fire() && myBulletCount < CONFIG.MAX_BULLETS) {
-            const bullet = game.ship.shoot();
-            if (bullet) {
-                game.bullets.push(bullet);
-                
-                // Create synced bullet in multiplayer
-                if (isSessionMode()) {
-                    createSyncedBullet(bullet);
-                }
+        const progression = getLocalProgression();
+        if (input.fire() && progression
+            && myBulletCount + progression.level <= CONFIG.MAX_BULLETS * progression.level) {
+            const volley = game.ship.shoot(progression.level);
+            if (volley) {
+                game.bullets.push(...volley);
+                if (isSessionMode()) volley.forEach(bullet => createSyncedBullet(bullet));
             }
         }
     }
@@ -8194,44 +9202,76 @@
         }
     }
 
-    // Same owner: resolve gameplay locally. There is no pendingHit transition
-    // for peers to observe, so emit the target-owned cue before ordered
-    // delete/replace.
+    // Damage is confirmed by the asteroid owner, not by a disappearing target.
     function resolveOwnedAsteroidHit(bullet, bulletIndex, asteroid) {
-        const points = asteroid.getPoints();
-        const impact = computeBulletAsteroidImpact(bullet, asteroid);
-        // The asteroid-owned event runs locally before send. On a successful
-        // connection-ordered broadcast, peers receive it before the subsequent
-        // replacement; a rejected/failed event can remain local-only.
+        const impact = claimCrossOwnerAsteroidHit(bullet, asteroid, false);
         emitOwnedAsteroidImpactCue(asteroid, bullet, impact);
-        const removedBullet = game.bullets.splice(bulletIndex, 1)[0];
-        if (removedBullet.syncObjectId) {
-            deleteSyncedBullet(removedBullet);
-        }
-        // Split sends to server — OnObjectReplaced handles asteroid state for all clients
-        splitAsteroid(asteroid, null, impact, game.ship);
-        // Self-award score on own ship
-        if (game.ship) {
-            game.ship.score = (game.ship.score || 0) + points;
-            emitShipStateChanged();
-        }
+        applyOwnedAsteroidDamage(asteroid, bullet, impact, bullet.ownerMemberId, game.ship);
     }
 
     // Cross-owner claim: hide the local bullet, show the shooter cue
     // immediately, and publish target-relative hit data on the bullet. Only the
     // asteroid owner can confirm by replacing/deleting the target.
-    function claimCrossOwnerAsteroidHit(bullet, asteroid) {
+    function claimCrossOwnerAsteroidHit(bullet, asteroid, showCue = true) {
         bullet.pendingHit = true;
         bullet.hitTargetId = asteroid.syncObjectId;
-        bullet.pendingPoints = asteroid.getPoints();
         const impact = computeBulletAsteroidImpact(bullet, asteroid);
         bullet.hitImpactTorque = impact.impactTorque;
         bullet.hitBulletAngle = impact.bulletAngle;
         bullet.hitOffsetN = impact.offsetN;
-        CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
+        if (showCue) CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
         if (bullet.syncObjectId) {
             ObjectSync.updateObject(bullet.syncObjectId, bullet.toUpdateData(), true);
         }
+        return impact;
+    }
+
+    async function applyOwnedAsteroidDamage(asteroid, damage, impact = null,
+        childOwnerMemberId = null, shooterShip = null, ignoreArmor = false) {
+        const record = asteroid.syncObjectId && ObjectSync.getObject(asteroid.syncObjectId);
+        if (!record || record.ownerMemberId !== SessionClient.getCurrentMember()?.id
+            || asteroid.replacementInFlight || isGameOver() || !GuidUtils.isGuid(damage.damageId)) return false;
+        asteroid.fromGameplayData(record.data);
+        const id = damage.damageId.toLowerCase();
+        if (Object.hasOwn(asteroid.processedDamage, id)) return false;
+        if (!ignoreArmor && asteroid.hitsRemaining > 1) {
+            asteroid.hitsRemaining--;
+            asteroid.processedDamage = { ...asteroid.processedDamage, [id]: 1 };
+            asteroid._processedDamageBytes = AstervoidsWireCodec.packCounterMap(asteroid.processedDamage);
+            ObjectSync.updateObject(record.id, { ...asteroid.toUpdateData(), ...asteroid.toDamageData() }, true);
+            return true;
+        }
+        const activeMembers = SessionClient.getCurrentSession()?.members || [];
+        const owner = activeMembers.some(member => member.id === childOwnerMemberId) ? childOwnerMemberId : null;
+        const epoch = SessionClient.getSessionEpoch();
+        asteroid.replacementInFlight = true;
+        try {
+            const result = await splitAsteroid(asteroid, owner, impact, shooterShip, damage);
+            return result !== null && result !== undefined;
+        } finally {
+            if (epoch === SessionClient.getSessionEpoch()) asteroid.replacementInFlight = false;
+        }
+    }
+
+    function applySoloAsteroidDamage(asteroid, damage, impact = null, shooterShip = game.ship, ignoreArmor = false) {
+        const id = damage.damageId.toLowerCase();
+        if (Object.hasOwn(asteroid.processedDamage, id) || !game.astervoids.includes(asteroid)) return false;
+        asteroid.processedDamage = { ...asteroid.processedDamage, [id]: 1 };
+        asteroid._processedDamageBytes = AstervoidsWireCodec.packCounterMap(asteroid.processedDamage);
+        if (!ignoreArmor && asteroid.hitsRemaining > 1) {
+            asteroid.hitsRemaining--;
+            return true;
+        }
+        game.astervoids.splice(game.astervoids.indexOf(asteroid), 1);
+        const xp = game.soloXp + PROGRESSION.XP_PER_ASTEROID;
+        getLevelForXp(xp);
+        game.soloXp = xp;
+        awardSoloAsteroidScore(asteroid.getPoints());
+        const size = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large'
+            : asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
+        AudioSystem.playExplosion(size);
+        splitAsteroid(asteroid, null, impact, shooterShip, damage);
+        return true;
     }
 
     // Solo mode — process locally. The cue starts before either splice so it
@@ -8240,12 +9280,7 @@
         const impact = computeBulletAsteroidImpact(bullet, asteroid);
         CollisionEffects.startAsteroidHit(bullet, asteroid, impact);
         game.bullets.splice(bulletIndex, 1);
-        game.astervoids.splice(asteroidIndex, 1);
-        awardSoloAsteroidScore(asteroid.getPoints());
-        const explosionSize = asteroid.radius >= CONFIG.ASTEROID_LARGE_THRESHOLD ? 'large' :
-                              asteroid.radius >= CONFIG.ASTEROID_MEDIUM_THRESHOLD ? 'medium' : 'small';
-        AudioSystem.playExplosion(explosionSize);
-        splitAsteroid(asteroid, null, impact, game.ship);
+        applySoloAsteroidDamage(asteroid, bullet, impact, game.ship);
     }
 
     // Asteroid owner confirms remote pendingHit claims targeting its objects.
@@ -8253,8 +9288,6 @@
         const bulletObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.BULLET);
         for (const bulletObj of bulletObjects) {
             if (!bulletObj.data?.pendingHit || !bulletObj.data?.hitTargetId) continue;
-            if (bulletObj.data?.ownerMemberId === myMemberId) continue; // skip own bullets
-            if (game.multiplayer.processedPendingBullets.has(bulletObj.id)) continue;
 
             // Check if we own the target asteroid
             const targetSyncObj = ObjectSync.getObject(bulletObj.data.hitTargetId);
@@ -8264,28 +9297,18 @@
             const asteroid = game.astervoids.find(a => a.syncObjectId === bulletObj.data.hitTargetId);
             if (!asteroid) continue; // Already destroyed
 
-            // Mark as processed to prevent duplicate splits during server round-trip
-            game.multiplayer.processedPendingBullets.add(bulletObj.id);
-
-            // Split asteroid with split attribution for bullet owner confirmation
             const impact = {
                 bulletAngle: bulletObj.data.hitBulletAngle || 0,
                 offsetN: bulletObj.data.hitOffsetN || 0,
                 impactTorque: bulletObj.data.hitImpactTorque || 0
             };
-            splitAsteroid(asteroid, bulletObj.data.ownerMemberId, impact, getShipByMemberId(bulletObj.data.ownerMemberId));
-        }
-
-        // Clean up processed bullets that no longer exist
-        for (const bulletId of game.multiplayer.processedPendingBullets) {
-            if (!ObjectSync.getObject(bulletId)) {
-                game.multiplayer.processedPendingBullets.delete(bulletId);
-            }
+            applyOwnedAsteroidDamage(asteroid, bulletObj.data, impact,
+                bulletObj.data.ownerMemberId, getShipByMemberId(bulletObj.data.ownerMemberId));
         }
     }
 
-    // Bullet owner treats authoritative target removal/replacement as
-    // confirmation, awards its score, and retires the hidden bullet.
+    // Nonbreaking acknowledgements retire a bullet without a reward. A bare
+    // disappearance also retires it, but is never evidence of an award.
     function retireConfirmedPendingBullets(myMemberId) {
         for (let i = game.bullets.length - 1; i >= 0; i--) {
             const bullet = game.bullets[i];
@@ -8293,12 +9316,14 @@
 
             // Check if target asteroid still exists
             const targetObj = bullet.hitTargetId ? ObjectSync.getObject(bullet.hitTargetId) : null;
-            if (targetObj) continue;
-            // Asteroid gone — bullet hit was processed (or asteroid destroyed by other means)
-            const points = bullet.pendingPoints || CONFIG.POINTS_SMALL;
-            if (game.ship) {
-                game.ship.score = (game.ship.score || 0) + points;
-                emitShipStateChanged();
+            if (targetObj) {
+                const processed = AstervoidsWireCodec.unpackCounterMap(targetObj.data.processedDamage);
+                if (!Object.hasOwn(processed, bullet.damageId.toLowerCase())) continue;
+                if (targetObj.ownerMemberId === myMemberId
+                    && !ObjectSync.isDataConfirmed(targetObj.id, {
+                        hitsRemaining: targetObj.data.hitsRemaining,
+                        processedDamage: targetObj.data.processedDamage
+                    })) continue;
             }
             const removedBullet = game.bullets.splice(i, 1)[0];
             if (removedBullet.syncObjectId) {
@@ -8375,7 +9400,9 @@
                 const crashBullet = new Bullet(
                     crash.x, crash.y,
                     game.ship.velocityX, game.ship.velocityY,
-                    game.ship.colorIndex, game.ship.memberId);
+                    game.ship.colorIndex, game.ship.memberId,
+                    { participantId: game.ship.participantId, participantTag: game.ship.participantTag,
+                        shipId: game.multiplayer.myShipObjectId || game.ship.syncObjectId });
                 // A terminal crash keeps today's behavior exactly: the wreck
                 // holds (or solo ends) and the asteroid is left untouched.
                 if (!handleShipHit(game.ship)) {
@@ -8389,6 +9416,7 @@
             confirmOwnedAsteroidHitClaims(myMemberId);
             retireConfirmedPendingBullets(myMemberId);
         }
+        checkGameEffectContacts();
     }
 
     // Pass-local data is prepared on first encounter, not from an array snapshot:
@@ -8782,7 +9810,8 @@
                 layoutChanged = true;
             }
         }
-        if (layoutChanged && sessionMode) fitSessionHud();
+        layoutChanged = updateProgressionHud(false) || layoutChanged;
+        if (layoutChanged) fitProgressionHud();
     }
 
     function publishDebugMetrics() {
@@ -8848,6 +9877,163 @@
             ctx.closePath();
         }
         ctx.stroke();
+        for (const asteroid of astervoids) {
+            if (asteroid.maxHits > 1) drawAsteroidArmor(ctx, asteroid);
+        }
+    }
+
+    function drawPayloadGlyph(ctx, kind, x, y, size) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.beginPath();
+        if (kind === PAYLOAD_KIND.NUKE) {
+            ctx.arc(0, 0, size * 0.2, 0, Math.PI * 2);
+            for (let i = 0; i < 3; i++) {
+                const angle = i * Math.PI * 2 / 3 - Math.PI / 2;
+                ctx.moveTo(Math.cos(angle - 0.4) * size, Math.sin(angle - 0.4) * size);
+                ctx.lineTo(Math.cos(angle) * size * 0.45, Math.sin(angle) * size * 0.45);
+                ctx.lineTo(Math.cos(angle + 0.4) * size, Math.sin(angle + 0.4) * size);
+                ctx.closePath();
+            }
+        } else if (kind === PAYLOAD_KIND.LEVELUP) {
+            for (const yOffset of [-0.2, 0.65]) {
+                ctx.moveTo(-size * 0.65, size * yOffset);
+                ctx.lineTo(0, size * (yOffset - 0.6));
+                ctx.lineTo(size * 0.65, size * yOffset);
+            }
+        } else if (kind === PAYLOAD_KIND.EXTRA_LIFE) {
+            ctx.moveTo(-size * 0.8, 0);
+            ctx.lineTo(size * 0.8, 0);
+            ctx.moveTo(0, -size * 0.8);
+            ctx.lineTo(0, size * 0.8);
+        } else if (kind === PAYLOAD_KIND.SMART_BOMB) {
+            ctx.arc(0, 0, size * 0.55, 0, Math.PI * 2);
+            for (let i = 0; i < 4; i++) {
+                const angle = i * Math.PI / 2;
+                ctx.moveTo(Math.cos(angle) * size * 0.2, Math.sin(angle) * size * 0.2);
+                ctx.lineTo(Math.cos(angle) * size, Math.sin(angle) * size);
+            }
+        } else if (kind === PAYLOAD_KIND.MINE || kind === PAYLOAD_KIND.SPRAY) {
+            const lanes = kind === PAYLOAD_KIND.MINE ? 8 : PROGRESSION.SPRAY_LANES;
+            for (let i = 0; i < lanes; i++) {
+                const angle = i * Math.PI * 2 / lanes;
+                ctx.moveTo(Math.cos(angle) * size * 0.4, Math.sin(angle) * size * 0.4);
+                ctx.lineTo(Math.cos(angle) * size, Math.sin(angle) * size);
+            }
+            if (kind === PAYLOAD_KIND.MINE) {
+                ctx.moveTo(size * 0.4, 0);
+                ctx.arc(0, 0, size * 0.4, 0, Math.PI * 2);
+            }
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function drawAsteroidArmor(ctx, asteroid) {
+        const x = fromNormalizedX(asteroid.x), y = fromNormalizedY(asteroid.y);
+        const radius = fromNormalizedSize(asteroid.radius);
+        const vertices = asteroid.getWorldVertices();
+        ctx.save();
+        ctx.strokeStyle = CONFIG.STROKE_COLOR;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let layer = 1; layer < asteroid.maxHits; layer++) {
+            const scale = 1 - layer * 0.14;
+            for (let i = 0; i < vertices.length; i++) {
+                const px = x + (vertices[i].x - x) * scale;
+                const py = y + (vertices[i].y - y) * scale;
+                if (i === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+        }
+        for (let i = 0; i < asteroid.maxHits; i++) {
+            const px = x + (i - (asteroid.maxHits - 1) / 2) * radius * 0.3;
+            const py = y - radius * 0.45;
+            if (i < asteroid.hitsRemaining) {
+                ctx.moveTo(px + 2, py);
+                ctx.arc(px, py, 2, 0, Math.PI * 2);
+            } else {
+                ctx.moveTo(px - 2, py - 2);
+                ctx.lineTo(px + 2, py + 2);
+            }
+        }
+        for (let i = 0; i < asteroid.maxHits - asteroid.hitsRemaining; i++) {
+            const sign = i % 2 ? -1 : 1;
+            ctx.moveTo(x + sign * radius * 0.75, y + radius * 0.15);
+            ctx.lineTo(x + sign * radius * 0.4, y + radius * 0.4);
+            ctx.lineTo(x + sign * radius * 0.55, y + radius * 0.55);
+            ctx.lineTo(x + sign * radius * 0.2, y + radius * 0.8);
+        }
+        ctx.stroke();
+        drawPayloadGlyph(ctx, asteroid.payloadKind, x, y + radius * 0.1, Math.max(3, radius * 0.22));
+        ctx.restore();
+    }
+
+    function drawGameEffects(ctx) {
+        const nowMs = getGameEffectNow();
+        if (nowMs == null) return;
+        for (const record of getGameEffectObjects()) {
+            const data = record.data;
+            if (!isGameEffectReady(record) || data.kind === GAME_EFFECT_KIND.BREAK_RECEIPT) continue;
+            const receipt = data.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT;
+            const age = nowMs - data.startedAt;
+            if (receipt ? age >= PROGRESSION.RECEIPT_FEEDBACK_MS : nowMs >= data.expiresAt) continue;
+            const pose = getGameEffectPose(data, nowMs);
+            const x = fromNormalizedX(pose.x), y = fromNormalizedY(pose.y);
+            const radius = fromNormalizedSize(PROGRESSION.PICKUP_RADIUS);
+            ctx.save();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = isHostileGameEffect(data.kind) ? '#ff8080' : '#fff';
+            ctx.fillStyle = ctx.strokeStyle;
+            if (data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET) {
+                const r = Math.max(2, fromNormalizedSize(CONFIG.BULLET_RADIUS));
+                ctx.beginPath();
+                ctx.moveTo(x - r, y - r);
+                ctx.lineTo(x + r, y + r);
+                ctx.moveTo(x - r, y + r);
+                ctx.lineTo(x + r, y - r);
+                ctx.moveTo(x, y);
+                ctx.lineTo(x - Math.cos(data.angle) * r * 3, y - Math.sin(data.angle) * r * 3);
+                ctx.stroke();
+            } else if (data.kind === GAME_EFFECT_KIND.SPRAY) {
+                ctx.setLineDash([3, 5]);
+                const reach = fromNormalizedSize(0.08);
+                ctx.beginPath();
+                for (let i = 0; i < PROGRESSION.SPRAY_LANES; i++) {
+                    const angle = i * Math.PI * 2 / PROGRESSION.SPRAY_LANES;
+                    ctx.moveTo(x + Math.cos(angle) * radius, y + Math.sin(angle) * radius);
+                    ctx.lineTo(x + Math.cos(angle) * reach, y + Math.sin(angle) * reach);
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+                drawPayloadGlyph(ctx, PAYLOAD_KIND.SPRAY, x, y, radius * 0.65);
+            } else if (data.kind === GAME_EFFECT_KIND.MINE) {
+                if (nowMs < data.armedAt) ctx.setLineDash([2, 3]);
+                drawPayloadGlyph(ctx, PAYLOAD_KIND.MINE, x, y, radius);
+                ctx.setLineDash([]);
+            } else {
+                if (receipt) {
+                    const progress = Math.max(0, age / PROGRESSION.RECEIPT_FEEDBACK_MS);
+                    ctx.globalAlpha = reducedGameplayMotion ? 1 : 1 - progress;
+                    if (data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB) {
+                        const reach = data.payloadKind === PAYLOAD_KIND.NUKE ? PROGRESSION.NUKE_RADIUS : 0.5;
+                        ctx.beginPath();
+                        ctx.arc(x, y, fromNormalizedSize(reach) * (reducedGameplayMotion ? 1 : progress), 0, Math.PI * 2);
+                        ctx.stroke();
+                    }
+                }
+                ctx.beginPath();
+                ctx.moveTo(x, y - radius);
+                ctx.lineTo(x + radius, y);
+                ctx.lineTo(x, y + radius);
+                ctx.lineTo(x - radius, y);
+                ctx.closePath();
+                ctx.stroke();
+                drawPayloadGlyph(ctx, data.payloadKind, x, y, radius * 0.5);
+            }
+            ctx.restore();
+        }
     }
 
     /**
@@ -9731,6 +10917,7 @@
 
     function gameLoop(timestamp) {
         if (game.identityChanging) {
+            updateProgressionHud();
             game.lastFrameTime = timestamp;
             requestAnimationFrame(gameLoop);
             return;
@@ -9897,8 +11084,8 @@
         const lobbySpectating = isLobbySpectating();
         if (!frozenForReconnect && (game.state === 'playing' || game.state === 'waveDelay')) {
 
-            // --- GAMEPLAY (only when lives > 0) ---
-            if (game.lives > 0) {
+            // --- GAMEPLAY (only while the canonical run is still alive) ---
+            if (game.lives > 0 && !isGameOver()) {
                 // Release a predicted-fatal hold whose prediction was wrong
                 // before the ship would otherwise be driven this frame.
                 resolveShipDeathHold();
@@ -9951,6 +11138,8 @@
                     syncLocalBullets();
                     updateBulletsFromSync();
                 }
+                updateGameEffects(dt);
+                if (isSessionMode()) syncLocalShipHazards();
                 
                 // Check collisions
                 checkCollisions();
@@ -9992,6 +11181,13 @@
         // migrations even if a future GameState explicitly uses "gameover".
         if (!frozenForReconnect && isSessionMode() && isGameOver()) {
             syncLocalShipScore();
+            syncLocalShipHazards();
+            updateGameEffects(0, true);
+            if (isGameStateOwner()) syncGameState();
+            updateGameStateFromSync();
+        }
+        if (!frozenForReconnect && !isSessionMode() && isGameOver()) {
+            updateGameEffects(0, true);
         }
         if (!frozenForReconnect && isSessionMode()
             && isDeterministicMode() && isGameOver()) {
@@ -10062,6 +11258,7 @@
         // Game over: drop thrust flames and end invulnerability blinking on the
         // visible half, after the rest passes that re-apply ship data.
         settleShipTerminalVisuals();
+        updateProgressionHud();
 
         // Clear entire canvas with black
         ctx.fillStyle = '#000';
@@ -10093,6 +11290,7 @@
             // Draw game entities (now in gameplay coordinates)
             drawAsteroidsBatched(ctx, game.astervoids);
             drawBulletsBatched(ctx, game.bullets);
+            drawGameEffects(ctx);
             // Draw ships
             if (game.state !== 'start') {
                 // Draw remote ships in multiplayer (including during lobby live preview)
@@ -11851,6 +13049,8 @@
                 parentState, batchValidAt, renderTime);
         if (!Number.isFinite(replacementBaselinePerf)) return;
         for (const child of createdObjects) {
+            if (child.data?.type !== OBJECT_TYPES.ASTEROID && child.data?.type !== OBJECT_TYPES.BULLET
+                && child.data?.type !== OBJECT_TYPES.SHIP) continue;
             const record = ObjectSync.getObject(child.id);
             if (record) {
                 record.replacementBaselinePerf =
@@ -11885,6 +13085,8 @@
         const velScaleY = refDim / getGameHeight();
 
         for (const child of createdObjects) {
+            if (child.data?.type !== OBJECT_TYPES.ASTEROID && child.data?.type !== OBJECT_TYPES.BULLET
+                && child.data?.type !== OBJECT_TYPES.SHIP) continue;
             // Skip locally-owned children — local game physics drives their
             // position, not the interpolator.
             if (child.ownerMemberId === myMemberId) continue;
@@ -12407,7 +13609,7 @@
 
     // Handle solo play without waiting for multiplayer services.
     async function handleSoloPlay() {
-        if (game.identityChanging) return;
+        if (game.identityChanging || game.connectionLost) return;
         const scoreCheckpoint = finishLeaderboardRun();
         cancelPickerOperations();
         const shouldLeaveSessionInBackground = sessionPicker.currentSessionId
@@ -13009,6 +14211,9 @@
                         if (migratedObject.data?.type === OBJECT_TYPES.GAME_STATE) {
                             game.multiplayer.gameStateObjectId = migratedObject.id;
                             applyGameStateData(migratedObject.data);
+                        } else if (migratedObject.data?.type === OBJECT_TYPES.ASTEROID) {
+                            const asteroid = game.astervoids.find(value => value.syncObjectId === migratedObject.id);
+                            if (asteroid) asteroid.fromGameplayData(migratedObject.data);
                         }
                     }
                     DeadReckon.remove(migration.objectId);
@@ -13091,6 +14296,9 @@
                     // has been chosen.
                     if (isGameOver()) {
                         syncLocalShipScore();
+                        syncLocalShipHazards();
+                        updateGameEffects(0, true);
+                        if (isGameStateOwner()) syncGameState();
                         updateGameStateFromSync();
                         updateRemoteShips();
                         updateAstervoidsFromSync();
@@ -13122,6 +14330,8 @@
                         bullet => updateLocalBullet(bullet, dt, bgMemberId));
                     syncLocalBullets();
                     updateBulletsFromSync();
+                    updateGameEffects(dt);
+                    syncLocalShipHazards();
                     
                     // Collision detection (coarser at ~1fps but prevents missed hits)
                     checkCollisions();

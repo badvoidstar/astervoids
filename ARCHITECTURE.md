@@ -88,7 +88,7 @@ client leaves transport negotiation to SignalR.
 | Regional backend | Membership, ownership authorization, lifecycle, accepted mutation order, versions, snapshots | Server-computed physics, collision validation, or anti-cheat validation of scores |
 | Object-owning browser | Simulation and game-specific decisions for that object | Authority over every object in the session |
 | `Server` member role | First member, initial round start, deterministic successor promotion | Permanent ownership of GameState or all asteroids |
-| GameState object owner | Shared score/life ledgers, wave progression, terminal state | That this member has the `Server` role or is actively playing |
+| GameState object owner | Shared score/life and personal XP ledgers, effect-receipt accounting, wave progression, terminal state | That this member has the `Server` role or is actively playing |
 | Identity service | Public player GUID/tag, browser bindings, invitations, atomic naming/rebinding | Server-authenticated score attribution, persistent gameplay, or an account/password system |
 
 GameState ownership can migrate independently of the `Server` role, including
@@ -282,7 +282,7 @@ snapshots. Membership and object broadcasts can overtake their response, so
 SessionClient queues raw arguments together until the response installs the
 creator's schema registry. Before installing it, SessionClient calls the
 game-injected synchronous metadata validator. Astervoids requires the exact
-current definitions of schemas 1–4; older, missing, reordered-field, or extended
+current definitions of schemas 1–6; older, missing, reordered-field, or extended
 layouts fail through the entry error/`onError` path, not a reduced-feature game.
 An accepted but rejected entry releases its allocated membership with
 `LeaveSession`; an ambiguous cleanup closes that connection. Epoch guards prevent
@@ -845,6 +845,13 @@ totals and history become recoverable when the GameState owner publishes the
 corresponding ledgers. Local event dispatch is neither durable score storage
 nor a backend acknowledgement.
 
+Asteroid damage and reward/hazard contacts instead use recoverable game records.
+The asteroid owner persists independent impact GUID acknowledgements and HP;
+a breaking replacement includes a durable break receipt. Pickup/hazard owners
+atomically replace a claimed target with an activation receipt. GameState
+persists receipt consumption and personal XP alongside score/life histories.
+The backend and reusable replication layers remain unaware of these mechanics.
+
 ## Timing, simulation and presentation
 
 Sources: [game loop and adapters](AstervoidsWeb/wwwroot/index.html),
@@ -865,9 +872,10 @@ flowchart TB
         Ship["Own ship, then remote ship reconciliation"]
         Asteroid["Owned asteroids, then asteroid reconciliation"]
         Bullet["Own bullets and expiry, then bullet reconciliation"]
+        Effects["Game effect deadlines, owner claims and blast commands"]
         Collision["Collisions and pending-hit confirmations"]
         State["Waves, GameState publication and reconciliation"]
-        Input --> Ship --> Asteroid --> Bullet --> Collision --> State
+        Input --> Ship --> Asteroid --> Bullet --> Effects --> Collision --> State
     end
     Render["Presentation, temporary local interpolation, draw"]
     Frame --> Tick --> Policy --> Input
@@ -900,6 +908,9 @@ collision handling and ship reconciliation **after** it. Terminal maintenance
 continues after gameplay stops. Returning after more than five seconds hidden
 can require full rejoin. Do not combine foreground and background orchestration
 merely because they share individual update helpers.
+Game effects run between bullet reconciliation and collisions on each path.
+UTC deadline processing does not convert hidden elapsed time into physics
+catch-up steps or add another frame driver.
 
 ### Coordinates, units and integration
 
@@ -1107,27 +1118,119 @@ sequenceDiagram
     Shooter->>Shooter: Detect hit and hide bullet
     Shooter->>Hub: Persist pending-hit claim
     Hub->>Target: Replicated claim on owned target
-    Target->>Target: Deduplicate and calculate fracture
-    Target->>Hub: ReplaceObject or delete target
-    Hub->>Shooter: Parent removal and replacement children
+    Target->>Target: Deduplicate independent damageId, apply one hit
+    Target->>Hub: Persist HP/ack, or atomically replace with children + break receipt + payload
+    Hub->>Shooter: Accepted damage acknowledgement or replacement
     Hub-->>Target: Replacement response
-    Shooter->>Shooter: Confirm hit, award score, retire bullet
+    Shooter->>Shooter: Retire acknowledged bullet, never self-award
+    participant StateOwner as GameState owner
+    Hub->>StateOwner: Durable break receipt
+    StateOwner->>Hub: Persist XP, points and processedEffects once
 ```
 
 Every remote hop is relayed through ObjectSync, SessionClient, and the hub.
 The asteroid owner, bullet owner, and GameState owner can be different members.
-For cross-owner splits, session-scoped children are assigned to the shooter.
-Same-owner hits resolve directly; solo play requires no replicated transaction.
+For splits, the replacement's single Session-scope owner override assigns
+children, receipt, and payload together to the shooter while that member is
+still present; otherwise the replacing owner retains them. A receipt is not
+assumed to be GameState-owned. Same-owner hits use the same durable confirmation
+rules; solo play resolves a break synchronously.
 
 The first pending-hit publication includes collision pose and claim fields.
 Later attempts retry only unconfirmed claim fields, not hidden-bullet motion or
 lifetime. Local lifetime still advances, and expiry or target removal retires
-the bullet. The target owner deduplicates processed bullet IDs.
+the bullet. `damageId` is independent of the asynchronously assigned bullet
+object ID, and participant GUID/tag and source ship attribution are attached
+before creation. The target owner persists `hitsRemaining` and
+`processedDamage`; rare changes retry with the current pose outside SendGate.
+Nonbreaking acknowledgements award nothing. A bare target disappearance likewise
+never grants score or XP.
+
+Every break, including the smallest asteroid, is a successful atomic replacement
+with one break receipt, normal fracture children if any, and the predetermined
+payload if any. The receipt carries the winner and previous damage IDs. Failed
+replacement or local-first deletion is not confirmation. GameState applies each
+receipt's size-based points to existing team/personal histories and ten personal
+XP exactly once, preserving the ship-counter calculator for other accepted
+counters without duplicate bullet self-awards.
 
 A survivable ship crash creates a hidden contact bullet with ship velocity and
 uses the same hit paths. Its cross-owner claim rides the creation payload because
 no synchronized bullet exists yet. A predicted-fatal crash or final solo-life
 crash leaves the asteroid intact. Same-owner impact cues are transient events.
+
+### Personal progression, payloads, and hazards
+
+`participantXp` is a session-retained normalized participant-GUID ledger.
+Ship death/recreation, rejoin, departed participants, and ownership migration
+do not reset it; browsers with the same participant share XP. Solo uses explicit
+run-local `soloXp`, reset by every new solo initialization irrespective of identity
+or leaderboard eligibility. `leaderboardRun` is not a progression key.
+Run-highest level is derived from all retained participant XP.
+
+Each confirmed original, fragment, or blast-caused break earns ten XP.
+Level `L` starts at `T(L) = 10 * L * (L - 1)`; advancement costs `20 * L`.
+Overflow carries. `Ship.shoot(level)` returns exactly `L` projectiles under one
+unchanged cooldown/sound. Levels 1–3 use a single, parallel pair, and parallel
+trio; level 4 onward uses symmetric fan spread
+`min(90, 24 + 8 * (L - 4))` degrees. `handleInput` reserves the complete volley
+within the old ten-active-projectile budget scaled by level; there is no shot
+plateau or partial volley.
+
+Wave originals are all normal at run-highest levels 1–3. At levels 4–6 their
+distribution is normal 80% / two-hit 20%; at 7 onward it is normal 70% / two-hit
+20% / three-hit 10%. The spawning owner predetermines armored contents:
+nuke, level-up, extra life, and smart bomb 20% each; mine and spray 10% each.
+Fracture children are always normal and payload-free. Inset vector contours,
+remaining-hit pips, cracks, and distinct contents glyphs convey durability.
+
+Stationary positive hollow diamonds have distinct vector glyphs and expire in
+12 seconds. An actual local ship-hull contact creates a Member-scoped `gameClaim`;
+the target owner validates attribution, deadlines, contact pose, and (for hazards)
+invulnerability revision, then chooses one claim and atomically replaces the
+target with an activation receipt. Local diamond/triangle or swept
+circle/triangle contact is exact; owner validation allows only q16w
+position-round-trip tolerance. Stale claims are cleaned up, not reactivated.
+The GameState owner applies level-up as exactly the next-threshold deficit,
+extra life to the existing shared pool while alive, and blast authorization
+once through `processedEffects`. Pure spectator owners perform this accounting.
+
+Nuke activation freezes starting asteroid IDs within normalized radius 0.25
+and ignores armor. Smart bomb freezes all starting asteroid IDs for one hit
+each and existing mine/spray/projectile IDs to clear. Target owners execute only
+these ID sets using the activation receipt ID for damage deduplication.
+Collector identity receives break XP/points. New fragments, loot, and hazards
+are not recursively included. Receipts remain until their GameState acknowledgement
+and target acknowledgements are durable; no separate command-create transaction
+or generic event replay is involved.
+
+Mines activate at destruction, arm after one second, expire after eight seconds
+total, and consume on one normal ship-damage contact. Spray telegraphs twelve
+radial lanes for 0.8 seconds, then atomically replaces itself with twelve hostile
+projectiles at 40% ordinary bullet speed, with a two-second flight and no wrap.
+Both respect normal invulnerability. Hazard activation receipts retain the exact
+ship ID and claimed revision; `Ship.handledHazards` and the hazard hit counter
+persist and retry with current ship motion outside ShipSendGate. A repeated,
+recreated-ship, respawn-revision, or terminal receipt cannot damage another life.
+
+Multiplayer timers are immutable server-UTC-millisecond deadlines anchored to
+accepted creation/replacement `validAt` and persisted before further owner
+mutation or contact. Later updates' moving `validAt` values never become birth
+times. Unborn records or an unavailable clock defer contact. Migration/recovery
+keep original deadlines; overdue hidden-owner spray retains its original launch
+and expiry rather than emitting a fresh barrage. Solo timers use simulation
+milliseconds and freeze on pause. Terminal maintenance processes receipt
+bookkeeping and expiry only, never new blasts, sprays, contacts, or revival.
+Effects/claims are game-owned canonical records; hostile movement is sampled
+analytically from these deadlines, without a generic presentation adapter or
+another loop. Replacement presentation bridges apply only to kinematic children.
+
+The native HTML/CSS top-right XP bar reserves score/wave/lives and touch-control
+space inside the actual play viewport, including letterboxing and safe areas.
+Its accessible values are change-gated, with level-only announcements rather
+than continuous XP announcements. Menus, recovery, game over, and pure spectators
+hide it. Rewards/hazards and armor are vector-only, use non-color cues, and
+respect reduced-motion preferences for cosmetic effects.
 
 ### Fracture physics
 
@@ -1188,8 +1291,9 @@ reduces serialized round trips, not message count or backend operation ordering.
 `calculateGameState` is a pure calculation over explicit inputs, not a mutation
 of them. `syncGameState` owns validation, serialization, side effects, and
 publication. Its persisted ledgers include processed hits/scores, counted
-participants, personal score/number/tag histories, and score-life awards so a
-new owner does not repeat effects. Persistence here means the lifetime of the
+participants, personal score/number/tag histories, score-life awards, personal
+XP, and processed effect receipts so a new owner does not repeat effects.
+Persistence here means the lifetime of the
 process-local session, not storage in the durable identity service.
 
 Every additional unique participant earns one entry life once; it is not based
@@ -1205,7 +1309,9 @@ Ledger/calculation caches compare actual inputs, including score/hit events
 that do not advance object versions. Private ledger snapshots detect in-place
 mutation. Session, ownership, and recovery transitions invalidate caches.
 Cached publication still queues against confirmed ObjectSync state, never an
-optimistic local write. Packed counter IDs and values must be valid before
+optimistic local write. XP and receipt inputs participate in cache validity;
+private packed-XP snapshots detect same-version and in-place mutation.
+Packed counter IDs and values must be valid before
 serialization.
 
 ### Personal score history and departure
@@ -1243,8 +1349,8 @@ is visibly unavailable; a sum different from the persisted team total is not
 presented as complete attribution. Tag validation/cache failure is separate:
 unavailable names become `Unknown` without hiding otherwise valid scores.
 Caches inspect private snapshots, including same-version/in-place mutations.
-Fresh GameState creation initializes all six packed ledgers. The owner refuses
-publication and effects when score history is missing/incomplete or entry-life
+Fresh GameState creation initializes all eight packed ledgers. The owner refuses
+publication and effects when score/progression history is missing/incomplete or entry-life
 history disagrees with its paid count; it never silently publishes a team-only
 older contract. The pure calculator can still omit personal history for local
 fatal-hit prediction, which is not a publication path.
@@ -1594,14 +1700,16 @@ rather than silently overwriting or partially installing definitions.
 
 Schema 0 is a generic MessagePack-map extension path. It preserves supported
 nested maps, arrays, nulls, bytes, and unknown fields. Current Astervoids object
-types select schemas 1 through 4:
+types select schemas 1 through 6:
 
 | Schema | Type | State family |
 | --- | --- | --- |
-| 1 | Ship | Pose/motion, controls, score/hits, invulnerability timing/revision, participant identity/tag, terminal target |
-| 2 | Asteroid | Pose/motion, radius/seed, optional packed fracture vertices, terminal target |
-| 3 | Bullet | Pose/motion/lifetime, ownership/color, optional pending-hit claim, terminal target |
-| 4 | GameState | Round/lives/score, wave state, packed hit/score/entry-life and personal-score/number/tag ledgers, terminal anchors and final-life ship |
+| 1 | Ship | Pose/motion, controls, score/hits, invulnerability timing/revision, participant identity/tag, terminal target, handled-hazard ledger |
+| 2 | Asteroid | Pose/motion, radius/seed, optional packed fracture vertices, terminal target, durability/payload and processed-damage ledger |
+| 3 | Bullet | Pose/motion/lifetime, ownership/color, pending-hit claim, terminal target, independent damage and participant/ship attribution |
+| 4 | GameState | Round/lives/score, wave state, hit/score/entry-life and personal-score/number/tag/XP ledgers, processed effects, terminal anchors and final-life ship |
+| 5 | gameEffect | Break/activation receipts, pickup/hazard state, immutable deadlines, source/claim/participant/ship attribution, frozen target sets |
+| 6 | gameClaim | Contact target/ship/participant, hull pose, UTC contact time and invulnerability revision |
 
 Each known type has **one superset schema** across live modes, create, update,
 replace, and terminal publication. The backend retains the object's creation
@@ -1612,13 +1720,31 @@ stored objects to schema 0. Empty positional writes likewise retain their
 selected schema. Schema 0 is selected explicitly (or by a generic caller's
 default), never to repair an unsupported positional contract.
 
-GameState preserves slots 0-15 and has `bytes` fields:
-`participantScores` at 16, `participantNumbers` at 17, and `participantTags` at 18.
-Ship appends `participantTag: str` at slot 27 after `participantId: guid` at 26;
-its presence mask remains four bytes. The nineteen-slot GameState mask is three
-bytes. The game validates every field name, type, position, and field count in
-all four advertised definitions, not just the score/tag slots. Sixteen- and
-eighteen-slot GameState generations and older Ship definitions are unsupported.
+The progression contract preserves all prior slots and appends:
+
+- Ship slot 28: `handledHazards: bytes`; 29 fields, four mask bytes.
+- Asteroid slots 14–17: `maxHits: u8`, `hitsRemaining: u8`, `payloadKind: u8`,
+  `processedDamage: bytes`; 18 fields, **three** mask bytes rather than two.
+- Bullet slots 16–19: `damageId: guid`, `participantId: guid`,
+  `shipId: nullable-guid`, `participantTag: str`; 20 fields, **three** mask bytes.
+- GameState slots 19–20: `participantXp: bytes`, `processedEffects: bytes`;
+  21 fields, three mask bytes. Personal scores/numbers/tags remain at 16–18.
+
+Schema 5 order is `type: str`, `kind: u8`, `payloadKind: u8`, `sourceId: guid`,
+`claimId: nullable-guid`, `participantId: nullable-guid`, `participantTag: str`,
+`shipId: nullable-guid`, `x: q16w`, `y: q16w`, `velocityX: f32`, `velocityY: f32`,
+`angle: q16_2pi`, `startedAt: f64`, `armedAt: f64`, `expiresAt: f64`,
+`points: u32`, `damageReceipts: bytes`, `asteroidTargets: bytes`,
+`hazardTargets: bytes`. Its mask is three bytes.
+
+Schema 6 order is `type: str`, `targetId: guid`, `shipId: guid`,
+`participantId: guid`, `participantTag: str`, `x: q16w`, `y: q16w`,
+`angle: q16_2pi`, `claimedAt: f64`, `invulnerabilityRevision: u32`.
+Its mask is two bytes.
+
+The game validates every field name, type, position, and field count in all six
+advertised definitions before decoding, not just appended slots. Older/missing
+layouts, including the nineteen-slot GameState generation, are unsupported.
 Schema-list order and additional distinct generic schemas do not change the
 game contract. Ship tags are created once, not sent on every pose update.
 
@@ -1672,6 +1798,12 @@ game-specific nested packing:
   little-endian uint32. Personal-score/number maps normalize GUIDs and validate
   nonnegative scores, positive ordinals, matching participants, and duplicate
   entries before use. These histories are distinct from the entry-life ledger.
+- XP maps sort normalized GUIDs and encode a 16-byte GUID plus little-endian
+  float64, 24 bytes per entry. Values must be nonnegative safe integers; there
+  is no uint32 ceiling, fractional/invalid-value clamp, or truncation.
+  Duplicate/unsorted IDs, unsafe values, and malformed lengths reject.
+  Damage, handled-hazard, processed-effect, and frozen-target ID maps reuse the
+  GUID/uint32 counter format; hazard receipts use it to retain claim revisions.
 - Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
   ASCII length, and tag bytes bounded by shared `identityTagMaxLength`.
   Invalid/duplicate entries or truncated bytes
@@ -1704,9 +1836,10 @@ No event-seed recipe payload is supported or being introduced.
 Removed compatibility paths are the mixed-generation game capability gates,
 score-only/tagless creation and publication, ordinal name fallbacks, old unpacked
 game fields, pre-compact/pre-envelope DTO acceptance, descriptor casing aliases,
-and positional-to-dictionary downgrades. The current positional layouts and
-cross-language bytes are unchanged; no event, extra full snapshot, or render-loop
-send was added.
+and positional-to-dictionary downgrades. Generic codecs and DTO layouts remain
+unchanged. Progression appends the game fields and schemas documented above,
+requires their exact current definitions, and adds no generic event, extra
+snapshot protocol, or independent render-loop send.
 
 Deliberately retained:
 

@@ -3,9 +3,18 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+const wire = require('./wwwroot/js/astervoids-wire-codec.js');
+const GuidUtils = require('./wwwroot/js/guid-utils.js');
+const constants = loadInlineGameConstants(['PROGRESSION', 'OBJECT_TYPES']);
+const LOCAL_MEMBER = '11111111-1111-4111-8111-111111111111';
+const BULLET_ID = '22222222-2222-4222-8222-222222222222';
+const ASTEROID_ID = '33333333-3333-4333-8333-333333333333';
 const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
 const presentationSource = readFileSync(
     resolve(here, 'wwwroot/js/replication-presentation.js'),
@@ -202,51 +211,76 @@ test('production ship-hit event carries the pre-reset pose and deduplicates by h
 function loadResolvers({ session }) {
     const calls = [];
     const game = {
-        bullets: [], astervoids: [], ship: { score: 0 }, score: 0, lives: 3,
+        bullets: [], astervoids: [], ship: { score: 0 }, score: 0, lives: 3, state: 'playing',
+        soloXp: 0,
         multiplayer: { processedPendingBullets: new Set() }
     };
+    const objects = new Map();
     const production = loadInlineGameFunctions([
         'resolveSoloAsteroidHit', 'resolveOwnedAsteroidHit',
         'claimCrossOwnerAsteroidHit', 'computeBulletAsteroidImpact',
-        'awardSoloAsteroidScore'
+        'awardSoloAsteroidScore', 'applySoloAsteroidDamage', 'applyOwnedAsteroidDamage',
+        'retireConfirmedPendingBullets', 'getLevelForXp', 'getLevelXpThreshold',
+        'Asteroid', 'Bullet', 'assignDefined',
     ], {
-        game,
+        ...constants, game, AstervoidsWireCodec: wire, GuidUtils, crypto: { randomUUID },
         CONFIG: {
             ASTEROID_LARGE_THRESHOLD: 0.05,
             ASTEROID_MEDIUM_THRESHOLD: 0.03,
-            EXTRA_LIFE_SCORE_THRESHOLD: 10000
+            EXTRA_LIFE_SCORE_THRESHOLD: 10000,
+            ASTEROID_VERTICES: 10, ASTEROID_JAGGEDNESS: 0.4,
+            POINTS_LARGE: 20, POINTS_MEDIUM: 50, POINTS_SMALL: 100,
+            BULLET_LIFETIME: 60,
         },
+        randomRange: () => 0,
         isSessionMode: () => session,
+        isGameOver: () => game.state === 'gameover' || game.lives <= 0,
+        SessionClient: {
+            getCurrentMember: () => ({ id: LOCAL_MEMBER }),
+            getCurrentSession: () => ({ members: [{ id: LOCAL_MEMBER }] }),
+            getSessionEpoch: () => 1,
+        },
         computeBulletImpact: () => ({ bulletAngle: 0.5, offsetN: 0.25, impactTorque: 2 }),
         CollisionEffects: {
-            startAsteroidHit: (...args) => calls.push(['cue', ...args])
+            startAsteroidHit: (...args) => {
+                assert.ok(game.bullets.includes(args[0]), 'the cue observes the still-live bullet');
+                assert.ok(game.astervoids.includes(args[1]), 'the cue observes the still-live asteroid');
+                calls.push(['cue', ...args]);
+            },
         },
-        emitOwnedAsteroidImpactCue: (...args) => calls.push(['owned-cue', ...args]),
+        emitOwnedAsteroidImpactCue: (...args) => {
+            assert.ok(objects.has(args[0].syncObjectId), 'the broadcast cue precedes replacement');
+            assert.ok(game.bullets.includes(args[1]), 'confirmation has not yet retired the bullet');
+            calls.push(['owned-cue', ...args]);
+        },
         deleteSyncedBullet: (...args) => calls.push(['delete', ...args]),
-        splitAsteroid: (...args) => calls.push(['split', ...args]),
+        splitAsteroid: (...args) => {
+            calls.push(['split', ...args]);
+            if (session) objects.delete(args[0].syncObjectId);
+            return [];
+        },
         emitShipStateChanged: () => calls.push(['ship-update']),
         announceExtraLifeAward: () => calls.push(['extra-life']),
         countExtraLivesForScore: (score, threshold) => Math.floor(score / threshold),
         AudioSystem: { playExplosion: size => calls.push(['explosion', size]) },
-        ObjectSync: { updateObject: (...args) => calls.push(['update', ...args]) }
+        ObjectSync: {
+            getObject: id => objects.get(id),
+            updateObject: (id, data, immediate) => {
+                assert.ok(objects.has(id));
+                Object.assign(objects.get(id).data, data);
+                calls.push(['update', id, data, immediate]);
+            },
+        },
     });
-    return { ...production, game, calls };
+    return { ...production, game, calls, objects };
 }
 
-function makeBullet(overrides = {}) {
-    return {
-        x: 0.5, y: 0.5, velocityX: 3, velocityY: 0,
-        toUpdateData: () => ({ type: 'bullet' }),
-        ...overrides
-    };
+function makeBullet(harness, overrides = {}) {
+    return Object.assign(new harness.Bullet(0.5, 0.5, 3, 0, 0, LOCAL_MEMBER), overrides);
 }
 
-function makeAsteroid(overrides = {}) {
-    return {
-        x: 0.52, y: 0.5, velocityX: 0, velocityY: 0, radius: 0.06,
-        getPoints: () => 20,
-        ...overrides
-    };
+function makeAsteroid(harness, overrides = {}) {
+    return Object.assign(new harness.Asteroid(0.52, 0.5, 0.06, 0, 0, 123), overrides);
 }
 
 test('solo collisions start the same local cues before removing their sources', () => {
@@ -264,8 +298,8 @@ test('solo collisions start the same local cues before removing their sources', 
     // Solo resolution: the cue must observe both bodies before either is spliced
     // out, otherwise it captures a stale (or missing) pose.
     const solo = loadResolvers({ session: false });
-    const bullet = makeBullet();
-    const asteroid = makeAsteroid();
+    const bullet = makeBullet(solo);
+    const asteroid = makeAsteroid(solo);
     solo.game.bullets.push(bullet);
     solo.game.astervoids.push(asteroid);
     solo.resolveSoloAsteroidHit(bullet, 0, asteroid, 0);
@@ -276,6 +310,8 @@ test('solo collisions start the same local cues before removing their sources', 
     assert.equal(cueAsteroid, asteroid);
     assert.equal(solo.game.bullets.length, 0, 'bullet removed after the cue');
     assert.equal(solo.game.astervoids.length, 0, 'asteroid removed after the cue');
+    assert.equal(solo.game.score, 20);
+    assert.equal(solo.game.soloXp, constants.PROGRESSION.XP_PER_ASTEROID);
 
     const shipHitStart = productionSource.indexOf('    function handleShipHit(ship) {');
     const shipHitEnd = productionSource.indexOf('    function updateHUD() {', shipHitStart);
@@ -310,23 +346,34 @@ test('same-owner asteroid impacts broadcast a target-relative cue before replace
     assert.match(helperSource, /cueId,\s*bulletAngle: impact\.bulletAngle,\s*offsetN: impact\.offsetN,/);
     assert.doesNotMatch(helperSource, /\bhit[XY]\b|\bimpact[XY]\b/);
 
-    // Same-owner resolution: broadcast the target-relative cue, then delete the
-    // bullet, then replace the asteroid — and never start a local shooter cue,
-    // which peers would double-render alongside the broadcast one.
+    // Same-owner resolution broadcasts its cue before replacement, and retires
+    // the pending bullet only after that replacement confirms the hit.
     const owned = loadResolvers({ session: true });
-    const ownedBullet = makeBullet({ syncObjectId: 'bullet-1' });
-    const ownedAsteroid = makeAsteroid({ syncObjectId: 'asteroid-1' });
+    const ownedBullet = makeBullet(owned, { syncObjectId: BULLET_ID });
+    const ownedAsteroid = makeAsteroid(owned, { syncObjectId: ASTEROID_ID });
+    owned.objects.set(BULLET_ID, {
+        id: BULLET_ID, ownerMemberId: LOCAL_MEMBER, data: ownedBullet.toSyncData(),
+    });
+    owned.objects.set(ASTEROID_ID, {
+        id: ASTEROID_ID, ownerMemberId: LOCAL_MEMBER, data: ownedAsteroid.toSyncData(),
+    });
     owned.game.bullets.push(ownedBullet);
     owned.game.astervoids.push(ownedAsteroid);
     owned.resolveOwnedAsteroidHit(ownedBullet, 0, ownedAsteroid);
     assert.deepEqual(
         owned.calls.map(call => call[0]),
-        ['owned-cue', 'delete', 'split', 'ship-update']);
-    const [, cueAsteroidArg, cueBulletArg] = owned.calls[0];
+        ['update', 'owned-cue', 'split']);
+    assert.equal(owned.game.bullets[0], ownedBullet, 'the resolver leaves the pending bullet for confirmation');
+    assert.equal(ownedBullet.pendingHit, true);
+    assert.equal(owned.calls[0][2].damageId, ownedBullet.damageId, 'the claim retains independent hit identity');
+    const [, cueAsteroidArg, cueBulletArg] = owned.calls[1];
     assert.equal(cueAsteroidArg, ownedAsteroid);
     assert.equal(cueBulletArg, ownedBullet);
+    owned.retireConfirmedPendingBullets(LOCAL_MEMBER);
+    assert.deepEqual(owned.calls.map(call => call[0]), ['update', 'owned-cue', 'split', 'delete']);
     assert.equal(owned.game.bullets.length, 0);
-    assert.ok(!owned.calls.some(call => call[0] === 'local-cue'),
+    assert.equal(owned.game.ship.score, 0, 'the asteroid resolver cannot self-award before a receipt');
+    assert.ok(!owned.calls.some(call => call[0] === 'cue'),
         'owner branch must not start a local shooter cue');
 });
 

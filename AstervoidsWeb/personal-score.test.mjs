@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
 import { loadClassicModule } from './test-support/classic-module.mjs';
 
 const require = createRequire(import.meta.url);
@@ -10,6 +10,9 @@ const GuidUtils = require('./wwwroot/js/guid-utils.js');
 const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 const { SCHEMAS, requireCurrentSchemas } = require('./wwwroot/js/game-wire-schemas.js');
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
+const progressionConstants = loadInlineGameConstants(['PROGRESSION', 'PAYLOAD_KIND', 'GAME_EFFECT_KIND']);
+const progressionFunctions = loadInlineGameFunctions(
+    ['getLevelXpThreshold', 'getLevelForXp', 'getProgressionForXp'], progressionConstants);
 const id = number => `${number.toString(16).padStart(8, '0')}-1111-2222-3333-aabbccddeeff`;
 const participantA = id(1);
 const participantB = id(2);
@@ -25,16 +28,18 @@ const ship = (shipId, participantId, score = 0, hitCount = 0) => ({
     data: { type: 'ship', participantId, score, hitCount },
 });
 const { calculateGameState } = loadInlineGameFunctions(['calculateGameState'], {
-    GuidUtils, AstervoidsWireCodec, countExtraLivesForScore,
+    ...progressionConstants, ...progressionFunctions, GuidUtils, AstervoidsWireCodec, countExtraLivesForScore,
 });
 
 function calculate({
     persisted = { lives: 3, groupScore: 0 },
     processedScores = {}, processedHits = {}, countedParticipants = {},
-    participantScores = {}, participantNumbers = {}, participantTags, ships = [],
+    participantScores = {}, participantNumbers = {}, participantTags,
+    participantXp = {}, processedEffects = {}, ships = [],
 } = {}) {
     return calculateGameState(persisted, {
-        processedScores, processedHits, countedParticipants, participantScores, participantNumbers, participantTags,
+        processedScores, processedHits, countedParticipants, participantScores, participantNumbers,
+        participantTags, participantXp, processedEffects,
     }, ships, {
         lives: 3, state: 'playing', observedScoreLifeAwardCount: null,
     }, 1000);
@@ -49,6 +54,8 @@ function continueFrom(previous, ships) {
         participantScores: previous.participantScores,
         participantNumbers: previous.participantNumbers,
         participantTags: previous.participantTags,
+        participantXp: previous.participantXp,
+        processedEffects: previous.processedEffects,
         ships,
     });
 }
@@ -290,7 +297,7 @@ test('topK depends on actual capacity, keeps highest scorers, and never caps the
 
 test('score and tag slots are mandatory in the current game session contract', () => {
     requireCurrentSchemas({ schemas: SCHEMAS });
-    for (const slots of [16, 18]) {
+    for (const slots of [16, 18, 19, 20]) {
         assert.throws(() => requireCurrentSchemas({
             schemas: SCHEMAS.map(schema => schema.id === 4
                 ? { ...schema, fields: schema.fields.slice(0, slots) } : schema),
@@ -506,6 +513,8 @@ function departureHarness({ migrate = false } = {}) {
             speedMultiplier: 2, waveDelayTimer: 0,
             participantScores: AstervoidsWireCodec.packCounterMap({}),
             participantNumbers: AstervoidsWireCodec.packCounterMap({}),
+            participantXp: AstervoidsWireCodec.packXpMap({ [participantA]: 70, [participantB]: 200 }),
+            processedEffects: AstervoidsWireCodec.packCounterMap({}),
         },
     };
     const scorer = ship(shipA, participantA, 30, 1);
@@ -547,12 +556,13 @@ function departureHarness({ migrate = false } = {}) {
         'gameStateCounterMapsEqual', 'gameStateLedgerMatches', 'readGameStateLedger',
         'packGameStateLedger', 'gameStateCalculationInputs', 'gameStateInputsEqual', 'applyGameStateData',
     ], {
-        game, ObjectSync, countExtraLivesForScore, GuidUtils, AstervoidsWireCodec,
+        game, ObjectSync, ...progressionConstants, ...progressionFunctions,
+        countExtraLivesForScore, GuidUtils, AstervoidsWireCodec,
         handlingMemberDeparture: false, malformedGameStateLedgerKey: null, gameStateSyncCache: null,
         isSessionMode: () => true,
         isGameStateOwner: () => gs.ownerMemberId === participantC,
         isLobbySpectating: () => true,
-        OBJECT_TYPES: { SHIP: 'ship', GAME_STATE: 'gameState' },
+        OBJECT_TYPES: { SHIP: 'ship', GAME_STATE: 'gameState', GAME_EFFECT: 'gameEffect' },
         CONFIG: { EXTRA_LIFE_SCORE_THRESHOLD: 1000, DEADRECKON_GAMEOVER_TERMINAL_DELAY_MS: 750 },
         SessionClient: {
             getSessionEpoch: () => 1, getCurrentMember: () => ({ id: participantC, role: 'Client' }),
@@ -590,6 +600,8 @@ for (const migrate of [false, true]) {
             { [participantA]: 1, [participantB]: 2 });
         assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(h.gs.data.countedParticipants), {});
         assert.equal(h.records.has(shipA), false);
+        assert.deepEqual(AstervoidsWireCodec.unpackXpMap(h.gs.data.participantXp),
+            { [participantA]: 70, [participantB]: 200 });
         assert.equal(h.gs.data.terminalShipId, shipA);
         h.syncGameState();
         assert.equal(h.game.score, 30, 'later empty membership cannot double-count or erase history');
@@ -667,12 +679,15 @@ test('session reset retires the local ship without pre-deleting the durable depa
     const previousShip = { deathHold: {} };
     const game = {
         mode: 'session', ship: previousShip,
-        multiplayer: { remoteShips: new Map(), processedPendingBullets: new Set() },
+        multiplayer: {
+            remoteShips: new Map(), processedPendingBullets: new Set(),
+            contactClaims: new Map(), effectMutations: new Set(), effectAnchors: new Map(),
+        },
     };
     let transportClears = 0;
     const clear = { clear() {} };
     const { resetMultiplayerState } = loadInlineGameFunctions(['resetMultiplayerState'], {
-        game, gameStateScoreViewCache: null, backgroundInterval: null,
+        game, gameStateScoreViewCache: null, sessionXpViewCache: null, hudCache: {}, backgroundInterval: null,
         resetGameStateSyncCache() {}, clearExtraLifeAwardFeedback() {},
         clearDeterministicTerminalState() {},
         CollisionEffects: clear, RemoteObjects: clear, DeadReckon: clear, SendGate: clear,
@@ -705,7 +720,7 @@ function scoreUiHarness({
         let text = '';
         let hidden = false;
         return {
-            tag, children: [], attributes: {}, style: {},
+            tag, children: [], attributes: {}, style: {}, offsetTop: 0, offsetHeight: 0,
             classList: {
                 toggle: (name, enabled) => { writes.push(['class', name, enabled]); enabled ? classes.add(name) : classes.delete(name); },
                 contains: name => classes.has(name),
@@ -715,6 +730,7 @@ function scoreUiHarness({
             set hidden(value) { hidden = value; writes.push(['hidden', value]); },
             get hidden() { return hidden; },
             setAttribute(name, value) { this.attributes[name] = value; writes.push(['attribute', name, value]); },
+            removeAttribute(name) { delete this.attributes[name]; writes.push(['remove-attribute', name]); },
             append(...children) { this.children.push(...children); },
             replaceChildren(fragment) { this.children = fragment.children; writes.push(['rows']); },
         };
@@ -722,7 +738,7 @@ function scoreUiHarness({
     const game = {
         mode: 'session', state: 'playing', score: 999, wave: 3, lives: 0,
         sessionInfo: { name: 'Long session name that must ellipsize', maxMembers },
-        ship: null,
+        ship: null, soloXp: 0, viewport: { x: 0, y: 0, width: 1000, height: 800 },
     };
     const record = {
         id: id(200), version: 1,
@@ -737,10 +753,13 @@ function scoreUiHarness({
         record.data.participantTags = tagsForParticipants(
             Object.keys(AstervoidsWireCodec.unpackCounterMap(record.data.participantNumbers)));
     }
+    record.data.participantXp ??= AstervoidsWireCodec.packXpMap({});
+    record.data.processedEffects ??= AstervoidsWireCodec.packCounterMap({});
     const elements = Object.fromEntries([
         'hudDisplay', 'scoreDisplay', 'yourScoreDisplay', 'teamScoreDisplay', 'playerIndicatorDisplay', 'waveDisplay',
         'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverPersonalScoreEl', 'gameoverScoreEl',
         'gameoverResultsEl', 'gameoverPromptEl', 'sessionIndicator',
+        'xpHud', 'xpLevel', 'xpFraction', 'xpBar', 'xpFill', 'levelAnnouncement',
     ].map(name => [name, element()]));
     const errors = [];
     const counts = { unpack: 0, layout: 0 };
@@ -749,8 +768,13 @@ function scoreUiHarness({
         'getSessionScoreView', 'normalizeParticipantLedger',
         'readParticipantScoreHistory', 'readGameStateLedger', 'gameStateLedgerMatches',
         'gameStateCounterMapsEqual', 'projectParticipantScore', 'rankParticipantScores',
+        'updateProgressionHud', 'fitProgressionHud', 'getSessionXpLedger', 'getLocalProgression',
+        'reportMalformedGameStateLedgers',
     ], {
-        ...elements, game, GuidUtils, gameStateScoreViewCache: null, hudCache: {}, overlayCache: {},
+        ...elements, ...progressionConstants, ...progressionFunctions,
+        game, GuidUtils, canvas: { width: 1000, height: 800 },
+        gameStateScoreViewCache: null, sessionXpViewCache: null, malformedGameStateLedgerKey: null,
+        hudCache: {}, overlayCache: {},
         AstervoidsWireCodec: {
             ...AstervoidsWireCodec,
             unpackCounterMap: value => { counts.unpack++; return AstervoidsWireCodec.unpackCounterMap(value); },
@@ -767,7 +791,7 @@ function scoreUiHarness({
         },
         ObjectSync: {
             getObjectByType: type => type === 'gameState' ? record : null,
-            getObjectsByType: () => ships,
+            getObjectsByType: type => type === 'ship' ? ships : [],
         },
         document: {
             getElementById: name => name === 'session-indicator' ? elements.sessionIndicator : null,
@@ -896,10 +920,12 @@ test('multiplayer HUD projects your lifetime score above team score, and solo ke
     assert.equal(h.hudDisplay.classList.contains('multiplayer'), true);
     const writes = h.writes.length;
     const decoded = h.counts.unpack;
+    const measured = h.counts.layout;
+    assert.equal(measured, 1, 'initial score layout and progression visibility share one fit');
     for (let frame = 0; frame < 120; frame++) h.updateHUD();
     assert.equal(h.writes.length, writes);
     assert.equal(h.counts.unpack, decoded, 'HUD never decodes unchanged maps every frame');
-    assert.equal(h.counts.layout, 1, 'unchanged HUD contents do not trigger per-frame layout reads');
+    assert.equal(h.counts.layout, measured, 'unchanged HUD contents do not trigger per-frame layout reads');
     h.ships[0].data.score = 30;
     h.updateHUD();
     assert.equal(h.yourScoreDisplay.textContent, '130', 'same-version score events remain visible');
@@ -1174,10 +1200,12 @@ function scoreLayoutHarness(width, height, aspectRatio, sessionMode = true) {
     const wave = { id: 'wave-overlay', style: {} };
     const over = { id: 'gameover-overlay', style: {} };
     const canvas = { width: 0, height: 0 };
+    const xpHud = { hidden: true, style: {}, offsetTop: 0, offsetHeight: 0 };
     const metadata = Object.freeze({ aspectRatio });
     const game = { sessionInfo: { metadata }, viewport: {} };
-    const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas'], {
-        game, canvas, isSessionMode: () => sessionMode, fitSessionHud() {},
+    const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas', 'fitProgressionHud'], {
+        game, canvas, xpHud, hudDisplay: { ...hud, offsetTop: 0, offsetHeight: 0 },
+        isSessionMode: () => sessionMode, fitSessionHud() {},
         getEffectiveAsteroidAspectScales: () => null,
         document: {
             getElementById: name => ({
@@ -1186,15 +1214,16 @@ function scoreLayoutHarness(width, height, aspectRatio, sessionMode = true) {
             querySelectorAll: () => [wave, over],
         },
     });
+    const cssPixels = value => parseFloat(value?.replace(/^max\(/, '') || 0);
     function box(element) {
         const x = parseFloat(view.style.left || 0);
         const y = parseFloat(view.style.top || 0);
-        const left = x + parseFloat(element.style.left);
-        const top = y + parseFloat(element.style.top);
+        const left = x + cssPixels(element.style.left);
+        const top = y + cssPixels(element.style.top);
         return {
             left, top,
             right: element === hud
-                ? x + parseFloat(view.style.width || width) - parseFloat(hud.style.right)
+                ? x + parseFloat(view.style.width || width) - cssPixels(hud.style.right)
                 : left + parseFloat(element.style.width),
             bottom: top + parseFloat(element.style.height || 0),
         };
@@ -1228,8 +1257,8 @@ test('production resize contains the complete HUD in the creator view without al
         assert.equal(hud.top, vp.y + Math.round(vp.height * 0.015));
         assert.ok(parseFloat(h.hud.style.fontSize) > 0);
         if (!sessionMode) {
-            assert.equal(h.hud.style.left, '5px');
-            assert.equal(h.hud.style.right, '5px');
+            assert.equal(parseFloat(h.hud.style.left.replace(/^max\(/, '')), 5);
+            assert.equal(parseFloat(h.hud.style.right.replace(/^max\(/, '')), 5);
             assert.equal(h.hud.style.fontSize, '13px', 'solo typography remains unchanged');
         }
     }

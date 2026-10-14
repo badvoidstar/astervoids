@@ -485,7 +485,7 @@ test('a snapshot supersedes parked updates rather than replaying them over it', 
         'the snapshot is newer than anything parked, so the stale delta is discarded');
 });
 
-test('a session handle costs 1-3 bytes instead of 18 and trims a bullet update from 31 to 14', async () => {
+test('a session handle costs 1-3 bytes instead of 18 and trims a bullet update from 32 to 15', async () => {
     const { client, calls, handlers } = await loadClient();
     await client.createSession();
     teachHandles(handlers, [OBJECT_ID]);
@@ -497,7 +497,9 @@ test('a session handle costs 1-3 bytes instead of 18 and trims a bullet update f
     const update = calls.at(-1).args[0][0];
     assert.equal(update[0], HANDLES[OBJECT_ID]);
     assert.equal(update[1][0], 3);
-    assert.equal(update[1][1].length, 8);
+    assert.equal(update[1][1].length, 9);
+    assert.deepEqual(Array.from(update[1][1].subarray(0, 3)), [0x26, 0, 0],
+        'the current bullet schema uses an exact three-byte presence mask');
 
     const handleId = MsgpackCodec.encode(update[0]);
     const binaryId = MsgpackCodec.encode(GuidUtils.guidToBytes(OBJECT_ID));
@@ -516,9 +518,10 @@ test('a session handle costs 1-3 bytes instead of 18 and trims a bullet update f
     const withStringId = MsgpackCodec.encode([OBJECT_ID, update[1]]);
     const withBinaryId = MsgpackCodec.encode([GuidUtils.guidToBytes(OBJECT_ID), update[1]]);
     const withHandle = MsgpackCodec.encode(update);
-    assert.equal(withStringId.length, 51);
-    assert.equal(withBinaryId.length, 31);
-    assert.equal(withHandle.length, 14);
+    assert.equal(withStringId.length, 52);
+    assert.equal(withBinaryId.length, 32);
+    assert.equal(withHandle.length, 15);
+    assert.equal(withBinaryId.length - withHandle.length, 17, 'handles retain their exact ID-only reduction');
     assert.deepEqual(MsgpackCodec.decode(withHandle), update);
     assert.deepEqual(withBinaryId.slice(19), withHandle.slice(2), 'only the ID encoding changes');
 });

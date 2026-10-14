@@ -7,6 +7,10 @@ import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const ReplicationRuntime = require('./wwwroot/js/replication-runtime.js');
+const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
+const { Asteroid: ProductionAsteroid } = loadInlineGameFunctions(['Asteroid', 'assignDefined'], {
+    AstervoidsWireCodec,
+});
 const OBJECT_TYPES = { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' };
 const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 const descriptorsSource = source.slice(
@@ -25,19 +29,21 @@ function harness() {
     let epoch = 1;
     const functions = loadInlineGameFunctions([
         'indexKinematicInstances', 'getKinematicInstance', 'currentKinematicData',
-        'buildReplicationContext'
+        'buildReplicationContext', 'assignDefined',
     ], {
         game, OBJECT_TYPES, performance: { now: () => 100 },
         SessionClient: { getSessionEpoch: () => epoch }
     });
     const entity = data => ({
         ...data,
-        fromSyncData(next) { Object.assign(this, next); }
+        processedDamage: {}, _processedDamageBytes: new Uint8Array(),
+        fromSyncData(next) { Object.assign(this, next); },
+        fromGameplayData: ProductionAsteroid.prototype.fromGameplayData,
     });
     const dependencies = {
         ...functions, game, OBJECT_TYPES, ReplicationRuntime,
         _warn: (...args) => warnings.push(args),
-        AstervoidsWireCodec: require('./wwwroot/js/astervoids-wire-codec.js'),
+        AstervoidsWireCodec,
         Asteroid: { fromSyncData: entity },
         Bullet: { fromSyncData: entity },
         ObjectSync: { getObject: id => records.get(id) },
@@ -65,7 +71,7 @@ function harness() {
     });
     runtime.beginSession({ epoch });
     return {
-        game, records, runtime, descriptors, warnings, ...functions,
+        game, records, runtime, descriptors, warnings, entity, ...functions,
         setEpoch: value => { epoch = value; },
         record(id, type, ownerMemberId = 'remote') {
             const record = { id, type, ownerMemberId, version: 1,
@@ -84,7 +90,7 @@ test('reconciliation indexes existing references once instead of scanning for ev
     ]) {
         for (let i = 0; i < 200; i++) {
             const record = h.record(`${type}-${i}`, type);
-            collection.push({ syncObjectId: record.id, fromSyncData() {} });
+            collection.push({ ...h.entity(record.data), syncObjectId: record.id });
         }
         collection.find = () => assert.fail('quadratic lookup during reconciliation');
         const originalOrder = [...collection];
@@ -96,6 +102,40 @@ test('reconciliation indexes existing references once instead of scanning for ev
         }
     }
 });
+
+for (const owned of [true, false]) {
+    test(`${owned ? 'owned adoption' : 'replica apply'} takes canonical armor independently of live kinematics`, () => {
+        const h = harness();
+        const damageId = '11111111-1111-4111-8111-111111111111';
+        const nextDamageId = '22222222-2222-4222-8222-222222222222';
+        const record = h.record('armor', OBJECT_TYPES.ASTEROID, owned ? 'local' : 'remote');
+        Object.assign(record.data, {
+            x: 0.2, y: 0.3, angle: 0.1, maxHits: 3, hitsRemaining: 2, payloadKind: 2,
+            processedDamage: AstervoidsWireCodec.packCounterMap({ [damageId]: 1 }),
+        });
+        const pose = { x: 0.8, y: 0.6, angle: 1.2 };
+        const instance = h.entity({ ...pose, maxHits: 1, hitsRemaining: 1, payloadKind: 0 });
+        instance.syncObjectId = record.id;
+        h.game.astervoids.push(instance);
+        const context = h.buildReplicationContext(OBJECT_TYPES.ASTEROID);
+        const ingest = () => owned
+            ? h.descriptors[0].adoptOwned(record, instance, { currentMemberId: 'local' }, context)
+            : h.descriptors[0].apply(instance, pose, { objectId: record.id });
+        ingest();
+        assert.deepEqual([instance.x, instance.y, instance.angle], Object.values(pose));
+        assert.deepEqual([instance.maxHits, instance.hitsRemaining, instance.payloadKind], [3, 2, 2]);
+        assert.deepEqual(instance.processedDamage, { [damageId]: 1 });
+        assert.deepEqual(instance._processedDamageBytes, record.data.processedDamage);
+        assert.notEqual(instance._processedDamageBytes, record.data.processedDamage, 'armor ingestion snapshots bytes');
+        record.data.hitsRemaining = 1;
+        record.data.processedDamage = AstervoidsWireCodec.packCounterMap({ [damageId]: 1, [nextDamageId]: 1 });
+        ingest();
+        assert.equal(instance.hitsRemaining, 1, 'later canonical acknowledgements are applied too');
+        assert.deepEqual(instance.processedDamage, { [damageId]: 1, [nextDamageId]: 1 });
+        assert.deepEqual([instance.x, instance.y, instance.angle], Object.values(pose));
+        assert.deepEqual(h.warnings, []);
+    });
+}
 
 test('malformed and old unpacked asteroid geometry never becomes an invented replica or owned shape', () => {
     for (const owner of ['remote', 'local']) {

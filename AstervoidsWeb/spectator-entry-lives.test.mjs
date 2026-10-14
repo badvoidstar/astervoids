@@ -26,10 +26,11 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
         ? { id: 'gs', type: GAME_STATE, ownerMemberId: gameStateOwner, version: 9, data: gameStateData }
         : null;
     const calls = [];
+    const hudCache = { xp: 20, xpLevel: 2 };
     const globals = {
         CONFIG: { MULTIPLAYER_LIVES: 3, INVULNERABILITY_TIME: 3, STARTING_LIVES: 3 },
         OBJECT_TYPES: { GAME_STATE, SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
-        game,
+        game, hudCache,
         isSessionMode: () => true,
         adoptSoloSim: () => {},
         SessionClient: { getCurrentMember: () => ({ id: 'me', role }) },
@@ -75,7 +76,7 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
     // Load the real helper alongside init so the entry path under test is
     // production code end to end, not a stub.
     const { init } = loadInlineGameFunctions(['adoptSharedLives', 'init'], globals);
-    return { game, init, calls };
+    return { game, init, calls, hudCache };
 }
 
 test('entering an in-progress game adopts the shared lives, not the local default', async () => {
@@ -90,6 +91,7 @@ test('entering an in-progress game adopts the shared lives, not the local defaul
 
         assert.equal(await harness.init(), true);
         assert.equal(harness.game.lives, lives);
+        assert.deepEqual(harness.hudCache, { xp: 20, xpLevel: 2 }, 'in-progress entry is not a new run');
     }
 });
 
@@ -116,4 +118,5 @@ test('a session with no GameState yet still starts from the local default', asyn
 
     assert.equal(await harness.init(), true);
     assert.equal(harness.game.lives, 3);
+    assert.deepEqual(harness.hudCache, { xp: null, xpLevel: null }, 'fresh initialization clears progression rendering');
 });

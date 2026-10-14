@@ -11,6 +11,7 @@ const AstervoidsWireCodec = (function () {
     const TWO_PI = Math.PI * 2;
     const ASTEROID_VERTEX_BYTES = 4;
     const COUNTER_ENTRY_BYTES = 20;
+    const XP_ENTRY_BYTES = 24;
 
     function isByteArray(value) {
         return value instanceof Uint8Array;
@@ -155,6 +156,57 @@ const AstervoidsWireCodec = (function () {
         return counters;
     }
 
+    function packXpMap(xp) {
+        if (xp == null) xp = {};
+        if (typeof xp !== 'object' || Array.isArray(xp) || isByteArray(xp)
+            || Object.prototype.toString.call(xp) !== '[object Object]') {
+            throw new TypeError('XP map must be a plain object');
+        }
+        const entries = Object.entries(xp).map(([id, value]) => [id.toLowerCase(), value])
+            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+        const bytes = new Uint8Array(entries.length * XP_ENTRY_BYTES);
+        const view = new DataView(bytes.buffer);
+        let previous = null;
+        for (let i = 0; i < entries.length; i++) {
+            const [id, value] = entries[i];
+            if (!guidUtils.isGuid(id) || id === previous) {
+                throw new TypeError('XP map contains an invalid or duplicate GUID');
+            }
+            if (!Number.isSafeInteger(value) || value < 0) {
+                throw new RangeError('XP must be a nonnegative safe integer');
+            }
+            const offset = i * XP_ENTRY_BYTES;
+            bytes.set(guidUtils.guidToBytes(id), offset);
+            view.setFloat64(offset + 16, value, true);
+            previous = id;
+        }
+        return bytes;
+    }
+
+    function unpackXpMap(value) {
+        if (value == null) return {};
+        if (!isByteArray(value)) throw new TypeError('packed XP map must be a Uint8Array');
+        if (value.length % XP_ENTRY_BYTES !== 0) {
+            throw new Error('packed XP map has an invalid byte length');
+        }
+        const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+        const xp = {};
+        let previous = null;
+        for (let offset = 0; offset < value.length; offset += XP_ENTRY_BYTES) {
+            const id = guidBytesToString(value, offset);
+            const amount = view.getFloat64(offset + 16, true);
+            if (previous !== null && id <= previous) {
+                throw new Error('packed XP map GUIDs must be distinct and sorted');
+            }
+            if (!Number.isSafeInteger(amount) || amount < 0) {
+                throw new RangeError('packed XP must be a nonnegative safe integer');
+            }
+            xp[id] = amount;
+            previous = id;
+        }
+        return xp;
+    }
+
     function isParticipantTag(value) {
         return typeof value === 'string' && config.IDENTITY_TAG_PATTERN.test(value);
     }
@@ -216,6 +268,8 @@ const AstervoidsWireCodec = (function () {
         unpackAsteroidVertices,
         packCounterMap,
         unpackCounterMap,
+        packXpMap,
+        unpackXpMap,
         isParticipantTag,
         packTagMap,
         unpackTagMap

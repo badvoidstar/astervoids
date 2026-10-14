@@ -22,6 +22,7 @@ const AstervoidsWireSchemas = (function() {
             ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
             ['participantId', 'guid'],
             ['participantTag', 'str'],
+            ['handledHazards', 'bytes'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],
@@ -34,6 +35,8 @@ const AstervoidsWireSchemas = (function() {
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['terminalAngle', 'f64'],
+            ['maxHits', 'u8'], ['hitsRemaining', 'u8'], ['payloadKind', 'u8'],
+            ['processedDamage', 'bytes'],
         ]},
         { id: 3, fields: [
             ['type', 'str'],
@@ -49,6 +52,8 @@ const AstervoidsWireSchemas = (function() {
             ['hitOffsetN', 'q16s'],
             ['terminalEpoch', 'f64'],
             ['terminalX', 'f64'], ['terminalY', 'f64'],
+            ['damageId', 'guid'], ['participantId', 'guid'],
+            ['shipId', 'nullable-guid'], ['participantTag', 'str'],
         ]},
         { id: 4, fields: [
             ['type', 'str'],
@@ -70,6 +75,24 @@ const AstervoidsWireSchemas = (function() {
             ['participantScores', 'bytes'],
             ['participantNumbers', 'bytes'],
             ['participantTags', 'bytes'],
+            ['participantXp', 'bytes'], ['processedEffects', 'bytes'],
+        ]},
+        { id: 5, fields: [
+            ['type', 'str'], ['kind', 'u8'], ['payloadKind', 'u8'],
+            ['sourceId', 'guid'], ['claimId', 'nullable-guid'],
+            ['participantId', 'nullable-guid'], ['participantTag', 'str'],
+            ['shipId', 'nullable-guid'],
+            ['x', 'q16w'], ['y', 'q16w'],
+            ['velocityX', 'f32'], ['velocityY', 'f32'], ['angle', 'q16_2pi'],
+            ['startedAt', 'f64'], ['armedAt', 'f64'], ['expiresAt', 'f64'],
+            ['points', 'u32'], ['damageReceipts', 'bytes'],
+            ['asteroidTargets', 'bytes'], ['hazardTargets', 'bytes'],
+        ]},
+        { id: 6, fields: [
+            ['type', 'str'], ['targetId', 'guid'], ['shipId', 'guid'],
+            ['participantId', 'guid'], ['participantTag', 'str'],
+            ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
+            ['claimedAt', 'f64'], ['invulnerabilityRevision', 'u32'],
         ]},
     ];
 
@@ -85,6 +108,8 @@ const AstervoidsWireSchemas = (function() {
         asteroid: 2,
         bullet: 3,
         gameState: 4,
+        gameEffect: 5,
+        gameClaim: 6,
     });
 
     function requireCurrentSchemas(metadata) {

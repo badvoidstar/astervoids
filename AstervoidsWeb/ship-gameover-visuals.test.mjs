@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const AstervoidsFracture = require('./wwwroot/js/asteroid-fracture.js');
+const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 
 const here = dirname(fileURLToPath(import.meta.url));
 const productionSource = readFileSync(resolve(here, 'wwwroot/index.html'), 'utf8');
@@ -36,7 +37,7 @@ function harness({ gameOver = true } = {}) {
         {
             CONFIG: config,
             game,
-            AstervoidsFracture,
+            AstervoidsFracture, AstervoidsWireCodec,
             OBJECT_TYPES: { GAME_STATE: 'gameState' },
             ObjectSync: { getObjectByType: () => ({ data: state.data }) },
             isSessionMode: () => state.sessionMode,

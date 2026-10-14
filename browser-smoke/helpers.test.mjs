@@ -350,7 +350,7 @@ test('local and remote configurations use the installed headless shell and keep 
     }
 });
 
-test('actual Playwright discovery keeps local coverage, bounds preview layouts and skips only the injected identity failure', async () => {
+test('actual Playwright discovery keeps local coverage and all progression scenarios, bounds preview layouts and skips only the injected identity failure', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'astervoids-smoke-discovery-'));
     try {
         const inventories = [];
@@ -392,12 +392,23 @@ test('actual Playwright discovery keeps local coverage, bounds preview layouts a
             inventories.push(inventory);
         }
         const [local, remote] = inventories;
-        assert.equal(local.length, 69);
+        assert.equal(local.length, 73);
         assert.ok(local.every(scenario => scenario.expectedStatus === 'passed'));
         assert.equal(local.filter(scenario => scenario.file === 'origin-guard.spec.mjs').length, 22);
         const faultTitle = 'identity failure and busy states keep their actions accessible in a reduced-height viewport';
         assert.equal(local.filter(scenario => scenario.title === faultTitle).length, 1);
-        assert.equal(remote.length, 47);
+        assert.equal(remote.length, 51);
+        const progressionTitles = [
+            'solo armored hits earn nothing until break, then real hull pickup advances exactly one level',
+            'actual per-break XP, full multishot, death retention, new-run reset and native bar (desktop)',
+            'actual per-break XP, full multishot, death retention, new-run reset and native bar (touch portrait)',
+            'independent SignalR clients replicate earned XP, preserve it through death, ownership migration and rejoin',
+        ];
+        for (const inventory of [local, remote]) {
+            assert.deepEqual(inventory.filter(scenario => scenario.file === 'progression.spec.mjs'),
+                progressionTitles.map(title => ({ file: 'progression.spec.mjs', title, expectedStatus: 'passed' })),
+                'all four progression cases remain runnable locally and remotely, including real input and SignalR');
+        }
         assert.deepEqual(remote, local
             .filter(scenario => scenario.file !== 'origin-guard.spec.mjs')
             .map(scenario => scenario.title === faultTitle

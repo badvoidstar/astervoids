@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { CURRENT_GAME_SCHEMAS } from './test-support/game-schema-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +22,7 @@ function registerProductionSchemas() {
 
 test('known gameplay objects each have one positional schema', () => {
     const schemas = WireSchemas.SCHEMAS;
-    assert.deepEqual(schemas.map(schema => schema.id), [1, 2, 3, 4]);
+    assert.deepEqual(schemas, CURRENT_GAME_SCHEMAS, 'pin every positional field, type, and order');
     for (const schema of schemas) {
         assert.ok(schema.fields.length <= 32);
         assert.equal(
@@ -34,6 +35,8 @@ test('known gameplay objects each have one positional schema', () => {
         asteroid: 2,
         bullet: 3,
         gameState: 4,
+        gameEffect: 5,
+        gameClaim: 6,
     });
 });
 
@@ -95,7 +98,7 @@ test('ship transition slots append to the stable schema and preserve timing prec
     const schema = SchemaCodec.get(1);
     assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
         ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
-        ['participantId', 'guid'], ['participantTag', 'str']
+        ['participantId', 'guid'], ['participantTag', 'str'], ['handledHazards', 'bytes']
     ]);
     const data = {
         invulnerable: 180, invulnerabilityRevision: 0xffffffff,
@@ -201,8 +204,8 @@ test('bullet schema keeps ballistic and hit deltas sparse', () => {
         hitOffsetN: -0.25,
     });
 
-    assert.equal(ballistic.length, 8);
-    assert.equal(hit.length, 26);
+    assert.equal(ballistic.length, 9, 'the twenty-slot bullet requires a three-byte mask');
+    assert.equal(hit.length, 27);
     assert.equal(SchemaCodec.decode(schema, ballistic).lifetime, 42);
     assert.equal(
         SchemaCodec.decode(schema, hit).hitTargetId,
@@ -238,15 +241,17 @@ test('known terminal updates do not fall back to schema zero', () => {
     }
 });
 
-test('GameState appends personal history after the stable final-life ship slot', () => {
+test('GameState appends history and progression after the stable final-life ship slot', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(4);
-    assert.equal(schema.fields.length, 19);
+    assert.equal(schema.fields.length, 21);
     assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]), [
         ['terminalShipId', 'guid'],
         ['participantScores', 'bytes'],
         ['participantNumbers', 'bytes'],
         ['participantTags', 'bytes'],
+        ['participantXp', 'bytes'],
+        ['processedEffects', 'bytes'],
     ]);
     const terminal = {
         lives: 0, gameOverAt: 1000, terminalAt: 1750,
@@ -260,7 +265,7 @@ test('GameState appends personal history after the stable final-life ship slot',
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
     assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5,
-        'nineteen optional slots retain the three-byte presence mask');
+        'twenty-one optional slots retain the three-byte presence mask');
 });
 
 test('rare ship score updates reuse the existing uint32 slot and eight-byte body', () => {
@@ -286,7 +291,7 @@ test('personal history has sparse three-byte masks and packed zero-score entries
     assert.deepEqual(SchemaCodec.decode(schema, encoded), payload);
 });
 
-test('fresh GameState producer initializes six empty ledgers with a sixty-nine-byte body', async () => {
+test('fresh GameState producer initializes eight empty ledgers with a seventy-seven-byte body', async () => {
     registerProductionSchemas();
     let created;
     const game = {
@@ -305,13 +310,27 @@ test('fresh GameState producer initializes six empty ledgers with a sixty-nine-b
     });
     await createSyncedGameState();
     const bytes = SchemaCodec.encode(SchemaCodec.get(4), created);
-    assert.equal(bytes.length, 69);
-    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 7]);
+    assert.equal(bytes.length, 77);
+    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 31]);
     assert.deepEqual(WireCodec.unpackTagMap(created.participantTags), {});
+    for (const field of ['participantXp', 'processedEffects']) {
+        assert.ok(created[field] instanceof Uint8Array, `${field} must be explicitly initialized`);
+        assert.equal(created[field].length, 0);
+    }
     for (const field of ['processedHits', 'processedScores', 'countedParticipants',
         'participantScores', 'participantNumbers']) {
         assert.deepEqual(WireCodec.unpackCounterMap(created[field]), {});
     }
+});
+
+test('armor and effect updates pay only their new presence-mask byte when slots are absent', () => {
+    registerProductionSchemas();
+    for (const id of [2, 3, 4, 5]) {
+        assert.equal(SchemaCodec.encode(SchemaCodec.get(id), {}).length, 3, `schema ${id}`);
+    }
+    assert.equal(SchemaCodec.encode(SchemaCodec.get(1), {}).length, 4);
+    assert.equal(SchemaCodec.encode(SchemaCodec.get(6), {}).length, 2);
+    assert.equal(SchemaCodec.encode(SchemaCodec.get(2), { x: 0.5, y: 0.5, angle: 0 }).length, 9);
 });
 
 test('production serializers keep optional high-cost data sparse', () => {

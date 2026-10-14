@@ -4,6 +4,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import {
+    SHIP_SCHEMA_FIELDS, ASTEROID_SCHEMA_FIELDS, BULLET_SCHEMA_FIELDS,
+    GAME_STATE_SCHEMA_FIELDS, GAME_EFFECT_SCHEMA_FIELDS, GAME_CLAIM_SCHEMA_FIELDS,
+    LARGE_XP_ENTRY_HEX, LARGE_XP_STATE_HEX,
+} from './test-support/game-schema-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const SchemaCodec = require('./wwwroot/js/schema-codec.js');
@@ -19,50 +24,6 @@ function hexToBytes(hex) {
 function freshRegistry() {
     SchemaCodec.clear();
 }
-
-const SHIP_SCHEMA_FIELDS = [
-    ['type', 'str'],
-    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
-    ['velocityX', 'f32'], ['velocityY', 'f32'], ['rotationSpeed', 'q16s'],
-    ['thrusting', 'bool'], ['invulnerable', 'u16'],
-    ['colorIndex', 'u8'], ['memberId', 'guid'],
-    ['score', 'u32'], ['hitCount', 'u16'],
-    ['thrustInput', 'f32'], ['brakeInput', 'q8'],
-    ['turnControlMode', 'u8'], ['turnTarget', 'q16s'],
-    ['turnTargetAngle', 'q16_2pi'], ['turnMagnitude', 'q8'], ['turnBias', 'q16s'],
-    ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
-    ['terminalY', 'f64'], ['terminalAngle', 'f64'],
-    ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
-    ['participantId', 'guid'],
-    ['participantTag', 'str'],
-];
-const ASTEROID_SCHEMA_FIELDS = [
-    ['type', 'str'],
-    ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'], ['radius', 'q16'],
-    ['velocityX', 'f32'], ['velocityY', 'f32'], ['rotationSpeed', 'f32'],
-    ['seed', 'f64'], ['vertices', 'bytes'],
-    ['terminalEpoch', 'f64'], ['terminalX', 'f64'],
-    ['terminalY', 'f64'], ['terminalAngle', 'f64'],
-];
-const BULLET_SCHEMA_FIELDS = [
-    ['type', 'str'],
-    ['x', 'q16w'], ['y', 'q16w'],
-    ['velocityX', 'q16s'], ['velocityY', 'q16s'],
-    ['lifetime', 'u16'], ['colorIndex', 'u8'], ['ownerMemberId', 'guid'],
-    ['pendingHit', 'bool'], ['hitTargetId', 'nullable-guid'],
-    ['hitImpactTorque', 'q16s'], ['hitBulletAngle', 'q16_2pi'],
-    ['hitOffsetN', 'q16s'], ['terminalEpoch', 'f64'],
-    ['terminalX', 'f64'], ['terminalY', 'f64'],
-];
-const GAME_STATE_SCHEMA_FIELDS = [
-    ['type', 'str'], ['gameStarted', 'bool'], ['wave', 'u16'], ['state', 'str'],
-    ['lives', 'u16'], ['groupScore', 'u32'], ['speedMultiplier', 'f32'],
-    ['waveDelayTimer', 'f32'], ['processedHits', 'bytes'], ['processedScores', 'bytes'],
-    ['peakShipCount', 'u8'], ['gameOverAt', 'f64'], ['terminalAt', 'f64'],
-    ['scoreLifeAwardCount', 'u32'], ['countedParticipants', 'bytes'],
-    ['terminalShipId', 'guid'], ['participantScores', 'bytes'], ['participantNumbers', 'bytes'],
-    ['participantTags', 'bytes'],
-];
 
 test('cross-wire: durable participant identity and tags retain sparse positional masks', () => {
     const ship = SchemaCodec.normalizeSchema(1, SHIP_SCHEMA_FIELDS);
@@ -80,7 +41,7 @@ test('cross-wire: durable participant identity and tags retain sparse positional
 test('cross-wire fixtures match every production positional field', () => {
     for (const [id, fields] of [
         [1, SHIP_SCHEMA_FIELDS], [2, ASTEROID_SCHEMA_FIELDS], [3, BULLET_SCHEMA_FIELDS],
-        [4, GAME_STATE_SCHEMA_FIELDS],
+        [4, GAME_STATE_SCHEMA_FIELDS], [5, GAME_EFFECT_SCHEMA_FIELDS], [6, GAME_CLAIM_SCHEMA_FIELDS],
     ]) {
         assert.deepEqual(fields, SCHEMAS.find(schema => schema.id === id).fields);
     }
@@ -89,7 +50,7 @@ test('cross-wire fixtures match every production positional field', () => {
 test('cross-wire: asteroid update — all fields', () => {
     freshRegistry();
     const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
-    const bytes = hexToBytes('0e00' + '0080' + '0060' + '0040');
+    const bytes = hexToBytes('0e0000' + '0080' + '0060' + '0040');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.ok(Math.abs(decoded.x - 0.5) < 0.00002);
     assert.ok(Math.abs(decoded.y - 0.25) < 0.00002);
@@ -99,7 +60,7 @@ test('cross-wire: asteroid update — all fields', () => {
 test('cross-wire: asteroid update — only angle bit set', () => {
     freshRegistry();
     const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
-    const bytes = hexToBytes('0800' + '0000');
+    const bytes = hexToBytes('080000' + '0000');
     const decoded = SchemaCodec.decode(schema, bytes);
     assert.equal('x' in decoded, false);
     assert.equal('y' in decoded, false);
@@ -144,7 +105,7 @@ test('cross-wire: bullet update — guid field', () => {
     freshRegistry();
     const schema = SchemaCodec.register(3, BULLET_SCHEMA_FIELDS);
     const bytes = hexToBytes(
-        '8600' +
+        '860000' +
         '0080' +
         '0080' +
         '443322116655887799aabbccddeeff00'
@@ -189,7 +150,7 @@ test('cross-wire: JS encode → C# hex round-trip (asteroid update)', () => {
     const bytes = SchemaCodec.encode(schema, { x: 0.5, y: 0.25, angle: Math.PI / 2 });
     const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     assert.equal(hex,
-        '0e00' +
+        '0e0000' +
         '0080' +
         '0060' +
         '0040'
@@ -201,7 +162,7 @@ test('cross-wire (Phase 5): quantized asteroid update produces canonical hex', (
     const schema = SchemaCodec.register(2, ASTEROID_SCHEMA_FIELDS);
     const bytes = SchemaCodec.encode(schema, { x: 0.5, y: 0.25, angle: Math.PI });
     const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-    assert.equal(hex, '0E00008000600080');
+    assert.equal(hex, '0E0000008000600080');
 });
 
 // PR #96 review fix #4 cross-wire parity.
@@ -305,4 +266,50 @@ test('cross-wire: independent custom registries keep their own positional layout
     assert.deepEqual(SchemaCodec.decode(label, hexToBytes('010600776964676574')), { label: 'widget' });
     assert.equal(Buffer.from(SchemaCodec.encode(counter, { value: 30 })).toString('hex'), '011e000000');
     assert.equal(Buffer.from(SchemaCodec.encode(label, { label: 'widget' })).toString('hex'), '010600776964676574');
+});
+
+test('cross-wire: progression and hazard slots retain exact sparse masks', () => {
+    for (const [id, fields, data, hex] of [
+        [1, SHIP_SCHEMA_FIELDS, { handledHazards: new Uint8Array() }, '0000001000000000'],
+        [2, ASTEROID_SCHEMA_FIELDS,
+            { maxHits: 3, hitsRemaining: 2, payloadKind: 6, processedDamage: new Uint8Array() },
+            '00c00303020600000000'],
+        [3, BULLET_SCHEMA_FIELDS, {
+            damageId: '00112233-4455-6677-8899-aabbccddeeff',
+            participantId: '11223344-5566-7788-99aa-bbccddeeff00',
+            shipId: null, participantTag: 'Pilot_1',
+        }, '00000f' + '33221100554477668899aabbccddeeff'
+            + '443322116655887799aabbccddeeff00' + '00' + '070050696c6f745f31'],
+        [4, GAME_STATE_SCHEMA_FIELDS, { participantXp: hexToBytes(LARGE_XP_ENTRY_HEX) }, LARGE_XP_STATE_HEX],
+        [4, GAME_STATE_SCHEMA_FIELDS, { processedEffects: new Uint8Array() }, '00001000000000'],
+    ]) {
+        const schema = SchemaCodec.normalizeSchema(id, fields);
+        const expected = hexToBytes(hex);
+        assert.deepEqual(SchemaCodec.encode(schema, data), expected, `schema ${id} appended slots`);
+        assert.deepEqual(SchemaCodec.decode(schema, expected), data, `schema ${id} snapshot`);
+    }
+});
+
+test('cross-wire: effect capture deadlines and fixed target lists are snapshot-safe', () => {
+    const schema = SchemaCodec.normalizeSchema(5, GAME_EFFECT_SCHEMA_FIELDS);
+    const data = {
+        claimId: null, participantId: null, shipId: null,
+        velocityX: 0.75, velocityY: -0.5, startedAt: 1000, armedAt: 1800, expiresAt: 3000,
+        damageReceipts: new Uint8Array(), asteroidTargets: new Uint8Array([1, 2]),
+        hazardTargets: new Uint8Array([3]),
+    };
+    const hex = 'b0ec0e' + '000000' + '0000403f000000bf'
+        + '0000000000408f40' + '0000000000209c40' + '000000000070a740'
+        + '00000000' + '020000000102' + '0100000003';
+    const expected = hexToBytes(hex);
+    assert.deepEqual(SchemaCodec.encode(schema, data), expected);
+    assert.deepEqual(SchemaCodec.decode(schema, expected), data);
+});
+
+test('cross-wire: claim time and ship revision remain exact and independently optional', () => {
+    const schema = SchemaCodec.normalizeSchema(6, GAME_CLAIM_SCHEMA_FIELDS);
+    const data = { claimedAt: 1000, invulnerabilityRevision: 0xffffffff };
+    const hex = '0003' + '0000000000408f40' + 'ffffffff';
+    assert.deepEqual(SchemaCodec.encode(schema, data), hexToBytes(hex));
+    assert.deepEqual(SchemaCodec.decode(schema, hexToBytes(hex)), data);
 });

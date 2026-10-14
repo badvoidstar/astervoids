@@ -1,15 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { attachGameplaySync } from './test-support/gameplay-sync.mjs';
 
 const require = createRequire(import.meta.url);
 const collision = require('./wwwroot/js/collision-geometry.js');
 const fracture = require('./wwwroot/js/asteroid-fracture.js');
 const wire = require('./wwwroot/js/astervoids-wire-codec.js');
+const guidUtils = require('./wwwroot/js/guid-utils.js');
+const sharedConfig = require('./wwwroot/js/game-config.js');
+const constants = loadInlineGameConstants(['PROGRESSION', 'PAYLOAD_KIND', 'GAME_EFFECT_KIND']);
+const progression = loadInlineGameFunctions(
+    ['getLevelXpThreshold', 'getLevelForXp'], constants);
 
-const ME = 'local';
-const PEER = 'peer';
+const ME = '00000001-1111-2222-3333-aabbccddeeff';
+const PEER = '00000002-1111-2222-3333-aabbccddeeff';
+const PARTICIPANT = '00000003-1111-2222-3333-aabbccddeeff';
+const SHIP_ID = '00000004-1111-2222-3333-aabbccddeeff';
+const ASTEROID_ID = '00000005-1111-2222-3333-aabbccddeeff';
 
 // A ship crashing into an asteroid is also a hit on that asteroid, resolved
 // through the production bullet paths: the contact point becomes the shot.
@@ -21,6 +30,7 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
     const viewport = { width: 1000, height: 1000 };
     const events = [];
     const config = {
+        ...sharedConfig.SHARED_DEFAULTS,
         TARGET_FPS: 60,
         ASTEROID_VERTICES: 10, ASTEROID_JAGGEDNESS: 0.4,
         ASTEROID_MAX_SPEED: 0.4, ASTEROID_MAX_SPIN: Math.PI / 6,
@@ -31,13 +41,39 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
     };
     const game = {
         astervoids: [], bullets: [], ship: null, state: 'playing',
-        score: 0, lives,
+        score: 0, lives, soloXp: 0, effects: [], simulationTimeMs: 0,
         multiplayer: {
             processedPendingBullets: new Set(),
-            myShipObjectId: session ? 'my-ship' : null,
+            myShipObjectId: session ? SHIP_ID : null,
+            effectAnchors: new Map(),
         },
     };
     const objects = new Map();
+    const objectSync = {
+        getObject: id => objects.get(id),
+        getObjectsByType: type => [...objects.values()].filter(obj => obj.data?.type === type),
+        updateObject: (...args) => events.push(['update', ...args]),
+    };
+    const sessionClient = {
+        getCurrentMember: () => ({ id: ME }),
+        getCurrentSession: () => ({ members: [{ id: ME }, { id: PEER }] }),
+        getSessionEpoch: () => 1,
+    };
+    const globals = {
+        ...constants, ...progression, CONFIG: config, game,
+        getGameWidth: () => viewport.width,
+        getGameHeight: () => viewport.height,
+        isSessionMode: () => session,
+        isGameOver: () => game.lives <= 0 || game.state === 'gameover',
+        SessionClient: sessionClient, ObjectSync: objectSync,
+        GuidUtils: guidUtils, AstervoidsWireCodec: wire,
+        countExtraLivesForScore: sharedConfig.countExtraLivesForScore,
+        OBJECT_TYPES: {
+            ASTEROID: 'asteroid', BULLET: 'bullet', SHIP: 'ship',
+            GAME_EFFECT: 'gameEffect', GAME_CLAIM: 'gameClaim',
+        },
+    };
+    let splitting;
     const production = loadInlineGameFunctions([
         'Asteroid', 'Bullet', 'assignDefined', 'getReferenceDimension',
         'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
@@ -49,29 +85,23 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
         'resolveBulletAsteroidHit', 'resolveOwnedAsteroidHit',
         'claimCrossOwnerAsteroidHit', 'resolveSoloAsteroidHit',
         'confirmOwnedAsteroidHitClaims', 'retireConfirmedPendingBullets',
+        'applyOwnedAsteroidDamage', 'applySoloAsteroidDamage', 'checkGameEffectContacts',
+        'calculateGameState',
     ], {
-        CONFIG: config, game,
-        getGameWidth: () => viewport.width,
-        getGameHeight: () => viewport.height,
+        ...globals,
         getEffectiveAsteroidAspectScales: () => ({ speedScale: 1 }),
         randomRange: () => 0,
         AstervoidsFracture: fracture,
-        AstervoidsWireCodec: wire,
         AstervoidsCollision: collision,
         pointInPolygon: collision.pointInPolygon,
-        OBJECT_TYPES: { ASTEROID: 'asteroid', BULLET: 'bullet', SHIP: 'ship' },
-        SessionClient: { getCurrentMember: () => ({ id: ME }) },
-        isSessionMode: () => session,
-        ObjectSync: {
-            getObject: id => objects.get(id),
-            getObjectsByType: type => [...objects.values()].filter(obj => obj.type === type),
-            updateObject: (...args) => events.push(['update', ...args]),
-        },
         CollisionEffects: {
             startAsteroidHit: (...args) => events.push(['cue', ...args]),
             startShipHit: (...args) => events.push(['ship-cue', ...args]),
         },
-        splitAsteroid: (...args) => events.push(['split', ...args]),
+        splitAsteroid: (...args) => {
+            events.push(['split', ...args]);
+            return splitting.splitAsteroid(...args);
+        },
         emitOwnedAsteroidImpactCue: (...args) => events.push(['owned-cue', ...args]),
         // Mirrors production: the claim must already be on the bullet when its
         // creation payload is built, or the asteroid owner never sees it.
@@ -79,7 +109,6 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
         deleteSyncedBullet: bullet => events.push(['delete-bullet', bullet]),
         emitShipStateChanged: (...args) => events.push(['ship-update', ...args]),
         getShipByMemberId: () => null,
-        countExtraLivesForScore: (score, threshold) => Math.floor(score / threshold),
         announceExtraLifeAward: () => events.push(['extra-life']),
         predictFatalShipHit: () => fatal,
         beginShipDeathHold: ship => {
@@ -96,7 +125,24 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
         },
         _error: error => { throw error; },
     });
-    return { ...production, viewport, events, config, game, objects };
+    splitting = loadInlineGameFunctions([
+        'splitAsteroid', 'replaceSyncedAsteroid', 'computeDeflectionImpulse',
+        'buildAsteroidBreakEffects', 'createGameEffectData', 'getAsteroidObjectId',
+        'addSoloGameEffect', 'getGameEffectTiming', 'ensureOwnedGameEffectAnchor',
+        'anchorGameEffectData', 'getGameEffectTimerData', 'isGameEffectReady',
+    ], {
+        ...globals, Asteroid: production.Asteroid, AstervoidsFracture: fracture,
+        getEffectiveAsteroidAspectScales: () => ({ speedScale: 1, radiusScale: 1 }),
+        getReferenceDimension: production.getReferenceDimension,
+        emitShipStateChanged: (...args) => events.push(['ship-update', ...args]),
+        updateHUD: () => events.push(['hud']),
+        publishDebugMetrics() {},
+        _error: error => { throw error; },
+    });
+    const result = { ...production, ...splitting, viewport, events, config, game, objects,
+        objectSync, sessionClient, clock: { server: 1000 } };
+    if (session) result.network = attachGameplaySync(result, ME);
+    return result;
 }
 
 // Square rock so contact points are exact: corners at ±10 px around its centre.
@@ -109,9 +155,10 @@ function rock(h, { x = 0.5, y = 0.5, halfWidth = 0.01, syncObjectId = null, owne
     asteroid.syncObjectId = syncObjectId;
     h.game.astervoids.push(asteroid);
     if (syncObjectId) {
-        h.objects.set(syncObjectId, {
-            id: syncObjectId, type: 'asteroid', ownerMemberId: owner, data: {},
-        });
+        h.network.seed([{
+            id: syncObjectId, ownerMemberId: owner, creatorMemberId: owner,
+            scope: 'Session', schemaId: 2, version: 1, data: asteroid.toSyncData(),
+        }]);
     }
     return asteroid;
 }
@@ -122,6 +169,8 @@ function ram(h, { vertex = { x: 505, y: 498 } } = {}) {
     const ship = {
         x: 0.52, y: 0.5, angle: 0, velocityX: -3, velocityY: 1.5,
         colorIndex: 2, memberId: ME, invulnerable: 0, score: 0, hitCount: 0,
+        participantId: PARTICIPANT, participantTag: 'CrashPilot',
+        syncObjectId: h.game.multiplayer.myShipObjectId,
         deathHold: null, resets: 0,
         getVertices: () => [vertex, { x: 520, y: 495 }, { x: 520, y: 505 }],
         reset() {
@@ -161,10 +210,11 @@ test('a survivable solo crash destroys the asteroid like a shot at the contact p
     assert.equal(ship.hitCount, 1);
     // ...and the crash now also resolves as a hit on the asteroid.
     assert.deepEqual(kinds(h), [
-        'ship-explosion', 'ship-cue', 'hud', 'cue', 'explosion', 'split',
+        'ship-explosion', 'ship-cue', 'hud', 'cue', 'explosion', 'split', 'hud',
     ]);
     assert.deepEqual(h.game.astervoids, [], 'the struck asteroid is destroyed');
     assert.equal(h.game.score, h.config.POINTS_SMALL);
+    assert.equal(h.game.soloXp, 10);
     assert.equal(h.game.bullets.length, 0, 'the equivalent shot is consumed by its hit');
 
     const [, cueBullet, cueTarget] = find(h, 'cue');
@@ -215,31 +265,62 @@ test('a fatal solo crash keeps the asteroid and today\'s game-over behavior', ()
     assert.deepEqual(h.game.bullets, [], 'and no equivalent shot is fired');
     assert.deepEqual(kinds(h), ['ship-explosion', 'ship-cue', 'hud']);
     assert.equal(h.game.score, 0);
+    assert.equal(h.game.soloXp, 0);
 });
 
-test('a survivable session crash into an owned asteroid splits it locally', () => {
+test('a survivable session crash into an owned asteroid commits one durable winner rather than self-crediting', async () => {
     const h = harness({ session: true });
-    const asteroid = rock(h, { syncObjectId: 'asteroid-1' });
+    const asteroid = rock(h, { syncObjectId: ASTEROID_ID });
     const ship = ram(h);
 
     h.checkCollisions();
 
     assert.equal(ship.resets, 1);
     assert.deepEqual(kinds(h), [
-        'ship-explosion', 'ship-update', 'update', 'owned-cue', 'split', 'ship-update',
+        'ship-explosion', 'ship-update', 'owned-cue', 'split', 'create-bullet',
     ]);
     const [, cueAsteroid, cueBullet] = find(h, 'owned-cue');
     assert.equal(cueAsteroid, asteroid);
     assert.equal(cueBullet.x, 0.505);
     assert.equal(cueBullet.y, 0.498);
-    assert.equal(ship.score, h.config.POINTS_SMALL, 'the crash scores like a shot');
-    assert.deepEqual(h.game.bullets, [], 'a locally resolved hit needs no synced bullet');
-    assert.equal(find(h, 'create-bullet'), undefined);
+    assert.equal(ship.score, 0, 'a bullet never self-credits the winning owner receipt');
+    const [, createdBullet, createdData] = find(h, 'create-bullet');
+    assert.equal(createdBullet, cueBullet);
+    assert.equal(createdData.pendingHit, true, 'the attributed claim exists before asynchronous replacement');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.objectSync.getObject(ASTEROID_ID), undefined);
+    h.retireConfirmedPendingBullets(ME);
+    assert.deepEqual(h.game.bullets, [], 'an accepted replacement retires its pending crash claim');
+    assert.equal(h.network.calls.filter(call => call.method === 'replace').length, 1);
+    const winners = h.objectSync.getObjectsByType('gameEffect');
+    assert.equal(winners.length, 1);
+    assert.equal(winners[0].data.kind, constants.GAME_EFFECT_KIND.BREAK_RECEIPT);
+    assert.equal(winners[0].data.claimId, createdData.damageId);
+    assert.equal(winners[0].data.participantId, PARTICIPANT);
+    assert.equal(winners[0].data.points, h.config.POINTS_SMALL);
+    assert.equal(h.ensureOwnedGameEffectAnchor(winners[0]), false);
+    await h.objectSync.flushUpdates();
+    assert.equal(h.isGameEffectReady(winners[0]), true, 'accepted immutable deadlines precede consumption');
+    const ledger = {
+        processedHits: {}, processedScores: {}, countedParticipants: { [PARTICIPANT]: 1 },
+        participantScores: { [PARTICIPANT]: 0 }, participantNumbers: { [PARTICIPANT]: 1 },
+        participantTags: { [PARTICIPANT]: 'CrashPilot' }, participantXp: { [PARTICIPANT]: 0 },
+        processedEffects: {},
+    };
+    const next = h.calculateGameState({ lives: 3, peakShipCount: 1 }, ledger,
+        [{ id: SHIP_ID, data: ship }], { lives: 3, state: 'playing' },
+        h.config.EXTRA_LIFE_SCORE_THRESHOLD, winners);
+    assert.equal(next.groupScore, h.config.POINTS_SMALL);
+    assert.equal(next.participantXp[PARTICIPANT], 10);
+    const repeated = h.calculateGameState(next, next, [],
+        { lives: next.lives, state: 'playing' }, h.config.EXTRA_LIFE_SCORE_THRESHOLD, winners);
+    assert.equal(repeated.groupScore, next.groupScore);
+    assert.equal(repeated.participantXp[PARTICIPANT], 10);
 });
 
 test('a survivable session crash into a peer asteroid claims the hit on the wire', () => {
     const h = harness({ session: true });
-    const asteroid = rock(h, { syncObjectId: 'asteroid-1', owner: PEER });
+    const asteroid = rock(h, { syncObjectId: ASTEROID_ID, owner: PEER });
     const ship = ram(h);
 
     h.checkCollisions();
@@ -251,8 +332,7 @@ test('a survivable session crash into a peer asteroid claims the hit on the wire
 
     const [claim] = h.game.bullets;
     assert.equal(claim.pendingHit, true);
-    assert.equal(claim.hitTargetId, 'asteroid-1');
-    assert.equal(claim.pendingPoints, h.config.POINTS_SMALL);
+    assert.equal(claim.hitTargetId, ASTEROID_ID);
     assert.equal(claim.ownerMemberId, ME);
 
     // The claim must ride the creation payload: the crash bullet has no synced
@@ -260,7 +340,12 @@ test('a survivable session crash into a peer asteroid claims the hit on the wire
     const [, createdBullet, createdData] = find(h, 'create-bullet');
     assert.equal(createdBullet, claim);
     assert.equal(createdData.pendingHit, true);
-    assert.equal(createdData.hitTargetId, 'asteroid-1');
+    assert.equal(createdData.hitTargetId, ASTEROID_ID);
+    assert.equal(createdData.pendingPoints ?? 0, 0, 'the claim cannot self-credit asteroid points');
+    assert.equal(createdData.damageId, claim.damageId);
+    assert.equal(guidUtils.isGuid(createdData.damageId), true);
+    assert.equal(createdData.participantId, PARTICIPANT);
+    assert.equal(createdData.shipId, SHIP_ID);
     const impact = h.computeBulletAsteroidImpact(claim, asteroid);
     assert.equal(createdData.hitBulletAngle, impact.bulletAngle);
     assert.equal(createdData.hitOffsetN, impact.offsetN);
@@ -270,7 +355,7 @@ test('a survivable session crash into a peer asteroid claims the hit on the wire
 
 test('a predicted-fatal session crash leaves the asteroid untouched', () => {
     const h = harness({ session: true, fatal: true });
-    const asteroid = rock(h, { syncObjectId: 'asteroid-1', owner: PEER });
+    const asteroid = rock(h, { syncObjectId: ASTEROID_ID, owner: PEER });
     const ship = ram(h);
 
     h.checkCollisions();

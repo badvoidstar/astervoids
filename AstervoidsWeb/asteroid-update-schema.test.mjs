@@ -47,6 +47,8 @@ const ASTEROID_UPDATE_SCHEMA_FIELDS = [
     ['seed', 'f64'], ['vertices', 'bytes'],
     ['terminalEpoch', 'f64'],
     ['terminalX', 'f64'], ['terminalY', 'f64'], ['terminalAngle', 'f64'],
+    ['maxHits', 'u8'], ['hitsRemaining', 'u8'],
+    ['payloadKind', 'u8'], ['processedDamage', 'bytes'],
 ];
 
 function freshSchema() {

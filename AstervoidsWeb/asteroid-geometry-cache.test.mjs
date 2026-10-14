@@ -1,12 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { randomUUID } from 'node:crypto';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const collision = require('./wwwroot/js/collision-geometry.js');
 const fracture = require('./wwwroot/js/asteroid-fracture.js');
 const wire = require('./wwwroot/js/astervoids-wire-codec.js');
+const GuidUtils = require('./wwwroot/js/guid-utils.js');
+const constants = loadInlineGameConstants(['PROGRESSION', 'OBJECT_TYPES']);
+const LOCAL_MEMBER = '11111111-1111-4111-8111-111111111111';
+const REMOTE_MEMBER = '22222222-2222-4222-8222-222222222222';
+const ASTEROID_ID = '33333333-3333-4333-8333-333333333333';
+const BULLET_ID = '44444444-4444-4444-8444-444444444444';
+const PENDING_TARGET_ID = '55555555-5555-4555-8555-555555555555';
+const { Bullet } = loadInlineGameFunctions(['Bullet'], {
+    CONFIG: { BULLET_LIFETIME: 60 }, OBJECT_TYPES: constants.OBJECT_TYPES, crypto: { randomUUID },
+});
 
 function harness({ session = false, width = 1000, height = 1000, onSplit } = {}) {
     const viewport = { width, height };
@@ -29,7 +40,8 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
     };
     const game = {
         astervoids: [], bullets: [], ship: null, state: 'playing',
-        score: 0, lives: 3, multiplayer: { processedPendingBullets: new Set() },
+        score: 0, soloXp: 0, lives: 3, effects: [], effectContactNowMs: 0,
+        multiplayer: { processedPendingBullets: new Set() },
     };
     const objects = new Map();
     const production = loadInlineGameFunctions([
@@ -43,8 +55,10 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
         'resolveBulletAsteroidHit', 'resolveOwnedAsteroidHit',
         'claimCrossOwnerAsteroidHit', 'resolveSoloAsteroidHit',
         'confirmOwnedAsteroidHitClaims', 'retireConfirmedPendingBullets',
+        'applySoloAsteroidDamage', 'applyOwnedAsteroidDamage',
+        'getLevelForXp', 'getLevelXpThreshold', 'checkGameEffectContacts', 'getGameEffectObjects',
     ], {
-        Math: math, CONFIG: config, game,
+        ...constants, Math: math, CONFIG: config, game, GuidUtils, crypto: { randomUUID },
         getGameWidth: () => viewport.width,
         getGameHeight: () => viewport.height,
         getEffectiveAsteroidAspectScales: () => ({ speedScale: 1 }),
@@ -70,13 +84,23 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
             },
         },
         pointInPolygon: collision.pointInPolygon,
-        OBJECT_TYPES: { ASTEROID: 'asteroid', BULLET: 'bullet' },
-        SessionClient: { getCurrentMember: () => ({ id: 'local' }) },
+        SessionClient: {
+            getCurrentMember: () => ({ id: LOCAL_MEMBER }),
+            getCurrentSession: () => ({ members: [{ id: LOCAL_MEMBER }, { id: REMOTE_MEMBER }] }),
+            getSessionEpoch: () => 1,
+        },
         isSessionMode: () => session,
+        isGameOver: () => game.state === 'gameover' || game.lives <= 0,
         ObjectSync: {
             getObject: id => objects.get(id),
             getObjectsByType: type => [...objects.values()].filter(obj => obj.type === type),
-            updateObject: (...args) => calls.events.push(['update', ...args]),
+            updateObject: (id, data, immediate) => {
+                calls.events.push(['update', id, data, immediate]);
+                assert.ok(objects.has(id), 'updates address an accepted object');
+                Object.assign(objects.get(id).data, data);
+            },
+            isDataConfirmed: (id, data) => Object.entries(data).every(
+                ([key, value]) => Object.is(objects.get(id)?.data[key], value)),
         },
         CollisionEffects: {
             startAsteroidHit: (...args) => calls.events.push(['cue', ...args]),
@@ -84,6 +108,8 @@ function harness({ session = false, width = 1000, height = 1000, onSplit } = {})
         splitAsteroid: (...args) => {
             calls.events.push(['split', ...args]);
             onSplit?.(game, ...args);
+            if (session) objects.delete(args[0].syncObjectId);
+            return [];
         },
         emitOwnedAsteroidImpactCue: (...args) => calls.events.push(['owned-cue', ...args]),
         deleteSyncedBullet: bullet => calls.events.push(['delete', bullet]),
@@ -125,11 +151,9 @@ function rock(h, x = 0.5, y = 0.5, halfWidth = 0.01, halfHeight = halfWidth) {
 }
 
 function bullet(x, y, previousX = x, previousY = y) {
-    return {
-        x, y, _collisionPrevX: previousX, _collisionPrevY: previousY,
-        velocityX: 0.2, velocityY: 0, ownerMemberId: 'local',
-        toUpdateData() { return { pendingHit: this.pendingHit, hitTargetId: this.hitTargetId }; },
-    };
+    return Object.assign(new Bullet(x, y, 0.2, 0, 0, LOCAL_MEMBER), {
+        _collisionPrevX: previousX, _collisionPrevY: previousY,
+    });
 }
 
 // Independent pre-cache polar transform, not a second collision implementation.
@@ -495,27 +519,44 @@ test('bullet and asteroid wraps never create a false sweep across the field', ()
 });
 
 test('session collision filtering and owner-specific hit flow remain unchanged', () => {
-    for (const owner of ['local', 'remote']) {
+    for (const owner of [LOCAL_MEMBER, REMOTE_MEMBER]) {
         const h = harness({ session: true });
         const asteroid = rock(h);
-        asteroid.syncObjectId = 'asteroid';
-        h.objects.set('asteroid', { id: 'asteroid', ownerMemberId: owner });
+        asteroid.syncObjectId = ASTEROID_ID;
+        h.objects.set(ASTEROID_ID, {
+            id: ASTEROID_ID, type: constants.OBJECT_TYPES.ASTEROID,
+            ownerMemberId: owner, data: asteroid.toSyncData(),
+        });
+        h.objects.set(PENDING_TARGET_ID, {
+            id: PENDING_TARGET_ID, type: constants.OBJECT_TYPES.ASTEROID,
+            ownerMemberId: REMOTE_MEMBER, data: asteroid.toSyncData(),
+        });
         const shot = bullet(0.5, 0.5);
-        shot.syncObjectId = 'shot';
-        const foreign = { ...bullet(0.5, 0.5), ownerMemberId: 'remote' };
-        const pending = { ...bullet(0.5, 0.5), pendingHit: true, hitTargetId: 'asteroid' };
+        shot.syncObjectId = BULLET_ID;
+        h.objects.set(BULLET_ID, {
+            id: BULLET_ID, type: constants.OBJECT_TYPES.BULLET,
+            ownerMemberId: LOCAL_MEMBER, data: shot.toSyncData(),
+        });
+        const foreign = Object.assign(bullet(0.5, 0.5), { ownerMemberId: REMOTE_MEMBER });
+        const pending = Object.assign(bullet(0.5, 0.5), {
+            pendingHit: true, hitTargetId: PENDING_TARGET_ID,
+        });
         h.game.bullets.push(shot, foreign, pending);
         h.game.astervoids.push(asteroid);
         h.checkCollisions();
         assert.equal(h.calls.broad.length, 1, 'foreign and pending bullets are excluded');
-        if (owner === 'local') {
-            assert.deepEqual(h.calls.events.map(event => event[0]), ['owned-cue', 'delete', 'split']);
+        if (owner === LOCAL_MEMBER) {
+            assert.deepEqual(h.calls.events.map(event => event[0]), ['update', 'owned-cue', 'split', 'delete']);
             assert.deepEqual(h.game.bullets, [foreign, pending]);
+            assert.equal(h.objects.has(ASTEROID_ID), false, 'accepted replacement precedes bullet retirement');
         } else {
             assert.equal(shot.pendingHit, true);
-            assert.equal(shot.hitTargetId, 'asteroid');
+            assert.equal(shot.hitTargetId, ASTEROID_ID);
             assert.equal(h.game.bullets.length, 3);
             assert.deepEqual(h.calls.events.map(event => event[0]), ['cue', 'update']);
+            assert.equal(h.objects.has(ASTEROID_ID), true, 'a cross-owner claim cannot remove its target');
         }
+        assert.equal(h.game.soloXp, 0, 'session collision paths never self-award XP');
+        assert.equal(h.game.score, 0, 'session rewards wait for their durable receipt');
     }
 });
