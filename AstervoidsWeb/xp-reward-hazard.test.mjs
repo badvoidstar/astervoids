@@ -385,13 +385,13 @@ function fullLedgers(overrides = {}) {
     };
 }
 
-function calculate({ persisted = {}, ledgers = fullLedgers(), ships = [], effects = [] } = {}) {
+function calculate({ persisted = {}, ledgers = fullLedgers(), ships = [], effects = [], retired = [] } = {}) {
     return calculateGameState({
         lives: 3, groupScore: 0, peakShipCount: 2, state: 'playing',
         ...persisted,
     }, ledgers, ships, {
         lives: 3, state: 'playing', observedScoreLifeAwardCount: 0,
-    }, 0, effects);
+    }, 0, effects, retired);
 }
 
 function calculateAgain(previous, { ships = [], effects = [] } = {}) {
@@ -449,6 +449,32 @@ test('each original, fragment, and blast break earns ten XP and its existing poi
         assert.equal(migrated.groupScore, 170);
         assert.deepEqual(migrated.processedEffects, first.processedEffects);
     }
+});
+
+test('retired receipt acknowledgements compact without undoing XP, points, lives or replaying stale inputs', () => {
+    const broken = receipt(140, { points: 100 });
+    const life = receipt(141, {
+        kind: GAME_EFFECT_KIND.ACTIVATION_RECEIPT, payloadKind: PAYLOAD_KIND.EXTRA_LIFE, points: 0,
+    });
+    const active = receipt(142, {
+        kind: GAME_EFFECT_KIND.ACTIVATION_RECEIPT, payloadKind: PAYLOAD_KIND.NUKE, points: 0,
+    });
+    const first = calculate({ effects: [broken, life, active] });
+    assert.equal(first.participantXp[participantA], 10);
+    assert.equal(first.groupScore, 100);
+    assert.equal(first.lives, 4);
+    const retired = [broken.id, life.id];
+    const compacted = calculate({
+        persisted: first, ledgers: fullLedgers(first), effects: [broken, life, active], retired,
+    });
+    assert.deepEqual(compacted.processedEffects, { [active.id]: 1 },
+        'active blast authorization is retained until target acknowledgements and receipt deletion');
+    assert.equal(compacted.participantXp[participantA], 10);
+    assert.equal(compacted.participantScores[participantA], 100);
+    assert.equal(compacted.groupScore, 100);
+    assert.equal(compacted.lives, 4);
+    assert.deepEqual(first.processedEffects, { [broken.id]: 1, [life.id]: 1, [active.id]: 1 },
+        'compaction is pure and cannot change a previously published ledger');
 });
 
 test('multiple browsers of one normalized participant share a personal run but not another identity XP', () => {
@@ -1108,6 +1134,38 @@ test('owned multiplayer blasts retry armor acknowledgements and reward only dura
             next.participantXp[participantA]);
         assert.equal(h.game.ship.score, 0);
     }
+});
+
+test('blast and hazard receipts wait for authoritative target removal, never pending or rejected local-first deletes', async () => {
+    const h = contactHarness({ session: true });
+    const ship = seedShip(h);
+    const asteroid = rock(h, { number: 430, hits: 3 });
+    const mine = timedEffect(h, { number: 431, kind: GAME_EFFECT_KIND.MINE, payload: PAYLOAD_KIND.MINE });
+    const data = h.createGameEffectData(GAME_EFFECT_KIND.ACTIVATION_RECEIPT, PAYLOAD_KIND.SMART_BOMB,
+        id(432), { participantId: participantA, shipId: ship.id });
+    Object.assign(data, h.collectBlastTargets(data, [
+        h.objectSync.getObject(asteroid.syncObjectId),
+    ], [mine]));
+    const command = { id: id(433), ownerMemberId: memberA, scope: 'Session', version: 1, schemaId: 5, data };
+    h.network.seed([command]);
+    const deleteObject = h.network.client.deleteObject;
+    const pending = [];
+    h.network.client.deleteObject = () => new Promise(resolve => pending.push(resolve));
+    const deleting = [asteroid.syncObjectId, mine.id, ship.id].map(id => h.objectSync.deleteObject(id));
+    assert.equal(h.isBlastCommandComplete(command), false);
+    assert.equal(h.isHazardReceiptHandled(data, command.id), false);
+    for (const resolve of pending) resolve({ success: false });
+    assert.deepEqual(await Promise.all(deleting), [false, false, false]);
+    assert.equal(h.isBlastCommandComplete(command), false, 'rejection is not a durable target acknowledgement');
+    assert.equal(h.isHazardReceiptHandled(data, command.id), false);
+    await h.objectSync.triggerReconciliation();
+    assert.ok(h.objectSync.getObject(asteroid.syncObjectId));
+    assert.ok(h.objectSync.getObject(mine.id));
+    assert.ok(h.objectSync.getObject(ship.id));
+    h.network.client.deleteObject = deleteObject;
+    await Promise.all([asteroid.syncObjectId, mine.id, ship.id].map(id => h.objectSync.deleteObject(id)));
+    assert.equal(h.isBlastCommandComplete(command), true);
+    assert.equal(h.isHazardReceiptHandled(data, command.id), true);
 });
 
 test('mine waits exactly one second, expires at eight total seconds, and consumes one normal ship hit', () => {

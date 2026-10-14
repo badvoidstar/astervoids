@@ -7450,9 +7450,13 @@
         syncLocalShipHazards(true);
     }
 
-    function isHazardReceiptHandled(data) {
+    function isHazardReceiptHandled(data, receiptId = null) {
         const ship = ObjectSync.getObject(data.shipId);
-        if (!ship) return true;
+        if (!ship) {
+            const snapshot = ObjectSync.getSnapshotObject(receiptId);
+            return ObjectSync.isObjectConfirmedAbsent(data.shipId,
+                snapshot?.data.shipId === data.shipId ? snapshot : null);
+        }
         const handled = AstervoidsWireCodec.unpackCounterMap(ship.data.handledHazards);
         if (!Object.hasOwn(handled, data.sourceId.toLowerCase())) return false;
         return ship.ownerMemberId !== SessionClient.getCurrentMember()?.id
@@ -7489,9 +7493,17 @@
 
     function isBlastCommandComplete(record) {
         const data = record.data;
+        const snapshot = ObjectSync.getSnapshotObject(record.id);
+        const asteroidSnapshot = snapshot && AstervoidsWireCodec.bytesEqual(
+            snapshot.data.asteroidTargets, data.asteroidTargets) ? snapshot : null;
+        const hazardSnapshot = snapshot && AstervoidsWireCodec.bytesEqual(
+            snapshot.data.hazardTargets, data.hazardTargets) ? snapshot : null;
         for (const id of Object.keys(AstervoidsWireCodec.unpackCounterMap(data.asteroidTargets))) {
             const asteroid = ObjectSync.getObject(id);
-            if (!asteroid) continue;
+            if (!asteroid) {
+                if (!ObjectSync.isObjectConfirmedAbsent(id, asteroidSnapshot)) return false;
+                continue;
+            }
             const processed = AstervoidsWireCodec.unpackCounterMap(asteroid.data.processedDamage);
             if (!Object.hasOwn(processed, record.id.toLowerCase())) return false;
             if (asteroid.ownerMemberId === SessionClient.getCurrentMember()?.id
@@ -7500,7 +7512,7 @@
                 })) return false;
         }
         return Object.keys(AstervoidsWireCodec.unpackCounterMap(data.hazardTargets))
-            .every(id => !ObjectSync.getObject(id));
+            .every(id => ObjectSync.isObjectConfirmedAbsent(id, hazardSnapshot));
     }
 
     function activateSoloPickup(record) {
@@ -7644,7 +7656,7 @@
                 if (!processed?.[record.id.toLowerCase()]) continue;
                 const hazard = data.payloadKind === PAYLOAD_KIND.MINE || data.payloadKind === PAYLOAD_KIND.SPRAY;
                 const blast = data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB;
-                const complete = hazard ? isHazardReceiptHandled(data)
+                const complete = hazard ? isHazardReceiptHandled(data, record.id)
                     : !blast || terminalOnly || processed[record.id.toLowerCase()] === 2 || isBlastCommandComplete(record);
                 if (complete && (terminalOnly || nowMs - data.startedAt >= PROGRESSION.RECEIPT_FEEDBACK_MS)) {
                     replaceGameEffect(record, []);
@@ -7671,11 +7683,14 @@
         cleanupGameContactClaims(nowMs);
     }
 
-    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold, effectObjects = []) {
+    function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold,
+        effectObjects = [], retiredEffectIds = []) {
         const processedHits = { ...ledgers.processedHits };
         const processedScores = { ...ledgers.processedScores };
         const participantXp = { ...ledgers.participantXp };
         const processedEffects = { ...ledgers.processedEffects };
+        const retiredEffects = new Set(retiredEffectIds);
+        for (const id of retiredEffects) delete processedEffects[id];
         const receipts = effectObjects.filter(record =>
             record.data?.kind === GAME_EFFECT_KIND.BREAK_RECEIPT
             || record.data?.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT)
@@ -7763,7 +7778,7 @@
         for (const receipt of receipts) {
             if (!GuidUtils.isGuid(receipt.id)) throw new TypeError('Invalid effect receipt ID');
             const effectId = receipt.id.toLowerCase();
-            if (Object.hasOwn(processedEffects, effectId)) continue;
+            if (retiredEffects.has(effectId) || Object.hasOwn(processedEffects, effectId)) continue;
             const data = receipt.data;
             if (!GuidUtils.isGuid(data.participantId)) {
                 throw new TypeError('Effect receipt is missing participant attribution');
@@ -8169,7 +8184,7 @@
     }
 
     function gameStateCalculationInputs(data, hits, scores, counted, ships, history = null,
-        xp = null, effects = null, effectObjects = []) {
+        xp = null, effects = null, effectObjects = [], retiredEffectIds = []) {
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
             data?.peakShipCount, data?.state, hits, scores, counted,
@@ -8190,6 +8205,7 @@
                 effect.data?.payloadKind, effect.data?.participantId, effect.data?.participantTag,
                 effect.data?.points);
         }
+        inputs.push(...retiredEffectIds);
         return inputs;
     }
 
@@ -8257,9 +8273,29 @@
         const effectObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT).filter(record =>
             (record.data?.kind !== GAME_EFFECT_KIND.BREAK_RECEIPT
                 && record.data?.kind !== GAME_EFFECT_KIND.ACTIVATION_RECEIPT) || isGameEffectReady(record));
+        // Aggregate XP/score/lives are permanent; receipt acknowledgements are
+        // needed only until authoritative removal, never a local-first absence.
+        const effectIds = Object.keys(cache.effects.counters);
+        const effectSnapshot = effectIds.length ? ObjectSync.getSnapshotObject(gsObj.id) : null;
+        if (effectIds.length && effectSnapshot !== cache.effectSnapshot) {
+            cache.effectSnapshot = effectSnapshot;
+            cache.snapshotEffects = null;
+            try {
+                if (effectSnapshot?.data?.processedEffects != null) {
+                    cache.snapshotEffects = AstervoidsWireCodec.unpackCounterMap(
+                        effectSnapshot.data.processedEffects);
+                }
+            } catch {
+                // A repaired live ledger must not use its older malformed
+                // snapshot as evidence that a receipt has retired.
+            }
+        }
+        const retiredEffectIds = effectIds
+            .filter(id => ObjectSync.isObjectConfirmedAbsent(id,
+                cache.snapshotEffects && Object.hasOwn(cache.snapshotEffects, id) ? effectSnapshot : null));
         const inputs = gameStateCalculationInputs(
             gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
-            cache.xp, cache.effects, effectObjects);
+            cache.xp, cache.effects, effectObjects, retiredEffectIds);
         const changed = !gameStateInputsEqual(inputs, cache.inputs);
         if (changed) {
             try {
@@ -8281,7 +8317,7 @@
                         state: game.state,
                         observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
                     },
-                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, effectObjects);
+                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, effectObjects, retiredEffectIds);
             } catch (error) {
                 reportMalformedGameStateLedgers(gsObj, error);
                 return;
@@ -8366,7 +8402,7 @@
             // the attempted payload (updateObject can fail).
             cache.inputs = gameStateCalculationInputs(
                 gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
-                cache.xp, cache.effects, effectObjects);
+                cache.xp, cache.effects, effectObjects, retiredEffectIds);
         }
     }
 

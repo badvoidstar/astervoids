@@ -58,8 +58,14 @@ export function attachGameplaySync(harness, memberId) {
         },
         async deleteObject(objectId) {
             server.delete(objectId);
-            callbacks.get('onObjectDeleted')(objectId, memberId, ++transport.sequence);
-            return { memberSequence: transport.sequence };
+            return { success: true, memberSequence: ++transport.sequence };
+        },
+        async getSessionState() {
+            const objects = [...server.values()].map(object => structuredClone(object));
+            return {
+                objects, memberSequences: {},
+                validAts: Object.fromEntries(objects.map(object => [object.id, harness.clock.server])),
+            };
         },
     };
     const sync = loadClassicModule('object-sync.js', 'ObjectSync', {
@@ -74,7 +80,7 @@ export function attachGameplaySync(harness, memberId) {
     sync.setSchemaIdSelector(WireSchemas.selectSchemaId);
     Object.assign(harness.objectSync, sync);
     return {
-        sync, calls, transport, server,
+        sync, calls, transport, server, client,
         seed(objects) {
             for (const object of objects) server.set(object.id, structuredClone(object));
             callbacks.get('onSessionJoined')({

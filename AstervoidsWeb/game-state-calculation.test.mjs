@@ -406,6 +406,8 @@ function loadSyncHarness({
         } },
         _error: () => events.push('error'),
         ObjectSync: objectSync ?? {
+            isObjectConfirmedAbsent: () => false,
+            getSnapshotObject: () => null,
             getObject: id => id === game.multiplayer.gameStateObjectId
                 ? controls.record : ships.find(ship => ship.id === id),
             getObjectsByType: type => type === 'ship' ? ships : type === 'gameEffect' ? effects : [],
@@ -911,6 +913,176 @@ function personalGameStateData(extra = {}) {
         ...extra,
     });
 }
+
+function receiptSyncHarness(data = personalGameStateData(), receipts = []) {
+    const handlers = {};
+    const server = new Map([{
+        id: 'gs', version: 1, ownerMemberId: 'member-a', scope: 'Session',
+        data: { type: 'gameState', ...data },
+    }, ...receipts].map(record => [record.id, structuredClone(record)]));
+    const transport = { acknowledge: true, delete: null, sequence: 0, epoch: 1 };
+    const batches = [];
+    const client = {
+        on: (name, handler) => { handlers[name] = handler; },
+        getSessionEpoch: () => transport.epoch,
+        getCurrentMember: () => ({ id: 'member-a' }),
+        isInSession: () => true,
+        getSessionState: async () => ({
+            objects: [...server.values()].map(record => structuredClone(record)),
+            validAts: {}, memberSequences: {},
+        }),
+        updateObjects: async updates => {
+            batches.push(structuredClone(updates));
+            const versions = {};
+            if (transport.acknowledge) {
+                for (const update of updates) {
+                    const record = server.get(update.objectId);
+                    Object.assign(record.data, structuredClone(update.data));
+                    versions[record.id] = ++record.version;
+                }
+            }
+            return { versions, memberSequence: ++transport.sequence };
+        },
+        deleteObject: async objectId => {
+            if (transport.delete) return transport.delete;
+            return { success: server.delete(objectId), memberSequence: ++transport.sequence };
+        },
+    };
+    const objectSync = loadClassicModule('object-sync.js', 'ObjectSync', {
+        SessionClient: client, window: { ASTERVOIDS_DEBUG: false },
+        AuthoritativeObject: require('./wwwroot/js/authoritative-object.js'),
+    });
+    objectSync.init();
+    objectSync.configure({ deltaEncoding: true });
+    handlers.onSessionJoined({ objects: [...server.values()].map(record => structuredClone(record)) });
+    const harness = loadSyncHarness({ objectSync });
+    return { ...harness, objectSync, client, server, transport, handlers, batches };
+}
+
+test('real ObjectSync receipt compaction preserves once-only awards across rejected deletes and rejected writes', async () => {
+    const receipt = {
+        id: thirdId, version: 1, ownerMemberId: 'member-a', scope: 'Session',
+        data: {
+            type: 'gameEffect', kind: progressionConstants.GAME_EFFECT_KIND.BREAK_RECEIPT,
+            payloadKind: progressionConstants.PAYLOAD_KIND.NONE, participantId: participantA,
+            participantTag: 'Pilot_A', shipId: firstId, points: 100,
+            startedAt: 1000, armedAt: 1000, expiresAt: 1000,
+        },
+    };
+    const h = receiptSyncHarness(personalGameStateData(), [receipt]);
+    const state = () => h.objectSync.getObject('gs').data;
+    const awards = () => [state().groupScore, state().lives,
+        codec.unpackXpMap(state().participantXp)[participantA]];
+    h.syncGameState();
+    await h.objectSync.flushUpdates();
+    assert.deepEqual(awards(), [100, 4, 10]);
+    let rejectDelete;
+    h.transport.delete = new Promise(resolve => { rejectDelete = resolve; });
+    const deleting = h.objectSync.deleteObject(receipt.id);
+    h.syncGameState();
+    assert.deepEqual(codec.unpackCounterMap(state().processedEffects), { [receipt.id]: 1 });
+    await h.objectSync.triggerReconciliation();
+    rejectDelete({ success: false });
+    assert.equal(await deleting, false);
+    h.syncGameState();
+    assert.deepEqual(codec.unpackCounterMap(state().processedEffects), { [receipt.id]: 1 },
+        'local absence and delete rejection cannot remove the exactly-once guard');
+    await h.objectSync.triggerReconciliation();
+    assert.ok(h.objectSync.getObject(receipt.id));
+    h.syncGameState();
+    assert.deepEqual(awards(), [100, 4, 10], 'restoring a rejected receipt cannot pay it again');
+
+    h.transport.delete = null;
+    assert.equal(await h.objectSync.deleteObject(receipt.id), true);
+    h.transport.acknowledge = false;
+    h.syncGameState();
+    assert.deepEqual(codec.unpackCounterMap(state().processedEffects), {});
+    await h.objectSync.flushUpdates();
+    assert.deepEqual(codec.unpackCounterMap(h.server.get('gs').data.processedEffects), { [receipt.id]: 1 });
+    assert.equal(h.objectSync.isDataConfirmed('gs', { processedEffects: state().processedEffects }), false);
+    h.syncGameState();
+    await h.objectSync.flushUpdates();
+    assert.deepEqual(awards(), [100, 4, 10]);
+    h.transport.acknowledge = true;
+    h.syncGameState();
+    await h.objectSync.flushUpdates();
+    assert.equal(h.objectSync.isDataConfirmed('gs', { processedEffects: state().processedEffects }), true);
+    assert.deepEqual(codec.unpackCounterMap(h.server.get('gs').data.processedEffects), {});
+    h.handlers.onObjectCreated(receipt, 'remote', 1, 1000);
+    h.handlers.onObjectsUpdated(
+        [{ id: receipt.id, version: 2, data: receipt.data }], 1000, 'remote', 2, 2, 50, 1000);
+    assert.equal(h.objectSync.getObject(receipt.id), undefined, 'delayed receipt replay hits a tombstone');
+    h.syncGameState();
+    assert.deepEqual(awards(), [100, 4, 10]);
+});
+
+test('late-join and migration compact legacy receipt history using the exact authoritative snapshot, not newer references', async () => {
+    const retired = Object.fromEntries(Array.from({ length: 2000 }, (_, index) =>
+        [`${index.toString(16).padStart(8, '0')}-3333-3333-3333-333333333333`, 1]));
+    const data = personalGameStateData({
+        groupScore: 200_000, lives: 4, scoreLifeAwardCount: 2000,
+        participantScores: codec.packCounterMap({ [participantA]: 200_000 }),
+        participantNumbers: codec.packCounterMap({ [participantA]: 1 }),
+        participantTags: codec.packTagMap({ [participantA]: 'Pilot_A' }),
+        participantXp: codec.packXpMap({ [participantA]: 20_000 }),
+        processedEffects: codec.packCounterMap(retired),
+    });
+    const h = receiptSyncHarness(data);
+    h.objectSync.handleOwnershipMigration([{ objectId: 'gs', newOwnerId: 'member-a', newVersion: 2 }]);
+    h.server.get('gs').version = 2;
+    h.syncGameState();
+    let state = h.objectSync.getObject('gs').data;
+    assert.equal(state.processedEffects.length, 0, 'old history is compacted before its first oversized publish');
+    assert.equal(state.groupScore, 200_000);
+    assert.equal(state.lives, 4);
+    assert.deepEqual(codec.unpackXpMap(state.participantXp), { [participantA]: 20_000 });
+    await h.objectSync.flushUpdates();
+    const replayId = Object.keys(retired)[0];
+    h.handlers.onObjectCreated({
+        id: replayId, version: 1, data: { type: 'gameEffect' }, ownerMemberId: 'member-a',
+    }, 'remote', 1, 1000);
+    assert.equal(h.objectSync.getObject(replayId), undefined,
+        'snapshot-proven retired IDs are tombstoned even when never previously observed');
+
+    h.transport.epoch++;
+    h.controls.epoch++;
+    h.handlers.onSessionTransition();
+    h.handlers.onSessionJoined(await h.client.getSessionState());
+    h.syncGameState();
+    state = h.objectSync.getObject('gs').data;
+    assert.equal(state.processedEffects.length, 0);
+    assert.equal(state.groupScore, 200_000);
+    assert.deepEqual(codec.unpackXpMap(state.participantXp), { [participantA]: 20_000 });
+});
+
+test('a newer GameState acknowledgement cannot use an older snapshot to discard an unseen receipt', () => {
+    const h = receiptSyncHarness();
+    h.handlers.onObjectsUpdated([{
+        id: 'gs', version: 2, data: {
+            groupScore: 100, scoreLifeAwardCount: 1, lives: 4,
+            participantScores: codec.packCounterMap({ [participantA]: 100 }),
+            participantNumbers: codec.packCounterMap({ [participantA]: 1 }),
+            participantTags: codec.packTagMap({ [participantA]: 'Pilot_A' }),
+            participantXp: codec.packXpMap({ [participantA]: 10 }),
+            processedEffects: codec.packCounterMap({ [thirdId]: 1 }),
+        },
+    }], 1000, 'remote', 1, 1, 50, 1000);
+    h.syncGameState();
+    assert.deepEqual(codec.unpackCounterMap(h.objectSync.getObject('gs').data.processedEffects), { [thirdId]: 1 });
+    h.handlers.onObjectCreated({
+        id: thirdId, version: 1, ownerMemberId: 'member-a', scope: 'Session',
+        data: {
+            type: 'gameEffect', kind: progressionConstants.GAME_EFFECT_KIND.BREAK_RECEIPT,
+            payloadKind: progressionConstants.PAYLOAD_KIND.NONE, participantId: participantA,
+            participantTag: 'Pilot_A', points: 100, startedAt: 1000, armedAt: 1000, expiresAt: 1000,
+        },
+    }, 'remote', 2, 1000);
+    h.syncGameState();
+    const state = h.objectSync.getObject('gs').data;
+    assert.equal(state.groupScore, 100);
+    assert.equal(codec.unpackXpMap(state.participantXp)[participantA], 10,
+        'late delivery of the acknowledged receipt does not award a second break');
+});
 
 test('personal ledgers reuse decoded maps and packed bytes across motion-only and unchanged ticks', () => {
     const harness = loadSyncHarness({

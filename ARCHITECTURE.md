@@ -827,6 +827,18 @@ from the live object map. Do not collapse them into a single collection.
 Unknown-handle updates are parked at the transport boundary until identity
 metadata arrives; they cannot invent a full object from an integer handle.
 
+`ObjectSync.getSnapshotObject(id)` exposes a borrowed, read-only record from the
+last authoritative session snapshot, with copied byte fields independent of
+optimistic writes. `isObjectConfirmedAbsent(id, snapshotReference)` accepts
+authoritative deletions/replacements or absence in that exact snapshot. For the
+snapshot path, the game must first verify that the reference record actually
+contains the referenced ID; an older snapshot cannot prove retirement of a
+reference introduced by a newer live update. Proven absence retains a tombstone
+against delayed creates/updates. Pending and failed local-first deletes remain
+uncertain until an authoritative response, event, or later snapshot settles them.
+A delete acknowledgement also advances its tombstone revision so an older
+in-flight snapshot cannot resurrect the deleted record.
+
 ### Durable records and transient events
 
 Object records are the client recovery contract. Object events are notifications,
@@ -1204,6 +1216,27 @@ are not recursively included. Receipts remain until their GameState acknowledgem
 and target acknowledgements are durable; no separate command-create transaction
 or generic event replay is involved.
 
+`processedEffects` is the acknowledgement set for outstanding receipts, not a
+permanent event history. The GameState owner removes an entry only after
+ObjectSync proves that receipt's authoritative absence. Late-join/recovery
+compaction checks the processed IDs and receipt inventory from the **same**
+server snapshot, including when ownership metadata has since advanced. Active
+blast/hazard receipts keep their acknowledgement until targets are durably
+handled or authoritatively absent; a pending/rejected local-first target delete
+does not complete a command. Aggregate XP, personal/team score, lives, and their
+other ledgers are not pruned or capped. Failed compaction writes retry against
+the confirmed baseline without awarding the receipt again.
+
+Each processed-effect entry is 20 bytes. Retaining every retired break ID made
+ordinary `UpdateObjects` invocations eventually exceed SignalR's unchanged
+32-KiB receive limit, disconnecting owners. Rejoin restored the same growing
+GameState, so subsequent publications failed again; sessions with no connected
+members were correctly omitted from discovery. Receipt retirement now bounds
+this ledger by outstanding work rather than total run progression. The
+local-only `progression-load.spec.mjs` exercises thousands of real hub-backed
+breaks, high-level volleys, late join, and ownership migration while measuring
+the complete MessagePack invocation, including its outer envelope/length prefix.
+
 Mines activate at destruction, arm after one second, expire after eight seconds
 total, and consume on one normal ship-damage contact. Spray telegraphs twelve
 radial lanes for 0.8 seconds, then atomically replaces itself with twelve hostile
@@ -1293,6 +1326,8 @@ of them. `syncGameState` owns validation, serialization, side effects, and
 publication. Its persisted ledgers include processed hits/scores, counted
 participants, personal score/number/tag histories, score-life awards, personal
 XP, and processed effect receipts so a new owner does not repeat effects.
+Processed-effect acknowledgements are compacted after authoritative receipt
+retirement; the aggregate progression and score/life histories remain.
 Persistence here means the lifetime of the
 process-local session, not storage in the durable identity service.
 

@@ -1,7 +1,10 @@
 import { test as base, expect } from '@playwright/test';
+import { createRequire } from 'node:module';
 import { configureAutomatedIdentities } from './automated-identities.mjs';
 import { provisionPlayer } from './identity-helpers.mjs';
 import { installOriginGuard } from './origin-guard.mjs';
+
+const MsgpackCodec = createRequire(import.meta.url)('../AstervoidsWeb/wwwroot/js/msgpack-codec.js');
 
 export const test = base.extend({
     players: async ({ browser, baseURL }, use) => {
@@ -21,6 +24,7 @@ export const test = base.extend({
                 const health = {
                     uncaught: 0, consoleErrors: 0, hubFrames: 0, scoreRequests: 0,
                     offOrigin: 0, redirects: 0, requestFailures: 0,
+                    maxHubMessageBytes: 0, maxUpdateMessageBytes: 0,
                 };
                 opened.push({ page, context, health });
                 page.on('pageerror', () => health.uncaught++);
@@ -33,6 +37,27 @@ export const test = base.extend({
                 page.on('websocket', socket => {
                     if (new URL(socket.url()).pathname === '/sessionHub') {
                         socket.on('framereceived', () => health.hubFrames++);
+                        socket.on('framesent', ({ payload }) => {
+                            if (typeof payload === 'string') return;
+                            for (let offset = 0; offset < payload.length;) {
+                                const start = offset;
+                                let length = 0, shift = 0, byte;
+                                do {
+                                    byte = payload[offset++];
+                                    length += (byte & 0x7f) * 2 ** shift;
+                                    shift += 7;
+                                } while (byte & 0x80);
+                                const bodyStart = offset;
+                                offset += length;
+                                const message = MsgpackCodec.decode(payload.subarray(bodyStart, offset));
+                                if (message[0] === 1 && message[3] === 'UpdateObjects') {
+                                    health.maxUpdateMessageBytes = Math.max(
+                                        health.maxUpdateMessageBytes, offset - start);
+                                }
+                                health.maxHubMessageBytes = Math.max(
+                                    health.maxHubMessageBytes, offset - start);
+                            }
+                        });
                     }
                 });
                 await installOriginGuard(page, baseURL, health);

@@ -209,6 +209,10 @@ const ObjectSync = (function() {
     // invoke resolves. On success the server snapshot omits it; on failure,
     // removing this guard allows a later reconciliation to restore server truth.
     const pendingDeletes = new Set();
+    // A resolved failure is still not authoritative absence. Keep that
+    // uncertainty until a delete event/response or a later snapshot settles it.
+    const unconfirmedDeletes = new Set();
+    let authoritativeSnapshot = null;
     
     // The last server-confirmed data for an object (from an update response or
     // authoritative snapshot) lives on the object record as `lastSentData`, so
@@ -495,6 +499,8 @@ const ObjectSync = (function() {
         senderSequence = 0;
         memberSequences.clear();
         pendingDeletes.clear();
+        unconfirmedDeletes.clear();
+        authoritativeSnapshot = null;
         reconciling = null;
         reconciliationCount = 0;
         flushInProgress = null;
@@ -553,10 +559,23 @@ const ObjectSync = (function() {
     function registerObject(objectInfo) {
         const obj = toLocalObject(objectInfo);
         objects.set(obj.id, obj);
+        unconfirmedDeletes.delete(obj.id);
         addToTypeIndex(obj);
         markObjectMutation(obj.id);
         applyPendingOwnershipMigration(obj);
         return obj;
+    }
+
+    function retainAuthoritativeSnapshot(snapshotObjects) {
+        authoritativeSnapshot = new Map(snapshotObjects.map(obj => [obj.id, Object.freeze({
+            id: obj.id, version: obj.version,
+            data: Object.freeze(snapshotDataValues(obj.data))
+        })]));
+    }
+
+    // Borrowed, read-only data from one server snapshot, not optimistic state.
+    function getSnapshotObject(objectId) {
+        return authoritativeSnapshot?.get(objectId) || null;
     }
 
     /**
@@ -668,6 +687,7 @@ const ObjectSync = (function() {
                     registered.lastSentData = { ...registered.data };
                 }
             }
+            retainAuthoritativeSnapshot(session.objects);
         }
 
     }
@@ -848,6 +868,7 @@ const ObjectSync = (function() {
      */
     function handleRemoteObjectDeleted(objectId, senderMemberId, memberSequence) {
         trackMemberSequence(senderMemberId, memberSequence);
+        unconfirmedDeletes.delete(objectId);
         const obj = removeObjectLocal(objectId);
         if (obj && callbacks.onObjectDeleted) {
             callbacks.onObjectDeleted(obj);
@@ -870,6 +891,7 @@ const ObjectSync = (function() {
     function handleRemoteObjectReplaced(event, senderMemberId, memberSequence, validAt) {
         const context = captureAsyncContext();
         trackMemberSequence(senderMemberId, memberSequence);
+        unconfirmedDeletes.delete(event.deletedObjectId);
         const deleted = removeObjectLocal(event.deletedObjectId);
         const createdCallbacks = [];
         const freshChildren = [];
@@ -1048,6 +1070,13 @@ const ObjectSync = (function() {
                     if (!isAsyncContextCurrent(context)) return;
                 }
             }
+            for (const id of unconfirmedDeletes) {
+                if (!pendingDeletes.has(id)
+                    && (objectRevisions.get(id) || 0) <= revisionAtStart) {
+                    unconfirmedDeletes.delete(id);
+                }
+            }
+            retainAuthoritativeSnapshot(snapshot.objects || []);
             
             reconciliationCount++;
             if (callbacks.onReconciliationComplete) {
@@ -1338,6 +1367,21 @@ const ObjectSync = (function() {
     }
 
     /**
+     * An absent local-first delete is not server truth. For an unknown ID the
+     * caller must establish its reference in the same read-only snapshot.
+     * Retain proven absence as a tombstone against delayed creates/updates.
+     */
+    function isObjectConfirmedAbsent(objectId, reference = null) {
+        if (objects.has(objectId) || pendingDeletes.has(objectId)
+            || unconfirmedDeletes.has(objectId) || pendingOwnershipMigrations.has(objectId)) return false;
+        if (objectRevisions.has(objectId)) return true;
+        if (!reference || authoritativeSnapshot?.get(reference.id) !== reference
+            || authoritativeSnapshot.has(objectId)) return false;
+        markObjectMutation(objectId);
+        return true;
+    }
+
+    /**
      * Flush all pending updates to the server.
      * Guarded to prevent overlapping flushes.
      *
@@ -1488,6 +1532,7 @@ const ObjectSync = (function() {
         const context = captureAsyncContext();
 
         // Local-first: remove immediately so getObjectsByType() won't return it
+        unconfirmedDeletes.add(objectId);
         removeObjectLocal(objectId);
         // Track as pending so an interleaving reconciliation snapshot does not
         // resurrect this object before the server processes the delete.
@@ -1503,6 +1548,12 @@ const ObjectSync = (function() {
             // Track own member sequence from response (no broadcast echo to track it from)
             if (response) {
                 trackOwnMemberSequence(response.memberSequence);
+            }
+            if (response?.success) {
+                unconfirmedDeletes.delete(objectId);
+                // A snapshot requested while the delete was pending can still
+                // carry the old object after this acknowledgement arrives.
+                markObjectMutation(objectId);
             }
 
             return response?.success ?? false;
@@ -1752,6 +1803,7 @@ const ObjectSync = (function() {
      */
     function handleMemberDeparture(deletedObjectIds) {
         for (const objectId of deletedObjectIds) {
+            unconfirmedDeletes.delete(objectId);
             const obj = removeObjectLocal(objectId);
             if (obj && callbacks.onObjectDeleted) {
                 callbacks.onObjectDeleted(obj);
@@ -1787,6 +1839,8 @@ const ObjectSync = (function() {
         replaceObject,
         updateObject,
         isDataConfirmed,
+        isObjectConfirmedAbsent,
+        getSnapshotObject,
         deleteObject,
         flushUpdates,
         tick,

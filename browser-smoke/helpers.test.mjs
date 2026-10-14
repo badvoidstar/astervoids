@@ -350,7 +350,7 @@ test('local and remote configurations use the installed headless shell and keep 
     }
 });
 
-test('actual Playwright discovery keeps local coverage and all progression scenarios, bounds preview layouts and skips only the injected identity failure', async () => {
+test('actual Playwright discovery keeps full local and real progression coverage, bounds preview layouts and identifies local-only load and identity faults', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'astervoids-smoke-discovery-'));
     try {
         const inventories = [];
@@ -392,26 +392,30 @@ test('actual Playwright discovery keeps local coverage and all progression scena
             inventories.push(inventory);
         }
         const [local, remote] = inventories;
-        assert.equal(local.length, 73);
+        assert.equal(local.length, 74);
         assert.ok(local.every(scenario => scenario.expectedStatus === 'passed'));
         assert.equal(local.filter(scenario => scenario.file === 'origin-guard.spec.mjs').length, 22);
         const faultTitle = 'identity failure and busy states keep their actions accessible in a reduced-height viewport';
         assert.equal(local.filter(scenario => scenario.title === faultTitle).length, 1);
-        assert.equal(remote.length, 51);
+        assert.equal(remote.length, 52);
+        const loadTitle = 'sustained real multiplayer breaks keep receipt state bounded and sessions joinable';
         const progressionTitles = [
             'solo armored hits earn nothing until break, then real hull pickup advances exactly one level',
             'actual per-break XP, full multishot, death retention, new-run reset and native bar (desktop)',
             'actual per-break XP, full multishot, death retention, new-run reset and native bar (touch portrait)',
             'independent SignalR clients replicate earned XP, preserve it through death, ownership migration and rejoin',
         ];
-        for (const inventory of [local, remote]) {
+        for (const [inventory, loadStatus] of [[local, 'passed'], [remote, 'skipped']]) {
             assert.deepEqual(inventory.filter(scenario => scenario.file === 'progression.spec.mjs'),
                 progressionTitles.map(title => ({ file: 'progression.spec.mjs', title, expectedStatus: 'passed' })),
                 'all four progression cases remain runnable locally and remotely, including real input and SignalR');
+            assert.deepEqual(inventory.filter(scenario => scenario.file === 'progression-load.spec.mjs'),
+                [{ file: 'progression-load.spec.mjs', title: loadTitle, expectedStatus: loadStatus }],
+                'the sustained load scenario remains runnable locally and is explicitly skipped in remote discovery');
         }
         assert.deepEqual(remote, local
             .filter(scenario => scenario.file !== 'origin-guard.spec.mjs')
-            .map(scenario => scenario.title === faultTitle
+            .map(scenario => scenario.title === faultTitle || scenario.title === loadTitle
                 ? { ...scenario, expectedStatus: 'skipped' } : scenario));
     } finally {
         await rm(directory, { recursive: true, force: true });

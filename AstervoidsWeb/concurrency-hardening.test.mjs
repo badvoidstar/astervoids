@@ -1646,6 +1646,130 @@ test('stale delete completion cannot clear the next session pending delete', asy
     assert.equal(await secondDelete, true);
 });
 
+test('confirmed absence needs an authoritative removal or an exact authoritative reference snapshot', async () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    assert.equal(sync.isObjectConfirmedAbsent('missing'), false);
+    client.transition();
+    client.join({
+        objects: [objectInfo('state', 1, { type: 'counter', value: 1 })],
+        validAts: {}, metadata: {}
+    });
+    assert.equal(sync.isObjectConfirmedAbsent('missing'), false, 'unknown is not deleted');
+    const originalSnapshot = sync.getSnapshotObject('state');
+    assert.equal(sync.isObjectConfirmedAbsent('missing', originalSnapshot), true,
+        'the same authoritative snapshot contains the reference but not its retired object');
+    client.handlers.onObjectsUpdated(
+        [{ id: 'state', version: 2, data: { value: 2 } }], 1000, 'remote', 1, 1, 50, 1000);
+    assert.equal(originalSnapshot.data.value, 1, 'snapshot proof never follows mutable live data');
+    assert.equal(sync.isObjectConfirmedAbsent('missing'), true, 'a proved retired ID stays retired');
+    assert.equal(sync.isObjectConfirmedAbsent('new-missing', sync.getObject('state')), false,
+        'mutable live data is never an authoritative snapshot reference');
+    client.getSessionState = async () => ({
+        objects: [objectInfo('state', 2, { type: 'counter', value: 2 })],
+        validAts: {}, memberSequences: {}
+    });
+    await sync.triggerReconciliation();
+    assert.equal(sync.isObjectConfirmedAbsent('new-missing', sync.getSnapshotObject('state')), true);
+    assert.equal(sync.isObjectConfirmedAbsent('another-missing', originalSnapshot), false,
+        'a replaced snapshot reference is no longer an absence certificate');
+    sync.updateObject('state', { value: 3 });
+    assert.equal(sync.isObjectConfirmedAbsent('another-missing', sync.getObject('state')), false,
+        'optimistic data is not part of the reference snapshot');
+});
+
+test('join retains the exact snapshot even when every live object already overtook it', () => {
+    const client = makeObjectSyncClient();
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.handlers.onObjectCreated(
+        objectInfo('state', 2, { type: 'counter', value: 2 }), 'remote', 1, 1000);
+    client.join({
+        objects: [objectInfo('state', 1, { type: 'counter', value: 1 })],
+        validAts: {}, metadata: {}
+    });
+    const snapshot = sync.getSnapshotObject('state');
+    assert.equal(snapshot?.version, 1);
+    assert.equal(snapshot.data.value, 1, 'the absence proof uses snapshot data, not newer live state');
+    assert.equal(sync.getObject('state').data.value, 2);
+});
+
+test('pending and rejected local-first deletes never prove absence, including a racing snapshot', async () => {
+    const client = makeObjectSyncClient();
+    const gate = deferred();
+    client.deleteObject = () => gate.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    const target = objectInfo('receipt', 1, { type: 'receipt' });
+    const state = objectInfo('state', 1, { type: 'counter' });
+    client.join({ objects: [state, target], validAts: {}, metadata: {} });
+    const deleting = sync.deleteObject('receipt');
+    assert.equal(sync.getObject('receipt'), undefined);
+    assert.equal(sync.isObjectConfirmedAbsent('receipt', sync.getSnapshotObject('state')), false);
+    client.getSessionState = async () => ({
+        objects: [state, target], validAts: {}, memberSequences: {}
+    });
+    await sync.triggerReconciliation();
+    gate.resolve({ success: false });
+    assert.equal(await deleting, false);
+    assert.equal(sync.isObjectConfirmedAbsent('receipt', sync.getSnapshotObject('state')), false,
+        'a rejected local deletion cannot retire an exactly-once acknowledgement');
+    await sync.triggerReconciliation();
+    assert.ok(sync.getObject('receipt'), 'the authoritative receipt is restored');
+    client.deleteObject = async () => ({ success: true, memberSequence: 1 });
+    assert.equal(await sync.deleteObject('receipt'), true);
+    assert.equal(sync.isObjectConfirmedAbsent('receipt', sync.getSnapshotObject('state')), true);
+    client.handlers.onObjectCreated(target, 'remote', 1, 1000);
+    assert.equal(sync.getObject('receipt'), undefined, 'a delayed create cannot replay a retired receipt');
+});
+
+test('delete acknowledgement overtaking a snapshot cannot resurrect a retired receipt', async () => {
+    const client = makeObjectSyncClient();
+    const deletion = deferred();
+    const snapshot = deferred();
+    client.deleteObject = () => deletion.promise;
+    client.getSessionState = () => snapshot.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    const target = objectInfo('receipt', 1, { type: 'receipt' });
+    client.join({ objects: [target], validAts: {}, metadata: {} });
+    const deleting = sync.deleteObject('receipt');
+    const reconciling = sync.triggerReconciliation();
+    deletion.resolve({ success: true, memberSequence: 1 });
+    assert.equal(await deleting, true);
+    snapshot.resolve({ objects: [target], validAts: {}, memberSequences: {} });
+    await reconciling;
+    assert.equal(sync.getObject('receipt'), undefined);
+    assert.equal(sync.isObjectConfirmedAbsent('receipt'), true);
+});
+
+test('ambiguous local deletion waits for a later authoritative snapshot and ignores stale epochs', async () => {
+    const client = makeObjectSyncClient();
+    const deletion = deferred();
+    client.deleteObject = () => deletion.promise;
+    const sync = loadObjectSync(client);
+    sync.init();
+    client.transition();
+    client.join({
+        objects: [objectInfo('receipt', 1, { type: 'receipt' })],
+        validAts: {}, metadata: {}
+    });
+    const deleting = sync.deleteObject('receipt');
+    deletion.resolve(null);
+    assert.equal(await deleting, false);
+    assert.equal(sync.isObjectConfirmedAbsent('receipt'), false);
+    client.getSessionState = async () => ({ objects: [], validAts: {}, memberSequences: {} });
+    await sync.triggerReconciliation();
+    assert.equal(sync.isObjectConfirmedAbsent('receipt'), true);
+    client.transition();
+    client.join({ objects: [], validAts: {}, metadata: {} });
+    assert.equal(sync.isObjectConfirmedAbsent('receipt'), false, 'absence tombstones are epoch-scoped');
+});
+
 test('ownership migration is strictly version-monotonic', () => {
     const client = makeObjectSyncClient();
     const objectSync = loadObjectSync(client);

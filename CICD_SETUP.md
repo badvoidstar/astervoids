@@ -583,6 +583,14 @@ ship; rejoining creates a fresh ship that replicates again. The clients leave
 only their own session, then verify it is absent from the active-session list.
 Empty-session retention/expiry is still server-owned. No fake hubs, transport
 responses, or test-only gameplay hooks are used.
+All four XP/armor/progression scenarios remain runnable in both modes. The
+additional accelerated progression-load regression exercises 3,600 production
+breaks on the isolated local server and verifies bounded receipt/message growth,
+full volleys, late join and ownership migration. It is explicitly skipped during
+remote discovery and never sends synthetic sustained load to deployed storage;
+local success is not a production performance or long-running-play guarantee.
+The exact discovery inventory is 74 local cases and 52 remote cases after
+excluding 22 loopback-origin regressions. These counts include skipped fixtures.
 The leaderboard screen is also opened without starting a game to exercise its
 public query and navigation. Scripted high-score seeding, ranking/filter, and
 drag/inertia scenarios run only in the isolated local File-provider fixture;

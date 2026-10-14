@@ -117,6 +117,11 @@ hazards. Blasts act only on their frozen starting targets, not recursively on
 new fragments, loot, or hazards. All art remains vector-only, with no bitmap assets.
 Solo effect timers freeze while paused.
 
+Multiplayer retains aggregate XP, score, and lives, but retires per-effect
+acknowledgements only after the server confirms receipt removal. Retired break
+IDs do not accumulate into oversized state updates during a long run; pending
+effects remain recoverable across rejoin and ownership changes.
+
 ## Multiplayer scores
 
 During play, the status rows read `Your Score: 125 : Pilot_1` and
@@ -268,6 +273,13 @@ bidirectional keyboard-input replication, and leave/rejoin. It checks live ship
 pose/version changes, not just HTTP success or a stale session label. It leaves
 its own session and verifies it disappears from the active list; the server
 expires the now-empty session normally.
+All four XP/armor/progression scenarios run locally and against previews. An
+additional local-only accelerated load scenario drives 3,600 production asteroid
+breaks through real SignalR, checks bounded receipt/message growth, and preserves
+full volleys, late join and ownership migration. It is declared skipped during
+remote discovery, not executed against deployed storage. Discovery lists 74
+local cases and 52 remote cases after excluding 22 loopback-origin regressions;
+remote totals include skipped fixtures, not 52 passing gameplay scenarios.
 Identity scenarios cover naming/reload, repeat/self invitations, new-browser
 confirmation, competing claims, atomic replacement across tabs, clipboard denial,
 and responsive native-text menu layout. Gameplay fixtures create synthetic tags
@@ -280,10 +292,11 @@ Node startup regressions also cover request timeouts, retry/Retry-After budgets,
 permanent errors, supersession and hidden/solo cancellation.
 The full local suite also keeps the reduced-height identity failure/busy-state
 regression, including its deliberately exhausted startup retries and accessible
-Retry controls. Preview smoke skips only that injected-failure scenario in
-addition to the existing local-only fixtures: replaying synthetic retry delays
-does not measure deployment cold starts. Real identity recovery/invitation flows
-and independent-client multiplayer checks still run against the preview.
+Retry controls. Preview smoke skips that injected-failure scenario and the
+accelerated progression load in addition to the existing local-only fixtures:
+replaying synthetic retry delays does not measure deployment cold starts. Real
+identity recovery/invitation flows and independent-client multiplayer checks
+still run against the preview.
 Local menu-layout coverage remains exhaustive: 1,152 landscape projections and
 60 resize configurations, including their original ordering and repeated visits.
 The same two preview scenarios use representative selections instead: 17 display
