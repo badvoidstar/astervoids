@@ -359,6 +359,7 @@ test('ship collision sees children created by the final bullet of the pass', () 
     h.game.bullets.push(bullet(0.5, 0.5));
     h.game.ship = {
         x: 0.7, y: 0.7, invulnerable: 0,
+        isShielded() { return this.invulnerable > 0; },
         getVertices: () => [{ x: 700, y: 700 }, { x: 701, y: 700 }, { x: 700, y: 701 }],
     };
     h.checkCollisions();
@@ -373,6 +374,7 @@ test('rejected bullet narrow phases and ship collision borrow geometry only once
     h.game.bullets.push(bullet(0.6, 0.5), bullet(0.6, 0.5));
     h.game.ship = {
         x: 0.6, y: 0.5, invulnerable: 0,
+        isShielded() { return this.invulnerable > 0; },
         getVertices: () => [{ x: 600, y: 500 }, { x: 601, y: 500 }, { x: 600, y: 501 }],
     };
     const getWorldVertices = asteroid.getWorldVertices.bind(asteroid);

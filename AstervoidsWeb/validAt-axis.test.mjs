@@ -25,8 +25,9 @@ import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 // Bridge-pose math comes from production, not a mirror.
 const { computeReplacementBridgePose } = loadInlineGameFunctions(
-    ['computeReplacementBridgePose'], {
+    ['Bullet', 'computeReplacementBridgePose'], {
         CONFIG: { TARGET_FPS: 60 },
+        OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
         AstervoidsWireCodec: {
             hasAsteroidVertices: v => Array.isArray(v) && v.length > 0
         }

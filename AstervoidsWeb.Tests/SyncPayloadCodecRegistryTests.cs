@@ -46,6 +46,9 @@ public class SyncPayloadCodecRegistryTests : TestBase
             new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
             new PositionalSchemaCodec.FieldSpec("participantTag", "str"),
             new PositionalSchemaCodec.FieldSpec("handledHazards", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("boostState", "bytes"),
+            new PositionalSchemaCodec.FieldSpec("modifierRequestMilestone", "u32"),
+            new PositionalSchemaCodec.FieldSpec("modifierRequestKind", "u8"),
         });
 
     private static Dictionary<string, object?> ShipCreateDict() => new()
@@ -65,6 +68,9 @@ public class SyncPayloadCodecRegistryTests : TestBase
         ["memberId"] = "00112233-4455-6677-8899-aabbccddeeff",
         ["score"] = 0,
         ["hitCount"] = 0,
+        ["boostState"] = Convert.FromHexString(RewardHazardSchemaFixture.BoostState),
+        ["modifierRequestMilestone"] = 0u,
+        ["modifierRequestKind"] = 0,
     };
 
     [Fact]
@@ -370,13 +376,16 @@ public class SyncPayloadCodecRegistryTests : TestBase
         {
             (ShipSchema(), new Dictionary<string, object?>
             {
-                ["type"] = "ship", ["handledHazards"] = new byte[] { 1, 2, 3 }
+                ["type"] = "ship", ["handledHazards"] = new byte[] { 1, 2, 3 },
+                ["boostState"] = Convert.FromHexString(RewardHazardSchemaFixture.BoostState),
+                ["modifierRequestMilestone"] = 8u, ["modifierRequestKind"] = 2,
             }),
             (GameStateSchemaFixture.Current, new Dictionary<string, object?>
             {
                 ["type"] = "gameState",
                 ["participantXp"] = Convert.FromHexString(GameStateSchemaFixture.LargeXpEntry),
-                ["processedEffects"] = new byte[] { 4, 5, 6 }
+                ["processedEffects"] = new byte[] { 4, 5, 6 },
+                ["participantModifiers"] = Convert.FromHexString(RewardHazardSchemaFixture.ModifierEntry),
             }),
             (RewardHazardSchemaFixture.Effect, new Dictionary<string, object?>
             {
@@ -385,6 +394,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
                 ["startedAt"] = 1000d, ["armedAt"] = 1800d, ["expiresAt"] = 3000d,
                 ["damageReceipts"] = new byte[] { 7, 8 },
                 ["asteroidTargets"] = new byte[] { 9 }, ["hazardTargets"] = new byte[] { 10 },
+                ["contributors"] = Convert.FromHexString(RewardHazardSchemaFixture.ContributorEntry),
+                ["shipLifeId"] = "00112233-4455-6677-8899-aabbccddeeff",
             }),
             (RewardHazardSchemaFixture.Claim, new Dictionary<string, object?>
             {
@@ -392,7 +403,8 @@ public class SyncPayloadCodecRegistryTests : TestBase
                 ["shipId"] = "11223344-5566-7788-99aa-bbccddeeff00",
                 ["participantId"] = "22334455-6677-8899-aabb-ccddeeff0011",
                 ["participantTag"] = "Pilot_1", ["claimedAt"] = 1000d,
-                ["invulnerabilityRevision"] = uint.MaxValue
+                ["invulnerabilityRevision"] = uint.MaxValue,
+                ["shipLifeId"] = "00112233-4455-6677-8899-aabbccddeeff",
             }),
         };
 

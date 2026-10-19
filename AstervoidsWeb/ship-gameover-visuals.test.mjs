@@ -27,16 +27,18 @@ function harness({ gameOver = true } = {}) {
     };
     const game = {
         ship: null,
+        simulationTimeMs: 0,
         multiplayer: { myShipObjectId: 'local', remoteShips: new Map() }
     };
     const state = { gameOver, sessionMode: true, data: null, now: 1000 };
     const production = loadInlineGameFunctions(
         ['Ship', 'ShipInvulnerability', 'assignDefined', 'settleShipTerminalVisuals',
             'resolveTerminalSession', 'createTerminalShipDecomposition',
-            'terminalShipDecompositionProgress'],
+            'terminalShipDecompositionProgress', 'getGameEffectNow'],
         {
             CONFIG: config,
             game,
+            reducedGameplayMotion: false,
             AstervoidsFracture, AstervoidsWireCodec,
             OBJECT_TYPES: { GAME_STATE: 'gameState' },
             ObjectSync: { getObjectByType: () => ({ data: state.data }) },
@@ -44,7 +46,10 @@ function harness({ gameOver = true } = {}) {
             isGameOver: () => state.gameOver,
             performance: { now: () => 1000 },
             replicationClock: { validAtToMonotonicMs: at => at },
-            RemoteObjects: { clock: { offsetInitialized: true }, serverNowMs: () => state.now },
+            RemoteObjects: {
+                clock: { offsetInitialized: true }, serverNowMs: () => state.now,
+                isClockOffsetInitialized: () => true,
+            },
             TURN_CONTROL_MODE: { KEYBOARD_RATE: 0, ANALOG_TARGET: 1 },
             normalizeTurnControlMode: value => value || 0,
             SHIP_COLORS: ['#0ff'],

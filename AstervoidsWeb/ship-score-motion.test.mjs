@@ -103,7 +103,7 @@ async function simulate({ deterministic, deltaEncoding, scoreFrames }) {
         DeadReckon: dead, RemoteObjects: remote, ReplicationPresentation,
         performance: { now: () => now },
         isDeterministicMode: () => deterministic,
-        OBJECT_TYPES: { SHIP: 'ship' },
+        OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
         TURN_CONTROL_MODE: { KEYBOARD_RATE: 0, ANALOG_RATE: 1, ANALOG_TARGET: 2 },
         velocityToNormalizedDeltaX: velocity => velocity / config.TARGET_FPS,
         velocityToNormalizedDeltaY: velocity => velocity / config.TARGET_FPS,
@@ -121,8 +121,9 @@ async function simulate({ deterministic, deltaEncoding, scoreFrames }) {
         shouldReplay: state => state.clampAngular,
         replay: production.replayDeadReckonedShip
     }));
-    const publisher = loadInlineGameFunctions(['syncLocalShip', 'syncLocalShipScore'], {
-        CONFIG: config, game, ObjectSync: owner.sync,
+    const publisher = loadInlineGameFunctions(['syncLocalShip', 'syncLocalShipScore', 'syncLocalShipBoosts'], {
+        CONFIG: config, game, ObjectSync: owner.sync, AstervoidsWireCodec,
+        SessionClient: { getCurrentMember: () => ({ id: ownerId }) },
         isSessionMode: () => true, isDeterministicMode: () => deterministic,
         ShipSendGate: createShipGate({
             config, nowMs: () => now, isDeterministic: () => deterministic,

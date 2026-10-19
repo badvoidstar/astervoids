@@ -26,7 +26,7 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
         ? { id: 'gs', type: GAME_STATE, ownerMemberId: gameStateOwner, version: 9, data: gameStateData }
         : null;
     const calls = [];
-    const hudCache = { xp: 20, xpLevel: 2 };
+    const hudCache = { xp: 20, xpLevel: 2, levelBannerUntil: 12345 };
     const globals = {
         CONFIG: { MULTIPLAYER_LIVES: 3, INVULNERABILITY_TIME: 3, STARTING_LIVES: 3 },
         OBJECT_TYPES: { GAME_STATE, SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
@@ -91,7 +91,8 @@ test('entering an in-progress game adopts the shared lives, not the local defaul
 
         assert.equal(await harness.init(), true);
         assert.equal(harness.game.lives, lives);
-        assert.deepEqual(harness.hudCache, { xp: 20, xpLevel: 2 }, 'in-progress entry is not a new run');
+        assert.deepEqual(harness.hudCache, { xp: 20, xpLevel: 2, levelBannerUntil: 12345 },
+            'in-progress entry is not a new run and preserves its current level banner');
     }
 });
 
@@ -118,5 +119,6 @@ test('a session with no GameState yet still starts from the local default', asyn
 
     assert.equal(await harness.init(), true);
     assert.equal(harness.game.lives, 3);
-    assert.deepEqual(harness.hudCache, { xp: null, xpLevel: null }, 'fresh initialization clears progression rendering');
+    assert.deepEqual(harness.hudCache, { xp: null, xpLevel: null, levelBannerUntil: 0 },
+        'fresh initialization clears progression rendering and the previous run level banner');
 });

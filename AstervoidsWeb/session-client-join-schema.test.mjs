@@ -193,7 +193,7 @@ for (const slots of [16, 18, 19]) {
             assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
             assert.equal(loaded.client.getCurrentSession(), null);
             assert.equal(loaded.client.getParticipantId(), null);
-            assert.equal(SchemaCodec.get(4).fields.length, 21, 'never install the unsupported layout');
+            assert.equal(SchemaCodec.get(4).fields.length, 22, 'never install the unsupported layout');
             assert.equal(loaded.calls.at(-1).method, 'LeaveSession', 'rejected entry releases its allocated membership');
             assert.equal(loaded.errors.length, 1);
             assert.match(loaded.errors[0], /Unsupported Astervoids session schemas/);
@@ -315,7 +315,7 @@ for (const method of ['CreateSession', 'JoinSession', 'RejoinSession']) {
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantScores), { [REMOTE_ID]: 30 });
         assert.deepEqual(WireCodec.unpackCounterMap(replica.data.participantNumbers), { [REMOTE_ID]: 1 });
         assert.deepEqual(WireCodec.unpackTagMap(replica.data.participantTags), { [REMOTE_ID]: 'Pilot_1' });
-        assert.equal(SchemaCodec.get(4).fields.length, 21);
+        assert.equal(SchemaCodec.get(4).fields.length, 22);
         assert.deepEqual(loaded.errors, []);
     });
 }
@@ -388,7 +388,7 @@ test('RejoinSession replaces a stale local registry before current live packets 
     assert.ok(await joining);
     assert.equal(loaded.sync.getObject(OBJECT_ID).data.groupScore, 30);
     assert.equal(loaded.sync.getObject(OBJECT_ID).version, 2);
-    assert.equal(SchemaCodec.get(4).fields.length, 21);
+    assert.equal(SchemaCodec.get(4).fields.length, 22);
 });
 
 for (const compact of [false, true]) {
@@ -523,7 +523,7 @@ test('snapshot seeds and received membership/object callbacks expose coherent en
         assert.equal(loaded.client.getCurrentMember().id, MEMBER_ID);
         assert.equal(loaded.client.getLastSessionId(), SESSION_ID);
         assert.equal(loaded.client.getParticipantId(), MEMBER_ID);
-        assert.equal(SchemaCodec.get(4).fields.length, 21);
+        assert.equal(SchemaCodec.get(4).fields.length, 22);
     };
     loaded.sync.on('onObjectCreated', obj => {
         assertIdentity();
@@ -763,7 +763,7 @@ for (const failure of ['null response', 'invoke rejection', 'missing credential'
             { id: CHILD_ID, handle: HANDLE, schemas: SCHEMAS }));
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 70);
-        assert.equal(SchemaCodec.get(4).fields.length, 21);
+        assert.equal(SchemaCodec.get(4).fields.length, 22);
     });
 }
 
@@ -835,7 +835,7 @@ for (const outcome of ['success', 'rejection']) {
         assert.equal(loaded.sync.getObject(OBJECT_ID), undefined);
         assert.equal(loaded.sync.getObject(CHILD_ID).data.groupScore, 80);
         assert.equal(loaded.sync.getObject(CHILD_ID).version, 2);
-        assert.equal(SchemaCodec.get(4).fields.length, 21);
+        assert.equal(SchemaCodec.get(4).fields.length, 22);
         assert.deepEqual(loaded.errors, []);
     });
 }

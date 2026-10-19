@@ -75,7 +75,7 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
     };
     let splitting;
     const production = loadInlineGameFunctions([
-        'Asteroid', 'Bullet', 'assignDefined', 'getReferenceDimension',
+        'Ship', 'ShipInvulnerability', 'Asteroid', 'Bullet', 'assignDefined', 'getReferenceDimension',
         'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapMarginX', 'wrapMarginY', 'wrapNormalized',
@@ -86,9 +86,11 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
         'claimCrossOwnerAsteroidHit', 'resolveSoloAsteroidHit',
         'confirmOwnedAsteroidHitClaims', 'retireConfirmedPendingBullets',
         'applyOwnedAsteroidDamage', 'applySoloAsteroidDamage', 'checkGameEffectContacts',
-        'calculateGameState',
+        'calculateGameState', 'getParticipatingParticipantIds', 'awardBreakXp',
+        'getProgressionForXp', 'syncLocalShipBoosts',
     ], {
         ...globals,
+        getGameEffectNow: () => session ? 1000 : game.simulationTimeMs,
         getEffectiveAsteroidAspectScales: () => ({ speedScale: 1 }),
         randomRange: () => 0,
         AstervoidsFracture: fracture,
@@ -172,8 +174,12 @@ function ram(h, { vertex = { x: 505, y: 498 } } = {}) {
         participantId: PARTICIPANT, participantTag: 'CrashPilot',
         syncObjectId: h.game.multiplayer.myShipObjectId,
         deathHold: null, resets: 0,
+        resetLife: h.Ship.prototype.resetLife,
+        boostData: h.Ship.prototype.boostData,
+        isShielded: h.Ship.prototype.isShielded,
         getVertices: () => [vertex, { x: 520, y: 495 }, { x: 520, y: 505 }],
         reset() {
+            this.resetLife();
             this.resets++;
             this.x = 0.5;
             this.y = 0.5;
@@ -184,6 +190,7 @@ function ram(h, { vertex = { x: 505, y: 498 } } = {}) {
         },
         toUpdateData() { return { x: this.x, y: this.y }; },
     };
+    ship.resetLife();
     h.game.ship = ship;
     return ship;
 }
@@ -268,6 +275,31 @@ test('a fatal solo crash keeps the asteroid and today\'s game-over behavior', ()
     assert.equal(h.game.soloXp, 0);
 });
 
+test('a timed shield protects the real hull collision until its original deadline without healing', () => {
+    const h = harness({ lives: 3 });
+    const asteroid = rock(h);
+    const ship = ram(h);
+    const lifeId = ship.boostState.lifeId;
+    ship.boostState.shieldUntil = 6000;
+    for (const now of [0, 3000, 5999.999]) {
+        h.game.simulationTimeMs = now;
+        h.checkCollisions();
+        assert.deepEqual(h.game.astervoids, [asteroid]);
+        assert.equal(h.game.lives, 3);
+        assert.equal(ship.hitCount, 0);
+        assert.equal(ship.resets, 0);
+        assert.equal(ship.boostState.lifeId, lifeId);
+    }
+    h.game.simulationTimeMs = 6000;
+    h.checkCollisions();
+    assert.equal(h.game.lives, 2);
+    assert.equal(ship.hitCount, 1);
+    assert.equal(ship.resets, 1);
+    assert.notEqual(ship.boostState.lifeId, lifeId);
+    assert.equal(ship.boostState.shieldUntil, 0);
+    assert.equal(ship.boostState.rapidFireUntil, 0);
+});
+
 test('a survivable session crash into an owned asteroid commits one durable winner rather than self-crediting', async () => {
     const h = harness({ session: true });
     const asteroid = rock(h, { syncObjectId: ASTEROID_ID });
@@ -305,7 +337,7 @@ test('a survivable session crash into an owned asteroid commits one durable winn
         processedHits: {}, processedScores: {}, countedParticipants: { [PARTICIPANT]: 1 },
         participantScores: { [PARTICIPANT]: 0 }, participantNumbers: { [PARTICIPANT]: 1 },
         participantTags: { [PARTICIPANT]: 'CrashPilot' }, participantXp: { [PARTICIPANT]: 0 },
-        processedEffects: {},
+        processedEffects: {}, participantModifiers: {},
     };
     const next = h.calculateGameState({ lives: 3, peakShipCount: 1 }, ledger,
         [{ id: SHIP_ID, data: ship }], { lives: 3, state: 'playing' },

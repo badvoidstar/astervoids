@@ -88,6 +88,7 @@ function assertBulletCreation(h) {
     assert.deepEqual(h.creates, [{
         data: {
             type: 'bullet', x: 0.2, y: 0.3, velocityX: 0.1, velocityY: 0,
+            velocityXFull: 0.1, velocityYFull: 0,
             lifetime: 60, colorIndex: 0, ownerMemberId: OWNER_ID, damageId: h.bullet.damageId,
             ...(h.attributed ? { participantId: PARTICIPANT_ID } : {}),
             participantTag: h.attributed ? 'Pilot_1' : '', shipId: h.attributed ? SHIP_ID : null,

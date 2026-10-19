@@ -616,8 +616,9 @@ test('production canonical retargeting carries sampled acceleration', () => {
 test('terminal target uses half-ballistic distance tied to terminalAt', () => {
     let nowServer = 1000;
     const { buildTerminalTargetPayload: build } = loadInlineGameFunctions(
-        ['buildTerminalTargetPayload'],
+        ['Bullet', 'buildTerminalTargetPayload'],
         {
+            OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
             CONFIG: { TARGET_FPS: 60, DEADRECKON_MAX_FRAMES: 30 },
             RemoteObjects: {
                 serverNowMs: () => nowServer,
@@ -663,8 +664,9 @@ test('a coasting wreck converges on the same stopping point for every member', (
     // spectators. Once friction has bled the coast off, that target collapses
     // onto the wreck's own pose.
     const { buildTerminalTargetPayload: build } = loadInlineGameFunctions(
-        ['buildTerminalTargetPayload'],
+        ['Bullet', 'buildTerminalTargetPayload'],
         {
+            OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
             CONFIG: { TARGET_FPS: 60, DEADRECKON_MAX_FRAMES: 30 },
             RemoteObjects: { serverNowMs: () => 1000, getBoundingRadius: () => 0 },
             wrapRadiusFor: () => 0,

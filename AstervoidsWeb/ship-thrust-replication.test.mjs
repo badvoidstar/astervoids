@@ -5,6 +5,7 @@ import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const ReplicationPresentation = require('./wwwroot/js/replication-presentation.js');
+const AstervoidsWireCodec = require('./wwwroot/js/astervoids-wire-codec.js');
 
 const epoch = 1_800_000_000_000;
 
@@ -39,7 +40,8 @@ function harness({ deterministic = true } = {}) {
         return delta;
     };
     const globals = {
-        CONFIG: config,
+        CONFIG: config, AstervoidsWireCodec, reducedGameplayMotion: false,
+        getGameEffectNow: () => epoch + now,
         game,
         performance: { now: () => now },
         replicationClock: { validAtToMonotonicMs: at => at - epoch },

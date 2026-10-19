@@ -12,21 +12,35 @@ export const test = base.extend({
         let sessionId;
         const players = {
             ownSession(id) { sessionId = id; },
-            async open({ viewport = { width: 1280, height: 900 }, touch = false } = {}) {
+            async open({
+                viewport = { width: 1280, height: 900 }, touch = false,
+                identityOf = null, reducedMotion = 'no-preference',
+            } = {}) {
                 const context = await browser.newContext({
-                    baseURL, viewport, hasTouch: touch, isMobile: touch, serviceWorkers: 'block',
+                    baseURL, viewport, hasTouch: touch, isMobile: touch, serviceWorkers: 'block', reducedMotion,
                 });
                 context.setDefaultTimeout(15_000);
                 await configureAutomatedIdentities(context);
-                const tag = `XpPilot${opened.length + 1}`;
-                await provisionPlayer(context, tag);
+                const source = identityOf && opened.find(player => player.page === identityOf.page);
+                if (identityOf && !source) throw new Error('Shared fixture identity must come from this test');
+                const tag = source?.tag ?? `XpPilot${opened.length + 1}`;
+                if (source) {
+                    const binding = await source.page.evaluate(() =>
+                        localStorage.getItem('astervoids.browser-binding'));
+                    expect(typeof binding === 'string' && binding.length > 0,
+                        'A same-identity connection uses the existing real automated browser binding').toBe(true);
+                    await context.addInitScript(value =>
+                        localStorage.setItem('astervoids.browser-binding', value), binding);
+                } else {
+                    await provisionPlayer(context, tag);
+                }
                 const page = await context.newPage();
                 const health = {
                     uncaught: 0, consoleErrors: 0, hubFrames: 0, scoreRequests: 0,
                     offOrigin: 0, redirects: 0, requestFailures: 0,
                     maxHubMessageBytes: 0, maxUpdateMessageBytes: 0,
                 };
-                opened.push({ page, context, health });
+                opened.push({ page, context, health, tag });
                 page.on('pageerror', () => health.uncaught++);
                 page.on('console', message => {
                     if (message.type() === 'error') health.consoleErrors++;
@@ -130,7 +144,11 @@ export async function createSession(page) {
 }
 
 export async function joinSession(page, id) {
-    await page.locator(`.session-item[data-session-id="${id}"]`).click();
+    const row = page.locator(`.session-item[data-session-id="${id}"]`);
+    // A div's disabled class does not participate in Playwright's native input gating.
+    await expect(row, 'Picker metadata advertises an available slot before joining')
+        .not.toHaveClass(/\bdisabled\b/);
+    await row.click();
     await expect.poll(() => page.evaluate(id => {
         const session = SessionClient.getCurrentSession();
         return session?.id === id && game.sessionInfo?.id === id

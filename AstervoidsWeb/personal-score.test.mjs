@@ -12,7 +12,10 @@ const { SCHEMAS, requireCurrentSchemas } = require('./wwwroot/js/game-wire-schem
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const progressionConstants = loadInlineGameConstants(['PROGRESSION', 'PAYLOAD_KIND', 'GAME_EFFECT_KIND']);
 const progressionFunctions = loadInlineGameFunctions(
-    ['getLevelXpThreshold', 'getLevelForXp', 'getProgressionForXp'], progressionConstants);
+    ['getLevelXpThreshold', 'getLevelForXp', 'getProgressionForXp',
+        'getParticipatingParticipantIds', 'awardBreakXp'], {
+        ...progressionConstants, GuidUtils, AstervoidsWireCodec,
+    });
 const id = number => `${number.toString(16).padStart(8, '0')}-1111-2222-3333-aabbccddeeff`;
 const participantA = id(1);
 const participantB = id(2);
@@ -25,7 +28,7 @@ const shipB = id(102);
 const shipC = id(103);
 const ship = (shipId, participantId, score = 0, hitCount = 0) => ({
     id: shipId, ownerMemberId: participantId,
-    data: { type: 'ship', participantId, score, hitCount },
+    data: { type: 'ship', participantId, memberId: participantId, score, hitCount },
 });
 const { calculateGameState } = loadInlineGameFunctions(['calculateGameState'], {
     ...progressionConstants, ...progressionFunctions, GuidUtils, AstervoidsWireCodec, countExtraLivesForScore,
@@ -35,11 +38,11 @@ function calculate({
     persisted = { lives: 3, groupScore: 0 },
     processedScores = {}, processedHits = {}, countedParticipants = {},
     participantScores = {}, participantNumbers = {}, participantTags,
-    participantXp = {}, processedEffects = {}, ships = [],
+    participantXp = {}, processedEffects = {}, participantModifiers = {}, ships = [],
 } = {}) {
     return calculateGameState(persisted, {
         processedScores, processedHits, countedParticipants, participantScores, participantNumbers,
-        participantTags, participantXp, processedEffects,
+        participantTags, participantXp, processedEffects, participantModifiers,
     }, ships, {
         lives: 3, state: 'playing', observedScoreLifeAwardCount: null,
     }, 1000);
@@ -56,6 +59,7 @@ function continueFrom(previous, ships) {
         participantTags: previous.participantTags,
         participantXp: previous.participantXp,
         processedEffects: previous.processedEffects,
+        participantModifiers: previous.participantModifiers,
         ships,
     });
 }
@@ -412,6 +416,9 @@ function counterHarness({ deltaEncoding = true } = {}) {
     const game = {
         ship: {
             x: 0.5, score: 0, hitCount: 0, syncObjectId: shipA,
+            boostState: { lifeId: id(901), shieldUntil: 0, rapidFireUntil: 0 },
+            modifierRequestMilestone: 0, modifierRequestKind: 0,
+            boostData() { return { boostState: AstervoidsWireCodec.packBoostState(this.boostState) }; },
             toUpdateData() { return { x: this.x }; },
         },
         multiplayer: { myShipObjectId: shipA },
@@ -437,13 +444,15 @@ function counterHarness({ deltaEncoding = true } = {}) {
     ObjectSync.init();
     ObjectSync.configure({ deltaEncoding });
     handlers.onSessionJoined({ objects: [{
-        id: shipA, data: { type: 'ship', participantId: participantA, score: 0, hitCount: 0 },
+        id: shipA, data: { type: 'ship', participantId: participantA, score: 0, hitCount: 0,
+            ...game.ship.boostData(), modifierRequestMilestone: 0, modifierRequestKind: 0 },
         version: 1, ownerMemberId: participantA, creatorMemberId: participantA, scope: 'Member',
     }] });
     const functions = loadInlineGameFunctions([
         'syncLocalShipScore', 'emitShipStateChanged', 'syncLocalShip', 'handleShipStateChangedEvent',
+        'syncLocalShipBoosts',
     ], {
-        game, ObjectSync, isSessionMode: () => true,
+        game, ObjectSync, SessionClient, AstervoidsWireCodec, isSessionMode: () => true,
         EVENT_KIND: { SHIP_STATE_CHANGED: 'ship-state-changed' },
         CollisionEffects: { startShipHit() {} },
         CONFIG: { SHIP_EDGE_SEND_ENABLED: true },
@@ -515,6 +524,7 @@ function departureHarness({ migrate = false } = {}) {
             participantNumbers: AstervoidsWireCodec.packCounterMap({}),
             participantXp: AstervoidsWireCodec.packXpMap({ [participantA]: 70, [participantB]: 200 }),
             processedEffects: AstervoidsWireCodec.packCounterMap({}),
+            participantModifiers: AstervoidsWireCodec.packParticipantModifiers({}),
         },
     };
     const scorer = ship(shipA, participantA, 30, 1);
@@ -528,6 +538,7 @@ function departureHarness({ migrate = false } = {}) {
     const publications = [];
     let functions;
     const ObjectSync = {
+        isDataConfirmed: () => false,
         getObject: objectId => records.get(objectId),
         getObjectByType: type => [...records.values()].find(record => record.data?.type === type),
         getObjectsByType: type => [...records.values()].filter(record => record.data?.type === type),
@@ -742,11 +753,11 @@ function scoreUiHarness({
     };
     const record = {
         id: id(200), version: 1,
-        data: data ?? {
+        data: { participantModifiers: AstervoidsWireCodec.packParticipantModifiers({}), ...(data ?? {
             groupScore: 120, processedScores: AstervoidsWireCodec.packCounterMap({}),
             participantScores: AstervoidsWireCodec.packCounterMap({ [participantA]: 100, [participantB]: 20 }),
             participantNumbers: AstervoidsWireCodec.packCounterMap({ [participantA]: 4, [participantB]: 2 }),
-        },
+        }) },
     };
     if (record.data.participantTags === undefined
         && record.data.participantNumbers instanceof Uint8Array) {
@@ -760,6 +771,8 @@ function scoreUiHarness({
         'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverPersonalScoreEl', 'gameoverScoreEl',
         'gameoverResultsEl', 'gameoverPromptEl', 'sessionIndicator',
         'xpHud', 'xpLevel', 'xpFraction', 'xpBar', 'xpFill', 'levelAnnouncement',
+        'levelBanner', 'boostStatus', 'modifierCurrent', 'modifierChoice', 'modifierTitle',
+        'modifierFocus', 'modifierSweep',
     ].map(name => [name, element()]));
     const errors = [];
     const counts = { unpack: 0, layout: 0 };
@@ -768,12 +781,14 @@ function scoreUiHarness({
         'getSessionScoreView', 'normalizeParticipantLedger',
         'readParticipantScoreHistory', 'readGameStateLedger', 'gameStateLedgerMatches',
         'gameStateCounterMapsEqual', 'projectParticipantScore', 'rankParticipantScores',
-        'updateProgressionHud', 'fitProgressionHud', 'getSessionXpLedger', 'getLocalProgression',
+        'updateProgressionHud', 'updateProgressionControls', 'fitProgressionHud',
+        'getSessionXpLedger', 'getLocalProgression', 'getSessionModifierLedger',
         'reportMalformedGameStateLedgers',
     ], {
         ...elements, ...progressionConstants, ...progressionFunctions,
         game, GuidUtils, canvas: { width: 1000, height: 800 },
-        gameStateScoreViewCache: null, sessionXpViewCache: null, malformedGameStateLedgerKey: null,
+        gameStateScoreViewCache: null, sessionXpViewCache: null, sessionModifierViewCache: null,
+        malformedGameStateLedgerKey: null, getGameEffectNow: () => 0,
         hudCache: {}, overlayCache: {},
         AstervoidsWireCodec: {
             ...AstervoidsWireCodec,
@@ -786,6 +801,7 @@ function scoreUiHarness({
         isLobbySpectating: () => false,
         SessionClient: {
             getSessionEpoch: () => identity.epoch, getParticipantId: () => identity.participantId,
+            getCurrentMember: () => ({ id: identity.participantId }),
             getParticipantIdentity: () => participantTag ? { id: identity.participantId, tag: participantTag } : null,
             getCurrentSession: () => ({ metadata: { schemas: SCHEMAS } }),
         },
@@ -1205,6 +1221,8 @@ function scoreLayoutHarness(width, height, aspectRatio, sessionMode = true) {
     const game = { sessionInfo: { metadata }, viewport: {} };
     const { resizeCanvas } = loadInlineGameFunctions(['resizeCanvas', 'fitProgressionHud'], {
         game, canvas, xpHud, hudDisplay: { ...hud, offsetTop: 0, offsetHeight: 0 },
+        levelBanner: { hidden: true, style: {}, offsetHeight: 0 },
+        modifierChoice: { hidden: true, style: {}, offsetHeight: 0 },
         isSessionMode: () => sessionMode, fitSessionHud() {},
         getEffectiveAsteroidAspectScales: () => null,
         document: {

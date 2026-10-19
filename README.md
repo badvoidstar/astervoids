@@ -80,8 +80,15 @@ and the deployment/retention runbook in `CICD_SETUP.md`.
 
 ## XP, levels, and asteroid rewards
 
-Every asteroid that actually breaks earns **10 personal XP**, including fragments
-and blast-caused breaks. Merely damaging armor earns neither XP nor points.
+Every asteroid that actually breaks earns its finisher **10 personal XP**,
+including fragments and blast-caused breaks. Other distinct confirmed-damage
+participants earn **5 assist XP** each (at most two assistants). Repeat hits by
+one identity count once; fragments start with fresh contribution history.
+Players at least two levels behind the highest currently participating identity
+receive **2 extra XP** per finisher/assist award. Spectators and departed retained
+history do not raise that catch-up reference; with no active ships there is no
+bonus. Merely damaging armor earns no immediate XP or points. Finisher points,
+team score, and lives are unchanged.
 The thin top-right bar shows your level and XP toward the next level. Level `L`
 starts at `10 * L * (L - 1)` total XP; the next level costs `20 * L`, with overflow
 carrying forward. XP survives deaths. Each new solo game resets it, even for a
@@ -92,30 +99,64 @@ There is no persistent cross-game progression.
 Your gun fires exactly one more projectile per level: one shot at level 1,
 a parallel pair at level 2, a parallel trio at level 3, then a symmetric fan.
 The active-bullet budget grows with level, and volleys are never truncated.
-Firing, cooldown, steering, and pause controls are unchanged.
+Steering and pause controls are unchanged; rapid fire temporarily changes only
+the cooldown of newly admitted complete volleys.
+
+At levels **4, 8, 12, …**, an optional, nonmodal pair of buttons lets you choose
+one persistent volley modifier:
+
+- **1 · FOCUS:** 15% faster shots and a 25% tighter fan.
+- **2 · SWEEP:** ordinary shot speed and a 25% wider fan, capped at 90°.
+
+Both still fire exactly your level in shots, with unchanged damage and lifetime.
+The current choice lasts until you replace it at a later milestone; choices do
+not stack or expire. If you skip several, only the latest milestone waits.
+Use 1/2, tap the native buttons, or Tab then Enter/Space. The game never pauses or
+moves focus for a choice. XP and accepted choices are shared by same-identity
+multiplayer browsers, while their individual ship boosts are not. A brief native
+level banner shows the added projectile count; boost countdown text changes only
+once per displayed second and is not repeatedly announced.
 
 Once the run's highest personal level reaches 4, some new wave asteroids have
 two-hit armor. At level 7, three-hit rocks also appear. Extra contours, remaining-hit
 pips, cracks, and a payload symbol distinguish these rocks. Their fragments are
-ordinary one-hit asteroids, without additional hidden payloads.
+ordinary one-hit asteroids, without additional hidden payloads or inherited
+contributors. Two-hit originals move at 85% ordinary capped spawn velocity;
+three-hit originals at 70%. Armor damage never speeds them up. Their direct
+fragments get a 15% linear speed boost before the existing safety/speed caps;
+later ordinary fractures behave normally. Reward halos and hazard chevrons
+distinguish contents without relying on color. Mine contact circles and fixed
+spray lanes are visible before destroying the armored rock.
 
 Armored rocks contain one of these rewards or hazards:
 
 | Contents | Activation and effect |
 | --- | --- |
-| **Nuke** | Collect the hollow diamond with your ship; breaks the starting asteroid set within radius 0.25, ignoring armor |
+| **Nuke** | Collect with your hull; breaks starting rocks within radius 0.25 ignoring armor, clears starting hazards there, and grants a 1-second collector shield without shortening a longer shield |
 | **Level +1** | Collect to fill exactly the remaining XP to your next level |
 | **Life +1** | Collect to add one solo/shared life; cannot revive a finished game |
-| **Smart bomb** | Collect to hit every starting asteroid once and clear existing hazards |
-| **Mine** | Appears when the rock breaks; arms after 1 second, damages one ship on contact, expires after 8 seconds total |
-| **Spray** | Appears when the rock breaks; warns along 12 radial lanes for 0.8 seconds, then launches 12 hostile shots at 40% normal bullet speed for 2 seconds, without wrapping |
+| **Smart bomb** | Collect to hit every starting asteroid once and clear all starting hazards; no shield |
+| **Shield** | 6 seconds of ordinary collision/hazard protection for the collecting ship life; no healing or lives |
+| **Rapid fire** | 6 seconds of 25% shorter cooldown for each newly admitted complete volley; existing cooldown and bullets are unchanged |
+| **Mine** | Appears when the rock breaks; arms after 1.5 seconds, damages one ship on contact, expires after 8 seconds total |
+| **Spray** | Warns for 1.2 seconds, then fires eight fixed lanes at 40% ordinary bullet speed for 2 seconds without wrapping; two horizontal 90° escape corridors remain |
+
+Armored contents are nuke, level-up, extra life, and smart bomb at 15% each;
+shield, rapid fire, mine, and spray at 10% each. Armor frequencies are unchanged:
+20% two-hit from level 4, plus 10% three-hit from level 7.
 
 Positive diamonds have distinct vector glyphs, stay stationary, and
 expire after 12 seconds unless actually touched by a ship's hull. Mines and spray
 activate on destruction, not pickup. Normal ship invulnerability applies to
 hazards. Blasts act only on their frozen starting targets, not recursively on
 new fragments, loot, or hazards. All art remains vector-only, with no bitmap assets.
-Solo effect timers freeze while paused.
+Shield and rapid fire coexist. Recollection refreshes to the later accepted
+deadline rather than adding durations, and nuke never shortens a longer shield.
+Boosts reset on damage/death/new ship; they do not follow another same-identity
+ship. Solo effect/boost timers freeze while paused. Multiplayer uses original
+accepted server deadlines through hidden tabs, recovery, and ownership changes;
+late spray processing cannot restart a fresh barrage. Reduced-motion mode uses
+static reward/hazard cues, without a new flash or camera shake.
 
 Multiplayer retains aggregate XP, score, and lives, but retires per-effect
 acknowledgements only after the server confirms receipt removal. Retired break

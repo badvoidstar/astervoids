@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const require = createRequire(import.meta.url);
 const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const codec = require('./wwwroot/js/astervoids-wire-codec.js');
 const GuidUtils = require('./wwwroot/js/guid-utils.js');
+const constants = loadInlineGameConstants(['PROGRESSION']);
 
 const MY_SHIP = 'aaaaaaaa-0000-0000-0000-000000000001';
 const OTHER_SHIP = 'bbbbbbbb-0000-0000-0000-000000000002';
@@ -45,15 +46,19 @@ function harness({ lives = 3, myShipObjectId = MY_SHIP, gameOver = false } = {})
     const warnings = [];
     const ObjectSync = {
         updateObject: (id, data, immediate) => writes.push({ id, data, immediate }),
+        getObject: id => records.get(id),
+        isDataConfirmed: () => false,
         getObjectByType: type => [...records.values()].find(r => r.type === type) || null,
         getObjectsByType: type => [...records.values()].filter(r => r.type === type)
     };
     const production = loadInlineGameFunctions([
         'Ship', 'ShipInvulnerability', 'assignDefined', 'rampInputToward',
         'calculateGameState', 'handleShipHit', 'predictFatalShipHit',
-        'beginShipDeathHold', 'resolveShipDeathHold'
+        'beginShipDeathHold', 'resolveShipDeathHold', 'syncLocalShipBoosts',
+        'getParticipatingParticipantIds', 'awardBreakXp', 'getLevelForXp', 'getLevelXpThreshold',
     ], {
-        CONFIG: config, game, ObjectSync, GuidUtils, countExtraLivesForScore,
+        ...constants, CONFIG: config, game, ObjectSync, GuidUtils, countExtraLivesForScore,
+        SessionClient: { getCurrentMember: () => ({ id: MY_SHIP }) },
         AstervoidsWireCodec: codec,
         OBJECT_TYPES: { SHIP: 'ship', GAME_STATE: 'gamestate' },
         performance: { now: () => now },

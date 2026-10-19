@@ -1180,21 +1180,57 @@ run-local `soloXp`, reset by every new solo initialization irrespective of ident
 or leaderboard eligibility. `leaderboardRun` is not a progression key.
 Run-highest level is derived from all retained participant XP.
 
-Each confirmed original, fragment, or blast-caused break earns ten XP.
+Each confirmed original, fragment, or blast-caused break earns its finisher ten XP.
+Each other distinct confirmed-damage participant earns five assist XP (at most
+two assistants); repeated hits by one identity do not multiply that award.
+The asteroid owner deduplicates independent damage GUIDs before changing HP or
+contributors, and publishes HP, damage acknowledgements, and first-hit contributor
+ordinals together outside the motion send gate. The breaking replacement freezes
+these contributors; fracture children start with empty contribution maps.
+For each receipt, beneficiaries whose pre-award level is at least two below the
+highest currently participating identity receive two additional XP. The reference
+uses current members' owned ships, deduplicated by participant, not retained
+history or pure spectators. All beneficiary levels and the reference are frozen
+before that receipt's grants; receipts retain normalized GUID ordering. Departed
+contributors retain earned awards. With no active players there is no catch-up
+bonus. Join, passive time, and level-up pickups grant no catch-up XP; score,
+finisher points, team points, and life accounting are unchanged.
 Level `L` starts at `T(L) = 10 * L * (L - 1)`; advancement costs `20 * L`.
 Overflow carries. `Ship.shoot(level)` returns exactly `L` projectiles under one
-unchanged cooldown/sound. Levels 1–3 use a single, parallel pair, and parallel
+cooldown/sound. Levels 1–3 use a single, parallel pair, and parallel
 trio; level 4 onward uses symmetric fan spread
 `min(90, 24 + 8 * (L - 4))` degrees. `handleInput` reserves the complete volley
 within the old ten-active-projectile budget scaled by level; there is no shot
 plateau or partial volley.
 
+Every fourth level unlocks one optional, exclusive persistent modifier:
+FOCUS multiplies newly fired bullet speed by 1.15 and fan spread by 0.75;
+SWEEP retains ordinary speed and multiplies fan spread by 1.25, capped at 90°.
+Neither changes shot count, damage, or lifetime. The accepted modifier remains
+until replacement; skipped choices collapse to the latest unlocked multiple of
+four. Multiplayer inputs are the owning ship's request milestone/kind. After XP
+accounting, the GameState owner validates current membership, ship ownership,
+participant, earned latest milestone, and consumed history. Co-visible conflicts
+for one identity use normalized ship-GUID order; an unconfirmed winner is latched
+until the GameState write settles. Only accepted GameState modifiers affect guns,
+not ship requests or optimistic GameState choices. Choices survive death, same-
+identity browsers, rejoin, and ownership transfer with XP, but never stack and
+never prevent receipt retirement.
+
 Wave originals are all normal at run-highest levels 1–3. At levels 4–6 their
 distribution is normal 80% / two-hit 20%; at 7 onward it is normal 70% / two-hit
-20% / three-hit 10%. The spawning owner predetermines armored contents:
-nuke, level-up, extra life, and smart bomb 20% each; mine and spray 10% each.
-Fracture children are always normal and payload-free. Inset vector contours,
-remaining-hit pips, cracks, and distinct contents glyphs convey durability.
+20% / three-hit 10%. This difficulty reference still includes retained departed
+XP, unlike catch-up. After the ordinary spawn cap, two-hit originals get 0.85
+linear velocity and three-hit originals 0.70, once from immutable `maxHits`;
+damage never changes that speed. The spawning owner predetermines armored
+contents: nuke, level-up, extra life, and smart bomb 15% each; shield, rapid fire,
+mine, and spray 10% each. Direct children of armored parents get 1.15 linear
+velocity before existing shooter avoidance and final speed caps; later fractures
+are ordinary. Children are one-hit, payload-free, and contribution-free. Inset
+vector contours, remaining-hit pips, cracks, contents glyphs, reward halos, and
+hazard chevrons convey durability and risk without relying on color. Armored
+mines preview their exact contact circle, and armored spray previews its fixed
+world-space lanes before destruction.
 
 Stationary positive hollow diamonds have distinct vector glyphs and expire in
 12 seconds. An actual local ship-hull contact creates a Member-scoped `gameClaim`;
@@ -1207,9 +1243,11 @@ The GameState owner applies level-up as exactly the next-threshold deficit,
 extra life to the existing shared pool while alive, and blast authorization
 once through `processedEffects`. Pure spectator owners perform this accounting.
 
-Nuke activation freezes starting asteroid IDs within normalized radius 0.25
-and ignores armor. Smart bomb freezes all starting asteroid IDs for one hit
-each and existing mine/spray/projectile IDs to clear. Target owners execute only
+Nuke activation freezes starting asteroid and hazard IDs within normalized
+radius 0.25 using current poses, ignores armor, clears those hazards, and grants
+its collector one second of shield without shortening an existing shield.
+Smart bomb freezes all starting asteroid IDs for one hit each and all existing
+mine/spray/projectile IDs to clear, without a shield. Target owners execute only
 these ID sets using the activation receipt ID for damage deduplication.
 Collector identity receives break XP/points. New fragments, loot, and hazards
 are not recursively included. Receipts remain until their GameState acknowledgement
@@ -1237,14 +1275,36 @@ local-only `progression-load.spec.mjs` exercises thousands of real hub-backed
 breaks, high-level volleys, late join, and ownership migration while measuring
 the complete MessagePack invocation, including its outer envelope/length prefix.
 
-Mines activate at destruction, arm after one second, expire after eight seconds
-total, and consume on one normal ship-damage contact. Spray telegraphs twelve
-radial lanes for 0.8 seconds, then atomically replaces itself with twelve hostile
-projectiles at 40% ordinary bullet speed, with a two-second flight and no wrap.
-Both respect normal invulnerability. Hazard activation receipts retain the exact
-ship ID and claimed revision; `Ship.handledHazards` and the hazard hit counter
+Mines activate at destruction, arm after 1.5 seconds, expire after eight seconds
+total, and consume on one normal ship-damage contact. Mines and spray respect
+ordinary or shield-boost invulnerability. Hazard activation receipts retain the exact
+ship ID, life GUID, and claimed revision; `Ship.handledHazards` and the hazard hit counter
 persist and retry with current ship motion outside ShipSendGate. A repeated,
 recreated-ship, respawn-revision, or terminal receipt cannot damage another life.
+
+Spray uses **eight** world-fixed lanes at 45°, 75°, 105°, 135°, 225°, 255°,
+285°, and 315°, leaving two horizontal 90° escape corridors. Its warning lasts
+1.2 seconds; hostile shots travel at 40% ordinary base bullet speed for two
+seconds without wrapping. The original accepted launch and expiry deadlines
+survive hidden ownership, recovery, and migration; late processing cannot
+restart the barrage.
+
+Shield and rapid-fire pickups affect only the exact collecting ship life for six
+seconds. Shield combines with ordinary invulnerability for ship/hazard collisions,
+without healing or granting lives. Rapid fire samples a 0.75 cooldown multiplier
+only when a new complete volley is admitted; it never rewrites a running cooldown
+or an existing bullet's velocity. The two boosts coexist, refresh with
+`max(existing, acceptedActivationStartedAt + duration)`, and never add durations.
+`boostState` retains expired numeric deadlines for idempotency. New ships and
+every actual damage/death/reset rotate the life GUID and clear boosts; recovery
+of the same record preserves it. Claims copy that life GUID and are checked
+against accepted boost state, retaining hazard revision checks. A boost activates
+only after a live GameState receipt acknowledgement, never during predicted
+death hold or after terminal state. Rare boost/request writes retry with current
+motion outside ShipSendGate. Receipt retirement needs confirmed GameState
+disposition plus a confirmed required ship deadline, or authoritative obsolete
+ship/life/terminal evidence; optimistic absence or death is not evidence. Nuke
+also waits for its blast targets. No additional boost receipt-ID ledger is used.
 
 Multiplayer timers are immutable server-UTC-millisecond deadlines anchored to
 accepted creation/replacement `validAt` and persisted before further owner
@@ -1261,9 +1321,14 @@ another loop. Replacement presentation bridges apply only to kinematic children.
 The native HTML/CSS top-right XP bar reserves score/wave/lives and touch-control
 space inside the actual play viewport, including letterboxing and safe areas.
 Its accessible values are change-gated, with level-only announcements rather
-than continuous XP announcements. Menus, recovery, game over, and pure spectators
-hide it. Rewards/hazards and armor are vector-only, use non-color cues, and
-respect reduced-motion preferences for cosmetic effects.
+than continuous XP announcements. A native CSS/text level banner coalesces jumps
+and shows `+1 projectile` (or the combined gain) for 1.5 seconds. Optional modifier
+buttons are nonmodal native controls at least 44 CSS pixels, supporting 1/2 and
+native Tab/Enter/Space without stealing focus or another control thumb. Boost
+text updates only when displayed integer seconds change, without live-region
+ticks. Menus, recovery, game over, and pure spectators hide these controls.
+Rewards/hazards and armor are vector-only, use non-color cues, and respect
+reduced-motion preferences with static cues and no new flashes or shake.
 
 ### Fracture physics
 
@@ -1755,27 +1820,39 @@ stored objects to schema 0. Empty positional writes likewise retain their
 selected schema. Schema 0 is selected explicitly (or by a generic caller's
 default), never to repair an unsupported positional contract.
 
-The progression contract preserves all prior slots and appends:
+The progression/risk-reward contract preserves all prior slots and appends:
 
-- Ship slot 28: `handledHazards: bytes`; 29 fields, four mask bytes.
+- Ship slot 28: `handledHazards: bytes`; slots 29–31:
+  `boostState: bytes`, `modifierRequestMilestone: u32`, `modifierRequestKind: u8`;
+  32 fields, four mask bytes.
 - Asteroid slots 14–17: `maxHits: u8`, `hitsRemaining: u8`, `payloadKind: u8`,
-  `processedDamage: bytes`; 18 fields, **three** mask bytes rather than two.
+  `processedDamage: bytes`; slot 18: `contributors: bytes`;
+  19 fields, three mask bytes.
 - Bullet slots 16–19: `damageId: guid`, `participantId: guid`,
-  `shipId: nullable-guid`, `participantTag: str`; 20 fields, **three** mask bytes.
+  `shipId: nullable-guid`, `participantTag: str`; slots 20–21:
+  `velocityXFull: f32`, `velocityYFull: f32`; 22 fields, three mask bytes.
 - GameState slots 19–20: `participantXp: bytes`, `processedEffects: bytes`;
-  21 fields, three mask bytes. Personal scores/numbers/tags remain at 16–18.
+  slot 21: `participantModifiers: bytes`; 22 fields, three mask bytes.
+  Personal scores/numbers/tags remain at 16–18.
 
 Schema 5 order is `type: str`, `kind: u8`, `payloadKind: u8`, `sourceId: guid`,
 `claimId: nullable-guid`, `participantId: nullable-guid`, `participantTag: str`,
 `shipId: nullable-guid`, `x: q16w`, `y: q16w`, `velocityX: f32`, `velocityY: f32`,
 `angle: q16_2pi`, `startedAt: f64`, `armedAt: f64`, `expiresAt: f64`,
 `points: u32`, `damageReceipts: bytes`, `asteroidTargets: bytes`,
-`hazardTargets: bytes`. Its mask is three bytes.
+`hazardTargets: bytes`, `contributors: bytes`, `shipLifeId: nullable-guid`.
+It has 22 fields and a three-byte mask. Only break receipts carry contributors;
+all other effects carry an empty contributor blob.
 
 Schema 6 order is `type: str`, `targetId: guid`, `shipId: guid`,
 `participantId: guid`, `participantTag: str`, `x: q16w`, `y: q16w`,
-`angle: q16_2pi`, `claimedAt: f64`, `invulnerabilityRevision: u32`.
-Its mask is two bytes.
+`angle: q16_2pi`, `claimedAt: f64`, `invulnerabilityRevision: u32`,
+`shipLifeId: guid`. It has 11 fields and a two-byte mask.
+
+The generic 32-field maximum is unchanged. Newly created ships always publish a
+valid boost blob and request pair 0/0; newly created asteroids have empty
+contributors. Existing payload enum values remain intact; SHIELD=7 and
+RAPID_FIRE=8 are appended.
 
 The game validates every field name, type, position, and field count in all six
 advertised definitions before decoding, not just appended slots. Older/missing
@@ -1810,6 +1887,12 @@ Wrap-extended position encoding prevents offscreen wrap margins from being
 clamped to the visible edge. Terminal positions/angles use full-precision
 fields. Ship thrust and ship/asteroid velocities use ranges capable of expressing
 their configured limits rather than assuming every quantity lies in `[0, 1]`.
+Bullet's existing signed-quantized velocity slots remain for positional stability,
+but clamp FOCUS's 1.15 axial velocity. Game-owned adapters resolve the appended
+full f32 pair before factory/adoption, presentation-policy ingestion, canonical
+projection, and terminal targeting. They copy rather than mutate borrowed
+canonical records; sparse updates preserve the full pair. Already-fired bullets
+never derive their speed from a player's later choice.
 
 Do not infer universal byte equality from language rounding names: JavaScript
 `Math.round` and C# `MidpointRounding.AwayFromZero` differ at negative signed
@@ -1839,6 +1922,17 @@ game-specific nested packing:
   Duplicate/unsorted IDs, unsafe values, and malformed lengths reject.
   Damage, handled-hazard, processed-effect, and frozen-target ID maps reuse the
   GUID/uint32 counter format; hazard receipts use it to retain claim revisions.
+- Contributor maps wrap that GUID/uint32 format with at most three identities,
+  distinct first-accepted damage ordinals 1–3, and no duplicate normalized GUIDs.
+  A participant's repeat impacts retain its first ordinal.
+- Boost state is exactly 32 bytes: life GUID in the existing 16-byte encoding,
+  then finite nonnegative little-endian f64 shield and rapid-fire deadlines at
+  offsets 16 and 24. It is life-specific, not an event history.
+- Participant modifier maps sort normalized GUIDs into 21-byte entries:
+  GUID16, little-endian u32 consumed milestone, and u8 kind (FOCUS=1, SWEEP=2).
+  Milestones are positive multiples of four, validated against earned XP at
+  accounting. Invalid kinds, duplicate/unsorted keys, and malformed lengths
+  reject instead of silently fabricating defaults.
 - Participant tag maps sort normalized GUIDs and encode a 16-byte GUID, one-byte
   ASCII length, and tag bytes bounded by shared `identityTagMaxLength`.
   Invalid/duplicate entries or truncated bytes

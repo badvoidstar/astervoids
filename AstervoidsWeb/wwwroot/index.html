@@ -120,6 +120,43 @@
             background: #fff;
         }
 
+        #boost-status, #modifier-current {
+            font-size: 0.85em;
+            line-height: 1.2;
+        }
+
+        #boost-status:empty { display: none; }
+
+        #modifier-choice, #level-banner {
+            position: absolute;
+            z-index: 5;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 4px;
+            font-size: 12px;
+            text-align: center;
+            box-sizing: border-box;
+        }
+
+        #modifier-choice[hidden], #level-banner[hidden] { display: none; }
+        #modifier-title { margin-bottom: 4px; }
+        #modifier-options { display: flex; gap: 6px; }
+        #modifier-options button {
+            flex: 1;
+            min-width: 44px;
+            min-height: 44px;
+            padding: 5px;
+            border: 1px solid #fff;
+            border-radius: 3px;
+            background: #111;
+            color: #fff;
+            font: inherit;
+            touch-action: manipulation;
+        }
+        #modifier-options button span { display: block; }
+        #modifier-options button:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+        #modifier-options button:disabled { border-style: dashed; color: #bbb; }
+
         .sr-only {
             position: absolute;
             width: 1px;
@@ -1225,8 +1262,18 @@
                 aria-valuemin="0" aria-valuemax="20" aria-valuenow="0">
                 <div id="xp-fill"></div>
             </div>
+            <div id="modifier-current">Baseline volley</div>
+            <div id="boost-status" aria-live="off"></div>
         </div>
         <div id="level-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+        <div id="level-banner" aria-hidden="true" hidden></div>
+        <div id="modifier-choice" role="group" aria-labelledby="modifier-title" hidden>
+            <div id="modifier-title">Optional volley upgrade</div>
+            <div id="modifier-options">
+                <button id="modifier-focus" type="button"><span>1 · FOCUS</span><span>Faster shots, tighter fan</span></button>
+                <button id="modifier-sweep" type="button"><span>2 · SWEEP</span><span>Normal speed, wider fan</span></button>
+            </div>
+        </div>
         
         <!-- Instructions: control hints -->
         <div id="instructions">
@@ -2548,6 +2595,7 @@
     // CONFIG.DEADRECKON_MAX_FRAMES so a stall cannot fling a replica away.
     // No Hermite buffer or adaptive render delay is involved.
     function createDeadReckoningState(data, recvPerf, context = null) {
+        if (data.type === OBJECT_TYPES.BULLET) data = Bullet.resolveVelocityData(data);
         const turnControlMode = normalizeTurnControlMode(data.turnControlMode);
         const turnSpeed = getShipTurnSpeed(turnControlMode);
         return {
@@ -2826,14 +2874,29 @@
 
     const PROGRESSION = Object.freeze({
         XP_PER_ASTEROID: 10,
+        XP_PER_ASSIST: 5,
+        CATCHUP_XP: 2,
+        CATCHUP_LEVEL_GAP: 2,
+        MODIFIER_INTERVAL: 4,
+        FOCUS_SPEED_SCALE: 1.15,
+        FOCUS_SPREAD_SCALE: 0.75,
+        SWEEP_SPREAD_SCALE: 1.25,
+        TWO_HIT_SPEED_SCALE: 0.85,
+        THREE_HIT_SPEED_SCALE: 0.70,
+        ARMORED_CHILD_SPEED_SCALE: 1.15,
+        BOOST_DURATION_MS: 6000,
+        NUKE_SHIELD_MS: 1000,
+        RAPID_FIRE_COOLDOWN_SCALE: 0.75,
+        LEVEL_BANNER_MS: 1500,
         PICKUP_RADIUS: 0.018,
         PICKUP_LIFETIME_MS: 12000,
         MINE_RADIUS: 0.012,
-        MINE_ARM_MS: 1000,
+        MINE_ARM_MS: 1500,
         MINE_LIFETIME_MS: 8000,
-        SPRAY_TELEGRAPH_MS: 800,
+        SPRAY_TELEGRAPH_MS: 1200,
         SPRAY_FLIGHT_MS: 2000,
-        SPRAY_LANES: 12,
+        SPRAY_LANES: 8,
+        SPRAY_ANGLES_DEG: Object.freeze([45, 75, 105, 135, 225, 255, 285, 315]),
         SPRAY_SPEED_SCALE: 0.4,
         NUKE_RADIUS: 0.25,
         CLAIM_TIMEOUT_MS: 16000,
@@ -2841,8 +2904,10 @@
         RECEIPT_FEEDBACK_MS: 500
     });
     const PAYLOAD_KIND = Object.freeze({
-        NONE: 0, NUKE: 1, LEVELUP: 2, EXTRA_LIFE: 3, SMART_BOMB: 4, MINE: 5, SPRAY: 6
+        NONE: 0, NUKE: 1, LEVELUP: 2, EXTRA_LIFE: 3, SMART_BOMB: 4, MINE: 5, SPRAY: 6,
+        SHIELD: 7, RAPID_FIRE: 8
     });
+    const MODIFIER_KIND = Object.freeze({ NONE: 0, FOCUS: 1, SWEEP: 2 });
     const GAME_EFFECT_KIND = Object.freeze({
         BREAK_RECEIPT: 1, PICKUP: 2, ACTIVATION_RECEIPT: 3,
         MINE: 4, SPRAY: 5, HOSTILE_BULLET: 6
@@ -2873,11 +2938,15 @@
             nextLevelXp: start + requiredXp, fraction: currentXp / requiredXp };
     }
 
-    function buildVolleyPattern(level) {
+    function buildVolleyPattern(level, modifierKind = 0) {
         if (!Number.isSafeInteger(level) || level < 1) {
             throw new RangeError('Volley level must be a positive safe integer');
         }
-        const spread = Math.min(90, 24 + 8 * (level - 4)) * Math.PI / 180;
+        if (![0, 1, 2].includes(modifierKind)) throw new RangeError('Invalid volley modifier');
+        const baseSpread = Math.min(90, 24 + 8 * (level - 4));
+        const spreadScale = modifierKind === 1 ? PROGRESSION.FOCUS_SPREAD_SCALE
+            : modifierKind === 2 ? PROGRESSION.SWEEP_SPREAD_SCALE : 1;
+        const spread = Math.min(90, baseSpread * spreadScale) * Math.PI / 180;
         return Array.from({ length: level }, (_, index) => level <= 3
             ? { angleOffset: 0, lateralOffset: index - (level - 1) / 2 }
             : { angleOffset: spread * (index / (level - 1) - 0.5), lateralOffset: 0 });
@@ -2888,11 +2957,13 @@
             : level < 7 ? (armorRoll < 0.8 ? 1 : 2)
                 : armorRoll < 0.7 ? 1 : armorRoll < 0.9 ? 2 : 3;
         const payloadKind = maxHits === 1 ? PAYLOAD_KIND.NONE
-            : payloadRoll < 0.2 ? PAYLOAD_KIND.NUKE
-                : payloadRoll < 0.4 ? PAYLOAD_KIND.LEVELUP
-                    : payloadRoll < 0.6 ? PAYLOAD_KIND.EXTRA_LIFE
-                        : payloadRoll < 0.8 ? PAYLOAD_KIND.SMART_BOMB
-                            : payloadRoll < 0.9 ? PAYLOAD_KIND.MINE : PAYLOAD_KIND.SPRAY;
+            : payloadRoll < 0.15 ? PAYLOAD_KIND.NUKE
+                : payloadRoll < 0.30 ? PAYLOAD_KIND.LEVELUP
+                    : payloadRoll < 0.45 ? PAYLOAD_KIND.EXTRA_LIFE
+                        : payloadRoll < 0.60 ? PAYLOAD_KIND.SMART_BOMB
+                            : payloadRoll < 0.70 ? PAYLOAD_KIND.SHIELD
+                                : payloadRoll < 0.80 ? PAYLOAD_KIND.RAPID_FIRE
+                                    : payloadRoll < 0.90 ? PAYLOAD_KIND.MINE : PAYLOAD_KIND.SPRAY;
         return { maxHits, hitsRemaining: maxHits, payloadKind };
     }
 
@@ -2917,8 +2988,8 @@
     // Position fields use wrap-extended q16w (2 B, ~3.05e-5 resolution over
     // [-0.5, 1.5]), which preserves off-screen toroidal wrap excursions instead
     // of clamping them at an edge. Angle uses q16_2pi (2 B, ~0.0055°
-    // resolution). Velocity uses q16s (2 B, signed [-1,1] — game velocities
-    // saturate well below ±1).
+    // resolution). Bullet's old q16s velocity slots remain stable; its appended
+    // full f32 pair preserves FOCUS speed beyond the signed quantizer's ±1 range.
     // `invulnerable` is a captured simulation-tick counter
     // (0..INVULNERABILITY_TIME, paired with invulnerableAt and a transition
     // revision; receivers derive its countdown and blink via Math.floor(v/BLINK_RATE)
@@ -3037,6 +3108,7 @@
      * remain in the same coordinate frame.
      */
     function projectSpawnData(data, stalenessSec) {
+        if (data.type === OBJECT_TYPES.BULLET) data = Bullet.resolveVelocityData(data);
         if (!stalenessSec) return data;
         const refDim = getReferenceDimension();
         const r = getRemoteBoundingRadius(data);
@@ -3190,6 +3262,7 @@
          *   the computed delay up toward the current delay value.
          */
         updateState(objectId, data, ownerMemberId, validAt, arrivalServerTime, recordSample = true) {
+            if (data.type === OBJECT_TYPES.BULLET) data = Bullet.resolveVelocityData(data);
             if (recordSample && validAt != null && ownerMemberId
                 && this.isClockOffsetInitialized()) {
                 const arrival = arrivalServerTime != null
@@ -3797,8 +3870,17 @@
         hudDisplay.style.right =
             `max(${right + (xpHud.hidden ? 0 : width + padding)}px, env(safe-area-inset-right, 0px))`;
         fitSessionHud();
-        const controlsTop = Math.max(vp.y + 50, hudDisplay.offsetTop + hudDisplay.offsetHeight + 8,
+        const belowHud = Math.max(vp.y + 50, hudDisplay.offsetTop + hudDisplay.offsetHeight + 8,
             xpHud.hidden ? 0 : xpHud.offsetTop + xpHud.offsetHeight + 8);
+        for (const panel of [levelBanner, modifierChoice]) {
+            panel.style.left = `max(${vp.x + padding}px, env(safe-area-inset-left, 0px))`;
+            panel.style.right = `max(${right}px, env(safe-area-inset-right, 0px))`;
+        }
+        levelBanner.style.top = `${belowHud}px`;
+        const choiceTop = belowHud + (levelBanner.hidden ? 0 : levelBanner.offsetHeight + 4);
+        modifierChoice.style.top = `${choiceTop}px`;
+        const controlsTop = modifierChoice.hidden ? choiceTop
+            : choiceTop + modifierChoice.offsetHeight + 8;
         for (const id of ['touch-pause', 'touch-restart', 'touch-fullscreen']) {
             const button = document.getElementById(id);
             if (!button) continue;
@@ -3814,16 +3896,17 @@
     function updateProgressionHud(refit = true) {
         const show = !!game.ship && !game.identityChanging && !game.connectionLost && !isGameOver()
             && (game.state === 'playing' || game.state === 'waveDelay');
-        const visibilityChanged = hudCache.xpVisible !== show;
-        if (visibilityChanged) {
+        let layoutChanged = hudCache.xpVisible !== show;
+        if (layoutChanged) {
             xpHud.hidden = !show;
             hudCache.xpVisible = show;
-            if (!show) levelAnnouncement.textContent = '';
-            if (refit) fitProgressionHud();
+            if (!show) {
+                levelAnnouncement.textContent = '';
+                hudCache.levelBannerUntil = 0;
+            }
         }
-        if (!show) return visibilityChanged;
-        const progression = getLocalProgression();
-        if (!progression) {
+        const progression = show ? getLocalProgression() : null;
+        if (show && !progression) {
             if (hudCache.xp !== 'unavailable') {
                 xpLevel.textContent = 'L—';
                 xpFraction.textContent = 'XP unavailable';
@@ -3835,23 +3918,79 @@
                 hudCache.xp = 'unavailable';
                 hudCache.xpLevel = null;
             }
-            return visibilityChanged;
+        } else if (show && hudCache.xp !== progression.xp) {
+            const { level, currentXp, requiredXp, fraction } = progression;
+            xpLevel.textContent = `L${level}`;
+            xpFraction.textContent = `${currentXp}/${requiredXp} XP`;
+            xpBar.setAttribute('aria-label', `Level ${level} experience`);
+            xpBar.setAttribute('aria-valuenow', currentXp);
+            xpBar.setAttribute('aria-valuemax', requiredXp);
+            xpBar.setAttribute('aria-valuetext', `Level ${level}, ${currentXp} of ${requiredXp} XP`);
+            xpFill.style.width = `${fraction * 100}%`;
+            if (hudCache.xpLevel != null && level > hudCache.xpLevel) {
+                const gain = level - hudCache.xpLevel;
+                levelAnnouncement.textContent = `Level ${level}. ${level} shots per volley.`;
+                levelBanner.textContent = `Level ${level} · +${gain} projectile${gain === 1 ? '' : 's'}`;
+                hudCache.levelBannerUntil = performance.now() + PROGRESSION.LEVEL_BANNER_MS;
+            }
+            hudCache.xp = progression.xp;
+            hudCache.xpLevel = level;
         }
-        if (hudCache.xp === progression.xp) return visibilityChanged;
-        const { level, currentXp, requiredXp, fraction } = progression;
-        xpLevel.textContent = `L${level}`;
-        xpFraction.textContent = `${currentXp}/${requiredXp} XP`;
-        xpBar.setAttribute('aria-label', `Level ${level} experience`);
-        xpBar.setAttribute('aria-valuenow', currentXp);
-        xpBar.setAttribute('aria-valuemax', requiredXp);
-        xpBar.setAttribute('aria-valuetext', `Level ${level}, ${currentXp} of ${requiredXp} XP`);
-        xpFill.style.width = `${fraction * 100}%`;
-        if (hudCache.xpLevel != null && level > hudCache.xpLevel) {
-            levelAnnouncement.textContent = `Level ${level}. ${level} shots per volley.`;
+        layoutChanged = updateProgressionControls(show, progression) || layoutChanged;
+        if (refit && layoutChanged) fitProgressionHud();
+        return layoutChanged;
+    }
+
+    function updateProgressionControls(show, progression) {
+        let layoutChanged = false;
+        const nowMs = getGameEffectNow();
+        const boosts = game.ship?.boostState;
+        const shield = show && nowMs != null ? Math.max(0, Math.ceil((boosts.shieldUntil - nowMs) / 1000)) : 0;
+        const rapid = show && nowMs != null ? Math.max(0, Math.ceil((boosts.rapidFireUntil - nowMs) / 1000)) : 0;
+        const boostText = [shield ? `Shield ${shield}s` : '', rapid ? `Rapid fire ${rapid}s` : '']
+            .filter(Boolean).join(' · ');
+        if (hudCache.boostText !== boostText) {
+            layoutChanged = !!hudCache.boostText !== !!boostText;
+            boostStatus.textContent = boostText;
+            hudCache.boostText = boostText;
         }
-        hudCache.xp = progression.xp;
-        hudCache.xpLevel = level;
-        return visibilityChanged;
+        const modifiers = show && isSessionMode() ? getSessionModifierLedger() : null;
+        const modifier = isSessionMode()
+            ? modifiers?.[SessionClient.getParticipantId()?.toLowerCase()] : game.soloModifier;
+        const currentText = modifier?.modifierKind === 1 ? 'FOCUS · faster / tighter'
+            : modifier?.modifierKind === 2 ? 'SWEEP · wider fan' : 'Baseline volley';
+        if (hudCache.modifierText !== currentText) {
+            modifierCurrent.textContent = currentText;
+            hudCache.modifierText = currentText;
+        }
+        const milestone = progression ? PROGRESSION.MODIFIER_INTERVAL
+            * Math.floor(progression.level / PROGRESSION.MODIFIER_INTERVAL) : 0;
+        const choiceVisible = show && !!progression && (!isSessionMode() || !!modifiers)
+            && milestone > (modifier?.consumedMilestone ?? 0);
+        if (hudCache.choiceVisible !== choiceVisible) {
+            modifierChoice.hidden = !choiceVisible;
+            hudCache.choiceVisible = choiceVisible;
+            layoutChanged = true;
+        }
+        const pending = choiceVisible && isSessionMode()
+            && game.ship.modifierRequestMilestone === milestone && game.ship.modifierRequestKind !== 0;
+        const title = pending ? `Level ${milestone} · confirming choice…` : `Level ${milestone} · optional volley upgrade`;
+        if (hudCache.choiceTitle !== title) {
+            modifierTitle.textContent = title;
+            hudCache.choiceTitle = title;
+        }
+        if (hudCache.choicePending !== pending) {
+            modifierFocus.disabled = pending;
+            modifierSweep.disabled = pending;
+            hudCache.choicePending = pending;
+        }
+        const bannerVisible = show && performance.now() < (hudCache.levelBannerUntil ?? 0);
+        if (hudCache.levelBannerVisible !== bannerVisible) {
+            levelBanner.hidden = !bannerVisible;
+            hudCache.levelBannerVisible = bannerVisible;
+            layoutChanged = true;
+        }
+        return layoutChanged;
     }
 
     /**
@@ -4538,6 +4677,9 @@
             this.score = 0;                // Per-ship score (self-awarded)
             this.hitCount = 0;             // Monotonic hit counter (GameState owner watches)
             this.handledHazards = {};
+            this.resetLife();
+            this.modifierRequestMilestone = 0;
+            this.modifierRequestKind = 0;
             // Local-only predicted-fatal hold: { hitCount, startedAtMs } while
             // this ship coasts, uncontrolled, awaiting the authority's verdict.
             // Deliberately absent from SYNC_FIELDS and the wire payloads — peers
@@ -4583,6 +4725,18 @@
             this.invulnerability.sample(renderTime, delayMs);
         }
 
+        resetLife() {
+            this.boostState = { lifeId: crypto.randomUUID(), shieldUntil: 0, rapidFireUntil: 0 };
+        }
+
+        boostData() {
+            return { boostState: AstervoidsWireCodec.packBoostState(this.boostState) };
+        }
+
+        isShielded(nowMs = getGameEffectNow()) {
+            return this.invulnerable > 0 || (nowMs != null && this.boostState.shieldUntil > nowMs);
+        }
+
         /**
          * Serialize ship state for ObjectSync
          * @returns {object} Ship data for syncing
@@ -4604,7 +4758,10 @@
                 participantTag: this.participantTag,
                 score: this.score || 0,
                 hitCount: this.hitCount || 0,
-                handledHazards: AstervoidsWireCodec.packCounterMap(this.handledHazards)
+                handledHazards: AstervoidsWireCodec.packCounterMap(this.handledHazards),
+                ...this.boostData(),
+                modifierRequestMilestone: this.modifierRequestMilestone,
+                modifierRequestKind: this.modifierRequestKind
             };
         }
 
@@ -4656,6 +4813,10 @@
             if (data.handledHazards !== undefined) {
                 this.handledHazards = AstervoidsWireCodec.unpackCounterMap(data.handledHazards);
             }
+            if (data.boostState !== undefined) {
+                this.boostState = AstervoidsWireCodec.unpackBoostState(data.boostState);
+            }
+            assignDefined(this, data, ['modifierRequestMilestone', 'modifierRequestKind']);
             // Fields below need validation or renaming, so they stay explicit.
             this.invulnerability.applySnapshot(data);
             if (data.turnControlMode !== undefined) {
@@ -4812,7 +4973,7 @@
          */
         draw(ctx) {
             // Skip drawing if blinking during invulnerability
-            if (this.invulnerable > 0 && 
+            if (!reducedGameplayMotion && this.invulnerable > 0 &&
                 Math.floor(this.invulnerable / CONFIG.INVULN_BLINK_RATE) % 2 === 0) {
                 return;
             }
@@ -4838,6 +4999,12 @@
                 ctx.closePath();
             }
             ctx.stroke();
+            const nowMs = getGameEffectNow();
+            if (!this.terminalDecomposition && nowMs != null && this.boostState.shieldUntil > nowMs) {
+                ctx.beginPath();
+                ctx.arc(pixelX, pixelY, size * 1.35, 0, Math.PI * 2);
+                ctx.stroke();
+            }
             
             // Draw thrust flame when accelerating
             if (this.thrusting) {
@@ -4894,10 +5061,15 @@
          * Fire a complete level-sized volley, with one cooldown and sound.
          * @returns {Bullet[]|null} New bullets or null if on cooldown
          */
-        shoot(level = 1) {
+        shoot(level = 1, modifierKind = 0) {
             if (this.shootCooldown > 0) return null;
-            const pattern = buildVolleyPattern(level);
-            this.shootCooldown = CONFIG.SHOOT_COOLDOWN;
+            const pattern = buildVolleyPattern(level, modifierKind);
+            const nowMs = getGameEffectNow();
+            this.shootCooldown = CONFIG.SHOOT_COOLDOWN
+                * (nowMs != null && this.boostState.rapidFireUntil > nowMs
+                    ? PROGRESSION.RAPID_FIRE_COOLDOWN_SCALE : 1);
+            const speed = CONFIG.BULLET_SPEED
+                * (modifierKind === 1 ? PROGRESSION.FOCUS_SPEED_SCALE : 1);
             AudioSystem.playFire();
             const noseX = this.x + Math.cos(this.angle) * sizeToNormalizedX(CONFIG.SHIP_SIZE);
             const noseY = this.y + Math.sin(this.angle) * sizeToNormalizedY(CONFIG.SHIP_SIZE);
@@ -4907,8 +5079,8 @@
                 return new Bullet(
                     noseX - Math.sin(this.angle) * sizeToNormalizedX(lane),
                     noseY + Math.cos(this.angle) * sizeToNormalizedY(lane),
-                    Math.cos(angle) * CONFIG.BULLET_SPEED,
-                    Math.sin(angle) * CONFIG.BULLET_SPEED,
+                    Math.cos(angle) * speed,
+                    Math.sin(angle) * speed,
                     this.colorIndex, this.memberId,
                     { participantId: this.participantId, participantTag: this.participantTag,
                         shipId: this.syncObjectId });
@@ -4919,6 +5091,7 @@
          * Reset ship to center of gameplay area (normalized: 0.5, 0.5)
          */
         reset() {
+            this.resetLife();
             this.terminalDecomposition = null;
             this.x = 0.5;
             this.y = 0.5;
@@ -4974,6 +5147,8 @@
             this.payloadKind = 0;
             this.processedDamage = {};
             this._processedDamageBytes = new Uint8Array();
+            this.contributors = {};
+            this._contributorsBytes = new Uint8Array();
             this.replacementInFlight = false;
         }
 
@@ -5022,7 +5197,8 @@
         toDamageData() {
             return {
                 maxHits: this.maxHits, hitsRemaining: this.hitsRemaining,
-                payloadKind: this.payloadKind, processedDamage: this._processedDamageBytes
+                payloadKind: this.payloadKind, processedDamage: this._processedDamageBytes,
+                contributors: this._contributorsBytes
             };
         }
 
@@ -5033,6 +5209,21 @@
                 this.processedDamage = AstervoidsWireCodec.unpackCounterMap(data.processedDamage);
                 this._processedDamageBytes = new Uint8Array(data.processedDamage);
             }
+            if (data.contributors !== undefined
+                && !AstervoidsWireCodec.bytesEqual(data.contributors, this._contributorsBytes)) {
+                this.contributors = AstervoidsWireCodec.unpackContributors(data.contributors);
+                this._contributorsBytes = new Uint8Array(data.contributors);
+            }
+        }
+
+        addContributor(damage) {
+            if (!GuidUtils.isGuid(damage.participantId)) return;
+            const id = damage.participantId.toLowerCase();
+            if (Object.hasOwn(this.contributors, id)) return;
+            const ordinal = this.maxHits - this.hitsRemaining + 1;
+            const contributors = { ...this.contributors, [id]: ordinal };
+            this._contributorsBytes = AstervoidsWireCodec.packContributors(contributors);
+            this.contributors = contributors;
         }
 
         /**
@@ -5245,6 +5436,8 @@
             this._collisionPrevY = y;
             this.velocityX = velocityX;    // Velocity in reference-dimension per second
             this.velocityY = velocityY;    // Velocity in reference-dimension per second
+            this.velocityXFull = velocityX;
+            this.velocityYFull = velocityY;
             this.lifetime = CONFIG.BULLET_LIFETIME;  // Frames until expiry
             this.colorIndex = colorIndex;  // Owner's color index for multiplayer
             this.ownerMemberId = ownerMemberId;  // Member ID who fired this bullet
@@ -5271,6 +5464,8 @@
                 y: this.y,
                 velocityX: this.velocityX,
                 velocityY: this.velocityY,
+                velocityXFull: this.velocityX,
+                velocityYFull: this.velocityY,
                 lifetime: this.lifetime,
                 colorIndex: this.colorIndex,
                 ownerMemberId: this.ownerMemberId,
@@ -5317,7 +5512,18 @@
          * @param {object} data - Sync data from ObjectSync
          */
         fromSyncData(data) {
-            assignDefined(this, data, Bullet.SYNC_FIELDS);
+            const resolved = Bullet.resolveVelocityData(data, this);
+            assignDefined(this, resolved, [...Bullet.SYNC_FIELDS, 'velocityXFull', 'velocityYFull']);
+        }
+
+        static resolveVelocityData(data, previous = null) {
+            if (data.velocityXFull === undefined && data.velocityYFull === undefined) return data;
+            const velocityX = data.velocityXFull === undefined ? previous?.velocityXFull : data.velocityXFull;
+            const velocityY = data.velocityYFull === undefined ? previous?.velocityYFull : data.velocityYFull;
+            if (!Number.isFinite(velocityX) || !Number.isFinite(velocityY)) {
+                throw new TypeError('Bullet full velocity must contain a finite pair');
+            }
+            return { ...data, velocityX, velocityY, velocityXFull: velocityX, velocityYFull: velocityY };
         }
 
         /**
@@ -5326,6 +5532,7 @@
          * @returns {Bullet} New bullet instance
          */
         static fromSyncData(data) {
+            data = Bullet.resolveVelocityData(data);
             const bullet = new Bullet(
                 data.x, 
                 data.y, 
@@ -5409,6 +5616,13 @@
     const xpBar = document.getElementById('xp-bar');
     const xpFill = document.getElementById('xp-fill');
     const levelAnnouncement = document.getElementById('level-announcement');
+    const levelBanner = document.getElementById('level-banner');
+    const boostStatus = document.getElementById('boost-status');
+    const modifierCurrent = document.getElementById('modifier-current');
+    const modifierChoice = document.getElementById('modifier-choice');
+    const modifierTitle = document.getElementById('modifier-title');
+    const modifierFocus = document.getElementById('modifier-focus');
+    const modifierSweep = document.getElementById('modifier-sweep');
     const gameplayMotionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
     let reducedGameplayMotion = gameplayMotionPreference.matches;
     gameplayMotionPreference.addEventListener('change', event => { reducedGameplayMotion = event.matches; });
@@ -5503,6 +5717,7 @@
         bullets: [],          // Active bullets
         effects: [],          // Solo effect records; sessions use ObjectSync's type index
         soloXp: 0,
+        soloModifier: null,
         simulationTimeMs: 0,
         effectContactNowMs: null,
         effectContactPreviousMs: null,
@@ -6041,6 +6256,7 @@
     function syncLocalShip() {
         if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
         syncLocalShipScore();
+        syncLocalShipBoosts();
         // Sample control edges every simulation frame. In deterministic mode an
         // edge requests an immediate flush; transport backpressure can still
         // defer it. Non-edge replay intent is queued through ShipSendGate and
@@ -6078,6 +6294,20 @@
             ObjectSync.updateObject(game.multiplayer.myShipObjectId, {
                 ...game.ship.toUpdateData(), ...payload
             }, immediate);
+        }
+    }
+
+    function syncLocalShipBoosts(immediate = false) {
+        const ship = game.ship, id = game.multiplayer.myShipObjectId;
+        if (!isSessionMode() || !ship || !id
+            || ObjectSync.getObject(id)?.ownerMemberId !== SessionClient.getCurrentMember()?.id) return;
+        const payload = {
+            ...ship.boostData(),
+            modifierRequestMilestone: ship.modifierRequestMilestone,
+            modifierRequestKind: ship.modifierRequestKind
+        };
+        if (!ObjectSync.isDataConfirmed(id, payload)) {
+            ObjectSync.updateObject(id, { ...ship.toUpdateData(), ...payload }, immediate);
         }
     }
 
@@ -6222,7 +6452,8 @@
 
     function currentKinematicData(type, id, record, context) {
         const instance = getKinematicInstance(type, id, context);
-        if (!instance) return record.data;
+        if (!instance) return type === OBJECT_TYPES.BULLET
+            ? Bullet.resolveVelocityData(record.data) : record.data;
         const data = {
             ...record.data,
             x: instance.x,
@@ -6259,6 +6490,7 @@
                     : RemoteObjects.states.has(id);
             },
             ingest(id, data, facts, record, context) {
+                if (facts.type === OBJECT_TYPES.BULLET) data = Bullet.resolveVelocityData(data);
                 const ship = facts.type === OBJECT_TYPES.SHIP
                     ? game.multiplayer.remoteShips.get(id) : null;
                 const shipTeleport = ship?.ingestInvulnerability(data, record) || false;
@@ -6331,6 +6563,10 @@
 
     function applyShipReplicaData(instance, data, facts, context) {
         instance.fromSyncData(data);
+        const raw = ObjectSync.getObject(facts.objectId)?.data;
+        if (raw?.boostState !== undefined) {
+            instance.boostState = AstervoidsWireCodec.unpackBoostState(raw.boostState);
+        }
         // DeadReckon only carries kinematics, so a deterministic sample drops
         // the owner's thrust flag. Apply it from the raw record so the flame
         // renders for every member, not just the controlling one. Buffered
@@ -6730,6 +6966,7 @@
         game.effectContactNowMs = null;
         game.effectContactPreviousMs = null;
         sessionXpViewCache = null;
+        sessionModifierViewCache = null;
         resetGameStateSyncCache();
         gameStateScoreViewCache = null;
         clearExtraLifeAwardFeedback();
@@ -6739,6 +6976,7 @@
         game.effects = [];
         hudCache.xp = null;
         hudCache.xpLevel = null;
+        hudCache.levelBannerUntil = 0;
         RemoteObjects.clear();
         DeadReckon.clear();
         SendGate.clear();
@@ -6891,7 +7129,8 @@
     }
 
     function buildTerminalTargetPayload(instance, record, terminal) {
-        const data = instance || record.data;
+        const data = instance || (record.data.type === OBJECT_TYPES.BULLET
+            ? Bullet.resolveVelocityData(record.data) : record.data);
         const stepMs = 1000 / CONFIG.TARGET_FPS;
         const nowServer = RemoteObjects.serverNowMs();
         let frames;
@@ -7052,7 +7291,8 @@
                 participantNumbers: AstervoidsWireCodec.packCounterMap({}),
                 participantTags: AstervoidsWireCodec.packTagMap({}),
                 participantXp: AstervoidsWireCodec.packXpMap({}),
-                processedEffects: AstervoidsWireCodec.packCounterMap({})
+                processedEffects: AstervoidsWireCodec.packCounterMap({}),
+                participantModifiers: AstervoidsWireCodec.packParticipantModifiers({})
             };
             
             const objectInfo = await ObjectSync.createObject(
@@ -7068,6 +7308,7 @@
     }
 
     let sessionXpViewCache = null;
+    let sessionModifierViewCache = null;
 
     function getSessionXpLedger() {
         const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
@@ -7090,6 +7331,70 @@
         if (!xp) return null;
         const id = SessionClient.getParticipantId()?.toLowerCase();
         return getProgressionForXp(xp[id] ?? 0);
+    }
+
+    function getSessionModifierLedger() {
+        const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        if (!record) return {};
+        const epoch = SessionClient.getSessionEpoch();
+        if (!sessionModifierViewCache || sessionModifierViewCache.record !== record
+            || sessionModifierViewCache.epoch !== epoch
+            || sessionModifierViewCache.ownerMemberId !== record.ownerMemberId) {
+            const accepted = sessionModifierViewCache?.record.id === record.id
+                && sessionModifierViewCache.epoch === epoch ? sessionModifierViewCache.accepted : null;
+            sessionModifierViewCache = { record, epoch, ownerMemberId: record.ownerMemberId, accepted };
+        }
+        const cache = sessionModifierViewCache;
+        try {
+            if (record.data?.participantModifiers == null) throw new Error('Modifier history is missing');
+            cache.entry = readGameStateLedger(record.data.participantModifiers, cache.entry, null, 'modifier');
+            const ownRecord = record.ownerMemberId === SessionClient.getCurrentMember()?.id;
+            if ((!ownRecord && !record.ownershipMigrationPending)
+                || (ownRecord && ObjectSync.isDataConfirmed(
+                    record.id, { participantModifiers: record.data.participantModifiers }))) {
+                cache.accepted = cache.entry;
+            } else if (!cache.accepted) {
+                const snapshot = ObjectSync.getSnapshotObject(record.id);
+                if (snapshot?.data?.participantModifiers != null) {
+                    cache.accepted = readGameStateLedger(snapshot.data.participantModifiers, null, null, 'modifier');
+                }
+            }
+            // A ship request or an optimistic GameState choice is not acceptance.
+            return cache.accepted?.counters ?? {};
+        } catch (error) {
+            reportMalformedGameStateLedgers(record, error);
+            return null;
+        }
+    }
+
+    function getLocalModifier() {
+        if (!isSessionMode()) return game.soloModifier?.modifierKind ?? 0;
+        const modifiers = getSessionModifierLedger();
+        return modifiers ? modifiers[SessionClient.getParticipantId()?.toLowerCase()]?.modifierKind ?? 0 : null;
+    }
+
+    function requestModifierChoice(kind) {
+        const ship = game.ship, progression = getLocalProgression();
+        if ((kind !== 1 && kind !== 2) || !ship || !progression || ship.deathHold || isGameOver()
+            || game.connectionLost || game.identityChanging
+            || (game.state !== 'playing' && game.state !== 'waveDelay')) return false;
+        const milestone = PROGRESSION.MODIFIER_INTERVAL
+            * Math.floor(progression.level / PROGRESSION.MODIFIER_INTERVAL);
+        const modifiers = isSessionMode() ? getSessionModifierLedger() : null;
+        if (isSessionMode() && !modifiers) return false;
+        const previous = isSessionMode()
+            ? modifiers[SessionClient.getParticipantId()?.toLowerCase()] : game.soloModifier;
+        if (milestone <= (previous?.consumedMilestone ?? 0)) return false;
+        if (!isSessionMode()) {
+            game.soloModifier = { consumedMilestone: milestone, modifierKind: kind };
+        } else {
+            if (ship.modifierRequestMilestone === milestone && ship.modifierRequestKind !== 0) return false;
+            ship.modifierRequestMilestone = milestone;
+            ship.modifierRequestKind = kind;
+            syncLocalShipBoosts(true);
+        }
+        updateProgressionHud();
+        return true;
     }
 
     function getRunHighestLevel() {
@@ -7122,7 +7427,8 @@
             x, y, velocityX: 0, velocityY: 0, angle: 0,
             startedAt: 0, armedAt: 0, expiresAt: 0, points: 0,
             damageReceipts: new Uint8Array(),
-            asteroidTargets: new Uint8Array(), hazardTargets: new Uint8Array()
+            asteroidTargets: new Uint8Array(), hazardTargets: new Uint8Array(),
+            contributors: new Uint8Array(), shipLifeId: attribution?.shipLifeId || null
         };
     }
 
@@ -7202,6 +7508,7 @@
         const receipt = createGameEffectData(
             GAME_EFFECT_KIND.BREAK_RECEIPT, PAYLOAD_KIND.NONE, sourceId, damage, asteroid.x, asteroid.y);
         receipt.points = asteroid.getPoints();
+        receipt.contributors = AstervoidsWireCodec.packContributors(asteroid.contributors);
         receipt.damageReceipts = AstervoidsWireCodec.packCounterMap({
             ...asteroid.processedDamage, [damage.damageId.toLowerCase()]: 1
         });
@@ -7217,6 +7524,7 @@
     function getProcessedGameEffects() {
         const record = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
         if (!record?.data?.processedEffects) return null;
+        if (record.ownershipMigrationPending) return null;
         let processed;
         try {
             processed = AstervoidsWireCodec.unpackCounterMap(record.data.processedEffects);
@@ -7224,6 +7532,7 @@
             reportMalformedGameStateLedgers(record, error);
             return null;
         }
+        // Optional modifier choices do not gate already-durable receipt rewards.
         if (record.ownerMemberId === SessionClient.getCurrentMember()?.id
             && !ObjectSync.isDataConfirmed(record.id, {
                 processedEffects: record.data.processedEffects,
@@ -7234,7 +7543,7 @@
         return processed;
     }
 
-    function collectBlastTargets(data, asteroids, hazards) {
+    function collectBlastTargets(data, asteroids, hazards, nowMs = getGameEffectNow()) {
         const asteroidTargets = {};
         const hazardTargets = {};
         for (const record of asteroids) {
@@ -7243,9 +7552,12 @@
                 asteroidTargets[record.id.toLowerCase()] = 1;
             }
         }
-        if (data.payloadKind === PAYLOAD_KIND.SMART_BOMB) {
-            for (const record of hazards) {
-                if (isHostileGameEffect(record.data.kind)) hazardTargets[record.id.toLowerCase()] = 1;
+        for (const record of hazards) {
+            if (!isHostileGameEffect(record.data.kind)) continue;
+            const pose = getGameEffectPose(record.data, nowMs);
+            if (data.payloadKind === PAYLOAD_KIND.SMART_BOMB
+                || normalizedDistance(data.x, data.y, pose.x, pose.y) <= PROGRESSION.NUKE_RADIUS) {
+                hazardTargets[record.id.toLowerCase()] = 1;
             }
         }
         return {
@@ -7271,7 +7583,7 @@
     function buildSprayProjectiles(record) {
         const data = record.data;
         return Array.from({ length: PROGRESSION.SPRAY_LANES }, (_, lane) => {
-            const angle = lane * Math.PI * 2 / PROGRESSION.SPRAY_LANES;
+            const angle = PROGRESSION.SPRAY_ANGLES_DEG[lane] * Math.PI / 180;
             const bullet = createGameEffectData(
                 GAME_EFFECT_KIND.HOSTILE_BULLET, PAYLOAD_KIND.SPRAY, record.id, null, data.x, data.y);
             bullet.velocityX = Math.cos(angle) * CONFIG.BULLET_SPEED * PROGRESSION.SPRAY_SPEED_SCALE;
@@ -7355,7 +7667,8 @@
             shipId: ship.syncObjectId, participantId: ship.participantId,
             participantTag: ship.participantTag || '',
             x: ship.x, y: ship.y, angle: ship.angle,
-            claimedAt: nowMs, invulnerabilityRevision: ship.invulnerabilityRevision
+            claimedAt: nowMs, invulnerabilityRevision: ship.invulnerabilityRevision,
+            shipLifeId: ship.boostState.lifeId
         };
     }
 
@@ -7369,7 +7682,8 @@
             const object = await ObjectSync.createObject(entry.data, 'Member', null, () =>
                 epoch === SessionClient.getSessionEpoch()
                 && game.multiplayer.contactClaims.get(record.id) === entry
-                && game.multiplayer.myShipObjectId === entry.data.shipId);
+                && game.multiplayer.myShipObjectId === entry.data.shipId
+                && game.ship?.boostState.lifeId === entry.data.shipLifeId);
             if (object && epoch === SessionClient.getSessionEpoch()) entry.id = object.id;
             else if (game.multiplayer.contactClaims.get(record.id) === entry) {
                 game.multiplayer.contactClaims.delete(record.id);
@@ -7393,9 +7707,14 @@
             || !Number.isFinite(contact.claimedAt)
             || contact.claimedAt < data.startedAt || contact.claimedAt >= data.expiresAt
             || contact.claimedAt > nowMs + PROGRESSION.CLAIM_CLOCK_TOLERANCE_MS) return false;
+        if (shipRecord.ownerMemberId === SessionClient.getCurrentMember()?.id
+            && !ObjectSync.isDataConfirmed(shipRecord.id, { boostState: shipRecord.data.boostState })) return false;
+        const boosts = AstervoidsWireCodec.unpackBoostState(shipRecord.data.boostState);
+        if (!GuidUtils.isGuid(contact.shipLifeId) || boosts.lifeId !== contact.shipLifeId.toLowerCase()) return false;
         if (isHostileGameEffect(data.kind)
             && (contact.claimedAt < data.armedAt
-                || contact.invulnerabilityRevision !== shipRecord.data.invulnerabilityRevision)) return false;
+                || contact.invulnerabilityRevision !== shipRecord.data.invulnerabilityRevision
+                || boosts.shieldUntil > contact.claimedAt)) return false;
         // Contact was tested against the real local hull. Account only for the
         // two q16w position round-trips when verifying that durable claim.
         return gameEffectTouchesShip(data, contact, contact.claimedAt, contact.claimedAt,
@@ -7428,7 +7747,7 @@
                         : projectSpawnData(asteroid.data, computeSpawnStaleness(nowMs, asteroid.validAt))
                 }));
             }
-            Object.assign(receipt, collectBlastTargets(receipt, asteroids, hazards));
+            Object.assign(receipt, collectBlastTargets(receipt, asteroids, hazards, nowMs));
         }
         return receipt;
     }
@@ -7445,9 +7764,58 @@
         const revision = revisions[data.claimId?.toLowerCase()];
         // Consume even an obsolete receipt, but never replay it onto a respawn.
         ship.handledHazards = { ...ship.handledHazards, [hazardId]: 1 };
-        if (!terminalOnly && !isGameOver() && !ship.deathHold && ship.invulnerable <= 0
+        if (!terminalOnly && !isGameOver() && !ship.deathHold && !ship.isShielded()
+            && data.shipLifeId === ship.boostState.lifeId
             && revision === ship.invulnerabilityRevision) handleShipHit(ship);
         syncLocalShipHazards(true);
+    }
+
+    function isTimedBoostPayload(kind) {
+        return kind === PAYLOAD_KIND.SHIELD || kind === PAYLOAD_KIND.RAPID_FIRE || kind === PAYLOAD_KIND.NUKE;
+    }
+
+    function applyBoostReceipt(record, disposition, terminalOnly = false) {
+        const data = record.data, ship = game.ship;
+        if (disposition !== 1 || terminalOnly || isGameOver() || !ship || ship.deathHold
+            || data.kind !== GAME_EFFECT_KIND.ACTIVATION_RECEIPT || !isTimedBoostPayload(data.payloadKind)
+            || data.shipId !== game.multiplayer.myShipObjectId
+            || data.participantId !== ship.participantId?.toLowerCase()
+            || data.shipLifeId !== ship.boostState.lifeId || !isGameEffectReady(record)
+            || getGameEffectNow() == null) return false;
+        const field = data.payloadKind === PAYLOAD_KIND.RAPID_FIRE ? 'rapidFireUntil' : 'shieldUntil';
+        const required = data.startedAt + (data.payloadKind === PAYLOAD_KIND.NUKE
+            ? PROGRESSION.NUKE_SHIELD_MS : PROGRESSION.BOOST_DURATION_MS);
+        if (!Number.isFinite(required) || required < 0) throw new RangeError('Invalid boost activation deadline');
+        if (ship.boostState[field] < required) {
+            ship.boostState = { ...ship.boostState, [field]: required };
+        }
+        syncLocalShipBoosts(true);
+        return true;
+    }
+
+    function isBoostReceiptHandled(data, receiptId, disposition) {
+        if (disposition === 2) return true;
+        if (disposition !== 1) return false;
+        const myMemberId = SessionClient.getCurrentMember()?.id;
+        const gs = ObjectSync.getObjectByType(OBJECT_TYPES.GAME_STATE);
+        if (gs && (gs.data.gameOverAt != null || gs.data.lives <= 0)
+            && (gs.ownerMemberId !== myMemberId || ObjectSync.isDataConfirmed(gs.id, {
+                processedEffects: gs.data.processedEffects, lives: gs.data.lives, gameOverAt: gs.data.gameOverAt
+            }))) return true;
+        const ship = ObjectSync.getObject(data.shipId);
+        if (!ship) {
+            const snapshot = ObjectSync.getSnapshotObject(receiptId);
+            return ObjectSync.isObjectConfirmedAbsent(data.shipId,
+                snapshot?.data.shipId === data.shipId && snapshot.data.shipLifeId === data.shipLifeId
+                    ? snapshot : null);
+        }
+        if (ship.ownerMemberId === myMemberId
+            && !ObjectSync.isDataConfirmed(ship.id, { boostState: ship.data.boostState })) return false;
+        const boosts = AstervoidsWireCodec.unpackBoostState(ship.data.boostState);
+        if (boosts.lifeId !== data.shipLifeId) return true;
+        const required = data.startedAt + (data.payloadKind === PAYLOAD_KIND.NUKE
+            ? PROGRESSION.NUKE_SHIELD_MS : PROGRESSION.BOOST_DURATION_MS);
+        return (data.payloadKind === PAYLOAD_KIND.RAPID_FIRE ? boosts.rapidFireUntil : boosts.shieldUntil) >= required;
     }
 
     function isHazardReceiptHandled(data, receiptId = null) {
@@ -7508,7 +7876,8 @@
             if (!Object.hasOwn(processed, record.id.toLowerCase())) return false;
             if (asteroid.ownerMemberId === SessionClient.getCurrentMember()?.id
                 && !ObjectSync.isDataConfirmed(id, {
-                    hitsRemaining: asteroid.data.hitsRemaining, processedDamage: asteroid.data.processedDamage
+                    hitsRemaining: asteroid.data.hitsRemaining, processedDamage: asteroid.data.processedDamage,
+                    contributors: asteroid.data.contributors
                 })) return false;
         }
         return Object.keys(AstervoidsWireCodec.unpackCounterMap(data.hazardTargets))
@@ -7526,7 +7895,15 @@
         } else if (data.payloadKind === PAYLOAD_KIND.EXTRA_LIFE) {
             game.lives++;
             announceExtraLifeAward();
+        } else if (data.payloadKind === PAYLOAD_KIND.SHIELD || data.payloadKind === PAYLOAD_KIND.RAPID_FIRE) {
+            const field = data.payloadKind === PAYLOAD_KIND.RAPID_FIRE ? 'rapidFireUntil' : 'shieldUntil';
+            game.ship.boostState[field] = Math.max(game.ship.boostState[field],
+                getGameEffectNow() + PROGRESSION.BOOST_DURATION_MS);
         } else {
+            if (data.payloadKind === PAYLOAD_KIND.NUKE) {
+                game.ship.boostState.shieldUntil = Math.max(game.ship.boostState.shieldUntil,
+                    getGameEffectNow() + PROGRESSION.NUKE_SHIELD_MS);
+            }
             const asteroids = game.astervoids.map(asteroid => ({
                 id: getAsteroidObjectId(asteroid), data: { x: asteroid.x, y: asteroid.y }
             }));
@@ -7555,7 +7932,7 @@
             const positive = data.kind === GAME_EFFECT_KIND.PICKUP;
             if ((!positive && data.kind !== GAME_EFFECT_KIND.MINE && data.kind !== GAME_EFFECT_KIND.HOSTILE_BULLET)
                 || !isGameEffectReady(record) || nowMs < data.armedAt || nowMs >= data.expiresAt
-                || (!positive && ship.invulnerable > 0)
+                || (!positive && ship.isShielded())
                 || !gameEffectTouchesShip(data, ship, nowMs, game.effectContactPreviousMs ?? nowMs)) continue;
             if (isSessionMode()) {
                 const contactAt = data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET
@@ -7578,6 +7955,7 @@
             const target = ObjectSync.getObject(data.targetId);
             if (!target
                 || data.shipId !== game.multiplayer.myShipObjectId
+                || data.shipLifeId !== game.ship?.boostState.lifeId
                 || (isHostileGameEffect(target.data.kind)
                     && data.invulnerabilityRevision !== game.ship?.invulnerabilityRevision)
                 || (nowMs != null && nowMs - data.claimedAt >= PROGRESSION.CLAIM_TIMEOUT_MS)) {
@@ -7594,6 +7972,7 @@
         for (const [targetId, claim] of game.multiplayer.contactClaims) {
             const target = ObjectSync.getObject(targetId);
             if (!target || claim.data.shipId !== game.multiplayer.myShipObjectId
+                || claim.data.shipLifeId !== game.ship?.boostState.lifeId
                 || (isHostileGameEffect(target.data.kind)
                     && claim.data.invulnerabilityRevision !== game.ship?.invulnerabilityRevision)
                 || (nowMs != null && nowMs - claim.data.claimedAt >= PROGRESSION.CLAIM_TIMEOUT_MS)) {
@@ -7640,6 +8019,7 @@
             if (data.kind === GAME_EFFECT_KIND.ACTIVATION_RECEIPT
                 && (terminalOnly || (nowMs != null && isGameEffectReady(record)))) {
                 applyHazardReceipt(record, terminalOnly);
+                applyBoostReceipt(record, processed?.[record.id.toLowerCase()], terminalOnly);
                 if (!terminalOnly && processed?.[record.id.toLowerCase()] === 1
                     && (data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB)) {
                     applyOwnedBlastCommand(record);
@@ -7656,8 +8036,11 @@
                 if (!processed?.[record.id.toLowerCase()]) continue;
                 const hazard = data.payloadKind === PAYLOAD_KIND.MINE || data.payloadKind === PAYLOAD_KIND.SPRAY;
                 const blast = data.payloadKind === PAYLOAD_KIND.NUKE || data.payloadKind === PAYLOAD_KIND.SMART_BOMB;
-                const complete = hazard ? isHazardReceiptHandled(data, record.id)
-                    : !blast || terminalOnly || processed[record.id.toLowerCase()] === 2 || isBlastCommandComplete(record);
+                const boost = isTimedBoostPayload(data.payloadKind);
+                const disposition = processed[record.id.toLowerCase()];
+                const complete = (!hazard || isHazardReceiptHandled(data, record.id))
+                    && (!blast || disposition === 2 || isBlastCommandComplete(record))
+                    && (!boost || isBoostReceiptHandled(data, record.id, disposition));
                 if (complete && (terminalOnly || nowMs - data.startedAt >= PROGRESSION.RECEIPT_FEEDBACK_MS)) {
                     replaceGameEffect(record, []);
                 }
@@ -7680,14 +8063,58 @@
                 replaceGameEffect(record, buildSprayProjectiles(record));
             }
         }
+        syncLocalShipBoosts();
         cleanupGameContactClaims(nowMs);
     }
 
+    function getParticipatingParticipantIds(shipObjects, activeMemberIds) {
+        const members = new Set(activeMemberIds.filter(GuidUtils.isGuid).map(id => id.toLowerCase()));
+        const participants = new Set();
+        for (const ship of shipObjects) {
+            if (!GuidUtils.isGuid(ship.ownerMemberId) || !GuidUtils.isGuid(ship.data?.participantId)
+                || ship.data?.memberId?.toLowerCase() !== ship.ownerMemberId.toLowerCase()
+                || !members.has(ship.ownerMemberId.toLowerCase())) continue;
+            participants.add(ship.data.participantId.toLowerCase());
+        }
+        return participants;
+    }
+
+    function awardBreakXp(data, participantXp, participatingIds) {
+        const finisher = data.participantId.toLowerCase();
+        const contributors = AstervoidsWireCodec.unpackContributors(data.contributors);
+        if (!Object.hasOwn(contributors, finisher)) {
+            throw new Error('Break contributors must include the finisher');
+        }
+        const beneficiaries = [finisher, ...Object.keys(contributors).filter(id => id !== finisher)
+            .sort((left, right) => contributors[left] - contributors[right])];
+        // Freeze the reference and every beneficiary before any grant in this receipt.
+        const highestLevel = [...participatingIds].reduce(
+            (level, id) => Math.max(level, getLevelForXp(participantXp[id] ?? 0)), 0);
+        const grants = beneficiaries.map(id => {
+            const xp = participantXp[id] ?? 0;
+            const catchup = highestLevel - getLevelForXp(xp) >= PROGRESSION.CATCHUP_LEVEL_GAP
+                ? PROGRESSION.CATCHUP_XP : 0;
+            const amount = (id === finisher ? PROGRESSION.XP_PER_ASTEROID : PROGRESSION.XP_PER_ASSIST) + catchup;
+            if (!Number.isSafeInteger(xp + amount)) throw new RangeError('Participant XP exceeds the safe integer range');
+            return [id, xp + amount];
+        });
+        for (const [id, xp] of grants) participantXp[id] = xp;
+    }
+
     function calculateGameState(persisted, ledgers, shipObjects, local, extraLifeThreshold,
-        effectObjects = [], retiredEffectIds = []) {
+        effectObjects = [], retiredEffectIds = [], activeMemberIds = []) {
         const processedHits = { ...ledgers.processedHits };
         const processedScores = { ...ledgers.processedScores };
         const participantXp = { ...ledgers.participantXp };
+        const participantModifiers = AstervoidsWireCodec.unpackParticipantModifiers(
+            AstervoidsWireCodec.packParticipantModifiers(ledgers.participantModifiers ?? {}));
+        for (const [id, modifier] of Object.entries(participantModifiers)) {
+            if (modifier.consumedMilestone > PROGRESSION.MODIFIER_INTERVAL
+                * Math.floor(getLevelForXp(participantXp[id] ?? 0) / PROGRESSION.MODIFIER_INTERVAL)) {
+                throw new RangeError('Participant modifier milestone has not been earned');
+            }
+        }
+        const participatingIds = getParticipatingParticipantIds(shipObjects, activeMemberIds);
         const processedEffects = { ...ledgers.processedEffects };
         const retiredEffects = new Set(retiredEffectIds);
         for (const id of retiredEffects) delete processedEffects[id];
@@ -7718,6 +8145,12 @@
                     participantTags[id] = record.data.participantTag;
                 }
                 if (!Object.hasOwn(participantXp, id)) participantXp[id] = 0;
+                if (record.data?.kind === GAME_EFFECT_KIND.BREAK_RECEIPT) {
+                    for (const contributor of Object.keys(AstervoidsWireCodec.unpackContributors(record.data.contributors))) {
+                        if (!Object.hasOwn(participantNumbers, contributor)) unseen.add(contributor);
+                        participantXp[contributor] ??= 0;
+                    }
+                }
             }
             // Registration is independent of entry lives, including fatal and
             // departure pivots. Only the owner assigns these durable ordinals.
@@ -7789,7 +8222,7 @@
                 if (!Number.isInteger(data.points) || data.points < 0 || data.points > 0xffffffff) {
                     throw new RangeError('Invalid break receipt points');
                 }
-                participantXp[participantId] += PROGRESSION.XP_PER_ASTEROID;
+                awardBreakXp(data, participantXp, participatingIds);
                 groupScore += data.points;
                 if (hasPersonalHistory) participantScores[participantId] += data.points;
                 processedEffects[effectId] = 1;
@@ -7898,6 +8331,30 @@
             if (awarded > 0) lives += awarded;
             peakShipCount = Math.max(peakShipCount, countedParticipantCount);
         }
+
+        if (lives > 0 && !alreadyTerminal) {
+            const accept = (id, milestone, kind) => {
+                const latest = PROGRESSION.MODIFIER_INTERVAL
+                    * Math.floor(getLevelForXp(participantXp[id] ?? 0) / PROGRESSION.MODIFIER_INTERVAL);
+                if (milestone > 0 && milestone === latest
+                    && milestone > (participantModifiers[id]?.consumedMilestone ?? 0)
+                    && (kind === 1 || kind === 2)) {
+                    participantModifiers[id] = { consumedMilestone: milestone, modifierKind: kind };
+                }
+            };
+            for (const [id, pending] of Object.entries(local.tentativeModifiers ?? {})) {
+                accept(id, pending.consumedMilestone, pending.modifierKind);
+            }
+            const members = new Set(activeMemberIds.filter(GuidUtils.isGuid).map(id => id.toLowerCase()));
+            for (const ship of [...shipObjects].sort((left, right) =>
+                left.id.toLowerCase().localeCompare(right.id.toLowerCase()))) {
+                const data = ship.data;
+                if (!GuidUtils.isGuid(data?.participantId) || !GuidUtils.isGuid(ship.ownerMemberId)
+                    || !members.has(ship.ownerMemberId.toLowerCase())
+                    || data.memberId?.toLowerCase() !== ship.ownerMemberId.toLowerCase()) continue;
+                accept(data.participantId.toLowerCase(), data.modifierRequestMilestone, data.modifierRequestKind);
+            }
+        }
         
         return {
             groupScore,
@@ -7910,6 +8367,7 @@
             ...(participantTags ? { participantTags } : {}),
             participantXp,
             processedEffects,
+            participantModifiers,
             peakShipCount,
             scoreLifeAwardCount,
             observedScoreLifeAwardCount,
@@ -7952,9 +8410,10 @@
 
     function serializeGameState(next, terminal, packedLedgers = null) {
         const { processedHits, processedScores, countedParticipants,
-            participantScores, participantNumbers, participantTags, participantXp, processedEffects } = next;
+            participantScores, participantNumbers, participantTags, participantXp, processedEffects,
+            participantModifiers } = next;
         if (participantScores == null || participantNumbers == null || participantTags == null
-            || participantXp == null || processedEffects == null) {
+            || participantXp == null || processedEffects == null || participantModifiers == null) {
             throw new Error('Cannot publish GameState without participant and progression history');
         }
         const ledgers = packedLedgers ?? {
@@ -7965,7 +8424,8 @@
             participantNumbers: AstervoidsWireCodec.packCounterMap(participantNumbers),
             participantTags: AstervoidsWireCodec.packTagMap(participantTags),
             participantXp: AstervoidsWireCodec.packXpMap(participantXp),
-            processedEffects: AstervoidsWireCodec.packCounterMap(processedEffects)
+            processedEffects: AstervoidsWireCodec.packCounterMap(processedEffects),
+            participantModifiers: AstervoidsWireCodec.packParticipantModifiers(participantModifiers)
         };
         return {
             type: OBJECT_TYPES.GAME_STATE,
@@ -7984,6 +8444,7 @@
             participantTags: ledgers.participantTags,
             participantXp: ledgers.participantXp,
             processedEffects: ledgers.processedEffects,
+            participantModifiers: ledgers.participantModifiers,
             peakShipCount: next.peakShipCount,
             gameOverAt: terminal.gameOverAt,
             terminalAt: terminal.terminalAt,
@@ -8018,7 +8479,11 @@
         let rightCount = 0;
         for (const key in left) {
             if (!Object.hasOwn(left, key)) continue;
-            if (!Object.hasOwn(right, key) || !Object.is(left[key], right[key])) return false;
+            if (!Object.hasOwn(right, key)) return false;
+            const a = left[key], b = right[key];
+            if (!Object.is(a, b) && !(a && b && typeof a === 'object' && typeof b === 'object'
+                && Number.isInteger(a.consumedMilestone)
+                && a.consumedMilestone === b.consumedMilestone && a.modifierKind === b.modifierKind)) return false;
             leftCount++;
         }
         for (const key in right) {
@@ -8064,8 +8529,9 @@
         if (gameStateLedgerMatches(value, previous)) return previous;
         const decoded = minimum === 'xp' ? AstervoidsWireCodec.unpackXpMap(value)
             : minimum === 'tag' ? AstervoidsWireCodec.unpackTagMap(value)
+            : minimum === 'modifier' ? AstervoidsWireCodec.unpackParticipantModifiers(value)
             : AstervoidsWireCodec.unpackCounterMap(value);
-        const counters = minimum === null || minimum === 'tag' || minimum === 'xp' ? decoded
+        const counters = minimum === null || minimum === 'tag' || minimum === 'xp' || minimum === 'modifier' ? decoded
             : normalizeParticipantLedger(decoded, value, minimum);
         return {
             counters,
@@ -8184,12 +8650,13 @@
     }
 
     function gameStateCalculationInputs(data, hits, scores, counted, ships, history = null,
-        xp = null, effects = null, effectObjects = [], retiredEffectIds = []) {
+        xp = null, effects = null, effectObjects = [], retiredEffectIds = [],
+        modifiers = null, activeMemberIds = []) {
         const inputs = [
             data?.groupScore, data?.scoreLifeAwardCount, data?.lives,
             data?.peakShipCount, data?.state, hits, scores, counted,
             history?.scores, history?.numbers, history?.tags,
-            xp, effects, data?.gameOverAt,
+            xp, effects, modifiers, data?.gameOverAt,
             data?.terminalShipId,
             game.lives, game.state, game.multiplayer.observedScoreLifeAwardCount,
             CONFIG.EXTRA_LIFE_SCORE_THRESHOLD
@@ -8198,13 +8665,16 @@
         // Preserve membership and iteration order (damage clamps per ship).
         for (const ship of ships) {
             inputs.push(ship.id, ship.ownerMemberId, ship.data?.participantId,
-                ship.data?.score, ship.data?.hitCount, ship.data?.participantTag);
+                ship.data?.score, ship.data?.hitCount, ship.data?.participantTag,
+                ship.data?.memberId, ship.data?.modifierRequestMilestone, ship.data?.modifierRequestKind);
         }
         for (const effect of effectObjects) {
             inputs.push(effect.id, effect.ownerMemberId, effect.data?.kind,
                 effect.data?.payloadKind, effect.data?.participantId, effect.data?.participantTag,
-                effect.data?.points);
+                effect.data?.points, effect.data?.contributors?.length);
+            if (effect.data?.contributors instanceof Uint8Array) inputs.push(...effect.data.contributors);
         }
+        inputs.push(...activeMemberIds);
         inputs.push(...retiredEffectIds);
         return inputs;
     }
@@ -8230,6 +8700,10 @@
         if (!game.multiplayer.gameStateObjectId) game.multiplayer.gameStateObjectId = gsObj.id;
         const epoch = SessionClient.getSessionEpoch();
         const memberId = SessionClient.getCurrentMember()?.id;
+        if (gsObj.ownerMemberId !== memberId) {
+            resetGameStateSyncCache();
+            return;
+        }
         if (!gameStateSyncCache || gameStateSyncCache.object !== gsObj
             || gameStateSyncCache.data !== gsObj.data
             || gameStateSyncCache.objectId !== game.multiplayer.gameStateObjectId
@@ -8237,11 +8711,13 @@
             || gameStateSyncCache.epoch !== epoch || gameStateSyncCache.memberId !== memberId) {
             const sameGame = gameStateSyncCache?.objectId === game.multiplayer.gameStateObjectId
                 && gameStateSyncCache.epoch === epoch && gameStateSyncCache.memberId === memberId;
+            const sameAuthority = sameGame && gameStateSyncCache.ownerMemberId === gsObj.ownerMemberId;
             gameStateSyncCache = {
                 object: gsObj, data: gsObj.data, epoch, memberId,
                 objectId: game.multiplayer.gameStateObjectId, ownerMemberId: gsObj.ownerMemberId,
                 stoppedHits: sameGame ? gameStateSyncCache.stoppedHits : null,
-                terminal: sameGame ? gameStateSyncCache.terminal : null
+                terminal: sameGame ? gameStateSyncCache.terminal : null,
+                tentativeModifiers: sameAuthority ? gameStateSyncCache.tentativeModifiers : {}
             };
         }
         const cache = gameStateSyncCache;
@@ -8258,18 +8734,29 @@
             }
             cache.history = readParticipantScoreHistory(gsObj.data, cache.history, cache.packedHistory);
             if (!cache.history) throw new Error('Participant score history is missing');
-            if (gsObj.data?.participantXp == null || gsObj.data?.processedEffects == null) {
+            if (gsObj.data?.participantXp == null || gsObj.data?.processedEffects == null
+                || gsObj.data?.participantModifiers == null) {
                 throw new Error('Participant progression history is missing');
             }
             cache.xp = readGameStateLedger(gsObj.data.participantXp, cache.xp, cache.packedXp, 'xp');
             cache.effects = readGameStateLedger(
                 gsObj.data.processedEffects, cache.effects, cache.packedEffects);
+            cache.modifiers = readGameStateLedger(
+                gsObj.data.participantModifiers, cache.modifiers, cache.packedModifiers, 'modifier');
+            if (ObjectSync.isDataConfirmed(gsObj.id, { participantModifiers: gsObj.data.participantModifiers })) {
+                for (const [id, pending] of Object.entries(cache.tentativeModifiers)) {
+                    if ((cache.modifiers.counters[id]?.consumedMilestone ?? 0) >= pending.consumedMilestone) {
+                        delete cache.tentativeModifiers[id];
+                    }
+                }
+            }
         } catch (error) {
             reportMalformedGameStateLedgers(gsObj, error);
             return;
         }
 
         const ships = shipInputs ?? ObjectSync.getObjectsByType(OBJECT_TYPES.SHIP);
+        const activeMemberIds = (SessionClient.getCurrentSession()?.members ?? []).map(member => member.id);
         const effectObjects = ObjectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT).filter(record =>
             (record.data?.kind !== GAME_EFFECT_KIND.BREAK_RECEIPT
                 && record.data?.kind !== GAME_EFFECT_KIND.ACTIVATION_RECEIPT) || isGameEffectReady(record));
@@ -8295,7 +8782,7 @@
                 cache.snapshotEffects && Object.hasOwn(cache.snapshotEffects, id) ? effectSnapshot : null));
         const inputs = gameStateCalculationInputs(
             gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
-            cache.xp, cache.effects, effectObjects, retiredEffectIds);
+            cache.xp, cache.effects, effectObjects, retiredEffectIds, cache.modifiers, activeMemberIds);
         const changed = !gameStateInputsEqual(inputs, cache.inputs);
         if (changed) {
             try {
@@ -8309,15 +8796,22 @@
                         participantNumbers: cache.history.numbers.counters,
                         participantTags: cache.history.tags.counters,
                         participantXp: cache.xp.counters,
-                        processedEffects: cache.effects.counters
+                        processedEffects: cache.effects.counters,
+                        participantModifiers: cache.modifiers.counters
                     },
                     ships,
                     {
                         lives: game.lives,
                         state: game.state,
-                        observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount
+                        observedScoreLifeAwardCount: game.multiplayer.observedScoreLifeAwardCount,
+                        tentativeModifiers: cache.tentativeModifiers
                     },
-                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, effectObjects, retiredEffectIds);
+                    CONFIG.EXTRA_LIFE_SCORE_THRESHOLD, effectObjects, retiredEffectIds, activeMemberIds);
+                for (const [id, modifier] of Object.entries(cache.next.participantModifiers)) {
+                    if (modifier.consumedMilestone > (cache.modifiers.counters[id]?.consumedMilestone ?? 0)) {
+                        cache.tentativeModifiers[id] = { ...modifier };
+                    }
+                }
             } catch (error) {
                 reportMalformedGameStateLedgers(gsObj, error);
                 return;
@@ -8351,6 +8845,8 @@
             next.participantTags, cache.packedHistory?.tags, AstervoidsWireCodec.packTagMap);
         const packedXp = packGameStateLedger(next.participantXp, cache.packedXp, AstervoidsWireCodec.packXpMap);
         const packedEffects = packGameStateLedger(next.processedEffects, cache.packedEffects);
+        const packedModifiers = packGameStateLedger(
+            next.participantModifiers, cache.packedModifiers, AstervoidsWireCodec.packParticipantModifiers);
         const packedHistory = scores === cache.packedHistory?.scores
             && numbers === cache.packedHistory?.numbers && tags === cache.packedHistory?.tags
             ? cache.packedHistory : { scores, numbers, tags };
@@ -8359,19 +8855,21 @@
             || packedHistory?.scores !== cache.packedHistory?.scores
             || packedHistory?.numbers !== cache.packedHistory?.numbers
             || packedHistory?.tags !== cache.packedHistory?.tags
-            || packedXp !== cache.packedXp || packedEffects !== cache.packedEffects;
+            || packedXp !== cache.packedXp || packedEffects !== cache.packedEffects
+            || packedModifiers !== cache.packedModifiers;
         cache.packedHits = packedHits;
         cache.packedScores = packedScores;
         cache.packedCounted = packedCounted;
         cache.packedHistory = packedHistory;
         cache.packedXp = packedXp;
         cache.packedEffects = packedEffects;
+        cache.packedModifiers = packedModifiers;
         const optimisticLedgersChanged = cache.hits !== packedHits || cache.scores !== packedScores
             || cache.counted !== packedCounted
             || cache.history?.scores !== packedHistory?.scores
             || cache.history?.numbers !== packedHistory?.numbers
             || cache.history?.tags !== packedHistory?.tags
-            || cache.xp !== packedXp || cache.effects !== packedEffects;
+            || cache.xp !== packedXp || cache.effects !== packedEffects || cache.modifiers !== packedModifiers;
         const gameStateData = serializeGameState(next, terminal, {
             processedHits: packedHits.bytes, processedScores: packedScores.bytes,
             countedParticipants: packedCounted.bytes,
@@ -8379,7 +8877,8 @@
             participantNumbers: packedHistory.numbers.bytes,
             participantTags: packedHistory.tags.bytes,
             participantXp: packedXp.bytes,
-            processedEffects: packedEffects.bytes
+            processedEffects: packedEffects.bytes,
+            participantModifiers: packedModifiers.bytes
         });
         const calculationWriteChanged = ['groupScore', 'scoreLifeAwardCount', 'lives',
             'peakShipCount', 'state', 'terminalShipId'].some(key => !Object.is(gsObj.data?.[key], gameStateData[key]));
@@ -8397,12 +8896,14 @@
             cache.history = readParticipantScoreHistory(gsObj.data, cache.history, packedHistory);
             cache.xp = readGameStateLedger(gsObj.data.participantXp, cache.xp, packedXp, 'xp');
             cache.effects = readGameStateLedger(gsObj.data.processedEffects, cache.effects, packedEffects);
+            cache.modifiers = readGameStateLedger(
+                gsObj.data.participantModifiers, cache.modifiers, packedModifiers, 'modifier');
             // Our own optimistic write and local effects must not dirty the next
             // step. Only adopt ledgers actually present in ObjectSync, not merely
             // the attempted payload (updateObject can fail).
             cache.inputs = gameStateCalculationInputs(
                 gsObj.data, cache.hits, cache.scores, cache.counted, ships, cache.history,
-                cache.xp, cache.effects, effectObjects, retiredEffectIds);
+                cache.xp, cache.effects, effectObjects, retiredEffectIds, cache.modifiers, activeMemberIds);
         }
     }
 
@@ -8585,6 +9086,7 @@
             game.score = 0;
             game.wave = 0;
             game.soloXp = 0;
+            game.soloModifier = null;
             game.simulationTimeMs = 0;
             game.effects = [];
             game.effectContactNowMs = null;
@@ -8599,6 +9101,7 @@
             game.speedMultiplier = 1;
             hudCache.xp = null;
             hudCache.xpLevel = null;
+            hudCache.levelBannerUntil = 0;
         }
         
         // Hide start screen
@@ -8726,6 +9229,11 @@
         const armorRoll = highestLevel >= 4 ? simRandom() : 0;
         const payloadRoll = highestLevel >= 4 ? simRandom() : 0;
         Object.assign(asteroid, chooseAsteroidLoadout(highestLevel, armorRoll, payloadRoll));
+        asteroid.clampMotion();
+        const armorSpeedScale = asteroid.maxHits === 2 ? PROGRESSION.TWO_HIT_SPEED_SCALE
+            : asteroid.maxHits === 3 ? PROGRESSION.THREE_HIT_SPEED_SCALE : 1;
+        asteroid.velocityX *= armorSpeedScale;
+        asteroid.velocityY *= armorSpeedScale;
         
         // In session mode, let OnObjectCreated → updateAstervoidsFromSync handle local state
         // In solo mode, push directly to game state
@@ -8919,6 +9427,12 @@
         });
         const children = asteroid.radius <= effectiveMinRadius ? []
             : AstervoidsFracture.calculateAsteroidFragments(asteroid, impact, fractureConfig).children;
+        if (asteroid.maxHits > 1) {
+            for (const child of children) {
+                child.vx *= PROGRESSION.ARMORED_CHILD_SPEED_SCALE;
+                child.vy *= PROGRESSION.ARMORED_CHILD_SPEED_SCALE;
+            }
+        }
 
         // ─── Shooter-deflection (linear-only) ──────────────────────────────
         // After fragment kinematics are settled, nudge any surviving child off a
@@ -8977,6 +9491,7 @@
             // children inherit parent.angle so their freshly-generated polygon
             // visually orbits with the parent's motion (legacy behaviour).
             a.angle = c.vertices ? 0 : asteroid.angle;
+            a.clampMotion();
             return a;
         });
 
@@ -9179,7 +9694,8 @@
         const progression = getLocalProgression();
         if (input.fire() && progression
             && myBulletCount + progression.level <= CONFIG.MAX_BULLETS * progression.level) {
-            const volley = game.ship.shoot(progression.level);
+            const modifierKind = getLocalModifier();
+            const volley = modifierKind == null ? null : game.ship.shoot(progression.level, modifierKind);
             if (volley) {
                 game.bullets.push(...volley);
                 if (isSessionMode()) volley.forEach(bullet => createSyncedBullet(bullet));
@@ -9270,6 +9786,7 @@
         asteroid.fromGameplayData(record.data);
         const id = damage.damageId.toLowerCase();
         if (Object.hasOwn(asteroid.processedDamage, id)) return false;
+        asteroid.addContributor(damage);
         if (!ignoreArmor && asteroid.hitsRemaining > 1) {
             asteroid.hitsRemaining--;
             asteroid.processedDamage = { ...asteroid.processedDamage, [id]: 1 };
@@ -9292,6 +9809,7 @@
     function applySoloAsteroidDamage(asteroid, damage, impact = null, shooterShip = game.ship, ignoreArmor = false) {
         const id = damage.damageId.toLowerCase();
         if (Object.hasOwn(asteroid.processedDamage, id) || !game.astervoids.includes(asteroid)) return false;
+        asteroid.addContributor(damage);
         asteroid.processedDamage = { ...asteroid.processedDamage, [id]: 1 };
         asteroid._processedDamageBytes = AstervoidsWireCodec.packCounterMap(asteroid.processedDamage);
         if (!ignoreArmor && asteroid.hitsRemaining > 1) {
@@ -9427,7 +9945,7 @@
         // held after its fatal hit is already dead and must not collide again;
         // its wreck coasts through whatever it drifts into.
         if (game.ship && !game.ship.deathHold
-            && game.ship.invulnerable <= 0 && game.state === 'playing') {
+            && !game.ship.isShielded() && game.state === 'playing') {
             const crash = checkShipAsteroidCollision(game.ship, asteroidCollisionCache);
             if (crash) {
                 // Built before the hit resets or holds the ship, so the
@@ -9559,12 +10077,14 @@
         AudioSystem.thrustSound.stop();
 
         const hitPose = { x: ship.x, y: ship.y, angle: ship.angle };
+        ship.resetLife();
         ship.hitCount = (ship.hitCount || 0) + 1;
         if (isSessionMode()) {
             // Phase 2.3: hitCount no longer rides on toUpdateData(); push it
             // through the per-object event channel so other peers see it
             // before the next per-frame batch.
             emitShipStateChanged(hitPose);
+            syncLocalShipBoosts(true);
 
             // A fatal hit is the last thing this ship ever does, so hold it at
             // the collision pose instead of respawning into a scene everyone is
@@ -9579,6 +10099,7 @@
             // Reset ship locally
             ship.reset();
             if (game.multiplayer.myShipObjectId) {
+                syncLocalShipBoosts(true);
                 ObjectSync.updateObject(game.multiplayer.myShipObjectId, ship.toUpdateData(), true);
             }
         } else {
@@ -9754,6 +10275,7 @@
         // respawn never inherits the coast the hold was carrying.
         ship.reset();
         if (myShipId) {
+            syncLocalShipBoosts(true);
             ObjectSync.updateObject(myShipId, ship.toUpdateData(), true);
         }
     }
@@ -9949,16 +10471,67 @@
                 ctx.moveTo(Math.cos(angle) * size * 0.2, Math.sin(angle) * size * 0.2);
                 ctx.lineTo(Math.cos(angle) * size, Math.sin(angle) * size);
             }
+        } else if (kind === PAYLOAD_KIND.SHIELD) {
+            ctx.moveTo(-size * 0.75, -size * 0.7);
+            ctx.lineTo(size * 0.75, -size * 0.7);
+            ctx.lineTo(size * 0.6, size * 0.25);
+            ctx.lineTo(0, size * 0.9);
+            ctx.lineTo(-size * 0.6, size * 0.25);
+            ctx.closePath();
+        } else if (kind === PAYLOAD_KIND.RAPID_FIRE) {
+            for (const offset of [-0.45, 0.45]) {
+                ctx.moveTo(size * offset, size * 0.85);
+                ctx.lineTo(size * offset, -size * 0.8);
+                ctx.moveTo(size * (offset - 0.25), -size * 0.4);
+                ctx.lineTo(size * offset, -size * 0.8);
+                ctx.lineTo(size * (offset + 0.25), -size * 0.4);
+            }
         } else if (kind === PAYLOAD_KIND.MINE || kind === PAYLOAD_KIND.SPRAY) {
             const lanes = kind === PAYLOAD_KIND.MINE ? 8 : PROGRESSION.SPRAY_LANES;
             for (let i = 0; i < lanes; i++) {
-                const angle = i * Math.PI * 2 / lanes;
+                const angle = kind === PAYLOAD_KIND.MINE ? i * Math.PI * 2 / lanes
+                    : PROGRESSION.SPRAY_ANGLES_DEG[i] * Math.PI / 180;
                 ctx.moveTo(Math.cos(angle) * size * 0.4, Math.sin(angle) * size * 0.4);
                 ctx.lineTo(Math.cos(angle) * size, Math.sin(angle) * size);
             }
             if (kind === PAYLOAD_KIND.MINE) {
                 ctx.moveTo(size * 0.4, 0);
                 ctx.arc(0, 0, size * 0.4, 0, Math.PI * 2);
+            }
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function drawPayloadEnvelope(ctx, kind, x, y, radius) {
+        ctx.beginPath();
+        if (kind === PAYLOAD_KIND.MINE || kind === PAYLOAD_KIND.SPRAY) {
+            for (const sign of [-1, 1]) {
+                ctx.moveTo(x + sign * radius * 0.8, y - radius);
+                ctx.lineTo(x + sign * radius * 1.5, y);
+                ctx.lineTo(x + sign * radius * 0.8, y + radius);
+            }
+        } else {
+            ctx.arc(x, y, radius * 1.35, 0, Math.PI * 2);
+        }
+        ctx.stroke();
+    }
+
+    function drawHazardPreview(ctx, kind, x, y) {
+        if (kind !== PAYLOAD_KIND.MINE && kind !== PAYLOAD_KIND.SPRAY) return;
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 5]);
+        ctx.beginPath();
+        if (kind === PAYLOAD_KIND.MINE) {
+            ctx.arc(x, y, fromNormalizedSize(PROGRESSION.MINE_RADIUS), 0, Math.PI * 2);
+        } else {
+            const reach = fromNormalizedSize(CONFIG.BULLET_SPEED * PROGRESSION.SPRAY_SPEED_SCALE
+                * PROGRESSION.SPRAY_FLIGHT_MS / 1000);
+            for (const degrees of PROGRESSION.SPRAY_ANGLES_DEG) {
+                const angle = degrees * Math.PI / 180;
+                ctx.moveTo(x, y);
+                ctx.lineTo(x + Math.cos(angle) * reach, y + Math.sin(angle) * reach);
             }
         }
         ctx.stroke();
@@ -10002,6 +10575,8 @@
             ctx.lineTo(x + sign * radius * 0.2, y + radius * 0.8);
         }
         ctx.stroke();
+        drawHazardPreview(ctx, asteroid.payloadKind, x, y);
+        drawPayloadEnvelope(ctx, asteroid.payloadKind, x, y + radius * 0.1, Math.max(4, radius * 0.3));
         drawPayloadGlyph(ctx, asteroid.payloadKind, x, y + radius * 0.1, Math.max(3, radius * 0.22));
         ctx.restore();
     }
@@ -10033,21 +10608,17 @@
                 ctx.lineTo(x - Math.cos(data.angle) * r * 3, y - Math.sin(data.angle) * r * 3);
                 ctx.stroke();
             } else if (data.kind === GAME_EFFECT_KIND.SPRAY) {
-                ctx.setLineDash([3, 5]);
-                const reach = fromNormalizedSize(0.08);
-                ctx.beginPath();
-                for (let i = 0; i < PROGRESSION.SPRAY_LANES; i++) {
-                    const angle = i * Math.PI * 2 / PROGRESSION.SPRAY_LANES;
-                    ctx.moveTo(x + Math.cos(angle) * radius, y + Math.sin(angle) * radius);
-                    ctx.lineTo(x + Math.cos(angle) * reach, y + Math.sin(angle) * reach);
-                }
-                ctx.stroke();
-                ctx.setLineDash([]);
+                drawHazardPreview(ctx, PAYLOAD_KIND.SPRAY, x, y);
+                drawPayloadEnvelope(ctx, PAYLOAD_KIND.SPRAY, x, y, radius);
                 drawPayloadGlyph(ctx, PAYLOAD_KIND.SPRAY, x, y, radius * 0.65);
             } else if (data.kind === GAME_EFFECT_KIND.MINE) {
                 if (nowMs < data.armedAt) ctx.setLineDash([2, 3]);
-                drawPayloadGlyph(ctx, PAYLOAD_KIND.MINE, x, y, radius);
+                ctx.beginPath();
+                ctx.arc(x, y, fromNormalizedSize(PROGRESSION.MINE_RADIUS), 0, Math.PI * 2);
+                ctx.stroke();
                 ctx.setLineDash([]);
+                drawPayloadEnvelope(ctx, PAYLOAD_KIND.MINE, x, y, radius);
+                drawPayloadGlyph(ctx, PAYLOAD_KIND.MINE, x, y, fromNormalizedSize(PROGRESSION.MINE_RADIUS) * 0.6);
             } else {
                 if (receipt) {
                     const progress = Math.max(0, age / PROGRESSION.RECEIPT_FEEDBACK_MS);
@@ -10066,6 +10637,7 @@
                 ctx.lineTo(x - radius, y);
                 ctx.closePath();
                 ctx.stroke();
+                drawPayloadEnvelope(ctx, data.payloadKind, x, y, radius);
                 drawPayloadGlyph(ctx, data.payloadKind, x, y, radius * 0.5);
             }
             ctx.restore();
@@ -11746,8 +12318,51 @@
     // ============================================
 
     // Track key presses
+    function bindModifierChoiceButton(button, kind) {
+        let touchId = null;
+        // A second thumb may never generate a click while the movement thumb is held.
+        button.addEventListener('touchstart', event => {
+            if (button.disabled || modifierChoice.hidden || touchId !== null) return;
+            const touch = Array.from(event.changedTouches).find(touch => button.contains(touch.target));
+            if (!touch) return;
+            touchId = touch.identifier;
+            event.preventDefault();
+        }, { passive: false });
+        button.addEventListener('touchend', event => {
+            const touch = Array.from(event.changedTouches).find(touch => touch.identifier === touchId);
+            if (!touch) return;
+            touchId = null;
+            event.preventDefault();
+            const rect = button.getBoundingClientRect();
+            if (!button.disabled && !modifierChoice.hidden
+                && touch.clientX >= rect.left && touch.clientX <= rect.right
+                && touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
+                requestModifierChoice(kind);
+            }
+        }, { passive: false });
+        button.addEventListener('touchcancel', event => {
+            if (Array.from(event.changedTouches).some(touch => touch.identifier === touchId)) touchId = null;
+        }, { passive: true });
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            if (event.pointerType === 'touch' || event.sourceCapabilities?.firesTouchEvents) {
+                event.preventDefault();
+                return;
+            }
+            requestModifierChoice(kind);
+        });
+    }
+    bindModifierChoiceButton(modifierFocus, 1);
+    bindModifierChoiceButton(modifierSweep, 2);
+
     document.addEventListener('keydown', (e) => {
         if (!leaderboardScreen.hidden) return;
+        if (e.target?.closest?.('#modifier-choice') && ['Space', 'Enter', 'Tab'].includes(e.code)) return;
+        if (!modifierChoice.hidden && ['Digit1', 'Digit2', 'Numpad1', 'Numpad2'].includes(e.code)) {
+            e.preventDefault();
+            if (!e.repeat) requestModifierChoice(e.code.endsWith('1') ? 1 : 2);
+            return;
+        }
         if (isPersonalScoreScrollTarget(e.target)
             && ['Space', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.code)) return;
         keys[e.code] = true;
@@ -11928,7 +12543,8 @@
     }
 
     function isMenuScrollTarget(target) {
-        return (!startScreen.classList.contains('hidden') && !!target?.closest?.('#start-screen-content'))
+        return !!target?.closest?.('#modifier-choice')
+            || (!startScreen.classList.contains('hidden') && !!target?.closest?.('#start-screen-content'))
             || (!leaderboardScreen.hidden && !!target?.closest?.('#leaderboard-screen'));
     }
 
@@ -13134,15 +13750,21 @@
             const delay = RemoteObjects.getDelayForMember(child.ownerMemberId);
             const bridgeValidAt = Math.round(RemoteObjects.serverNowMs() - delay);
             const bridgeIsBeforeAuth = bridgeValidAt <= childValidAt;
+            const childData = child.data.type === OBJECT_TYPES.BULLET
+                ? Bullet.resolveVelocityData(child.data) : child.data;
             const bridgeData = {
-                ...child.data,
-                ...computeReplacementBridgePose(child.data, parentInterp, {
+                ...childData,
+                ...computeReplacementBridgePose(childData, parentInterp, {
                     timeDiffSec: (childValidAt - bridgeValidAt) / 1000,
                     bridgeIsBeforeAuth,
                     velScaleX,
                     velScaleY
                 })
             };
+            if (childData.type === OBJECT_TYPES.BULLET) {
+                bridgeData.velocityXFull = bridgeData.velocityX;
+                bridgeData.velocityYFull = bridgeData.velocityY;
+            }
             if (bridgeIsBeforeAuth) {
                 // LAN: bridge older than authority → bridge first. Bridge
                 // snapshot is synthetic (validAt back-projected from current
@@ -13173,6 +13795,7 @@
     // the parent's currently displayed (interpolated) transform. Pure function
     // of its inputs — no ObjectSync/RemoteObjects access.
     function computeReplacementBridgePose(childData, parentInterp, timing) {
+        if (childData.type === OBJECT_TYPES.BULLET) childData = Bullet.resolveVelocityData(childData);
         const { timeDiffSec, bridgeIsBeforeAuth, velScaleX, velScaleY } = timing;
         // Velocity used both as the back-projection anchor for bridge.x/y and
         // as the bridge snapshot's velocity:

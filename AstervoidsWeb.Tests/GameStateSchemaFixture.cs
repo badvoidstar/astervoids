@@ -27,6 +27,7 @@ internal static class GameStateSchemaFixture
         new("participantTags", "bytes"),
         new("participantXp", "bytes"),
         new("processedEffects", "bytes"),
+        new("participantModifiers", "bytes"),
     ]);
 
     internal const string ScoreEntries =

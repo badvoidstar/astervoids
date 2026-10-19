@@ -10,7 +10,11 @@ const { countExtraLivesForScore } = require('./wwwroot/js/game-config.js');
 const codec = require('./wwwroot/js/astervoids-wire-codec.js');
 const progressionConstants = loadInlineGameConstants(['PROGRESSION', 'PAYLOAD_KIND', 'GAME_EFFECT_KIND']);
 const progressionFunctions = loadInlineGameFunctions(
-    ['getLevelXpThreshold', 'getLevelForXp'], progressionConstants);
+    ['getLevelXpThreshold', 'getLevelForXp', 'getProgressionForXp',
+        'getParticipatingParticipantIds', 'awardBreakXp'], {
+        ...progressionConstants, GuidUtils: require('./wwwroot/js/guid-utils.js'),
+        AstervoidsWireCodec: codec,
+    });
 const firstId = 'aaaaaaaa-0000-0000-0000-000000000001';
 const secondId = 'bbbbbbbb-0000-0000-0000-000000000002';
 const thirdId = 'cccccccc-0000-0000-0000-000000000003';
@@ -41,7 +45,7 @@ function calculate({
         persisted,
         { processedHits: hits, processedScores: scores, countedParticipants: counted,
             participantScores: {}, participantNumbers: {}, participantTags: {},
-            participantXp: {}, processedEffects: {} },
+            participantXp: {}, processedEffects: {}, participantModifiers: {} },
         ships,
         { lives: 3, state: 'playing', observedScoreLifeAwardCount: null, ...local },
         threshold);
@@ -315,6 +319,7 @@ function completeGameStateData(data = {}) {
         participantTags: codec.packTagMap({}),
         participantXp: codec.packXpMap({}),
         processedEffects: codec.packCounterMap({}),
+        participantModifiers: codec.packParticipantModifiers({}),
         ...data,
     };
 }
@@ -332,6 +337,7 @@ function loadSyncHarness({
     const record = { id: 'gs', data: completeGameStateData(data), version: 1, ownerMemberId: 'member-a' };
     const controls = {
         sessionMode, owner, epoch: 1, memberId: 'member-a', record,
+        members: [],
         optimistic, writeResult: true, throwWrite: false, clock: 1000.4,
     };
     const config = {
@@ -372,6 +378,7 @@ function loadSyncHarness({
             getCurrentMember: () => ({ id: controls.memberId }),
             getCurrentSession: () => ({
                 metadata: { schemas: require('./wwwroot/js/game-wire-schemas.js').SCHEMAS },
+                members: controls.members.map(id => ({ id })),
             }),
         },
         AstervoidsWireCodec: {
@@ -406,6 +413,7 @@ function loadSyncHarness({
         } },
         _error: () => events.push('error'),
         ObjectSync: objectSync ?? {
+            isDataConfirmed: () => false,
             isObjectConfirmedAbsent: () => false,
             getSnapshotObject: () => null,
             getObject: id => id === game.multiplayer.gameStateObjectId
@@ -451,6 +459,7 @@ test('GameState effects precede terminal clock sampling and packed publication',
         participantTags: codec.packTagMap({}),
         participantXp: codec.packXpMap({}),
         processedEffects: codec.packCounterMap({}),
+        participantModifiers: codec.packParticipantModifiers({}),
         peakShipCount: 1, gameOverAt: 1000, terminalAt: 1750, scoreLifeAwardCount: 1,
         terminalShipId: firstId,
     });
@@ -668,8 +677,10 @@ test('canonical replacement and ownership/session identity changes discard cache
     const changes = [
         harness => { harness.controls.record = { ...harness.record }; },
         harness => { harness.record.data = structuredClone(harness.record.data); },
-        harness => { harness.record.ownerMemberId = 'member-b'; },
-        harness => { harness.controls.memberId = 'member-b'; },
+        harness => {
+            harness.record.ownerMemberId = 'member-b';
+            harness.controls.memberId = 'member-b';
+        },
         harness => { harness.controls.epoch++; },
         harness => { harness.game.multiplayer.gameStateObjectId = 'replacement'; },
         harness => {
@@ -702,6 +713,20 @@ test('canonical replacement and ownership/session identity changes discard cache
     }
     const { resetMultiplayerState } = loadInlineGameFunctions(['resetMultiplayerState']);
     assert.match(resetMultiplayerState.toString(), /resetGameStateSyncCache\(\)/);
+});
+
+test('a changed caller identity cannot publish the former owners cached result before authoritative migration', () => {
+    const harness = loadSyncHarness({ data: { lives: 3, peakShipCount: 0 } });
+    harness.syncGameState();
+    harness.controls.memberId = 'member-b';
+    harness.syncGameState();
+    assert.equal(harness.publications.length, 1, 'the real object owner check overrides a stale owner-role hint');
+    assert.equal(harness.counts.calculate, 1);
+    harness.record.ownerMemberId = 'member-b';
+    harness.syncGameState();
+    assert.equal(harness.publications.length, 2);
+    assert.deepEqual(harness.counts, { calculate: 2, pack: 12, unpack: 12 },
+        'the new authoritative member starts a fresh calculation cache');
 });
 
 test('a same-version recovery snapshot replaces optimistic scores and lives', () => {
@@ -967,6 +992,8 @@ test('real ObjectSync receipt compaction preserves once-only awards across rejec
             payloadKind: progressionConstants.PAYLOAD_KIND.NONE, participantId: participantA,
             participantTag: 'Pilot_A', shipId: firstId, points: 100,
             startedAt: 1000, armedAt: 1000, expiresAt: 1000,
+            contributors: codec.packContributors({ [participantA]: 1 }),
+            shipLifeId: null,
         },
     };
     const h = receiptSyncHarness(personalGameStateData(), [receipt]);
@@ -1153,6 +1180,7 @@ test('accepted break receipts invalidate cached GameState once and preserve larg
             payloadKind: progressionConstants.PAYLOAD_KIND.NONE, participantId: participantA,
             participantTag: 'Pilot_A', shipId: firstId, points: 20,
             startedAt: 1000, armedAt: 1000, expiresAt: 1000,
+            contributors: codec.packContributors({ [participantA]: 1 }), shipLifeId: null,
         },
     });
     harness.syncGameState();
@@ -1186,6 +1214,110 @@ test('missing or malformed progression and receipt ledgers refuse all effects un
             const harness = loadSyncHarness({
                 data: personalGameStateData({ [field]: invalid }),
                 ships: [{ id: firstId, data: { participantId: participantA, score: 200, hitCount: 1 } }],
+            });
+
+            test('same-version modifier requests and in-place modifier/contributor bytes invalidate aggregation without replaying awards', () => {
+                const ships = [{
+                    id: firstId, ownerMemberId: memberA, version: 1,
+                    data: { type: 'ship', memberId: memberA, participantId: participantA,
+                        participantTag: 'Pilot_A', score: 0, hitCount: 0,
+                        modifierRequestMilestone: 0, modifierRequestKind: 0 },
+                }];
+                const h = loadSyncHarness({
+                    ships, data: personalGameStateData({
+                        participantXp: codec.packXpMap({ [participantA]: 120, [participantB]: 0 }),
+                    }),
+                });
+                h.controls.members = [memberA];
+                h.syncGameState();
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 1);
+                ships[0].data.modifierRequestMilestone = 4;
+                ships[0].data.modifierRequestKind = 1;
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 2);
+                assert.deepEqual(codec.unpackParticipantModifiers(h.record.data.participantModifiers), {
+                    [participantA]: { consumedMilestone: 4, modifierKind: 1 },
+                });
+                ships[0].data.modifierRequestKind = 2;
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 3);
+                assert.equal(codec.unpackParticipantModifiers(h.record.data.participantModifiers)[participantA].modifierKind, 1,
+                    'a competing same-milestone request cannot overwrite an already accepted choice');
+                h.record.data.participantModifiers[20] = 2;
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 4);
+                assert.equal(codec.unpackParticipantModifiers(h.record.data.participantModifiers)[participantA].modifierKind, 2);
+                const receipt = {
+                    id: thirdId, ownerMemberId: memberA, version: 1, data: {
+                        type: 'gameEffect', kind: progressionConstants.GAME_EFFECT_KIND.BREAK_RECEIPT,
+                        payloadKind: progressionConstants.PAYLOAD_KIND.NONE,
+                        participantId: participantA, participantTag: 'Pilot_A', points: 20,
+                        contributors: codec.packContributors({ [participantA]: 1, [participantB]: 2 }),
+                        startedAt: 1000, armedAt: 1000, expiresAt: 1000, shipLifeId: null,
+                    },
+                };
+                h.effects.push(receipt);
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 5);
+                const awarded = codec.unpackXpMap(h.record.data.participantXp);
+                assert.deepEqual(awarded, { [participantA]: 130, [participantB]: 7 });
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 5);
+                const contributors = new DataView(receipt.data.contributors.buffer);
+                contributors.setUint32(16, 2, true);
+                contributors.setUint32(36, 1, true);
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 6);
+                assert.deepEqual(codec.unpackXpMap(h.record.data.participantXp), awarded,
+                    'changing a consumed receipt cannot duplicate either personal XP or score');
+                assert.equal(h.record.data.groupScore, 20);
+                assert.equal(ships[0].version, 1);
+                assert.equal(receipt.version, 1);
+            });
+
+            test('a pure spectator GameState owner invalidates cached catch-up when current participation changes without versions', () => {
+                const ships = [
+                    { id: firstId, ownerMemberId: memberA, version: 1,
+                        data: { memberId: memberA, participantId: participantA, participantTag: 'Pilot_A' } },
+                    { id: secondId, ownerMemberId: memberB, version: 1,
+                        data: { memberId: memberB, participantId: participantB, participantTag: 'Pilot_B' } },
+                ];
+                const h = loadSyncHarness({
+                    ships, data: personalGameStateData({
+                        participantXp: codec.packXpMap({ [participantA]: 10, [participantB]: 120 }),
+                    }),
+                });
+                h.controls.memberId = memberC;
+                h.record.ownerMemberId = memberC;
+                h.controls.members = [memberA, memberB, memberC];
+                h.syncGameState();
+                h.controls.members = [memberA, memberC];
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 2, 'member departure alone invalidates the cached reference set');
+                const receipt = id => ({
+                    id, ownerMemberId: memberA, version: 1, data: {
+                        type: 'gameEffect', kind: progressionConstants.GAME_EFFECT_KIND.BREAK_RECEIPT,
+                        payloadKind: progressionConstants.PAYLOAD_KIND.NONE,
+                        participantId: participantA, participantTag: 'Pilot_A', points: 20,
+                        contributors: codec.packContributors({ [participantA]: 1 }),
+                        startedAt: 1000, armedAt: 1000, expiresAt: 1000, shipLifeId: null,
+                    },
+                });
+                h.effects.push(receipt(thirdId));
+                h.syncGameState();
+                assert.equal(codec.unpackXpMap(h.record.data.participantXp)[participantA], 20,
+                    'the retained L4 history and departed member-owned Ship are not a current catch-up leader');
+                h.controls.members = [memberA, memberB, memberC];
+                h.syncGameState();
+                assert.equal(h.counts.calculate, 4);
+                h.effects.push(receipt('dddddddd-0000-0000-0000-000000000004'));
+                h.syncGameState();
+                assert.equal(codec.unpackXpMap(h.record.data.participantXp)[participantA], 32,
+                    'the re-participating L4 identity gives an L2 finisher exactly the inclusive +2 bonus');
+                assert.equal(codec.unpackXpMap(h.record.data.participantXp)[participantB], 120);
+                assert.equal(ships[0].version, 1);
+                assert.equal(ships[1].version, 1);
             });
             const before = structuredClone(harness.game);
             harness.syncGameState();

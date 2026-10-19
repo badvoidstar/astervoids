@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { loadInlineGameFunctions } from './test-support/inline-game.mjs';
+import { loadInlineGameConstants, loadInlineGameFunctions } from './test-support/inline-game.mjs';
 
 const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8');
 
@@ -24,16 +24,21 @@ test('all nine former HUD publications preserve metric cadence; the solo pickup 
 });
 
 test('HUD rendering no longer computes or publishes debug metrics', () => {
-    const game = { state: 'playing', score: 20, wave: 2, lives: 3 };
+    const game = { state: 'playing', score: 20, wave: 2, lives: 3, simulationTimeMs: 0 };
     const hudCache = {};
     const scoreDisplay = {};
     const waveDisplay = {};
     const livesDisplay = {};
     const xpHud = { hidden: false };
     let fits = 0;
-    const { updateHUD } = loadInlineGameFunctions(['updateHUD', 'updateProgressionHud'], {
+    const { updateHUD } = loadInlineGameFunctions([
+        'updateHUD', 'updateProgressionHud', 'updateProgressionControls', 'getGameEffectNow',
+    ], {
+        ...loadInlineGameConstants(['PROGRESSION']),
         game, hudCache, scoreDisplay, waveDisplay, livesDisplay,
         hudDisplay: null, xpHud, levelAnnouncement: {},
+        levelBanner: { hidden: true }, boostStatus: {}, modifierCurrent: {},
+        modifierChoice: { hidden: true }, modifierTitle: {}, modifierFocus: {}, modifierSweep: {},
         fitProgressionHud: () => fits++,
         isSessionMode: () => false,
         document: { getElementById: () => null },

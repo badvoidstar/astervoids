@@ -23,6 +23,8 @@ const AstervoidsWireSchemas = (function() {
             ['participantId', 'guid'],
             ['participantTag', 'str'],
             ['handledHazards', 'bytes'],
+            ['boostState', 'bytes'],
+            ['modifierRequestMilestone', 'u32'], ['modifierRequestKind', 'u8'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],
@@ -37,6 +39,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalAngle', 'f64'],
             ['maxHits', 'u8'], ['hitsRemaining', 'u8'], ['payloadKind', 'u8'],
             ['processedDamage', 'bytes'],
+            ['contributors', 'bytes'],
         ]},
         { id: 3, fields: [
             ['type', 'str'],
@@ -54,6 +57,7 @@ const AstervoidsWireSchemas = (function() {
             ['terminalX', 'f64'], ['terminalY', 'f64'],
             ['damageId', 'guid'], ['participantId', 'guid'],
             ['shipId', 'nullable-guid'], ['participantTag', 'str'],
+            ['velocityXFull', 'f32'], ['velocityYFull', 'f32'],
         ]},
         { id: 4, fields: [
             ['type', 'str'],
@@ -76,6 +80,7 @@ const AstervoidsWireSchemas = (function() {
             ['participantNumbers', 'bytes'],
             ['participantTags', 'bytes'],
             ['participantXp', 'bytes'], ['processedEffects', 'bytes'],
+            ['participantModifiers', 'bytes'],
         ]},
         { id: 5, fields: [
             ['type', 'str'], ['kind', 'u8'], ['payloadKind', 'u8'],
@@ -87,12 +92,14 @@ const AstervoidsWireSchemas = (function() {
             ['startedAt', 'f64'], ['armedAt', 'f64'], ['expiresAt', 'f64'],
             ['points', 'u32'], ['damageReceipts', 'bytes'],
             ['asteroidTargets', 'bytes'], ['hazardTargets', 'bytes'],
+            ['contributors', 'bytes'], ['shipLifeId', 'nullable-guid'],
         ]},
         { id: 6, fields: [
             ['type', 'str'], ['targetId', 'guid'], ['shipId', 'guid'],
             ['participantId', 'guid'], ['participantTag', 'str'],
             ['x', 'q16w'], ['y', 'q16w'], ['angle', 'q16_2pi'],
             ['claimedAt', 'f64'], ['invulnerabilityRevision', 'u32'],
+            ['shipLifeId', 'guid'],
         ]},
     ];
 

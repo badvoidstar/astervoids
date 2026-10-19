@@ -12,6 +12,8 @@ const AstervoidsWireCodec = (function () {
     const ASTEROID_VERTEX_BYTES = 4;
     const COUNTER_ENTRY_BYTES = 20;
     const XP_ENTRY_BYTES = 24;
+    const BOOST_STATE_BYTES = 32;
+    const MODIFIER_ENTRY_BYTES = 21;
 
     function isByteArray(value) {
         return value instanceof Uint8Array;
@@ -207,6 +209,129 @@ const AstervoidsWireCodec = (function () {
         return xp;
     }
 
+    function requirePlainObject(value, name) {
+        if (value == null || typeof value !== 'object'
+            || Object.prototype.toString.call(value) !== '[object Object]') {
+            throw new TypeError(`${name} must be a plain object`);
+        }
+    }
+
+    function packBoostState(state) {
+        requirePlainObject(state, 'boost state');
+        if (!guidUtils.isGuid(state.lifeId)) throw new TypeError('boost life ID must be a GUID');
+        for (const deadline of [state.shieldUntil, state.rapidFireUntil]) {
+            if (!Number.isFinite(deadline) || deadline < 0) {
+                throw new RangeError('boost deadlines must be finite and nonnegative');
+            }
+        }
+        const bytes = new Uint8Array(BOOST_STATE_BYTES);
+        bytes.set(guidUtils.guidToBytes(state.lifeId), 0);
+        const view = new DataView(bytes.buffer);
+        view.setFloat64(16, state.shieldUntil, true);
+        view.setFloat64(24, state.rapidFireUntil, true);
+        return bytes;
+    }
+
+    function unpackBoostState(value) {
+        if (!isByteArray(value)) throw new TypeError('packed boost state must be a Uint8Array');
+        if (value.length !== BOOST_STATE_BYTES) throw new Error('packed boost state must contain 32 bytes');
+        const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+        const state = {
+            lifeId: guidUtils.bytesToGuid(value, 0),
+            shieldUntil: view.getFloat64(16, true),
+            rapidFireUntil: view.getFloat64(24, true)
+        };
+        for (const deadline of [state.shieldUntil, state.rapidFireUntil]) {
+            if (!Number.isFinite(deadline) || deadline < 0) {
+                throw new RangeError('packed boost deadlines must be finite and nonnegative');
+            }
+        }
+        return state;
+    }
+
+    function validateModifier(value) {
+        requirePlainObject(value, 'participant modifier');
+        if (!Number.isInteger(value.consumedMilestone) || value.consumedMilestone <= 0
+            || value.consumedMilestone > 0xffffffff || value.consumedMilestone % 4 !== 0) {
+            throw new RangeError('modifier milestone must be a positive uint32 multiple of four');
+        }
+        if (value.modifierKind !== 1 && value.modifierKind !== 2) {
+            throw new RangeError('modifier kind must be FOCUS or SWEEP');
+        }
+    }
+
+    function packParticipantModifiers(modifiers) {
+        requirePlainObject(modifiers, 'participant modifiers');
+        const entries = Object.entries(modifiers).map(([id, value]) => [id.toLowerCase(), value])
+            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+        const bytes = new Uint8Array(entries.length * MODIFIER_ENTRY_BYTES);
+        const view = new DataView(bytes.buffer);
+        let previous = null;
+        for (let i = 0; i < entries.length; i++) {
+            const [id, value] = entries[i];
+            if (!guidUtils.isGuid(id) || id === previous) {
+                throw new TypeError('participant modifiers contain an invalid or duplicate GUID');
+            }
+            validateModifier(value);
+            const offset = i * MODIFIER_ENTRY_BYTES;
+            bytes.set(guidUtils.guidToBytes(id), offset);
+            view.setUint32(offset + 16, value.consumedMilestone, true);
+            bytes[offset + 20] = value.modifierKind;
+            previous = id;
+        }
+        return bytes;
+    }
+
+    function unpackParticipantModifiers(value) {
+        if (!isByteArray(value)) throw new TypeError('packed participant modifiers must be a Uint8Array');
+        if (value.length % MODIFIER_ENTRY_BYTES !== 0) {
+            throw new Error('packed participant modifiers have an invalid byte length');
+        }
+        const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+        const modifiers = {};
+        let previous = null;
+        for (let offset = 0; offset < value.length; offset += MODIFIER_ENTRY_BYTES) {
+            const id = guidUtils.bytesToGuid(value, offset);
+            if (previous !== null && id <= previous) {
+                throw new Error('packed participant modifier GUIDs must be distinct and sorted');
+            }
+            const modifier = {
+                consumedMilestone: view.getUint32(offset + 16, true),
+                modifierKind: value[offset + 20]
+            };
+            validateModifier(modifier);
+            modifiers[id] = modifier;
+            previous = id;
+        }
+        return modifiers;
+    }
+
+    function validateContributors(contributors) {
+        requirePlainObject(contributors, 'contributors');
+        const entries = Object.entries(contributors);
+        if (entries.length > 3) throw new RangeError('contributors cannot contain more than three identities');
+        const ordinals = new Set();
+        for (const [id, ordinal] of entries) {
+            if (!guidUtils.isGuid(id)) throw new TypeError('contributor ID must be a GUID');
+            if (!Number.isInteger(ordinal) || ordinal < 1 || ordinal > 3 || ordinals.has(ordinal)) {
+                throw new RangeError('contributor ordinals must be distinct integers from one to three');
+            }
+            ordinals.add(ordinal);
+        }
+    }
+
+    function packContributors(contributors) {
+        validateContributors(contributors);
+        return packCounterMap(contributors);
+    }
+
+    function unpackContributors(value) {
+        if (!isByteArray(value)) throw new TypeError('packed contributors must be a Uint8Array');
+        const contributors = unpackCounterMap(value);
+        validateContributors(contributors);
+        return contributors;
+    }
+
     function isParticipantTag(value) {
         return typeof value === 'string' && config.IDENTITY_TAG_PATTERN.test(value);
     }
@@ -270,6 +395,12 @@ const AstervoidsWireCodec = (function () {
         unpackCounterMap,
         packXpMap,
         unpackXpMap,
+        packBoostState,
+        unpackBoostState,
+        packParticipantModifiers,
+        unpackParticipantModifiers,
+        packContributors,
+        unpackContributors,
         isParticipantTag,
         packTagMap,
         unpackTagMap

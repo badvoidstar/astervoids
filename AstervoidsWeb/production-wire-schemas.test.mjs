@@ -98,7 +98,8 @@ test('ship transition slots append to the stable schema and preserve timing prec
     const schema = SchemaCodec.get(1);
     assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
         ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
-        ['participantId', 'guid'], ['participantTag', 'str'], ['handledHazards', 'bytes']
+        ['participantId', 'guid'], ['participantTag', 'str'], ['handledHazards', 'bytes'],
+        ['boostState', 'bytes'], ['modifierRequestMilestone', 'u32'], ['modifierRequestKind', 'u8'],
     ]);
     const data = {
         invulnerable: 180, invulnerabilityRevision: 0xffffffff,
@@ -204,7 +205,7 @@ test('bullet schema keeps ballistic and hit deltas sparse', () => {
         hitOffsetN: -0.25,
     });
 
-    assert.equal(ballistic.length, 9, 'the twenty-slot bullet requires a three-byte mask');
+    assert.equal(ballistic.length, 9, 'the twenty-two-slot bullet retains a three-byte mask');
     assert.equal(hit.length, 27);
     assert.equal(SchemaCodec.decode(schema, ballistic).lifetime, 42);
     assert.equal(
@@ -244,7 +245,7 @@ test('known terminal updates do not fall back to schema zero', () => {
 test('GameState appends history and progression after the stable final-life ship slot', () => {
     registerProductionSchemas();
     const schema = SchemaCodec.get(4);
-    assert.equal(schema.fields.length, 21);
+    assert.equal(schema.fields.length, 22);
     assert.deepEqual(schema.fields.slice(15).map(field => [field.name, field.type]), [
         ['terminalShipId', 'guid'],
         ['participantScores', 'bytes'],
@@ -252,6 +253,7 @@ test('GameState appends history and progression after the stable final-life ship
         ['participantTags', 'bytes'],
         ['participantXp', 'bytes'],
         ['processedEffects', 'bytes'],
+        ['participantModifiers', 'bytes'],
     ]);
     const terminal = {
         lives: 0, gameOverAt: 1000, terminalAt: 1750,
@@ -265,7 +267,7 @@ test('GameState appends history and progression after the stable final-life ship
     assert.deepEqual(decoded, terminal);
     assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, decoded)), terminal);
     assert.equal(SchemaCodec.encode(schema, { lives: 3 }).length, 5,
-        'twenty-one optional slots retain the three-byte presence mask');
+        'twenty-two optional slots retain the three-byte presence mask');
 });
 
 test('rare ship score updates reuse the existing uint32 slot and eight-byte body', () => {
@@ -291,7 +293,7 @@ test('personal history has sparse three-byte masks and packed zero-score entries
     assert.deepEqual(SchemaCodec.decode(schema, encoded), payload);
 });
 
-test('fresh GameState producer initializes eight empty ledgers with a seventy-seven-byte body', async () => {
+test('fresh GameState producer initializes nine empty ledgers with an eighty-one-byte body', async () => {
     registerProductionSchemas();
     let created;
     const game = {
@@ -310,10 +312,10 @@ test('fresh GameState producer initializes eight empty ledgers with a seventy-se
     });
     await createSyncedGameState();
     const bytes = SchemaCodec.encode(SchemaCodec.get(4), created);
-    assert.equal(bytes.length, 77);
-    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 31]);
+    assert.equal(bytes.length, 81);
+    assert.deepEqual(Array.from(bytes.subarray(0, 3)), [255, 103, 63]);
     assert.deepEqual(WireCodec.unpackTagMap(created.participantTags), {});
-    for (const field of ['participantXp', 'processedEffects']) {
+    for (const field of ['participantXp', 'processedEffects', 'participantModifiers']) {
         assert.ok(created[field] instanceof Uint8Array, `${field} must be explicitly initialized`);
         assert.equal(created[field].length, 0);
     }

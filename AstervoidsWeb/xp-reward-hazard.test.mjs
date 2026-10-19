@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { compileFunction } from 'node:vm';
 import {
     loadInlineGameConstants, loadInlineGameFunctions,
 } from './test-support/inline-game.mjs';
@@ -15,7 +17,7 @@ const AstervoidsConfig = require('./wwwroot/js/game-config.js');
 const AstervoidsCollision = require('./wwwroot/js/collision-geometry.js');
 const AstervoidsFracture = require('./wwwroot/js/asteroid-fracture.js');
 const constants = loadInlineGameConstants([
-    'PROGRESSION', 'PAYLOAD_KIND', 'GAME_EFFECT_KIND', 'OBJECT_TYPES', 'TURN_CONTROL_MODE', 'CONFIG',
+    'PROGRESSION', 'PAYLOAD_KIND', 'MODIFIER_KIND', 'GAME_EFFECT_KIND', 'OBJECT_TYPES', 'TURN_CONTROL_MODE', 'CONFIG',
 ], { SHARED_CONFIG_DEFAULTS: AstervoidsConfig.SHARED_DEFAULTS });
 const { PROGRESSION, PAYLOAD_KIND, GAME_EFFECT_KIND, OBJECT_TYPES } = constants;
 const progression = loadInlineGameFunctions([
@@ -48,7 +50,7 @@ function baseHarness({ session = false, extraNames = [], globals = {} } = {}) {
     const game = {
         mode: session ? 'session' : 'solo', state: 'playing', previousState: null,
         score: 0, lives: 3, wave: 1, speedMultiplier: 1, waveDelayTimer: 0,
-        soloXp: 0, simulationTimeMs: 0, leaderboardRun: null,
+        soloXp: 0, soloModifier: null, simulationTimeMs: 0, leaderboardRun: null,
         ship: null, astervoids: [], bullets: [], effects: [],
         multiplayer: {
             myShipObjectId: session ? shipA : null,
@@ -73,15 +75,16 @@ function baseHarness({ session = false, extraNames = [], globals = {} } = {}) {
         deleteObject: async objectId => { objects.delete(objectId); events.push(['delete', objectId]); },
         isDataConfirmed: () => false,
     };
-    const production = loadInlineGameFunctions([
+    const production = loadInlineGameFunctions([...new Set([
         'ShipInvulnerability', 'Ship', 'Asteroid', 'Bullet', 'assignDefined',
         'getReferenceDimension', 'fromNormalizedX', 'fromNormalizedY', 'fromNormalizedSize',
         'sizeToNormalizedX', 'sizeToNormalizedY',
         'velocityToNormalizedDeltaX', 'velocityToNormalizedDeltaY',
         'wrapNormalized', 'wrapMarginX', 'wrapMarginY',
         'normalizeTurnControlMode', 'getShipTurnSpeed', 'rampInputToward',
+        'getGameEffectNow', 'getLocalModifier',
         ...extraNames,
-    ], {
+    ])], {
         ...constants, ...progression, CONFIG: config, game, GuidUtils,
         AstervoidsWireCodec, AstervoidsCollision, AstervoidsFracture,
         pointInPolygon: AstervoidsCollision.pointInPolygon,
@@ -100,6 +103,8 @@ function baseHarness({ session = false, extraNames = [], globals = {} } = {}) {
         },
         SessionClient: sessionClient,
         ObjectSync: objectSync,
+        getSessionModifierLedger: () => ({}),
+        reducedGameplayMotion: false,
         AudioSystem: {
             init() {}, resume() {},
             playFire: () => events.push(['fire']),
@@ -255,12 +260,12 @@ test('wave originals follow exact level armor bands and every armored payload di
         }
         assert.deepEqual(counts, expected, `level ${level}`);
     }
-    const payloads = Array(6).fill(0);
+    const payloads = Array(8).fill(0);
     for (let index = 0; index < 1000; index++) {
         const loadout = progression.chooseAsteroidLoadout(7, 0.95, (index + 0.5) / 1000);
         payloads[loadout.payloadKind - 1]++;
     }
-    assert.deepEqual(payloads, [200, 200, 200, 200, 100, 100]);
+    assert.deepEqual(payloads, [150, 150, 150, 150, 100, 100, 100, 100]);
     assert.equal(progression.chooseAsteroidLoadout(4, 0.8, 0).maxHits, 2);
     assert.equal(progression.chooseAsteroidLoadout(7, 0.7, 0).maxHits, 2);
     assert.equal(progression.chooseAsteroidLoadout(7, 0.9, 0).maxHits, 3);
@@ -368,7 +373,9 @@ test('independent impact GUID and attribution are fixed before either asynchrono
         'damage identity does not change to the transport object ID');
 });
 
-const { calculateGameState } = loadInlineGameFunctions(['calculateGameState'], {
+const { calculateGameState } = loadInlineGameFunctions([
+    'calculateGameState', 'getParticipatingParticipantIds', 'awardBreakXp',
+], {
     ...constants, ...progression, GuidUtils, AstervoidsWireCodec,
     countExtraLivesForScore: AstervoidsConfig.countExtraLivesForScore,
 });
@@ -381,17 +388,19 @@ function fullLedgers(overrides = {}) {
         participantNumbers: { [participantA]: 1, [participantB]: 2 },
         participantTags: { [participantA]: 'Pilot_1', [participantB]: 'Pilot_2' },
         participantXp: { [participantA]: 0, [participantB]: 0 }, processedEffects: {},
+        participantModifiers: {},
         ...overrides,
     };
 }
 
-function calculate({ persisted = {}, ledgers = fullLedgers(), ships = [], effects = [], retired = [] } = {}) {
+function calculate({ persisted = {}, ledgers = fullLedgers(), ships = [], effects = [], retired = [],
+    activeMembers = [] } = {}) {
     return calculateGameState({
         lives: 3, groupScore: 0, peakShipCount: 2, state: 'playing',
         ...persisted,
     }, ledgers, ships, {
         lives: 3, state: 'playing', observedScoreLifeAwardCount: 0,
-    }, 0, effects, retired);
+    }, 0, effects, retired, activeMembers);
 }
 
 function calculateAgain(previous, { ships = [], effects = [] } = {}) {
@@ -404,7 +413,9 @@ function receipt(number, {
 } = {}) {
     return { id: id(number), data: {
         type: OBJECT_TYPES.GAME_EFFECT, kind, participantId, participantTag: 'Pilot_1',
-        points, payloadKind, sourceId,
+        points, payloadKind, sourceId, shipLifeId: null,
+        contributors: kind === GAME_EFFECT_KIND.BREAK_RECEIPT && GuidUtils.isGuid(participantId)
+            ? AstervoidsWireCodec.packContributors({ [participantId]: 1 }) : new Uint8Array(),
     } };
 }
 
@@ -637,8 +648,8 @@ test('effect deadlines use accepted validAt once and never reset on migration, r
     const h = effectHarness({ session: true });
     h.game.multiplayer.effectAnchors = new Map();
     for (const [kind, armDelay, lifetime] of [
-        [GAME_EFFECT_KIND.PICKUP, 0, 12000], [GAME_EFFECT_KIND.MINE, 1000, 8000],
-        [GAME_EFFECT_KIND.SPRAY, 800, 2800], [GAME_EFFECT_KIND.HOSTILE_BULLET, 0, 2000],
+        [GAME_EFFECT_KIND.PICKUP, 0, 12000], [GAME_EFFECT_KIND.MINE, 1500, 8000],
+        [GAME_EFFECT_KIND.SPRAY, 1200, 3200], [GAME_EFFECT_KIND.HOSTILE_BULLET, 0, 2000],
     ]) {
         const initial = h.createGameEffectData(kind, PAYLOAD_KIND.NONE, id(150));
         const anchored = h.anchorGameEffectData(initial, 1000);
@@ -681,27 +692,27 @@ test('solo effects use simulation time, not wall time, so paused runs do not age
     assert.equal(h.getGameEffectNow(), 100_000);
 });
 
-test('spray launches twelve radial 40-percent-speed no-wrap bullets on its original 0.8-second deadline', () => {
+test('spray launches eight fixed 40-percent-speed no-wrap lanes on its original 1.2-second deadline', () => {
     const h = effectHarness();
     const record = { id: id(180), data: {
-        kind: GAME_EFFECT_KIND.SPRAY, x: 0.98, y: 0.5, startedAt: 1000, armedAt: 1800, expiresAt: 3800,
+        kind: GAME_EFFECT_KIND.SPRAY, x: 0.98, y: 0.5, startedAt: 1000, armedAt: 2200, expiresAt: 4200,
     } };
     h.clock.server = 40_000;
     const bullets = h.buildSprayProjectiles(record);
-    assert.equal(bullets.length, 12);
+    assert.equal(bullets.length, 8);
     for (let lane = 0; lane < bullets.length; lane++) {
         const bullet = bullets[lane];
         assert.equal(bullet.kind, GAME_EFFECT_KIND.HOSTILE_BULLET);
         assert.equal(bullet.sourceId, record.id);
         approx(Math.hypot(bullet.velocityX, bullet.velocityY), h.config.BULLET_SPEED * 0.4);
-        approx(bullet.angle, lane * Math.PI * 2 / 12);
-        assert.equal(bullet.startedAt, 1800);
-        assert.equal(bullet.armedAt, 1800);
-        assert.equal(bullet.expiresAt, 3800);
+        approx(bullet.angle, PROGRESSION.SPRAY_ANGLES_DEG[lane] * Math.PI / 180);
+        assert.equal(bullet.startedAt, 2200);
+        assert.equal(bullet.armedAt, 2200);
+        assert.equal(bullet.expiresAt, 4200);
     }
-    approx(h.getGameEffectPose(bullets[0], 2800).x, 1.38);
-    approx(h.getGameEffectPose(bullets[0], 1800).x, 0.98);
-    assert.ok(h.getGameEffectPose(bullets[0], 2800).x > 1, 'hostile bullets leave the viewport instead of wrapping');
+    approx(h.getGameEffectPose(bullets[0], 3200).x, 0.98 + Math.cos(Math.PI / 4) * 0.4);
+    approx(h.getGameEffectPose(bullets[0], 2200).x, 0.98);
+    assert.ok(h.getGameEffectPose(bullets[0], 3200).x > 1, 'hostile bullets leave the viewport instead of wrapping');
 });
 
 test('nuke fixes its starting radius targets and smart bomb fixes all starting asteroids and existing hazards', () => {
@@ -712,14 +723,15 @@ test('nuke fixes its starting radius targets and smart bomb fixes all starting a
         { id: id(192), data: { x: 0.7501, y: 0.5, hitsRemaining: 1 } },
     ];
     const hazards = [
-        { id: id(193), data: { kind: GAME_EFFECT_KIND.MINE } },
-        { id: id(194), data: { kind: GAME_EFFECT_KIND.SPRAY } },
-        { id: id(195), data: { kind: GAME_EFFECT_KIND.HOSTILE_BULLET } },
-        { id: id(196), data: { kind: GAME_EFFECT_KIND.PICKUP } },
+        { id: id(193), data: { kind: GAME_EFFECT_KIND.MINE, x: 0.5, y: 0.5, velocityX: 0, velocityY: 0 } },
+        { id: id(194), data: { kind: GAME_EFFECT_KIND.SPRAY, x: 0.75, y: 0.5, velocityX: 0, velocityY: 0 } },
+        { id: id(195), data: { kind: GAME_EFFECT_KIND.HOSTILE_BULLET, x: 0.8, y: 0.5,
+            velocityX: 0, velocityY: 0, startedAt: 0 } },
+        { id: id(196), data: { kind: GAME_EFFECT_KIND.PICKUP, x: 0.5, y: 0.5, velocityX: 0, velocityY: 0 } },
     ];
     const nuke = h.collectBlastTargets({ payloadKind: PAYLOAD_KIND.NUKE, x: 0.5, y: 0.5 }, asteroids, hazards);
     assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(nuke.asteroidTargets), { [id(190)]: 1, [id(191)]: 1 });
-    assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(nuke.hazardTargets), {});
+    assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(nuke.hazardTargets), { [id(193)]: 1, [id(194)]: 1 });
     const smart = h.collectBlastTargets({ payloadKind: PAYLOAD_KIND.SMART_BOMB, x: 0.5, y: 0.5 }, asteroids, hazards);
     assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(smart.asteroidTargets),
         { [id(190)]: 1, [id(191)]: 1, [id(192)]: 1 });
@@ -740,7 +752,7 @@ function damageHarness(options = {}) {
             'applyOwnedAsteroidDamage', 'applySoloAsteroidDamage', 'awardSoloAsteroidScore',
             'splitAsteroid', 'replaceSyncedAsteroid', 'computeDeflectionImpulse',
             'retireConfirmedPendingBullets', 'deleteSyncedBullet', 'syncLocalAstervoids',
-            'handleShipHit', 'syncLocalShipHazards', 'getShipByMemberId',
+            'handleShipHit', 'syncLocalShipHazards', 'syncLocalShipBoosts', 'getShipByMemberId',
             ...(options.extraNames ?? []),
         ],
         globals: {
@@ -955,6 +967,7 @@ function contactHarness(options = {}) {
             'buildGameContactClaim', 'createGameContactClaim',
             'isGameContactClaimEligible', 'chooseGameContactClaim', 'buildActivationReceipt',
             'replaceGameEffect', 'applyHazardReceipt', 'isHazardReceiptHandled',
+            'applyBoostReceipt', 'isBoostReceiptHandled', 'isTimedBoostPayload',
             'applyOwnedBlastCommand', 'isBlastCommandComplete', 'getProcessedGameEffects',
             'activateSoloPickup', 'checkGameEffectContacts', 'cleanupGameContactClaims', 'updateGameEffects',
             ...(options.extraNames ?? []),
@@ -997,6 +1010,7 @@ function contactClaim(h, record, {
             type: OBJECT_TYPES.GAME_CLAIM, targetId: record.id,
             shipId: ship, participantId: participant, participantTag: 'Pilot_1',
             x, y, angle: h.game.ship.angle, claimedAt: at, invulnerabilityRevision: revision,
+            shipLifeId: AstervoidsWireCodec.unpackBoostState(h.objectSync.getObject(ship).data.boostState).lifeId,
         } };
 }
 
@@ -1102,7 +1116,7 @@ test('owned multiplayer blasts retry armor acknowledgements and reward only dura
         assert.equal(h.objectSync.getObject(first.syncObjectId), undefined);
         assert.equal(!!h.objectSync.getObject(second.syncObjectId), !nuke);
         assert.equal(h.objectSync.getObject(outside.syncObjectId).data.hitsRemaining, nuke ? 3 : 2);
-        for (const hazard of hazards) assert.equal(!!h.objectSync.getObject(hazard.id), nuke);
+        for (const hazard of hazards) assert.equal(!!h.objectSync.getObject(hazard.id), false);
         const children = h.objectSync.getObjectsByType(OBJECT_TYPES.ASTEROID)
             .filter(record => ![second.syncObjectId, outside.syncObjectId].includes(record.id));
         assert.ok(children.length >= 2);
@@ -1168,11 +1182,11 @@ test('blast and hazard receipts wait for authoritative target removal, never pen
     assert.equal(h.isHazardReceiptHandled(data, command.id), true);
 });
 
-test('mine waits exactly one second, expires at eight total seconds, and consumes one normal ship hit', () => {
+test('mine waits exactly 1.5 seconds, expires at eight total seconds, and consumes one normal ship hit', () => {
     const h = contactHarness();
     h.game.simulationTimeMs = 1000;
     const mine = timedEffect(h, { kind: GAME_EFFECT_KIND.MINE, payload: PAYLOAD_KIND.MINE });
-    h.updateGameEffects(59.94);
+    h.updateGameEffects(89.94);
     h.checkGameEffectContacts();
     assert.equal(h.game.ship.hitCount, 0);
     assert.equal(h.game.effects.includes(mine), true);
@@ -1193,47 +1207,47 @@ test('mine waits exactly one second, expires at eight total seconds, and consume
     assert.equal(expired.game.ship.hitCount, 0);
 });
 
-test('the actual effect updater telegraphs spray for 0.8 seconds and never grants a hidden owner a fresh lifespan', () => {
+test('the actual effect updater telegraphs spray for 1.2 seconds and never grants a hidden owner a fresh lifespan', () => {
     const h = contactHarness();
     h.game.simulationTimeMs = 1000;
     timedEffect(h, { kind: GAME_EFFECT_KIND.SPRAY, payload: PAYLOAD_KIND.SPRAY, x: 0.9, y: 0.9 });
-    h.updateGameEffects(47.94);
+    h.updateGameEffects(71.94);
     assert.equal(h.game.effects.length, 1);
     assert.equal(h.game.effects[0].data.kind, GAME_EFFECT_KIND.SPRAY);
     h.updateGameEffects(0.06);
-    assert.equal(h.game.effects.length, 12);
+    assert.equal(h.game.effects.length, 8);
     assert.ok(h.game.effects.every(effect => effect.data.kind === GAME_EFFECT_KIND.HOSTILE_BULLET
-        && effect.data.startedAt === 1800 && effect.data.expiresAt === 3800));
+        && effect.data.startedAt === 2200 && effect.data.expiresAt === 4200));
     h.updateGameEffects(120);
     assert.equal(h.game.effects.length, 0);
     const late = contactHarness();
     late.game.simulationTimeMs = 1000;
     timedEffect(late, { kind: GAME_EFFECT_KIND.SPRAY, payload: PAYLOAD_KIND.SPRAY });
-    late.updateGameEffects(180);
+    late.updateGameEffects(240);
     assert.equal(late.game.effects.length, 0, 'already expired spray is cleaned up, not relaunched');
     assert.equal(late.game.soloXp, 0);
 });
 
-test('multiplayer spray atomically launches one twelve-bullet burst and migration cannot restart its persisted deadlines', async () => {
+test('multiplayer spray atomically launches one eight-bullet burst and migration cannot restart its persisted deadlines', async () => {
     const h = contactHarness({ session: true });
     const spray = timedEffect(h, {
         number: 410, kind: GAME_EFFECT_KIND.SPRAY, payload: PAYLOAD_KIND.SPRAY, x: 0.9, y: 0.9,
     });
-    h.clock.server = 1800;
+    h.clock.server = 2200;
     h.updateGameEffects(0);
     h.updateGameEffects(0);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.objectSync.getObject(spray.id), undefined);
     assert.equal(h.network.calls.filter(call => call.method === 'replace').length, 1);
     const bullets = h.objectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT);
-    assert.equal(bullets.length, 12);
+    assert.equal(bullets.length, 8);
     for (const bullet of bullets) {
         assert.equal(bullet.scope, 'Session');
         assert.equal(bullet.ownerMemberId, memberA);
         assert.equal(bullet.data.kind, GAME_EFFECT_KIND.HOSTILE_BULLET);
-        assert.equal(bullet.data.startedAt, 1800);
-        assert.equal(bullet.data.armedAt, 1800);
-        assert.equal(bullet.data.expiresAt, 3800);
+        assert.equal(bullet.data.startedAt, 2200);
+        assert.equal(bullet.data.armedAt, 2200);
+        assert.equal(bullet.data.expiresAt, 4200);
         approx(Math.hypot(bullet.data.velocityX, bullet.data.velocityY), h.config.BULLET_SPEED * 0.4, 1e-7);
     }
     const migrated = [...h.network.server.values()].map(record => ({
@@ -1247,7 +1261,7 @@ test('multiplayer spray atomically launches one twelve-bullet burst and migratio
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.objectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT).length, 0,
         'the new owner expires the original burst rather than granting two more seconds');
-    assert.equal(h.network.calls.filter(call => call.method === 'replace').length, 12);
+    assert.equal(h.network.calls.filter(call => call.method === 'replace').length, 8);
     assert.equal(h.network.calls.filter(call => call.method === 'create').length, 0);
     assert.equal(h.game.soloXp, 0);
 });
@@ -1319,7 +1333,7 @@ test('owner contact validation checks GUID attribution, member ownership, actual
         { ownerMemberId: memberB }, { data: { participantId: participantB } },
         { data: { participantId: 'not-a-guid' } }, { data: { shipId: shipB } },
         { data: { targetId: id(399) } }, { data: { claimedAt: NaN } },
-        { data: { claimedAt: 1999 } }, { data: { claimedAt: 9000 } },
+        { data: { claimedAt: 2499 } }, { data: { claimedAt: 9000 } },
         { data: { claimedAt: 2500 + PROGRESSION.CLAIM_CLOCK_TOLERANCE_MS + 1 } },
         { data: { invulnerabilityRevision: 6 } }, { data: { x: 0.9, y: 0.9 } },
     ]) {
@@ -1395,7 +1409,8 @@ test('hazard receipts respect invulnerability and respawn revisions, persist onc
         if (blocked === 'death hold') h.game.ship.deathHold = {};
         const hazardId = id(317);
         const data = h.createGameEffectData(GAME_EFFECT_KIND.ACTIVATION_RECEIPT, PAYLOAD_KIND.MINE,
-            hazardId, { claimId: id(318), participantId: participantA, shipId: shipA });
+            hazardId, { claimId: id(318), participantId: participantA, shipId: shipA,
+                shipLifeId: h.game.ship.boostState.lifeId });
         data.damageReceipts = AstervoidsWireCodec.packCounterMap({ [id(318)]: 0 });
         const record = { id: id(319), data };
         h.applyHazardReceipt(record, blocked === 'terminal maintenance');
@@ -1474,6 +1489,7 @@ test('multiplayer terminal maintenance performs expiry only, never pickup activa
         scope: 'Session', schemaId: 4, version: 1, data: {
             type: OBJECT_TYPES.GAME_STATE, lives: 0, groupScore: 0,
             participantXp: xp, participantScores: new Uint8Array(), processedEffects: new Uint8Array(),
+            participantModifiers: new Uint8Array(),
         },
     }]);
     const pickup = timedEffect(h, { number: 330, payload: PAYLOAD_KIND.SMART_BOMB });
@@ -1516,9 +1532,11 @@ function hudHarness() {
     }
     const elements = Object.fromEntries([
         'xpHud', 'xpLevel', 'xpFraction', 'xpBar', 'xpFill', 'levelAnnouncement',
+        'levelBanner', 'boostStatus', 'modifierCurrent', 'modifierChoice', 'modifierTitle',
+        'modifierFocus', 'modifierSweep',
     ].map(name => [name, element(name)]));
     const h = baseHarness({
-        extraNames: ['getLocalProgression', 'updateProgressionHud'],
+        extraNames: ['getLocalProgression', 'updateProgressionHud', 'updateProgressionControls', 'requestModifierChoice'],
         globals: { ...elements, hudCache: {}, fitProgressionHud: () => writes.push(['fit']) },
     });
     return { ...h, ...elements, writes };
@@ -1676,7 +1694,7 @@ test('a rejected pre-respawn mine claim releases accepted and pending entries fo
             owner: memberB, x: 0.5, y: 0.5,
         });
         assert.equal(mine.data.expiresAt, 9000);
-        h.clock.server = 2100;
+        h.clock.server = 2600;
         h.updateGameEffects(0);
         h.checkGameEffectContacts();
         h.checkGameEffectContacts();
@@ -1701,8 +1719,8 @@ test('a rejected pre-respawn mine claim releases accepted and pending entries fo
         assert.equal(h.objectSync.getObjectsByType(OBJECT_TYPES.GAME_EFFECT).length, 1);
         assert.equal(h.game.ship.hitCount, 1);
 
-        h.clock.server = 5200;
-        h.game.ship.update((5200 - 2100) * h.config.TARGET_FPS / 1000);
+        h.clock.server = 5700;
+        h.game.ship.update((5700 - 2600) * h.config.TARGET_FPS / 1000);
         assert.equal(h.game.ship.invulnerable, 0);
         assert.equal(h.game.ship.invulnerabilityRevision, 2);
         h.game.ship.x = 0.9;
@@ -1724,7 +1742,7 @@ test('a rejected pre-respawn mine claim releases accepted and pending entries fo
         assert.notEqual(currentClaim.id, oldClaim.id);
         assert.equal(h.objectSync.getObject(oldClaim.id), undefined);
         assert.equal(currentClaim.data.invulnerabilityRevision, 2);
-        assert.equal(currentClaim.data.claimedAt, 5200);
+        assert.equal(currentClaim.data.claimedAt, 5700);
         assert.ok(currentClaim.data.claimedAt < mine.data.expiresAt);
         assert.equal(h.game.multiplayer.contactClaims.get(mine.id).id, currentClaim.id);
         assert.equal(h.chooseGameContactClaim(mine, [oldClaim], h.clock.server), null);
@@ -1763,7 +1781,7 @@ test('a rejected pre-respawn mine claim releases accepted and pending entries fo
         assert.deepEqual(h.game.ship.handledHazards, { [mine.id]: 1 });
         assert.equal(h.game.ship.invulnerabilityRevision, 3);
         assert.equal(h.game.multiplayer.contactClaims.size, 0);
-        h.clock.server = 8500;
+        h.clock.server = 8900;
         h.game.ship.update(h.config.INVULNERABILITY_TIME);
         h.updateGameEffects(0);
         h.updateGameEffects(0);
@@ -1773,5 +1791,378 @@ test('a rejected pre-respawn mine claim releases accepted and pending entries fo
         const persisted = h.network.server.get(shipA).data;
         assert.equal(persisted.hitCount, 2);
         assert.deepEqual(AstervoidsWireCodec.unpackCounterMap(persisted.handledHazards), { [mine.id]: 1 });
+    }
+});
+
+test('cooperative awards freeze pre-receipt levels and ignore departed history and duplicate identity ships', () => {
+    const third = id(3), departedHigh = id(4);
+    const effect = receipt(600);
+    effect.data.contributors = AstervoidsWireCodec.packContributors({
+        [participantB]: 1, [third]: 2, [participantA]: 3,
+    });
+    const ledgers = fullLedgers({
+        participantXp: { [participantA]: 190, [participantB]: 60, [third]: 19, [departedHigh]: 1560 },
+    });
+    const ships = [
+        { id: shipA, ownerMemberId: memberA, data: {
+            participantId: participantA, memberId: memberA, score: 0, hitCount: 0,
+        } },
+        { id: shipB, ownerMemberId: memberB, data: {
+            participantId: participantA.toUpperCase(), memberId: memberB, score: 0, hitCount: 0,
+        } },
+    ];
+    const next = calculate({ ledgers, ships, activeMembers: [memberA, memberB], effects: [effect] });
+    assert.equal(next.participantXp[participantA], 200);
+    assert.equal(next.participantXp[participantB], 65,
+        'the finisher entering level five cannot retroactively turn a level-three assist into catch-up');
+    assert.equal(next.participantXp[third], 26, 'a departed contributor retains its five XP plus pre-award catch-up');
+    assert.equal(next.participantXp[departedHigh], 1560);
+    assert.equal(next.groupScore, 100);
+    assert.equal(next.participantScores[participantA], 100);
+    assert.equal(next.participantScores[participantB], 0);
+    assert.equal(next.participantScores[third], 0);
+    assert.equal(next.lives, 3);
+    assert.deepEqual(calculateAgain(next, { effects: [effect] }).participantXp, next.participantXp);
+    const nobody = calculate({ ledgers, ships, effects: [effect] });
+    assert.equal(nobody.participantXp[participantB], 65);
+    assert.equal(nobody.participantXp[third], 24, 'no current owned ships means no catch-up reference');
+});
+
+test('FOCUS keeps full fired velocity through the production wire and sparse adapter recovery', () => {
+    const SchemaCodec = require('./wwwroot/js/schema-codec.js');
+    const WireSchemas = require('./wwwroot/js/game-wire-schemas.js');
+    SchemaCodec.replaceAll(WireSchemas.SCHEMAS);
+    const h = baseHarness({ session: true });
+    const shot = h.game.ship.shoot(5, 1)[2];
+    approx(shot.velocityX, h.config.BULLET_SPEED * 1.15);
+    const wire = Object.freeze(SchemaCodec.decode(SchemaCodec.get(3),
+        SchemaCodec.encode(SchemaCodec.get(3), shot.toSyncData())));
+    assert.equal(wire.velocityX, 1, 'the old signed-quantized slot is retained, not silently retyped');
+    approx(wire.velocityXFull, Math.fround(1.15));
+    const recovered = h.Bullet.fromSyncData(wire);
+    approx(recovered.velocityX, Math.fround(1.15));
+    assert.equal(wire.velocityX, 1, 'adapter resolution never scratch-mutates borrowed canonical records');
+    recovered.fromSyncData({ x: 0.8, lifetime: 7 });
+    approx(recovered.velocityX, Math.fround(1.15));
+    assert.equal(recovered.lifetime, 7);
+    h.game.soloModifier = { consumedMilestone: 4, modifierKind: 2 };
+    approx(recovered.velocityX, Math.fround(1.15), 1e-10);
+    assert.throws(() => h.Bullet.resolveVelocityData({ velocityXFull: NaN, velocityYFull: 0 }), TypeError);
+    assert.throws(() => recovered.fromSyncData({ velocityXFull: null }), TypeError,
+        'an explicit malformed field is not an omitted sparse field');
+});
+
+test('solo shield and rapid fire coexist without healing, block hull hazards, and reset at the next actual hit', () => {
+    const h = contactHarness();
+    h.game.simulationTimeMs = 1500;
+    h.game.effectContactNowMs = 1500;
+    const lifeId = h.game.ship.boostState.lifeId;
+    for (const payload of [PAYLOAD_KIND.SHIELD, PAYLOAD_KIND.RAPID_FIRE]) timedEffect(h, { number: 610 + payload, payload });
+    h.checkGameEffectContacts();
+    assert.equal(h.game.ship.boostState.shieldUntil, 7500);
+    assert.equal(h.game.ship.boostState.rapidFireUntil, 7500);
+    assert.equal(h.game.lives, 3);
+    assert.equal(h.game.soloXp, 0);
+    const volley = h.game.ship.shoot(4);
+    assert.equal(volley.length, 4);
+    assert.equal(h.game.ship.shootCooldown, h.config.SHOOT_COOLDOWN * 0.75);
+    const cooldown = h.game.ship.shootCooldown;
+    h.game.state = 'paused';
+    h.clock.server = 50_000;
+    assert.equal(h.getGameEffectNow(), 1500);
+    assert.equal(h.game.ship.shootCooldown, cooldown);
+    h.game.state = 'playing';
+    const mine = timedEffect(h, { number: 620, kind: GAME_EFFECT_KIND.MINE, payload: PAYLOAD_KIND.MINE });
+    h.game.simulationTimeMs = h.game.effectContactNowMs = 2600;
+    h.checkGameEffectContacts();
+    assert.equal(h.game.ship.hitCount, 0);
+    assert.ok(h.game.effects.includes(mine));
+    h.game.simulationTimeMs = h.game.effectContactNowMs = 8000;
+    assert.equal(h.game.ship.boostState.shieldUntil, 7500, 'expiry preserves the numeric idempotency deadline');
+    h.checkGameEffectContacts();
+    assert.equal(h.game.ship.hitCount, 1);
+    assert.equal(h.game.lives, 2);
+    assert.notEqual(h.game.ship.boostState.lifeId, lifeId);
+    assert.equal(h.game.ship.boostState.shieldUntil, 0);
+    assert.equal(h.game.ship.boostState.rapidFireUntil, 0);
+});
+
+test('boost receipts require GameState authorization and confirmed ship deadlines, retry motion, and never refresh by replay', async () => {
+    const h = contactHarness({ session: true });
+    seedShip(h);
+    const data = h.anchorGameEffectData(h.createGameEffectData(
+        GAME_EFFECT_KIND.ACTIVATION_RECEIPT, PAYLOAD_KIND.SHIELD, id(630), {
+            participantId: participantA, shipId: shipA, shipLifeId: h.game.ship.boostState.lifeId,
+        }), 1000);
+    const record = { id: id(631), data, ownerMemberId: memberA, creatorMemberId: memberA,
+        scope: 'Session', version: 1, schemaId: 5, validAt: 1000 };
+    h.network.seed([record]);
+    h.clock.server = 1500;
+    h.updateGameEffects(0);
+    assert.equal(h.game.ship.boostState.shieldUntil, 0, 'a durable activation alone is not live accounting authority');
+    h.network.seed([{
+        id: id(31), ownerMemberId: memberA, creatorMemberId: memberA, scope: 'Session',
+        version: 1, schemaId: 4, data: {
+            type: OBJECT_TYPES.GAME_STATE, lives: 3, groupScore: 0,
+            participantXp: AstervoidsWireCodec.packXpMap({ [participantA]: 0 }),
+            participantScores: AstervoidsWireCodec.packCounterMap({ [participantA]: 0 }),
+            participantModifiers: AstervoidsWireCodec.packParticipantModifiers({}),
+            processedEffects: AstervoidsWireCodec.packCounterMap({ [record.id]: 1 }),
+        },
+    }]);
+    h.network.transport.acknowledge = false;
+    h.updateGameEffects(0);
+    await h.objectSync.flushUpdates();
+    assert.equal(h.game.ship.boostState.shieldUntil, 7000);
+    assert.equal(h.isBoostReceiptHandled(data, record.id, 1), false);
+    assert.ok(h.objectSync.getObject(record.id));
+    h.game.ship.x = 0.67;
+    h.clock.server = 9000;
+    h.updateGameEffects(0);
+    await h.objectSync.flushUpdates();
+    assert.equal(h.game.ship.boostState.shieldUntil, 7000, 'replay after expiry cannot move the accepted deadline');
+    assert.equal(h.game.ship.isShielded(), false);
+    assert.ok(h.objectSync.getObject(record.id), 'unconfirmed optimistic ship state cannot retire the receipt');
+    h.network.transport.acknowledge = true;
+    h.syncLocalShipBoosts();
+    await h.objectSync.flushUpdates();
+    assert.equal(h.isBoostReceiptHandled(data, record.id, 1), true);
+    approx(h.network.server.get(shipA).data.x, 0.67, 1 / 32767);
+    assert.equal(AstervoidsWireCodec.unpackBoostState(h.network.server.get(shipA).data.boostState).shieldUntil, 7000);
+    h.updateGameEffects(0);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.objectSync.getObject(record.id), undefined);
+    assert.deepEqual(h.game.ship.handledHazards, {}, 'boosts do not add a per-receipt handled-hazard ledger');
+});
+
+test('native progression controls keep persistent choices and integer-only non-live boost countdown text', () => {
+    const h = hudHarness();
+    h.game.ship.boostState.shieldUntil = h.game.ship.boostState.rapidFireUntil = 6000;
+    h.updateProgressionHud();
+    assert.equal(h.boostStatus.textContent, 'Shield 6s · Rapid fire 6s');
+    const unchanged = h.writes.length;
+    h.game.simulationTimeMs = 100;
+    h.updateProgressionHud();
+    assert.equal(h.writes.length, unchanged);
+    h.game.simulationTimeMs = 1000;
+    h.updateProgressionHud();
+    assert.deepEqual(h.writes.slice(unchanged), [['boostStatus', 'text', 'Shield 5s · Rapid fire 5s']]);
+    h.game.soloXp = progression.getLevelXpThreshold(4);
+    h.updateProgressionHud();
+    assert.equal(h.modifierChoice.hidden, false);
+    assert.equal(h.requestModifierChoice(1), true);
+    assert.equal(h.modifierChoice.hidden, true);
+    assert.equal(h.game.soloModifier.modifierKind, 1);
+    h.game.simulationTimeMs = 100_000;
+    h.updateProgressionHud();
+    assert.equal(h.game.soloModifier.modifierKind, 1, 'choices have no time expiry');
+    h.game.soloXp = progression.getLevelXpThreshold(12);
+    h.updateProgressionHud();
+    assert.equal(h.modifierChoice.hidden, false);
+    assert.match(h.modifierTitle.textContent, /Level 12/);
+    assert.equal(h.requestModifierChoice(2), true);
+    assert.deepEqual(h.game.soloModifier, { consumedMilestone: 12, modifierKind: 2 });
+    assert.equal(h.requestModifierChoice(1), false, 'one choice consumes that milestone');
+});
+
+test('metadata-only ownership changes cannot authorize an old owner optimistic choice or receipt', () => {
+    const h = baseHarness({
+        session: true,
+        extraNames: ['getSessionModifierLedger', 'getProcessedGameEffects', 'readGameStateLedger',
+            'gameStateLedgerMatches', 'gameStateCounterMapsEqual', 'normalizeParticipantLedger'],
+        globals: { sessionModifierViewCache: null, reportMalformedGameStateLedgers: assert.fail },
+    });
+    const accepted = AstervoidsWireCodec.packParticipantModifiers({
+        [participantA]: { consumedMilestone: 4, modifierKind: 1 },
+    });
+    const record = {
+        id: id(31), ownerMemberId: memberA, version: 1,
+        data: {
+            type: OBJECT_TYPES.GAME_STATE, participantModifiers: accepted,
+            processedEffects: AstervoidsWireCodec.packCounterMap({}), lives: 3, groupScore: 0,
+        },
+    };
+    h.objects.set(record.id, record);
+    h.objectSync.getSnapshotObject = () => ({ ...record, data: { ...record.data, participantModifiers: accepted } });
+    assert.equal(h.getLocalModifier(), 1);
+    record.data = {
+        ...record.data,
+        participantModifiers: AstervoidsWireCodec.packParticipantModifiers({
+            [participantA]: { consumedMilestone: 8, modifierKind: 2 },
+        }),
+        processedEffects: AstervoidsWireCodec.packCounterMap({ [id(670)]: 1 }),
+    };
+    assert.equal(h.getLocalModifier(), 1, 'an optimistic own GameState is not an accepted modifier');
+    assert.equal(h.getProcessedGameEffects(), null);
+    record.ownerMemberId = memberB;
+    record.ownershipMigrationPending = true;
+    assert.equal(h.getLocalModifier(), 1, 'ownership metadata does not make the old optimistic choice authoritative');
+    assert.equal(h.getProcessedGameEffects(), null);
+    record.data.participantModifiers = AstervoidsWireCodec.packParticipantModifiers({
+        [participantA]: { consumedMilestone: 8, modifierKind: 1 },
+    });
+    record.ownershipMigrationPending = false;
+    assert.equal(h.getLocalModifier(), 1);
+    assert.deepEqual(h.getSessionModifierLedger()[participantA], { consumedMilestone: 8, modifierKind: 1 });
+    assert.equal(h.getProcessedGameEffects()[id(670)], 1, 'a new-owner data-bearing update restores authority');
+});
+
+function choiceInputHarness() {
+    const h = hudHarness();
+    const keys = {}, activations = [], stickInput = { moveTouchId: null, fireTouchId: null };
+    function eventTarget(element = {}, parent = null) {
+        const listeners = new Map();
+        Object.assign(element, {
+            parentElement: parent,
+            classList: { contains: () => false },
+            addEventListener(type, callback) {
+                if (!listeners.has(type)) listeners.set(type, []);
+                listeners.get(type).push(callback);
+            },
+            contains(target) {
+                for (; target; target = target.parentElement) if (target === this) return true;
+                return false;
+            },
+            closest(selector) {
+                return selector === '#modifier-choice'
+                    && [h.modifierFocus, h.modifierSweep, h.modifierChoice].includes(this)
+                    ? h.modifierChoice : this.parentElement?.closest(selector) ?? null;
+            },
+            getBoundingClientRect: () => ({ left: 20, right: 155, top: 100, bottom: 164 }),
+            focus() { assert.fail('Choice activation must not steal focus'); },
+            receive(event) {
+                for (const callback of listeners.get(event.type) ?? []) callback(event);
+                if (!event.cancelBubble) parent?.receive(event);
+            },
+            dispatch(type, fields = {}) {
+                const event = {
+                    type, target: this, changedTouches: [], touches: [],
+                    defaultPrevented: false, cancelBubble: false,
+                    preventDefault() { this.defaultPrevented = true; },
+                    stopPropagation() { this.cancelBubble = true; },
+                    ...fields,
+                };
+                this.receive(event);
+                return event;
+            },
+        });
+        return element;
+    }
+    const container = eventTarget(), document = eventTarget();
+    document.getElementById = name => name === 'game-container' ? container : null;
+    eventTarget(h.modifierChoice, container);
+    eventTarget(h.modifierFocus, h.modifierChoice);
+    eventTarget(h.modifierSweep, h.modifierChoice);
+    const label = eventTarget({}, h.modifierFocus);
+    const canvas = eventTarget({}, container);
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, right: 320, bottom: 568, width: 320, height: 568 });
+    const globals = {
+        game: h.game, stickInput, canvas, document, gameContainer: container, keys,
+        modifierFocus: h.modifierFocus, modifierSweep: h.modifierSweep, modifierChoice: h.modifierChoice,
+        requestModifierChoice(kind) { activations.push(kind); return h.requestModifierChoice(kind); },
+        startScreen: { classList: { contains: () => true } }, leaderboardScreen: { hidden: true },
+        isPersonalScoreScrollTarget: () => false, isAnalogControlSchemeEnabled: () => true,
+        AudioSystem: { init() {}, resume() {} }, enableTouchControls() {},
+    };
+    Object.assign(globals, loadInlineGameFunctions([
+        'isMenuScrollTarget', 'isStickTouchTarget', 'isPointWithinRect', 'classifyTouchSide',
+        'beginMoveAnchor', 'updateMoveAnchor', 'endMoveAnchor', 'beginFireInput', 'endFireInput',
+    ], globals));
+    const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+    function install(start, end) {
+        const first = source.indexOf(start), last = source.indexOf(end, first);
+        assert.ok(first >= 0 && last > first, 'Production input registration markers must remain present');
+        compileFunction(source.slice(first, last), Object.keys(globals))(...Object.values(globals));
+    }
+    install('    // Track key presses', '    // Prevent focus loss from affecting input');
+    install("    document.getElementById('game-container').addEventListener('touchstart'",
+        '    // ─── Anchor-based analog schemes');
+    install("        gameContainer.addEventListener('touchstart'", '        // Mouse movement control:');
+    h.game.soloXp = progression.getLevelXpThreshold(4);
+    h.updateProgressionHud();
+    const move = { identifier: 1, clientX: 64, clientY: 426, target: canvas };
+    const choice = { identifier: 2, clientX: 85, clientY: 130, target: label };
+    return { ...h, container, document, canvas, label, move, choice, stickInput, keys, activations };
+}
+
+test('a second-thumb choice releases through real input handlers while movement remains held and never needs a click', () => {
+    const h = choiceInputHarness();
+    h.canvas.dispatch('touchstart', { changedTouches: [h.move], touches: [h.move] });
+    h.move.clientY -= 12;
+    h.canvas.dispatch('touchmove', { changedTouches: [h.move], touches: [h.move] });
+    h.label.dispatch('touchstart', { changedTouches: [h.choice], touches: [h.move, h.choice] });
+    assert.equal(h.game.soloModifier, null, 'Touch down must not choose before release');
+    const release = h.label.dispatch('touchend', { changedTouches: [h.choice], touches: [h.move] });
+    assert.deepEqual(h.game.soloModifier, { consumedMilestone: 4, modifierKind: 1 });
+    assert.equal(release.defaultPrevented, true);
+    assert.equal(release.cancelBubble, false, 'Touch end must still reach other gameplay touch bookkeeping');
+    assert.equal(h.stickInput.moveTouchId, 1);
+    assert.equal(h.stickInput.moveCurrentY, 414);
+    assert.equal(h.stickInput.fireTouchId, null);
+    assert.equal(h.keys.Space, undefined);
+    assert.deepEqual(h.activations, [1]);
+    h.game.soloXp = progression.getLevelXpThreshold(8);
+    h.updateProgressionHud();
+    for (const fields of [{ pointerType: 'touch' }, { sourceCapabilities: { firesTouchEvents: true } }]) {
+        const click = h.label.dispatch('click', { detail: 1, ...fields });
+        assert.equal(click.defaultPrevented, true, 'A compatibility click must not consume a later milestone');
+    }
+    assert.deepEqual(h.activations, [1]);
+    assert.equal(h.game.soloModifier.consumedMilestone, 4);
+    h.canvas.dispatch('touchend', { changedTouches: [h.move], touches: [] });
+    assert.equal(h.stickInput.moveTouchId, null, 'The original thumb can still release normally');
+});
+
+test('choice touches honor cancellation, release bounds, disabled state and independent touch identifiers', () => {
+    for (const reason of ['cancel', 'outside', 'disabled', 'hidden']) {
+        const h = choiceInputHarness();
+        h.canvas.dispatch('touchstart', { changedTouches: [h.move], touches: [h.move] });
+        h.label.dispatch('touchstart', { changedTouches: [h.choice], touches: [h.move, h.choice] });
+        if (reason === 'cancel') h.label.dispatch('touchcancel', { changedTouches: [h.choice], touches: [h.move] });
+        if (reason === 'outside') h.choice.clientX = 156;
+        if (reason === 'disabled') h.modifierFocus.disabled = true;
+        if (reason === 'hidden') h.modifierChoice.hidden = true;
+        h.label.dispatch('touchend', { changedTouches: [h.choice], touches: [h.move] });
+        assert.equal(h.game.soloModifier, null, reason);
+        assert.deepEqual(h.activations, [], reason);
+        assert.equal(h.stickInput.moveTouchId, 1, reason);
+        assert.equal(h.stickInput.fireTouchId, null, reason);
+    }
+    const h = choiceInputHarness();
+    h.canvas.dispatch('touchstart', { changedTouches: [h.move], touches: [h.move] });
+    h.label.dispatch('touchstart', { changedTouches: [h.choice], touches: [h.move, h.choice] });
+    h.canvas.dispatch('touchend', { changedTouches: [h.move], touches: [h.choice] });
+    assert.equal(h.game.soloModifier, null, 'An unrelated thumb ending cannot choose');
+    h.label.dispatch('touchend', { changedTouches: [h.choice], touches: [] });
+    assert.equal(h.game.soloModifier.modifierKind, 1);
+    assert.deepEqual(h.activations, [1]);
+});
+
+test('choice controls retain native keyboard and mouse clicks and consume numeric shortcuts without firing', () => {
+    for (const code of ['Tab', 'Enter', 'Space']) {
+        const h = choiceInputHarness();
+        const event = h.document.dispatch('keydown', { code, target: h.modifierSweep });
+        assert.equal(event.defaultPrevented, false, code);
+        assert.equal(h.keys.Space, undefined, 'Native button keys must not become gameplay fire');
+        assert.deepEqual(h.activations, []);
+        h.modifierSweep.dispatch('click', { detail: 0 });
+        assert.equal(h.game.soloModifier.modifierKind, 2);
+        assert.deepEqual(h.activations, [2]);
+    }
+    const mouse = choiceInputHarness();
+    const click = mouse.modifierFocus.dispatch('click', { detail: 1, pointerType: 'mouse' });
+    assert.equal(click.cancelBubble, true);
+    assert.deepEqual(mouse.activations, [1]);
+    for (const code of ['Digit1', 'Digit2', 'Numpad1', 'Numpad2']) {
+        const h = choiceInputHarness();
+        const event = h.document.dispatch('keydown', { code, target: h.canvas });
+        assert.equal(event.defaultPrevented, true);
+        assert.equal(h.game.soloModifier.modifierKind, code.endsWith('1') ? 1 : 2);
+        assert.equal(h.keys.Space, undefined);
+        h.game.soloXp = progression.getLevelXpThreshold(8);
+        h.updateProgressionHud();
+        h.document.dispatch('keydown', { code, repeat: true, target: h.canvas });
+        assert.equal(h.game.soloModifier.consumedMilestone, 4, 'A held shortcut cannot choose again');
+        assert.equal(h.activations.length, 1);
     }
 });

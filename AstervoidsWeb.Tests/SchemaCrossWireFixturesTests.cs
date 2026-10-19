@@ -37,7 +37,8 @@ public class SchemaCrossWireFixturesTests
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
         ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"),
-        ("participantId", "guid"), ("participantTag", "str"), ("handledHazards", "bytes"));
+        ("participantId", "guid"), ("participantTag", "str"), ("handledHazards", "bytes"),
+        ("boostState", "bytes"), ("modifierRequestMilestone", "u32"), ("modifierRequestKind", "u8"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
@@ -46,7 +47,8 @@ public class SchemaCrossWireFixturesTests
         ("seed", "f64"), ("vertices", "bytes"),
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
-        ("maxHits", "u8"), ("hitsRemaining", "u8"), ("payloadKind", "u8"), ("processedDamage", "bytes"));
+        ("maxHits", "u8"), ("hitsRemaining", "u8"), ("payloadKind", "u8"), ("processedDamage", "bytes"),
+        ("contributors", "bytes"));
 
     private static PositionalSchemaCodec.Schema BulletSchema() => Schema(3,
         ("type", "str"),
@@ -57,7 +59,8 @@ public class SchemaCrossWireFixturesTests
         ("hitImpactTorque", "q16s"), ("hitBulletAngle", "q16_2pi"),
         ("hitOffsetN", "q16s"), ("terminalEpoch", "f64"),
         ("terminalX", "f64"), ("terminalY", "f64"),
-        ("damageId", "guid"), ("participantId", "guid"), ("shipId", "nullable-guid"), ("participantTag", "str"));
+        ("damageId", "guid"), ("participantId", "guid"), ("shipId", "nullable-guid"), ("participantTag", "str"),
+        ("velocityXFull", "f32"), ("velocityYFull", "f32"));
 
     [Fact]
     public void Fixture_AsteroidUpdate_AllFields()
@@ -245,7 +248,7 @@ public class SchemaCrossWireFixturesTests
             "03000000" + "00000000" +
             "33221100554477668899aabbccddeeff";
 
-        GameStateSchemaFixture.Current.Fields.Should().HaveCount(21);
+        GameStateSchemaFixture.Current.Fields.Should().HaveCount(22);
         GameStateSchemaFixture.Current.BitmaskBytes.Should().Be(3);
         GameStateSchemaFixture.Current.Fields[16].Should().Be(
             new PositionalSchemaCodec.FieldSpec("participantScores", "bytes"));
@@ -306,6 +309,7 @@ public class SchemaCrossWireFixturesTests
     [InlineData("participantTags", "00000400000000")]
     [InlineData("participantXp", "00000800000000")]
     [InlineData("processedEffects", "00001000000000")]
+    [InlineData("participantModifiers", "00002000000000")]
     public void Fixture_GameState_PersonalMapSlots_AreIndependentlyOptional(string field, string hex)
     {
         var encoded = PositionalSchemaCodec.Encode(GameStateSchemaFixture.Current,
@@ -484,5 +488,81 @@ public class SchemaCrossWireFixturesTests
         var decoded = PositionalSchemaCodec.Decode(RewardHazardSchemaFixture.Claim, encoded);
         decoded["claimedAt"].Should().Be(1000d);
         Convert.ToUInt32(decoded["invulnerabilityRevision"]).Should().Be(uint.MaxValue);
+    }
+
+    [Fact]
+    public void Fixture_Ship32ndSlot_PreservesUnsignedHighBitWithoutExpandingTheMask()
+    {
+        var schema = ShipSchema();
+        schema.Fields.Should().HaveCount(32);
+        schema.BitmaskBytes.Should().Be(4);
+        var data = new Dictionary<string, object?> { ["modifierRequestKind"] = 2 };
+        var encoded = PositionalSchemaCodec.Encode(schema, data);
+        Hex(encoded).Should().Be("0000008002");
+        Convert.ToInt32(PositionalSchemaCodec.Decode(schema, encoded)["modifierRequestKind"]).Should().Be(2);
+
+        data["boostState"] = Convert.FromHexString(RewardHazardSchemaFixture.BoostState);
+        data["modifierRequestMilestone"] = 8u;
+        encoded = PositionalSchemaCodec.Encode(schema, data);
+        Hex(encoded).Should().Be("000000e020000000" + RewardHazardSchemaFixture.BoostState + "0800000002");
+        var decoded = PositionalSchemaCodec.Decode(schema, encoded);
+        decoded["boostState"].Should().BeOfType<byte[]>().Which.Should()
+            .Equal(Convert.FromHexString(RewardHazardSchemaFixture.BoostState));
+        PositionalSchemaCodec.Encode(schema, decoded).Should().Equal(encoded);
+    }
+
+    [Fact]
+    public void Fixture_RiskRewardSlots_AppendWithoutChangingPriorSparsePayloads()
+    {
+        var life = "00112233-4455-6677-8899-aabbccddeeff";
+        var contributor = Convert.FromHexString(RewardHazardSchemaFixture.ContributorEntry);
+        var cases = new[]
+        {
+            (AsteroidSchema(), new Dictionary<string, object?> { ["contributors"] = contributor },
+                "00000414000000" + RewardHazardSchemaFixture.ContributorEntry),
+            (GameStateSchemaFixture.Current, new Dictionary<string, object?>
+            {
+                ["participantModifiers"] = Convert.FromHexString(RewardHazardSchemaFixture.ModifierEntry)
+            }, "00002015000000" + RewardHazardSchemaFixture.ModifierEntry),
+            (RewardHazardSchemaFixture.Effect, new Dictionary<string, object?>
+            {
+                ["contributors"] = contributor, ["shipLifeId"] = life
+            }, "00003014000000" + RewardHazardSchemaFixture.ContributorEntry
+                + "01" + "33221100554477668899aabbccddeeff"),
+            (RewardHazardSchemaFixture.Effect, new Dictionary<string, object?>
+            {
+                ["contributors"] = Array.Empty<byte>(), ["shipLifeId"] = null
+            }, "0000300000000000"),
+            (RewardHazardSchemaFixture.Claim, new Dictionary<string, object?> { ["shipLifeId"] = life },
+                "0004" + "33221100554477668899aabbccddeeff"),
+        };
+        foreach (var (schema, data, hex) in cases)
+        {
+            var encoded = PositionalSchemaCodec.Encode(schema, data);
+            Hex(encoded).Should().Be(hex);
+            var decoded = PositionalSchemaCodec.Decode(schema, encoded);
+            decoded.Should().BeEquivalentTo(data);
+            PositionalSchemaCodec.Encode(schema, decoded).Should().Equal(encoded);
+        }
+    }
+
+    [Theory]
+    [InlineData(1.15, 0, "3333933f00000000")]
+    [InlineData(0, -1.15, "00000000333393bf")]
+    public void Fixture_FocusBulletFullVelocity_RetainsValuesBeyondLegacySignedUnitSlots(
+        double x, double y, string body)
+    {
+        var schema = BulletSchema();
+        schema.Fields.Should().HaveCount(22);
+        schema.BitmaskBytes.Should().Be(3);
+        var encoded = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
+        {
+            ["velocityXFull"] = x, ["velocityYFull"] = y
+        });
+        Hex(encoded).Should().Be("000030" + body);
+        var decoded = PositionalSchemaCodec.Decode(schema, encoded);
+        Convert.ToDouble(decoded["velocityXFull"]).Should().BeApproximately(x, 1e-6);
+        Convert.ToDouble(decoded["velocityYFull"]).Should().BeApproximately(y, 1e-6);
+        PositionalSchemaCodec.Encode(schema, decoded).Should().Equal(encoded);
     }
 }

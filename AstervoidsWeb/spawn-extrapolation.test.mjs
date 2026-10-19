@@ -54,10 +54,11 @@ const {
     wrapMarginX,
     wrapMarginY,
 } = loadInlineGameFunctions(
-    ['computeSpawnStaleness', 'projectSpawnData', 'wrapNormalized',
+    ['Bullet', 'computeSpawnStaleness', 'projectSpawnData', 'wrapNormalized',
         'wrapMarginX', 'wrapMarginY'],
     {
         CONFIG,
+        OBJECT_TYPES: { SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
         getGameWidth: () => 1000,
         getGameHeight: () => 1000,
         getReferenceDimension: () => 1000,
