@@ -62,6 +62,7 @@ function harness({ session = false, lives = 3, fatal = false } = {}) {
         OBJECT_TYPES: { ASTEROID: 'asteroid', BULLET: 'bullet', SHIP: 'ship' },
         SessionClient: { getCurrentMember: () => ({ id: ME }) },
         isSessionMode: () => session,
+        resetStickInput() {},
         ObjectSync: {
             getObject: id => objects.get(id),
             getObjectsByType: type => [...objects.values()].filter(obj => obj.type === type),

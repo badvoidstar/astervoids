@@ -29,6 +29,8 @@ const AstervoidsConfig = (function() {
         SHIP_KEYBOARD_TURN_SPEED: 0.125,
         SHIP_ANALOG_TURN_SPEED: 0.3,
         SHIP_MAX_SPEED: 1.0,
+        SHIP_SHIELD_DRAIN_SECONDS: 2,
+        SHIP_SHIELD_RECHARGE_SECONDS: 10,
         ANALOG_RECTILINEAR_TURN_DEADZONE_PX: 16,
         ANALOG_RECTILINEAR_THRUST_DEADZONE_PX: 16,
         ANALOG_POLAR_DEADZONE_PX: 16,
@@ -60,6 +62,11 @@ const AstervoidsConfig = (function() {
         MAX_EXTRAPOLATION: 2.0,
     });
 
+    const SHIELD_CONFIG_KEYS = Object.freeze([
+        'SHIP_SHIELD_DRAIN_SECONDS',
+        'SHIP_SHIELD_RECHARGE_SECONDS',
+    ]);
+
     const SESSION_CONFIG_KEYS = Object.freeze([
         'FRACTURE_ENABLED',
         'ASTEROID_VERTICES',
@@ -70,6 +77,7 @@ const AstervoidsConfig = (function() {
         'EXTRA_LIFE_SCORE_THRESHOLD',
         'SHIP_TERMINAL_SEPARATION',
         'SHIP_TERMINAL_ROTATION',
+        ...SHIELD_CONFIG_KEYS,
     ]);
 
     const DEBUG_CONFIG_STORAGE_KEY = 'astervoids-debug-config';
@@ -242,6 +250,20 @@ const AstervoidsConfig = (function() {
             help: 'Reference-dimension-per-second cap on ship velocity. 0 disables the cap.',
         }),
         control({
+            key: 'SHIP_SHIELD_DRAIN_SECONDS',
+            label: 'Ship shield full-drain time (s)',
+            min: 0.1, max: 60, step: 0.1,
+            fmt: value => `${value.toFixed(1)} s`,
+            help: 'Seconds to drain a full charge while shielding. Partial charges last proportionally; reaching zero requires release and a fresh activation.',
+        }),
+        control({
+            key: 'SHIP_SHIELD_RECHARGE_SECONDS',
+            label: 'Ship shield full-recharge time (s)',
+            min: 0.1, max: 60, step: 0.1,
+            fmt: value => `${value.toFixed(1)} s`,
+            help: 'Seconds to refill from empty while inactive during live gameplay, including death/respawn waits. Pausing freezes recharge; every new life starts full.',
+        }),
+        control({
             key: 'ANALOG_THRUST_GAIN',
             label: 'Analog thrust-input gain',
             min: 0, max: 5, step: 0.1,
@@ -335,10 +357,20 @@ const AstervoidsConfig = (function() {
         return undefined;
     }
 
+    function isValidConfigOverride(key, value) {
+        // Existing settings retain their coercion rules; only shield durations add bounds.
+        if (!SHIELD_CONFIG_KEYS.includes(key)) return true;
+        const definition = CONFIG_CONTROLS.find(control => control.key === key);
+        return typeof value === 'number' && Number.isFinite(value)
+            && value >= definition.min && value <= definition.max;
+    }
+
     function applyConfigOverride(config, key, rawValue) {
         if (!Object.prototype.hasOwnProperty.call(config, key)) return false;
+        if (SHIELD_CONFIG_KEYS.includes(key)
+            && typeof rawValue !== 'number' && typeof rawValue !== 'string') return false;
         const value = coerceConfigOverrideValue(rawValue, config[key]);
-        if (value === undefined) return false;
+        if (value === undefined || !isValidConfigOverride(key, value)) return false;
         config[key] = value;
         return true;
     }
@@ -351,20 +383,24 @@ const AstervoidsConfig = (function() {
         }
     }
 
+    // Return only normalized saved overrides so callers can preserve sparse persistence.
     function applyStoredDebugConfigOverrides(config, storage) {
+        const applied = {};
         try {
             const raw = storage?.getItem(DEBUG_CONFIG_STORAGE_KEY);
-            if (!raw) return;
+            if (!raw) return applied;
             const overrides = JSON.parse(raw);
-            if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return;
+            if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return applied;
             for (const key of DEBUG_OVERRIDABLE_KEYS) {
-                if (Object.prototype.hasOwnProperty.call(overrides, key)) {
-                    applyConfigOverride(config, key, overrides[key]);
+                if (Object.prototype.hasOwnProperty.call(overrides, key)
+                    && applyConfigOverride(config, key, overrides[key])) {
+                    applied[key] = config[key];
                 }
             }
         } catch {
             // Storage access and malformed debug state must not block game startup.
         }
+        return applied;
     }
 
     function applyLiveConfigOverride(
@@ -400,15 +436,26 @@ const AstervoidsConfig = (function() {
     }
 
     function buildSessionConfigMetadata(config, keys = SESSION_CONFIG_KEYS) {
-        return snapshotConfigValues(config, keys);
+        const out = snapshotConfigValues(config, keys);
+        for (const key of keys) {
+            if (SHIELD_CONFIG_KEYS.includes(key) && !isValidConfigOverride(key, out[key])) {
+                out[key] = SHARED_DEFAULTS[key];
+            }
+        }
+        return out;
     }
 
     function applySessionConfigMetadata(metadata, config, keys = SESSION_CONFIG_KEYS) {
-        if (!metadata || typeof metadata !== 'object') return;
-        const overrides = metadata.config;
-        if (!overrides || typeof overrides !== 'object') return;
+        const overrides = metadata && typeof metadata === 'object'
+            && metadata.config && typeof metadata.config === 'object'
+            ? metadata.config : null;
         for (const key of keys) {
-            if (Object.prototype.hasOwnProperty.call(overrides, key)) {
+            const hasOverride = overrides && Object.prototype.hasOwnProperty.call(overrides, key);
+            if (SHIELD_CONFIG_KEYS.includes(key)
+                && Object.prototype.hasOwnProperty.call(config, key)) {
+                const value = hasOverride ? overrides[key] : undefined;
+                config[key] = isValidConfigOverride(key, value) ? value : SHARED_DEFAULTS[key];
+            } else if (hasOverride) {
                 applyConfigOverride(config, key, overrides[key]);
             }
         }
@@ -426,6 +473,7 @@ const AstervoidsConfig = (function() {
         SESSION_CONFIG_KEYS,
         parseBooleanLike,
         coerceConfigOverrideValue,
+        isValidConfigOverride,
         applyConfigOverride,
         applyUrlConfigOverrides,
         applyStoredDebugConfigOverrides,

@@ -89,6 +89,14 @@
             display: none;
         }
 
+        #score-block {
+            min-width: 0;
+        }
+
+        #hud.multiplayer #score-block {
+            flex: 1;
+        }
+
         #hud.multiplayer #score {
             display: none;
         }
@@ -145,6 +153,39 @@
 
         #hud.multiplayer.compact #multiplayer-scores {
             flex-basis: 100%;
+        }
+
+        #hud.multiplayer.compact #score-block {
+            flex-basis: 100%;
+        }
+
+        #shield-hud {
+            display: flex;
+            align-items: center;
+            gap: 0.4em;
+            width: 12em;
+            max-width: 100%;
+            margin-top: 0.3em;
+            font-size: 0.65em;
+            line-height: 1.15;
+        }
+
+        #shield-hud[hidden] {
+            display: none;
+        }
+
+        #shield-meter {
+            flex: 1;
+            min-width: 0;
+            height: 0.65em;
+            padding: 1px;
+            border: 1px solid currentColor;
+        }
+
+        #shield-fill {
+            height: 100%;
+            width: 100%;
+            background: currentColor;
         }
 
         #hud.multiplayer.compact #wave,
@@ -1143,26 +1184,35 @@
         
         <!-- HUD: displays game stats (hidden on start screen, shown by updateHUD) -->
         <div id="hud" style="display: none;">
-            <span id="score">Score: 0</span>
-            <span id="multiplayer-scores">
-                <span class="score-row">
-                    <span class="score-counter"><span class="score-label">Your Score:</span><span id="your-score" class="score-value">0</span></span>
-                    <span class="score-field-separator" aria-hidden="true">:</span>
-                    <span id="player-indicator">Player --</span>
+            <div id="score-block">
+                <span id="score">Score: 0</span>
+                <span id="multiplayer-scores">
+                    <span class="score-row">
+                        <span class="score-counter"><span class="score-label">Your Score:</span><span id="your-score" class="score-value">0</span></span>
+                        <span class="score-field-separator" aria-hidden="true">:</span>
+                        <span id="player-indicator">Player --</span>
+                    </span>
+                    <span class="score-row">
+                        <span class="score-counter"><span class="score-label">Team Score:</span><span id="team-score" class="score-value">0</span></span>
+                        <span class="score-field-separator" aria-hidden="true">:</span>
+                        <span id="session-indicator"></span>
+                    </span>
                 </span>
-                <span class="score-row">
-                    <span class="score-counter"><span class="score-label">Team Score:</span><span id="team-score" class="score-value">0</span></span>
-                    <span class="score-field-separator" aria-hidden="true">:</span>
-                    <span id="session-indicator"></span>
-                </span>
-            </span>
+                <div id="shield-hud" hidden>
+                    <span id="shield-label">Shield</span>
+                    <div id="shield-meter" role="progressbar" aria-labelledby="shield-label"
+                         aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+                        <div id="shield-fill"></div>
+                    </div>
+                </div>
+            </div>
             <span id="wave">Wave: 1</span>
             <span id="lives">Lives: 3</span>
         </div>
         
         <!-- Instructions: control hints -->
         <div id="instructions">
-            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Right-click or SPACE to shoot | P to pause (solo)
+            Arrow Left/Right/Up or A/D/W to move | Down Arrow or S to brake | Click + drag to steer/thrust | Hold SHIFT or double-click + hold to shield | Right-click or SPACE to shoot | P to pause (solo)
         </div>
 
         <!-- Pause menu overlay -->
@@ -1173,7 +1223,9 @@
             <div class="menu-item desktop-only"><span>Arrow Left/Right/Up</span> / <span>A/D/W</span> - Move</div>
             <div class="menu-item desktop-only"><span>DOWN</span> / <span>S</span> - Brake</div>
             <div class="menu-item desktop-only"><span>SPACE</span> - Shoot</div>
+            <div class="menu-item desktop-only">Hold <span>SHIFT</span> or double-click and hold movement - Shield</div>
             <div class="menu-item touch-only">Tap <span>❚❚</span> to Resume</div>
+            <div class="menu-item touch-only">Double-tap left movement, hold second touch - Shield</div>
             <div class="menu-item touch-only"><button id="pause-restart-btn">RESTART</button></div>
         </div>
 
@@ -2102,6 +2154,8 @@
         STARTING_LIVES: 3,          // Lives at game start
         EXTRA_LIFE_SCORE_THRESHOLD: SHARED_CONFIG_DEFAULTS.EXTRA_LIFE_SCORE_THRESHOLD,
         INVULNERABILITY_TIME: 180,  // Nominal 60 Hz ticks of invulnerability (~3.0 s)
+        SHIP_SHIELD_DRAIN_SECONDS: SHARED_CONFIG_DEFAULTS.SHIP_SHIELD_DRAIN_SECONDS,
+        SHIP_SHIELD_RECHARGE_SECONDS: SHARED_CONFIG_DEFAULTS.SHIP_SHIELD_RECHARGE_SECONDS,
         WAVE_DELAY: 120,            // Nominal 60 Hz ticks between waves (~2.0 s)
         
         // Wave progression
@@ -4280,9 +4334,60 @@
     }
 
     class Ship {
+        static HULL_LINE_WIDTH = 2;
+        static HULL_MITER_LIMIT = 10;
+        static SHIELD_LINE_WIDTH = 1.5;
+        static _hullGeometry = null;
+
+        static getHullGeometry() {
+            const size = CONFIG.SHIP_SIZE;
+            const cached = Ship._hullGeometry;
+            if (cached?.size === size) return cached;
+
+            const wingX = Math.cos(Math.PI * 0.8) * size * 0.7;
+            const wingY = Math.sin(Math.PI * 0.8) * size * 0.7;
+            const vertices = [{ x: size, y: 0 }, { x: wingX, y: wingY }, { x: wingX, y: -wingY }];
+            const miters = vertices.map((v, i) => {
+                if (size === 0) return { x: 0, y: 0 };
+                const previous = vertices[(i + 2) % 3], next = vertices[(i + 1) % 3];
+                const previousLength = Math.hypot(previous.x - v.x, previous.y - v.y);
+                const nextLength = Math.hypot(next.x - v.x, next.y - v.y);
+                const ax = (previous.x - v.x) / previousLength;
+                const ay = (previous.y - v.y) / previousLength;
+                const bx = (next.x - v.x) / nextLength;
+                const by = (next.y - v.y) / nextLength;
+                const bisectorLength = Math.hypot(ax + bx, ay + by);
+                const sineHalf = Math.sqrt((1 - ax * bx - ay * by) / 2);
+                // This triangle's three miters are below HULL_MITER_LIMIT.
+                const miter = 1 / sineHalf;
+                return {
+                    x: -(ax + bx) / bisectorLength * miter,
+                    y: -(ay + by) / bisectorLength * miter
+                };
+            });
+            const [a, b, c] = vertices;
+            const bx = b.x - a.x, by = b.y - a.y;
+            const cx = c.x - a.x, cy = c.y - a.y;
+            const denominator = 2 * (bx * cy - by * cx);
+            const bSquared = bx * bx + by * by, cSquared = cx * cx + cy * cy;
+            // Translate, never reshape. The centerline circumcenter is expressed
+            // in reference units, so CSS stroke width cannot change collisions.
+            const originX = denominator ? a.x + (cy * bSquared - by * cSquared) / denominator : 0;
+            const originY = denominator ? a.y + (bx * cSquared - cx * bSquared) / denominator : 0;
+            for (const vertex of vertices) {
+                vertex.x -= originX;
+                vertex.y -= originY;
+            }
+            return Ship._hullGeometry = {
+                size, originX, originY, vertices, miters,
+                radius: Math.hypot(a.x, a.y)
+            };
+        }
+
         // Sync fields copied verbatim by fromSyncData. Fields needing
         // validation or renaming (invulnerable/invulnerabilityRevision, which
-        // ShipInvulnerability owns, and turnControlMode) stay explicit there.
+        // ShipInvulnerability owns, shield state/charge, and turnControlMode)
+        // stay explicit there.
         static SYNC_FIELDS = [
             'x', 'y', 'angle', 'velocityX', 'velocityY', 'rotationSpeed',
             'thrusting', 'thrustInput', 'brakeInput',
@@ -4315,6 +4420,9 @@
             this.turnMagnitude = 0;
             this.turnBias = 0;
             this.invulnerability = new ShipInvulnerability();
+            this.shieldState = 0;
+            this.shieldCharge = 1;
+            this.shieldVisualSettled = false;
             this.shootCooldown = 0;        // Frames until can shoot again
             this.colorIndex = colorIndex;  // Player color index (0-3)
             this.syncObjectId = null;      // ObjectSync ID when in session
@@ -4333,11 +4441,12 @@
             this.deathHold = null;
             this.terminalDecomposition = null; // Render-only offsets; never affect collision or sync pose
             // Vertex cache — avoid re-computing the triangle every frame when pose
-            // hasn't changed. Invalidated when x/y/angle/reference dimension shift.
+            // hasn't changed. Geometry also tracks size/reference changes.
             this._verts = [{x: 0, y: 0}, {x: 0, y: 0}, {x: 0, y: 0}];
             this._vertCacheX = NaN;
             this._vertCacheY = NaN;
             this._vertCacheAngle = NaN;
+            this._vertCacheGeometry = null;
             this._vertCacheRef = NaN;
         }
 
@@ -4371,6 +4480,16 @@
             this.invulnerability.sample(renderTime, delayMs);
         }
 
+        get shieldActive() {
+            return !this.shieldVisualSettled && (this.shieldState & 1) !== 0;
+        }
+
+        setShieldActive(active) {
+            if (((this.shieldState & 1) !== 0) === !!active) return false;
+            this.shieldState = (this.shieldState + 1) >>> 0;
+            return true;
+        }
+
         /**
          * Serialize ship state for ObjectSync
          * @returns {object} Ship data for syncing
@@ -4386,6 +4505,8 @@
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
                 ...this.captureInvulnerability(),
+                shieldState: this.shieldState,
+                shieldCharge: this.shieldCharge,
                 colorIndex: this.colorIndex,
                 memberId: this.memberId,
                 participantId: this.participantId,
@@ -4416,7 +4537,9 @@
                 velocityY: this.velocityY,
                 rotationSpeed: this.rotationSpeed,
                 thrusting: this.thrusting,
-                ...this.captureInvulnerability()
+                ...this.captureInvulnerability(),
+                shieldState: this.shieldState,
+                shieldCharge: this.shieldCharge
             };
             if (isDeterministicMode()) {
                 Object.assign(data, {
@@ -4442,6 +4565,13 @@
             assignDefined(this, data, Ship.SYNC_FIELDS);
             // Fields below need validation or renaming, so they stay explicit.
             this.invulnerability.applySnapshot(data);
+            if (Number.isInteger(data.shieldState)
+                && data.shieldState >= 0 && data.shieldState <= 0xffffffff) {
+                this.shieldState = data.shieldState;
+            }
+            if (Number.isFinite(data.shieldCharge)) {
+                this.shieldCharge = Math.max(0, Math.min(1, data.shieldCharge));
+            }
             if (data.turnControlMode !== undefined) {
                 this.turnControlMode = normalizeTurnControlMode(data.turnControlMode);
             }
@@ -4453,6 +4583,7 @@
          * doesn't continue rotating/thrusting once gameplay resumes.
          */
         resetControls() {
+            this.setShieldActive(false);
             this.turnTarget = 0;
             this.turnInput = 0;
             this.rotationSpeed = 0;
@@ -4470,13 +4601,17 @@
          * its final frame. Input handling stops at game over with `thrusting`
          * latched at its last value, so the flame is dropped explicitly, and
          * invulnerability blinking ends with the ship VISIBLE rather than
-         * freezing a wreck on a hidden blink frame. Pose and velocity are left
+         * freezing a wreck on a hidden blink frame. Shield presentation also
+         * stays off across stale resting snapshots. Pose and velocity are left
          * alone — the terminal convergence passes own those.
          */
         stopTerminalVisuals() {
             this.thrusting = false;
             this.thrustInput = 0;
             this.invulnerability.settleVisible();
+            // Presentation must stay off even if a resting replica reapplies
+            // its last live record. Only the local owner authors the off edge.
+            this.shieldVisualSettled = true;
         }
 
         /**
@@ -4559,35 +4694,96 @@
          * Get the ship's triangle vertices in pixel coordinates for rendering
          * Converts from normalized position to pixels.
          * Uses an in-place cache of 3 pre-allocated vertex objects; only recomputes
-         * when position, angle, or reference dimension change.
+         * when position, angle, or the pixel-scaled hull geometry changes.
          * @returns {array} Array of {x, y} vertices in pixels (shared; do not mutate)
          */
         getVertices() {
             const pixelX = fromNormalizedX(this.x);
             const pixelY = fromNormalizedY(this.y);
             const ref = getReferenceDimension();
+            const geometry = Ship.getHullGeometry();
             if (pixelX === this._vertCacheX &&
                 pixelY === this._vertCacheY &&
                 this.angle === this._vertCacheAngle &&
+                geometry === this._vertCacheGeometry &&
                 ref === this._vertCacheRef) {
                 return this._verts;
             }
-            const size = CONFIG.SHIP_SIZE * ref;
             const v = this._verts;
-            // Nose (front point)
-            v[0].x = pixelX + Math.cos(this.angle) * size;
-            v[0].y = pixelY + Math.sin(this.angle) * size;
-            // Left wing
-            v[1].x = pixelX + Math.cos(this.angle + Math.PI * 0.8) * size * 0.7;
-            v[1].y = pixelY + Math.sin(this.angle + Math.PI * 0.8) * size * 0.7;
-            // Right wing
-            v[2].x = pixelX + Math.cos(this.angle - Math.PI * 0.8) * size * 0.7;
-            v[2].y = pixelY + Math.sin(this.angle - Math.PI * 0.8) * size * 0.7;
+            const cos = Math.cos(this.angle), sin = Math.sin(this.angle);
+            for (let i = 0; i < v.length; i++) {
+                const local = geometry.vertices[i];
+                v[i].x = pixelX + ref * (cos * local.x - sin * local.y);
+                v[i].y = pixelY + ref * (sin * local.x + cos * local.y);
+            }
             this._vertCacheX = pixelX;
             this._vertCacheY = pixelY;
             this._vertCacheAngle = this.angle;
+            this._vertCacheGeometry = geometry;
             this._vertCacheRef = ref;
             return v;
+        }
+
+        getCollisionRadius() {
+            return fromNormalizedSize(Ship.getHullGeometry().radius);
+        }
+
+        getShieldRadius() {
+            return this.getCollisionRadius() + (Ship.HULL_LINE_WIDTH + Ship.SHIELD_LINE_WIDTH) / 2;
+        }
+
+        getHullStrokeRadius() {
+            if (this.shieldActive && !(this.terminalDecomposition?.progress > 0)) {
+                return this.getCollisionRadius() + Ship.HULL_LINE_WIDTH / 2;
+            }
+            const geometry = Ship.getHullGeometry();
+            let radius = 0;
+            for (let i = 0; i < geometry.vertices.length; i++) {
+                const v = geometry.vertices[i], miter = geometry.miters[i];
+                radius = Math.max(radius, Math.hypot(
+                    fromNormalizedSize(v.x) + miter.x * Ship.HULL_LINE_WIDTH / 2,
+                    fromNormalizedSize(v.y) + miter.y * Ship.HULL_LINE_WIDTH / 2));
+            }
+            return radius;
+        }
+
+        forEachWrapImage(bound, draw) {
+            const x = fromNormalizedX(this.x), y = fromNormalizedY(this.y);
+            const width = fromNormalizedX(1), height = fromNormalizedY(1);
+            if (width <= 0 || height <= 0) return;
+            // CSS stroke extents must not change the normalized period shared
+            // by owner integration, remote prediction and terminal convergence.
+            const margin = fromNormalizedSize(CONFIG.SHIP_SIZE);
+            const periodX = width + 2 * margin, periodY = height + 2 * margin;
+            const minX = Math.ceil((-bound - x) / periodX);
+            const maxX = Math.floor((width + bound - x) / periodX);
+            const minY = Math.ceil((-bound - y) / periodY);
+            const maxY = Math.floor((height + bound - y) / periodY);
+            for (let ix = minX; ix <= maxX; ix++) {
+                for (let iy = minY; iy <= maxY; iy++) {
+                    draw(ix * periodX, iy * periodY, x + ix * periodX, y + iy * periodY);
+                }
+            }
+        }
+
+        drawShield(ctx) {
+            const radius = this.getShieldRadius();
+            const bound = radius + Ship.SHIELD_LINE_WIDTH / 2;
+            ctx.save();
+            try {
+                ctx.strokeStyle = SHIP_COLORS[this.colorIndex] || CONFIG.STROKE_COLOR;
+                ctx.lineWidth = Ship.SHIELD_LINE_WIDTH;
+                ctx.shadowColor = ctx.strokeStyle;
+                ctx.shadowBlur = 6;
+                ctx.beginPath();
+                this.forEachWrapImage(bound, (dx, dy, cx, cy) => {
+                    ctx.moveTo(cx + radius, cy);
+                    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                });
+                ctx.stroke();
+            } finally {
+                ctx.restore();
+            }
         }
 
         /**
@@ -4595,6 +4791,7 @@
          * @param {CanvasRenderingContext2D} ctx - Canvas context
          */
         draw(ctx) {
+            if (this.shieldActive) this.drawShield(ctx);
             // Skip drawing if blinking during invulnerability
             if (this.invulnerable > 0 && 
                 Math.floor(this.invulnerable / CONFIG.INVULN_BLINK_RATE) % 2 === 0) {
@@ -4602,57 +4799,68 @@
             }
             
             const vertices = this.getVertices();
-            const pixelX = fromNormalizedX(this.x);
-            const pixelY = fromNormalizedY(this.y);
-            const size = fromNormalizedSize(CONFIG.SHIP_SIZE);
+            const geometry = Ship.getHullGeometry();
+            const size = fromNormalizedSize(geometry.size);
+            const originX = fromNormalizedSize(geometry.originX);
+            const originY = fromNormalizedSize(geometry.originY);
+            const cos = Math.cos(this.angle), sin = Math.sin(this.angle);
+            const pixelX = fromNormalizedX(this.x) - cos * originX + sin * originY;
+            const pixelY = fromNormalizedY(this.y) - sin * originX - cos * originY;
+            const flameLength = this.thrusting ? size * (0.8 + Math.random() * 0.4) : 0;
+            let bound = this.getHullStrokeRadius();
+            if (this.thrusting) {
+                bound = Math.max(bound, flameLength + Math.hypot(originX, originY)
+                    + Ship.HULL_MITER_LIMIT * Ship.HULL_LINE_WIDTH / 2);
+            }
+            if (this.terminalDecomposition?.progress > 0) {
+                bound += size * (2 + Math.max(0, CONFIG.SHIP_TERMINAL_SEPARATION));
+            }
             
             // Use ship color (multiplayer) or default white (solo)
             const shipColor = SHIP_COLORS[this.colorIndex] || CONFIG.STROKE_COLOR;
             
-            // Draw ship triangle
-            ctx.strokeStyle = shipColor;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            if (this.terminalDecomposition?.progress > 0) {
-                this.drawTerminalEdges(ctx, vertices, size);
-            } else {
-                ctx.moveTo(vertices[0].x, vertices[0].y);
-                ctx.lineTo(vertices[1].x, vertices[1].y);
-                ctx.lineTo(vertices[2].x, vertices[2].y);
-                ctx.closePath();
-            }
-            ctx.stroke();
-            
-            // Draw thrust flame when accelerating
-            if (this.thrusting) {
-                ctx.strokeStyle = CONFIG.THRUST_COLOR;
+            this.forEachWrapImage(bound, (offsetX, offsetY) => {
+                ctx.strokeStyle = shipColor;
+                ctx.lineWidth = Ship.HULL_LINE_WIDTH;
+                ctx.lineJoin = this.shieldActive && !(this.terminalDecomposition?.progress > 0)
+                    ? 'round' : 'miter';
+                ctx.miterLimit = Ship.HULL_MITER_LIMIT;
                 ctx.beginPath();
-                
-                // Flame base points (between wings)
-                const flameBase1 = {
-                    x: pixelX + Math.cos(this.angle + Math.PI * 0.9) * size * 0.4,
-                    y: pixelY + Math.sin(this.angle + Math.PI * 0.9) * size * 0.4
-                };
-                const flameBase2 = {
-                    x: pixelX + Math.cos(this.angle - Math.PI * 0.9) * size * 0.4,
-                    y: pixelY + Math.sin(this.angle - Math.PI * 0.9) * size * 0.4
-                };
-                
-                // Flame tip (flickers randomly)
-                const flameLength = size * (0.8 + Math.random() * 0.4);
-                const flameTip = {
-                    x: pixelX + Math.cos(this.angle + Math.PI) * flameLength,
-                    y: pixelY + Math.sin(this.angle + Math.PI) * flameLength
-                };
-                
-                ctx.moveTo(flameBase1.x, flameBase1.y);
-                ctx.lineTo(flameTip.x, flameTip.y);
-                ctx.lineTo(flameBase2.x, flameBase2.y);
+                if (this.terminalDecomposition?.progress > 0) {
+                    this.drawTerminalEdges(ctx, vertices, size, offsetX, offsetY);
+                } else {
+                    ctx.moveTo(vertices[0].x + offsetX, vertices[0].y + offsetY);
+                    ctx.lineTo(vertices[1].x + offsetX, vertices[1].y + offsetY);
+                    ctx.lineTo(vertices[2].x + offsetX, vertices[2].y + offsetY);
+                    ctx.closePath();
+                }
                 ctx.stroke();
-            }
+                ctx.lineJoin = 'miter';
+
+                if (this.thrusting) {
+                    ctx.strokeStyle = CONFIG.THRUST_COLOR;
+                    ctx.beginPath();
+                    const flameBase1 = {
+                        x: pixelX + Math.cos(this.angle + Math.PI * 0.9) * size * 0.4,
+                        y: pixelY + Math.sin(this.angle + Math.PI * 0.9) * size * 0.4
+                    };
+                    const flameBase2 = {
+                        x: pixelX + Math.cos(this.angle - Math.PI * 0.9) * size * 0.4,
+                        y: pixelY + Math.sin(this.angle - Math.PI * 0.9) * size * 0.4
+                    };
+                    const flameTip = {
+                        x: pixelX + Math.cos(this.angle + Math.PI) * flameLength,
+                        y: pixelY + Math.sin(this.angle + Math.PI) * flameLength
+                    };
+                    ctx.moveTo(flameBase1.x + offsetX, flameBase1.y + offsetY);
+                    ctx.lineTo(flameTip.x + offsetX, flameTip.y + offsetY);
+                    ctx.lineTo(flameBase2.x + offsetX, flameBase2.y + offsetY);
+                    ctx.stroke();
+                }
+            });
         }
 
-        drawTerminalEdges(ctx, vertices, size) {
+        drawTerminalEdges(ctx, vertices, size, offsetX = 0, offsetY = 0) {
             const { edges, progress } = this.terminalDecomposition;
             const separation = Math.max(0, CONFIG.SHIP_TERMINAL_SEPARATION) * size * progress;
             const rotation = Math.max(0, CONFIG.SHIP_TERMINAL_ROTATION) * progress;
@@ -4669,8 +4877,8 @@
                 const angle = edge.rotation * rotation;
                 const rx = dx * Math.cos(angle) - dy * Math.sin(angle);
                 const ry = dx * Math.sin(angle) + dy * Math.cos(angle);
-                ctx.moveTo(mx - rx, my - ry);
-                ctx.lineTo(mx + rx, my + ry);
+                ctx.moveTo(mx - rx + offsetX, my - ry + offsetY);
+                ctx.lineTo(mx + rx + offsetX, my + ry + offsetY);
             }
         }
 
@@ -4686,14 +4894,11 @@
             // Play fire sound
             AudioSystem.playFire();
             
-            // Get nose position in normalized coords
-            // Use aspect-ratio-aware conversion for the offset
-            const noseX = this.x + Math.cos(this.angle) * sizeToNormalizedX(CONFIG.SHIP_SIZE);
-            const noseY = this.y + Math.sin(this.angle) * sizeToNormalizedY(CONFIG.SHIP_SIZE);
+            const nose = this.getVertices()[0];
             
             return new Bullet(
-                noseX,
-                noseY,
+                nose.x / fromNormalizedX(1),
+                nose.y / fromNormalizedY(1),
                 Math.cos(this.angle) * CONFIG.BULLET_SPEED,
                 Math.sin(this.angle) * CONFIG.BULLET_SPEED,
                 this.colorIndex,    // Inherit ship's color
@@ -4706,6 +4911,9 @@
          */
         reset() {
             this.terminalDecomposition = null;
+            this.shieldVisualSettled = false;
+            this.setShieldActive(false);
+            this.shieldCharge = 1;
             this.x = 0.5;
             this.y = 0.5;
             this.angle = -Math.PI / 2;
@@ -5151,6 +5359,9 @@
     const playerIndicatorDisplay = document.getElementById('player-indicator');
     const waveDisplay = document.getElementById('wave');
     const livesDisplay = document.getElementById('lives');
+    const shieldHudDisplay = document.getElementById('shield-hud');
+    const shieldMeterDisplay = document.getElementById('shield-meter');
+    const shieldFillDisplay = document.getElementById('shield-fill');
 
     // HUD last-rendered values — avoid redundant DOM textContent writes every frame.
     // Score/wave/lives change at most on discrete events, so rewriting at 60 Hz is wasted work.
@@ -5619,6 +5830,83 @@
 
     // Input tracking
     const keys = {};
+    const SHIELD_GESTURE = Object.freeze({
+        TAP_MAX_DURATION_MS: 300,
+        SECOND_DOWN_MAX_DELAY_MS: 300,
+        MAX_DISTANCE_PX: 24
+    });
+    const SHIELD_CHARGE_EPSILON = 1e-12;
+    const shieldInput = {
+        heldSources: new Set(),
+        depleted: false,
+        firstTap: null,
+        movePress: null
+    };
+    let localShipShieldWrite = null;
+
+    function canActivateLocalShipShield() {
+        return !!game.ship && !game.ship.deathHold && game.lives > 0
+            && (game.state === 'playing' || game.state === 'waveDelay')
+            && !game.connectionLost && !game.identityChanging && !isGameOver();
+    }
+
+    function refreshLocalShipShield() {
+        if (!game.ship) return;
+        const active = canActivateLocalShipShield()
+            && shieldInput.heldSources.size > 0 && !shieldInput.depleted
+            && game.ship.shieldCharge > 0;
+        if (game.ship.setShieldActive(active)) syncLocalShipShield();
+    }
+
+    function requestLocalShipShield(source, held) {
+        if (held) {
+            if (shieldInput.heldSources.has(source) || !canActivateLocalShipShield()) return false;
+            shieldInput.heldSources.add(source);
+            if (game.ship.shieldCharge <= 0) shieldInput.depleted = true;
+        } else {
+            if (!shieldInput.heldSources.delete(source)) return false;
+            // Every exhausted source must release. Releasing one Shift key
+            // cannot rearm the other key or a still-held movement gesture.
+            if (shieldInput.heldSources.size === 0) shieldInput.depleted = false;
+        }
+        refreshLocalShipShield();
+        return true;
+    }
+
+    function resetLocalShipShieldInput() {
+        shieldInput.heldSources.clear();
+        shieldInput.depleted = false;
+        shieldInput.firstTap = null;
+        shieldInput.movePress = null;
+        if (game.ship) game.ship.setShieldActive(false);
+        syncLocalShipShield();
+    }
+
+    // Only the two local simulation pivots call this. Ship.update also serves
+    // prediction scratch ships, which must never drain or recharge resources.
+    function advanceLocalShipShield(dt) {
+        const ship = game.ship;
+        if (!ship || !Number.isFinite(dt) || dt <= 0
+            || game.connectionLost || game.identityChanging
+            || !['playing', 'waveDelay', 'respawning'].includes(game.state)
+            || isGameOver()) return;
+        refreshLocalShipShield();
+        const seconds = dt / CONFIG.TARGET_FPS;
+        if (ship.shieldActive) {
+            ship.shieldCharge = Math.max(0,
+                ship.shieldCharge - seconds / CONFIG.SHIP_SHIELD_DRAIN_SECONDS);
+            if (ship.shieldCharge <= SHIELD_CHARGE_EPSILON) {
+                ship.shieldCharge = 0;
+                shieldInput.depleted = shieldInput.heldSources.size > 0;
+                refreshLocalShipShield();
+            }
+        } else {
+            ship.shieldCharge = Math.min(1,
+                ship.shieldCharge + seconds / CONFIG.SHIP_SHIELD_RECHARGE_SECONDS);
+            if (1 - ship.shieldCharge <= SHIELD_CHARGE_EPSILON) ship.shieldCharge = 1;
+        }
+        syncLocalShipShield();
+    }
     
     /**
      * Anchor-based analog state for the `rectilinear` and `polar` modes. Touch
@@ -5672,6 +5960,7 @@
     }
 
     function resetStickInput() {
+        resetLocalShipShieldInput();
         setMouseMoveControlActive(false);
         mouseFireControlActive = false;
         mouseFireContextMenuTargets = null;
@@ -5798,6 +6087,32 @@
         }
     }
 
+    function syncLocalShipShield() {
+        if (!isSessionMode() || !game.ship || !game.multiplayer.myShipObjectId) return;
+        const id = game.multiplayer.myShipObjectId;
+        const record = ObjectSync.getObject(id);
+        if (!record) return;
+        const state = game.ship.shieldState;
+        const pending = localShipShieldWrite?.objectId === id ? localShipShieldWrite : null;
+        if (ObjectSync.isDataConfirmed(id, { shieldState: state })
+            || (!pending && record.lastSentData?.shieldState === undefined
+                && record.data?.shieldState === state)) {
+            // A successful create already carries the initial state even
+            // before ObjectSync establishes its first outbound delta baseline.
+            localShipShieldWrite = null;
+            return;
+        }
+        if (!pending || pending.state !== state) {
+            localShipShieldWrite = { objectId: id, state, lastAttempt: -Infinity };
+        }
+        const now = performance.now();
+        if (now - localShipShieldWrite.lastAttempt < CONFIG.SEND_ON_CHANGE_HEARTBEAT_MS) return;
+        localShipShieldWrite.lastAttempt = now;
+        // Retry the transition, not every charge tick. As with score writes,
+        // its current pose must accompany every data-bearing version.
+        ObjectSync.updateObject(id, game.ship.toUpdateData(), true);
+    }
+
     // Events keep zero-wait local feedback; only the counter update below is
     // durable across snapshots, late join, and GameState ownership migration.
     function emitShipStateChanged(hitPose = null) {
@@ -5846,6 +6161,8 @@
      * Retires a ship without departing the session membership
      */
     async function deleteSyncedShip() {
+        resetStickInput();
+        localShipShieldWrite = null;
         if (!game.multiplayer.myShipObjectId) return;
 
         if (isGameStateOwner()) syncGameState(true);
@@ -6053,9 +6370,16 @@
         // renders for every member, not just the controlling one. Buffered
         // samples already carry the field at the member's render delay and are
         // left alone.
-        if (data.thrusting === undefined) {
+        if (data.thrusting === undefined || data.shieldState === undefined
+            || data.shieldCharge === undefined) {
             const record = ObjectSync.getObject(facts.objectId);
-            if (record) instance.thrusting = !!record.data.thrusting;
+            if (record) {
+                if (data.thrusting === undefined) instance.thrusting = !!record.data.thrusting;
+                instance.fromSyncData({
+                    shieldState: data.shieldState === undefined ? record.data.shieldState : undefined,
+                    shieldCharge: data.shieldCharge === undefined ? record.data.shieldCharge : undefined
+                });
+            }
         }
         instance.sampleInvulnerability(
             context?.renderTime,
@@ -6081,6 +6405,8 @@
         },
         createReplica(record) {
             const remoteShip = new Ship(record.data.x, record.data.y, record.data.colorIndex || 0);
+            remoteShip.shieldCharge = 0;
+            remoteShip.fromSyncData(record.data);
             game.multiplayer.remoteShips.set(record.id, remoteShip);
             return seedReplicaAtTerminalTarget(remoteShip, record);
         },
@@ -6424,6 +6750,8 @@
      * Called when leaving a session
      */
     function resetMultiplayerState() {
+        resetStickInput();
+        localShipShieldWrite = null;
         game.multiplayer.myShipObjectId = null;
         game.multiplayer.myColorIndex = 0;
         // A predicted-fatal hold is scoped to the session that produced it; a
@@ -7406,6 +7734,7 @@
      */
     async function init(isCurrentStart = () => true) {
         if (!isCurrentStart()) return false;
+        resetStickInput();
         // Track whether we're entering an in-progress game vs starting fresh.
         // Used to guard state resets and wave spawning below.
         let freshGameStart = true;
@@ -7898,7 +8227,7 @@
             const shipRefY   = shooterShip.y   * worldRefH;
             const shipVx     = shooterShip.velocityX || 0;
             const shipVy     = shooterShip.velocityY || 0;
-            const shipR      = CONFIG.SHIP_SIZE;
+            const shipR      = shooterShip.getCollisionRadius() / refDimD;
             const wrapDelta = (d, span) => span > 0 ? d - Math.round(d / span) * span : d;
 
             for (const c of children) {
@@ -7997,6 +8326,7 @@
             pauseMenu.classList.add('visible');
             // Stop ship thrust visual/sound when pausing
             if (game.ship) game.ship.resetControls();
+            resetStickInput();
             AudioSystem.thrustSound.stop();
             // Pause background beat
             AudioSystem.beat.stop();
@@ -8424,10 +8754,16 @@
      *   asteroid with the normalized contact point, or null when clear
      */
     function checkShipAsteroidCollision(ship, asteroidCollisionCache = new Map()) {
+        if (ship.shieldActive && ship.shieldCharge > 0) return null;
         const shipVertices = ship.getVertices();
         const shipPxX = fromNormalizedX(ship.x);
         const shipPxY = fromNormalizedY(ship.y);
-        const shipPxRadius = fromNormalizedSize(CONFIG.SHIP_SIZE);
+        let shipPxRadiusSquared = 0;
+        for (const vertex of shipVertices) {
+            shipPxRadiusSquared = Math.max(shipPxRadiusSquared,
+                (vertex.x - shipPxX) ** 2 + (vertex.y - shipPxY) ** 2);
+        }
+        const shipPxRadius = Math.sqrt(shipPxRadiusSquared);
 
         for (const asteroid of game.astervoids) {
             // Broad phase: circle-vs-circle on bounding radii to skip far-away asteroids.
@@ -8491,6 +8827,7 @@
      *   death hold or solo game over — and no respawn followed
      */
     function handleShipHit(ship) {
+        resetStickInput();
         AudioSystem.playShipExplosion();
         AudioSystem.thrustSound.stop();
 
@@ -8642,6 +8979,7 @@
         // of that velocity agrees on (deterministic replay, buffered
         // extrapolation, terminal projection, late-join seeding).
         ship.resetControls();
+        resetStickInput();
         ship.deathHold = {
             hitCount: ship.hitCount || 0,
             startedAtMs: performance.now()
@@ -8780,6 +9118,28 @@
                 sessionIndicator.style.display = desiredVisible;
                 hudCache.sessionIndicatorVisible = desiredVisible;
                 layoutChanged = true;
+            }
+        }
+        if (shieldHudDisplay) {
+            const visible = !!game.ship && game.state !== 'start';
+            if (hudCache.shieldVisible !== visible) {
+                shieldHudDisplay.hidden = !visible;
+                hudCache.shieldVisible = visible;
+                layoutChanged = true;
+            }
+            if (visible) {
+                const charge = Number.isFinite(game.ship.shieldCharge)
+                    ? Math.max(0, Math.min(1, game.ship.shieldCharge)) : 0;
+                const percent = Math.round(charge * 1000) / 10;
+                if (hudCache.shieldPercent !== percent) {
+                    shieldFillDisplay.style.width = `${percent}%`;
+                    hudCache.shieldPercent = percent;
+                }
+                const progress = Math.round(percent);
+                if (hudCache.shieldProgress !== progress) {
+                    shieldMeterDisplay.setAttribute('aria-valuenow', String(progress));
+                    hudCache.shieldProgress = progress;
+                }
             }
         }
         if (layoutChanged && sessionMode) fitSessionHud();
@@ -9910,6 +10270,7 @@
                 // velocity would leave every replica extrapolating motion the
                 // owner never performed, with no heartbeat to correct it.
                 if (game.ship) {
+                    advanceLocalShipShield(dt);
                     game.ship.update(dt);
                     
                     // Sync local ship to ObjectSync in multiplayer
@@ -9991,6 +10352,7 @@
         // block. It keeps consuming target-bearing versions and ownership
         // migrations even if a future GameState explicitly uses "gameover".
         if (!frozenForReconnect && isSessionMode() && isGameOver()) {
+            resetLocalShipShieldInput();
             syncLocalShipScore();
         }
         if (!frozenForReconnect && isSessionMode()
@@ -10517,6 +10879,9 @@
         if (isPersonalScoreScrollTarget(e.target)
             && ['Space', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.code)) return;
         keys[e.code] = true;
+        if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !e.repeat) {
+            requestLocalShipShield(e.code, true);
+        }
         
         // Initialize and resume audio on first user interaction
         AudioSystem.init();
@@ -10563,6 +10928,9 @@
 
     document.addEventListener('keyup', (e) => {
         keys[e.code] = false;
+        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+            requestLocalShipShield(e.code, false);
+        }
     });
 
     // Prevent focus loss from affecting input - auto pause (solo only)
@@ -10746,6 +11114,19 @@
 
         function beginMoveAnchor(identifier, clientX, clientY) {
             if (stickInput.moveTouchId !== null) return false;
+            const now = performance.now();
+            const kind = identifier === MOUSE_MOVE_TOUCH_ID ? 'mouse' : 'touch';
+            const first = shieldInput.firstTap;
+            const eligible = canActivateLocalShipShield();
+            const secondDown = eligible && first?.kind === kind
+                && now - first.releasedAt >= 0
+                && now - first.releasedAt <= SHIELD_GESTURE.SECOND_DOWN_MAX_DELAY_MS
+                && Math.hypot(clientX - first.x, clientY - first.y) <= SHIELD_GESTURE.MAX_DISTANCE_PX;
+            shieldInput.firstTap = null;
+            shieldInput.movePress = {
+                identifier, kind, startedAt: now, x: clientX, y: clientY,
+                maxExcursionSq: 0, eligible, shieldHold: secondDown
+            };
             stickInput.moveTouchId = identifier;
             stickInput.mappingDirty = true;
             stickInput.moveAnchorX = clientX;
@@ -10755,6 +11136,7 @@
             stickInput.rectCapturedHeading =
                 Number.isFinite(game.ship?.angle) ? game.ship.angle : 0;
             stickInput.rectRotationOffset = 0;
+            if (secondDown) requestLocalShipShield(identifier, true);
             return true;
         }
 
@@ -10762,11 +11144,26 @@
             if (identifier !== stickInput.moveTouchId) return false;
             stickInput.moveCurrentX = clientX;
             stickInput.moveCurrentY = clientY;
+            const press = shieldInput.movePress;
+            if (press?.identifier === identifier) {
+                press.maxExcursionSq = Math.max(press.maxExcursionSq,
+                    (clientX - press.x) ** 2 + (clientY - press.y) ** 2);
+            }
             return true;
         }
 
-        function endMoveAnchor(identifier) {
+        function endMoveAnchor(identifier, cancelled = false) {
             if (identifier !== stickInput.moveTouchId) return false;
+            const press = shieldInput.movePress;
+            const now = performance.now();
+            shieldInput.firstTap = !cancelled && press?.eligible && !press.shieldHold
+                && canActivateLocalShipShield()
+                && now - press.startedAt <= SHIELD_GESTURE.TAP_MAX_DURATION_MS
+                && press.maxExcursionSq <= SHIELD_GESTURE.MAX_DISTANCE_PX ** 2
+                ? { kind: press.kind, releasedAt: now, x: press.x, y: press.y }
+                : null;
+            shieldInput.movePress = null;
+            requestLocalShipShield(identifier, false);
             stickInput.moveTouchId = null;
             stickInput.rectRotationOffset = 0;
             stickInput.thrustInput = 0;
@@ -10916,7 +11313,8 @@
 
         function endTouch(e) {
             for (const t of e.changedTouches) {
-                if (endMoveAnchor(t.identifier)) {
+                updateMoveAnchor(t.identifier, t.clientX, t.clientY);
+                if (endMoveAnchor(t.identifier, e.type === 'touchcancel')) {
                     continue;
                 }
                 endFireInput(t.identifier);
@@ -10933,10 +11331,12 @@
                 && (game.state === 'playing' || game.state === 'waveDelay');
         }
 
-        function endMouseMoveControl() {
+        function endMouseMoveControl(cancelled = false, event = null) {
             if (!mouseMoveControlActive) return false;
+            if (event) updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, event.clientX, event.clientY);
             setMouseMoveControlActive(false);
-            endMoveAnchor(MOUSE_MOVE_TOUCH_ID);
+            if (cancelled) endMoveAnchor(MOUSE_MOVE_TOUCH_ID, true);
+            else endMoveAnchor(MOUSE_MOVE_TOUCH_ID);
             return true;
         }
 
@@ -10983,7 +11383,7 @@
             if (mouseMoveControlActive) {
                 controlsActive = true;
                 if (e.buttons !== undefined && (e.buttons & 1) === 0) {
-                    endMouseMoveControl();
+                    endMouseMoveControl(true);
                 } else {
                     updateMoveAnchor(MOUSE_MOVE_TOUCH_ID, e.clientX, e.clientY);
                 }
@@ -11006,7 +11406,7 @@
 
         document.addEventListener('mouseup', (e) => {
             const ended = e.button === 0
-                ? endMouseMoveControl()
+                ? endMouseMoveControl(false, e)
                 : e.button === 2 && endMouseFireControl(e);
             if (ended) {
                 e.preventDefault();
@@ -11082,6 +11482,7 @@
     }
 
     function resetStartScreenVisuals() {
+        resetStickInput();
         game.ship = null;
         game.astervoids = [];
         game.bullets = [];
@@ -12854,6 +13255,7 @@
             AudioSystem.beat.stop();
             AudioSystem.thrustSound.stop();
             if (game.ship) game.ship.resetControls();
+            resetStickInput();
         }
     });
 
@@ -12911,6 +13313,7 @@
             AudioSystem.beat.stop();
             AudioSystem.thrustSound.stop();
             if (game.ship) game.ship.resetControls();
+            resetStickInput();
         }
 
         if (lostSessionId) {
@@ -13090,6 +13493,7 @@
                     // colliding, or replacing objects after their terminal target
                     // has been chosen.
                     if (isGameOver()) {
+                        resetLocalShipShieldInput();
                         syncLocalShipScore();
                         updateGameStateFromSync();
                         updateRemoteShips();
@@ -13105,6 +13509,7 @@
                     // reason as the visible loop.
                     resolveShipDeathHold();
                     if (game.ship) {
+                        advanceLocalShipShield(dt);
                         game.ship.update(dt);
                         syncLocalShip();
                     }
@@ -13583,8 +13988,8 @@
 
     function releaseIdentityInput() {
         Object.keys(keys).forEach(key => { keys[key] = false; });
-        resetStickInput();
         game.ship?.resetControls();
+        resetStickInput();
         AudioSystem.thrustSound.stop();
     }
 

@@ -30,6 +30,7 @@ function makeEntryHarness({ role, gameStateOwner, gameStateData }) {
         CONFIG: { MULTIPLAYER_LIVES: 3, INVULNERABILITY_TIME: 3, STARTING_LIVES: 3 },
         OBJECT_TYPES: { GAME_STATE, SHIP: 'ship', ASTEROID: 'asteroid', BULLET: 'bullet' },
         game,
+        resetStickInput() {},
         isSessionMode: () => true,
         adoptSoloSim: () => {},
         SessionClient: { getCurrentMember: () => ({ id: 'me', role }) },

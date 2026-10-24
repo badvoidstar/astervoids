@@ -58,6 +58,7 @@ function harness({ lives = 3, myShipObjectId = MY_SHIP, gameOver = false } = {})
         OBJECT_TYPES: { SHIP: 'ship', GAME_STATE: 'gamestate' },
         performance: { now: () => now },
         isSessionMode: () => true,
+        resetStickInput() {},
         isGameOver: () => gameOver,
         isDeterministicMode: () => true,
         emitShipStateChanged: pose => events.push(pose),

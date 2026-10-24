@@ -76,6 +76,7 @@ test('unified ship schema carries adaptive, replay, identity, and terminal subse
         'turnTargetAngle', 'turnMagnitude', 'turnBias',
         'terminalEpoch', 'terminalX', 'terminalY', 'terminalAngle',
         'invulnerabilityRevision', 'invulnerableAt',
+        'shieldState', 'shieldCharge',
     ]) {
         assert.ok(names.has(name), `ship schema missing ${name}`);
     }
@@ -95,7 +96,8 @@ test('ship transition slots append to the stable schema and preserve timing prec
     const schema = SchemaCodec.get(1);
     assert.deepEqual(schema.fields.slice(24).map(field => [field.name, field.type]), [
         ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
-        ['participantId', 'guid'], ['participantTag', 'str']
+        ['participantId', 'guid'], ['participantTag', 'str'],
+        ['shieldState', 'u32'], ['shieldCharge', 'q16']
     ]);
     const data = {
         invulnerable: 180, invulnerabilityRevision: 0xffffffff,
@@ -105,6 +107,29 @@ test('ship transition slots append to the stable schema and preserve timing prec
     assert.equal(bytes.length, 18, '4-byte mask + 2-byte countdown + 4-byte revision + 8-byte timestamp');
     assert.deepEqual(SchemaCodec.decode(schema, bytes), data);
     assert.equal(SchemaCodec.encode(schema, { x: 0.5 }).length, 6, 'absent timing slots have no body cost');
+});
+
+test('shield fields append at slots 28–29 with a four-byte mask and six-byte body', () => {
+    registerProductionSchemas();
+    const schema = SchemaCodec.get(1);
+    assert.equal(schema.fields.length, 30);
+    const encoded = SchemaCodec.encode(schema, { shieldState: 7, shieldCharge: 0.5 });
+    assert.equal(Buffer.from(encoded).toString('hex'), '00000030070000000080',
+        'shared with the C# production shield fixture');
+    const decoded = SchemaCodec.decode(schema, encoded);
+    assert.equal(decoded.shieldState, 7);
+    assert.ok(Math.abs(decoded.shieldCharge - 0.5) <= 1 / 65535);
+    for (const [shieldState, shieldCharge, hex] of [
+        [0, 0, '00000030000000000000'],
+        [0xffffffff, 1, '00000030ffffffffffff'],
+    ]) {
+        const fields = { shieldState, shieldCharge };
+        assert.equal(Buffer.from(SchemaCodec.encode(schema, fields)).toString('hex'), hex);
+        assert.deepEqual(SchemaCodec.decode(schema, SchemaCodec.encode(schema, fields)), fields);
+    }
+    assert.deepEqual(Object.keys(SchemaCodec.decode(schema, SchemaCodec.encode(schema, { x: 0.5 }))),
+        ['x'],
+        'an ordinary sparse pose must not invent shield fields');
 });
 
 test('ship schema preserves analog thrust above the unit interval', () => {

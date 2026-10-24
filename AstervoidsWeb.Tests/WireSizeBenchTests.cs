@@ -31,6 +31,7 @@ public class WireSizeBenchTests
     /// replaced on the hot paths.
     /// </summary>
     private const int SampleHandle = 1000;
+    private const int ShieldWireBytes = sizeof(uint) + sizeof(ushort);
 
     // ── Representative payloads ────────────────────────────────────────────────
 
@@ -122,7 +123,7 @@ public class WireSizeBenchTests
         Version: 17L);
 
     // ── Production positional schemas ──────────────────────────────────────────
-    // These mirror index.html WIREOPT_SCHEMAS exactly.
+    // These mirror game-wire-schemas.js exactly.
 
     private static readonly PositionalSchemaCodec.Schema ShipSchema =
         new(1, new[] {
@@ -154,6 +155,8 @@ public class WireSizeBenchTests
             new PositionalSchemaCodec.FieldSpec("invulnerableAt", "f64"),
             new PositionalSchemaCodec.FieldSpec("participantId", "guid"),
             new PositionalSchemaCodec.FieldSpec("participantTag", "str"),
+            new PositionalSchemaCodec.FieldSpec("shieldState", "u32"),
+            new PositionalSchemaCodec.FieldSpec("shieldCharge", "q16"),
         });
 
     private static readonly PositionalSchemaCodec.Schema AsteroidSchema =
@@ -401,6 +404,8 @@ public class WireSizeBenchTests
             ["turnTargetAngle"] = 1.5,
             ["turnMagnitude"] = 1d,
             ["turnBias"] = 0d,
+            ["shieldState"] = 7,
+            ["shieldCharge"] = 0.5d,
         })),
         Version: 42L);
 
@@ -434,7 +439,8 @@ public class WireSizeBenchTests
     public void Production_ShipUpdate_PerFrame_Quantized()
     {
         var size = Size(SampleShipUpdateQuantized());
-        size.Should().BeInRange(50, 60, "full replay-capable ship update with countdown timing");
+        size.Should().BeInRange(50 + ShieldWireBytes, 60 + ShieldWireBytes,
+            "full replay-capable ship update with countdown timing and six shield bytes");
     }
 
     [Fact]
@@ -470,7 +476,27 @@ public class WireSizeBenchTests
             SampleBulletUpdateQuantized(), SampleBulletUpdateQuantized()
         };
         var size = Size(batch);
-        size.Should().BeInRange(150, 175, "mixed steady-state positional batch with ship timing");
+        size.Should().BeInRange(150 + ShieldWireBytes, 175 + ShieldWireBytes,
+            "mixed steady-state positional batch with ship timing and six shield bytes");
+    }
+
+    [Fact]
+    public void Production_ShipShield_AddsExactlySixBytesWithoutGrowingThePresenceMask()
+    {
+        ShipSchema.Fields.Should().HaveCount(30);
+        ShipSchema.BitmaskBytes.Should().Be(4);
+        var withShield = SampleShipUpdateQuantized();
+        var data = PositionalSchemaCodec.Decode(ShipSchema, withShield.Data.Data);
+        data.Remove("shieldState").Should().BeTrue();
+        data.Remove("shieldCharge").Should().BeTrue();
+        var withoutShield = withShield with
+        {
+            Data = new SyncPayload(1, PositionalSchemaCodec.Encode(ShipSchema, data))
+        };
+
+        withShield.Data.Data.Length.Should().Be(withoutShield.Data.Data.Length + ShieldWireBytes);
+        Size(withShield).Should().Be(Size(withoutShield) + ShieldWireBytes);
+        Size(withoutShield).Should().BeInRange(50, 60, "the pre-shield ship budget remains unchanged");
     }
 
     [Fact]
@@ -541,7 +567,8 @@ public class WireSizeBenchTests
             ["invulnerabilityRevision"] = 1, ["invulnerableAt"] = 1_800_000_000_000d,
             ["colorIndex"] = 1,
             ["memberId"] = "00112233-4455-6677-8899-aabbccddeeff",
-            ["score"] = 0, ["hitCount"] = 0
+            ["score"] = 0, ["hitCount"] = 0,
+            ["shieldState"] = 0, ["shieldCharge"] = 1d
         });
         var asteroidCreate = PositionalSchemaCodec.Encode(AsteroidSchema, new Dictionary<string, object?>
         {
@@ -576,7 +603,7 @@ public class WireSizeBenchTests
             ["scoreLifeAwardCount"] = 0
         });
 
-        shipCreate.Length.Should().Be(64);
+        shipCreate.Length.Should().Be(64 + ShieldWireBytes, "shield state and full charge add six bytes");
         asteroidCreate.Length.Should().Be(40);
         bulletCreate.Length.Should().Be(37);
         gameStateCreate.Length.Should().Be(53, "19 optional slots still require a three-byte mask");

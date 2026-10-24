@@ -386,7 +386,36 @@ astervoids/
 
 ## Controls
 
-**Desktop:** Arrow keys to move, Space to fire, P to pause (solo)
+**Desktop:** Arrow keys or A/D/W to move, Down Arrow or S to brake,
+Space or right mouse to fire, P to pause (solo). Hold either **Shift** key for
+the shield. Left-click and drag moves anywhere on the canvas; double-click and
+hold the second press to move with the shield.
 
-**Mobile:** Touch controls appear automatically on touch devices
+**Mobile:** Touch the left half to move and hold the right half to fire.
+Double-tap the left movement controller and **hold the second touch** to shield;
+release that touch to stop. The first tap must last at most 300 ms and stay
+within 24 CSS pixels of its origin; the second down must be within 300 ms of
+release and within 24 CSS pixels of that origin. The held second drag can move
+freely. The same timing and distance rules apply to left mouse input.
+
+The glowing vector circle lets the ship pass through asteroids without damage
+or disturbing them; fired bullets still hit normally. The outlined **Shield**
+bar beneath the score shows remaining charge. A full charge lasts 2 seconds
+and refills in 10 seconds while inactive; partial charges work. Depletion ends
+protection immediately: release every held shield input and press again to
+reactivate, even if charge has returned. Every new run/life starts full.
+Recharge continues during active-game death/respawn waits, but pausing freezes
+charge. Existing spawn invulnerability is separate.
+
+The unchanged triangular ship rotates around its centerline circumcenter (not
+its center of mass). While shielding, subtly rounded hull corners meet the
+circle's inner rim at all three vertices with no extra clearance. The normal
+unshielded and terminal hulls retain their sharp corners.
+
+The debug/admin page and `cfg.SHIP_SHIELD_DRAIN_SECONDS` /
+`cfg.SHIP_SHIELD_RECHARGE_SECONDS` URL overrides tune those durations from
+0.1–60 seconds. Multiplayer uses the creator's session settings; local changes
+while joined affect future games only. Missing or invalid session durations
+use shared defaults, not a guest's local overrides. After updating game assets,
+recreate sessions: older or extended incompatible ship schemas are rejected.
 # Test
