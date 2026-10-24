@@ -24,6 +24,7 @@ test('HUD rendering no longer computes or publishes debug metrics', () => {
     const { updateHUD } = loadInlineGameFunctions(['updateHUD'], {
         game, hudCache, scoreDisplay, waveDisplay, livesDisplay,
         hudDisplay: null,
+        shieldHudDisplay: null,
         isSessionMode: () => false,
         document: { getElementById: () => null },
         publishDebugMetrics: () => assert.fail('implicit publication'),

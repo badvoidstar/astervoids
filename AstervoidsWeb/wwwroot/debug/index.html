@@ -159,10 +159,11 @@
             <h2>Configuration</h2>
             <div id="config-panel"></div>
             <button class="config-reset" id="config-reset" type="button">Reset to defaults</button>
-            <p class="config-help" style="margin-top:8px;">Overrides apply live and persist in this browser. They take effect on the next asteroid split.</p>
+            <p class="config-help" style="margin-top:8px;">Overrides persist in this browser and apply live where supported. While joined, shared session settings (including shield timing) stay locked to the creator's configuration; edits update your local baseline for after leaving and future sessions.</p>
         </div>
     </div>
 
+    <script src="/js/shared-config-data.js"></script>
     <script src="/js/game-config.js"></script>
     <script>
         const channel = new BroadcastChannel('astervoids-debug');
@@ -255,10 +256,15 @@
 
         const STORAGE_KEY = AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY;
         const overrides = (() => {
+            const values = Object.fromEntries(CONFIG_DEFS.map(def => [def.key, def.default]));
+            let storage;
             try {
-                const raw = localStorage.getItem(STORAGE_KEY);
-                return raw ? JSON.parse(raw) : {};
-            } catch { return {}; }
+                storage = window.localStorage;
+            } catch (error) {
+                if (error?.name !== 'SecurityError') throw error;
+                console.warn('Debug configuration storage is unavailable; overrides will not persist.', error);
+            }
+            return AstervoidsConfig.applyStoredDebugConfigOverrides(values, storage);
         })();
 
         function persistOverrides() {

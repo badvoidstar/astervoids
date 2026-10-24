@@ -845,6 +845,14 @@ totals and history become recoverable when the GameState owner publishes the
 corresponding ledgers. Local event dispatch is neither durable score storage
 nor a backend acknowledgement.
 
+Shield edges persist through the game-owned `syncLocalShipShield`, also outside
+`ShipSendGate`, with the current motion snapshot and an immediate ObjectSync
+flush request. It retries genuinely unconfirmed transitions at existing heartbeat
+opportunities, including hidden and terminal maintenance, without treating a
+successful create's missing local outbound baseline as an unconfirmed edge.
+Charge changes ride ordinary eligible/heartbeat ship updates; there is no
+shield transport wrapper, event, independent send gate, or timer.
+
 ## Timing, simulation and presentation
 
 Sources: [game loop and adapters](AstervoidsWeb/wwwroot/index.html),
@@ -914,8 +922,19 @@ merely because they share individual update helpers.
 
 The session fixes aspect ratio and aspect compensation inputs at creation.
 Clients letterbox/pillarbox rather than changing the simulation's space.
-Wrapping waits for the whole object bound to exit; asteroid margins use its true
-vertex bound, not its area-equivalent radius.
+Wrapping uses shared normalized margins; asteroid margins use its true vertex
+bound, not its area-equivalent radius. Ships retain their design-size margin
+across owner integration, replica prediction, interpolation, and terminal
+convergence. Visible hull/shield copies cover fixed-CSS-pixel stroke extents
+without making that shared wrap period viewport-dependent.
+
+Ship `x/y` is the rotation pivot and circumcenter of the unchanged centerline
+triangle, not its centroid or center of mass. One reference-unit geometry
+translates the original silhouette without changing edge lengths; collision
+vertices are invariant under proportional viewport resizing. The muzzle and
+thrust flame use that same translated hull, and size/reference changes
+invalidate the pixel-vertex cache. CSS stroke widths never shift physical
+vertices or the pivot.
 
 Owner integration is game-specific:
 
@@ -932,6 +951,10 @@ Defaults and tunable bounds belong to the owning `CONFIG` and
 `GameConfig.DEFAULTS`, not a second exhaustive constants catalog here.
 Session metadata locks mode, seed, schemas, and selected gameplay configuration;
 local URL/debug overrides must not override those shared invariants.
+Shield drain/recharge durations use `AstervoidsConfig.SHARED_DEFAULTS` and the shared
+`isValidConfigOverride` guard, with inclusive limits derived from the debug/admin
+control definitions. Creation validates authored values; absent/invalid session
+duration fields adopt shared defaults rather than a guest's local baseline.
 
 ### Send eligibility, cadence and backpressure
 
@@ -984,6 +1007,58 @@ Explicit revisions distinguish respawn teleports from heartbeat corrections,
 including repeated resets to the same duration. Heartbeat captures re-anchor
 simulation-versus-wall-time drift without publishing every countdown tick.
 These meanings stay in the ship adapter/schema, not in generic replication.
+
+### Player shield
+
+`advanceLocalShipShield(dt)` runs only at the foreground local-ship simulation
+pivot and the existing bounded hidden-multiplayer pivot, before collision
+handling. It converts nominal ticks with `dt / CONFIG.TARGET_FPS`; it never runs
+inside `Ship.update`, which also replays prediction scratch ships. Defaults drain
+a full charge in 2 simulation seconds and recharge it in 10 seconds. Charge is
+clamped to `[0, 1]`, including floating-point endpoint cleanup. Inactive recharge
+continues through active-game death holds/respawn waits; dead ships cannot activate.
+Pause/reconnect/identity freezes do not consume simulation time, and hidden tabs
+retain their existing dt cap instead of catching up to wall time.
+
+Either Shift key supplies an independent press-and-hold request. Left touch
+movement and the existing anywhere-on-canvas left mouse movement controller
+recognize a short first tap followed by a held second down: first press at most
+300 ms, maximum excursion 24 CSS px, second down within 300 ms of first release
+and within 24 CSS px of first origin. Touch identifiers may change between taps.
+Movement begins immediately and the second drag is unrestricted; only its owner
+can release it. Cancellations never prime another gesture. Right touch/right
+mouse/Space firing is independent. Exhaustion latches all held requests off until
+every source releases and a fresh activation arrives; key repeats cannot rearm
+it. Blur, hiding, orientation, pause, reconnect, departure, identity change, and
+death clear requests and pending gestures.
+
+The shared `checkShipAsteroidCollision` guard skips only ship/asteroid contact
+while effective. It runs before geometry and any crash damage, equivalent bullet,
+split, score, deflection, ownership, or cue side effect. Normal bullets and
+pending-hit confirmation continue through the same collision pass. Spawn
+invulnerability is independent. New local ships and respawns are inactive/full.
+
+Ship records carry `shieldState` (unsigned transition counter; low bit active)
+and normalized `shieldCharge`. Only active changes increment the counter.
+Replica creation defaults missing shield data to inactive/zero; sparse subsequent
+updates retain omitted fields. The adapter recovers durable shield data from
+the canonical record when deterministic samples contain only kinematics, without
+projecting remote charge using wall time. Terminal owners publish inactive state
+in both modes, while `stopTerminalVisuals` suppresses the circle even if resting
+reconciliation reapplies the last live data.
+
+The circle is centered on the ship's exact rotation origin. Only while the
+shield is visible, the hull uses round joins: the inner shield rim touches all
+three rounded outer corners at centerline circumradius plus half the fixed
+hull stroke width, with no extra clearance. Inactive and terminal hulls retain
+their sharp miter joins; collision vertices never depend on shield state or CSS
+stroke width. Invulnerability blink and exhaust do not change the circle.
+Drawing restores glow state and does not leak the active-only join. Visible
+toroidal circle and hull images preserve the shared design-size wrap period
+without changing movement or generic prediction bounds. A native-text, outlined
+rectilinear Shield HUD beneath the score block shows proportional charge with
+change-gated fill/progress values, no per-frame live announcements, and no canvas
+text stretching. It is hidden when no local ship exists.
 
 ### Clocks and validAt
 
@@ -1096,8 +1171,10 @@ or end-to-end network performance.
 
 The bullet owner tests only its own bullets, using relative swept translation,
 wrap-aware bounds, then the asteroid's current polygon. Ship collision uses
-bounding-circle rejection and vertex inclusion, not a general continuous
-rigid-body solver. Only the local ship owner decides its damage.
+bounding-circle rejection derived from the actual recentered centerline vertices
+and vertex inclusion, not a general continuous rigid-body solver. Shooter
+deflection uses the same centerline circumradius. Only the local ship owner
+decides its damage.
 
 ```mermaid
 sequenceDiagram
@@ -1598,7 +1675,7 @@ types select schemas 1 through 4:
 
 | Schema | Type | State family |
 | --- | --- | --- |
-| 1 | Ship | Pose/motion, controls, score/hits, invulnerability timing/revision, participant identity/tag, terminal target |
+| 1 | Ship | Pose/motion, controls, score/hits, invulnerability timing/revision, participant identity/tag, terminal target, shield transition/charge |
 | 2 | Asteroid | Pose/motion, radius/seed, optional packed fracture vertices, terminal target |
 | 3 | Bullet | Pose/motion/lifetime, ownership/color, optional pending-hit claim, terminal target |
 | 4 | GameState | Round/lives/score, wave state, packed hit/score/entry-life and personal-score/number/tag ledgers, terminal anchors and final-life ship |
@@ -1614,11 +1691,15 @@ default), never to repair an unsupported positional contract.
 
 GameState preserves slots 0-15 and has `bytes` fields:
 `participantScores` at 16, `participantNumbers` at 17, and `participantTags` at 18.
-Ship appends `participantTag: str` at slot 27 after `participantId: guid` at 26;
-its presence mask remains four bytes. The nineteen-slot GameState mask is three
-bytes. The game validates every field name, type, position, and field count in
+Ship retains slots 0–27, including `participantId: guid` at 26 and
+`participantTag: str` at 27, then appends `shieldState: u32` at 28 and
+`shieldCharge: q16` at 29. Its thirty-field presence mask remains four bytes;
+both shield fields add six body bytes when present. The nineteen-slot GameState
+mask is three bytes. The game validates every field name, type, position, and field count in
 all four advertised definitions, not just the score/tag slots. Sixteen- and
 eighteen-slot GameState generations and older Ship definitions are unsupported.
+Recreate sessions after updating game assets; mixed old/new or extended
+incompatible layouts are not supported.
 Schema-list order and additional distinct generic schemas do not change the
 game contract. Ship tags are created once, not sent on every pose update.
 

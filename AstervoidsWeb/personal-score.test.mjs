@@ -494,8 +494,8 @@ test('rejected score writes retry outside the motion gate until confirmed, inclu
     assert.equal(h.requests.length, 3);
     const source = readFileSync(new URL('./wwwroot/index.html', import.meta.url), 'utf8')
         .replace(/\r\n/g, '\n');
-    assert.match(source, /if \(!frozenForReconnect && isSessionMode\(\) && isGameOver\(\)\) \{\s*syncLocalShipScore\(\);/);
-    assert.match(source, /if \(isGameOver\(\)\) \{\s*syncLocalShipScore\(\);/);
+    assert.match(source, /if \(!frozenForReconnect && isSessionMode\(\) && isGameOver\(\)\) \{\s*resetLocalShipShieldInput\(\);\s*syncLocalShipScore\(\);/);
+    assert.match(source, /if \(isGameOver\(\)\) \{\s*resetLocalShipShieldInput\(\);\s*syncLocalShipScore\(\);/);
 });
 
 function departureHarness({ migrate = false } = {}) {
@@ -673,6 +673,7 @@ test('session reset retires the local ship without pre-deleting the durable depa
     const clear = { clear() {} };
     const { resetMultiplayerState } = loadInlineGameFunctions(['resetMultiplayerState'], {
         game, gameStateScoreViewCache: null, backgroundInterval: null,
+        localShipShieldWrite: null, resetStickInput() {},
         resetGameStateSyncCache() {}, clearExtraLifeAwardFeedback() {},
         clearDeterministicTerminalState() {},
         CollisionEffects: clear, RemoteObjects: clear, DeadReckon: clear, SendGate: clear,
@@ -741,6 +742,7 @@ function scoreUiHarness({
         'hudDisplay', 'scoreDisplay', 'yourScoreDisplay', 'teamScoreDisplay', 'playerIndicatorDisplay', 'waveDisplay',
         'livesDisplay', 'waveOverlay', 'waveTextEl', 'gameoverOverlay', 'gameoverPersonalScoreEl', 'gameoverScoreEl',
         'gameoverResultsEl', 'gameoverPromptEl', 'sessionIndicator',
+        'shieldHudDisplay', 'shieldMeterDisplay', 'shieldFillDisplay',
     ].map(name => [name, element()]));
     const errors = [];
     const counts = { unpack: 0, layout: 0 };

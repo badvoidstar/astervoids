@@ -22,6 +22,7 @@ const AstervoidsWireSchemas = (function() {
             ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
             ['participantId', 'guid'],
             ['participantTag', 'str'],
+            ['shieldState', 'u32'], ['shieldCharge', 'q16'],
         ]},
         { id: 2, fields: [
             ['type', 'str'],

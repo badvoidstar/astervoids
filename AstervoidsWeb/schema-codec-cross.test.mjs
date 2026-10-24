@@ -35,6 +35,7 @@ const SHIP_SCHEMA_FIELDS = [
     ['invulnerabilityRevision', 'u32'], ['invulnerableAt', 'f64'],
     ['participantId', 'guid'],
     ['participantTag', 'str'],
+    ['shieldState', 'u32'], ['shieldCharge', 'q16'],
 ];
 const ASTEROID_SCHEMA_FIELDS = [
     ['type', 'str'],
@@ -84,6 +85,15 @@ test('cross-wire fixtures match every production positional field', () => {
     ]) {
         assert.deepEqual(fields, SCHEMAS.find(schema => schema.id === id).fields);
     }
+});
+
+test('cross-wire: shield transition and normalized charge retain the four-byte mask', () => {
+    const schema = SchemaCodec.normalizeSchema(1, SHIP_SCHEMA_FIELDS);
+    const bytes = hexToBytes('00000030070000000080');
+    const decoded = SchemaCodec.decode(schema, bytes);
+    assert.equal(decoded.shieldState, 7);
+    assert.ok(Math.abs(decoded.shieldCharge - 0.5) <= 1 / 65535);
+    assert.deepEqual(SchemaCodec.encode(schema, { shieldState: 7, shieldCharge: 0.5 }), bytes);
 });
 
 test('cross-wire: asteroid update — all fields', () => {

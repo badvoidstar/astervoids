@@ -1789,3 +1789,411 @@ test('player tags preserve solo scoring and game-over controls', async ({ player
     await page.locator('#touch-restart').tap();
     await expect(page.locator('#start-screen')).toBeVisible();
 });
+
+async function expectShieldMeter(page) {
+    await expect(page.locator('#shield-label')).toHaveText('Shield');
+    const meter = page.getByRole('progressbar', { name: 'Shield', exact: true });
+    await expect(meter).toBeVisible();
+    await expect(meter).toHaveAttribute('aria-valuemin', '0');
+    await expect(meter).toHaveAttribute('aria-valuemax', '100');
+    return meter;
+}
+
+async function expectRenderedShieldCircle(page, objectId = null) {
+    // Observe the next real render, forwarding every canvas call unchanged.
+    // No fabricated ring, transport replacement, or permanent debug API.
+    const evidence = await page.evaluate(id => new Promise(resolve => {
+        const ship = id === null ? game.ship : game.multiplayer.remoteShips.get(id);
+        if (!ship) return resolve(null);
+        const hadOwnDraw = Object.hasOwn(ship, 'drawShield');
+        const originalDraw = ship.drawShield;
+        const finish = result => {
+            clearTimeout(timeout);
+            if (hadOwnDraw) ship.drawShield = originalDraw;
+            else delete ship.drawShield;
+            resolve(result);
+        };
+        const timeout = setTimeout(() => finish(null), 1500);
+        ship.drawShield = function(context) {
+            const arcs = [];
+            const originalArc = context.arc;
+            const origin = { x: fromNormalizedX(this.x), y: fromNormalizedY(this.y) };
+            const radius = this.getShieldRadius();
+            const vertexDistances = this.getVertices().map(vertex =>
+                Math.hypot(vertex.x - origin.x, vertex.y - origin.y));
+            const transform = context.getTransform();
+            context.arc = function(x, y, r, start, end, ...rest) {
+                arcs.push({ x, y, radius: r, start, end, glow: this.shadowBlur, lineWidth: this.lineWidth });
+                return originalArc.call(this, x, y, r, start, end, ...rest);
+            };
+            try {
+                originalDraw.call(this, context);
+            } finally {
+                context.arc = originalArc;
+                finish({
+                    arcs, origin, radius, vertexDistances, hullLineWidth: Ship.HULL_LINE_WIDTH,
+                    periodX: getGameWidth() + 2 * fromNormalizedSize(CONFIG.SHIP_SIZE),
+                    periodY: getGameHeight() + 2 * fromNormalizedSize(CONFIG.SHIP_SIZE),
+                    transform: { a: transform.a, b: transform.b, c: transform.c, d: transform.d },
+                });
+            }
+        };
+    }), objectId);
+    expect(evidence, 'An active local/remote shield reaches the real canvas renderer').not.toBeNull();
+    expect(evidence.arcs.length, 'The rendered shield contains a visible circle').toBeGreaterThan(0);
+    expect(evidence.vertexDistances).toHaveLength(3);
+    for (const arc of evidence.arcs) {
+        expect(arc.radius).toBeCloseTo(evidence.radius, 6);
+        expect(arc.radius).toBeGreaterThan(0);
+        expect(arc.lineWidth).toBeGreaterThan(0);
+        for (const [index, distance] of evidence.vertexDistances.entries()) {
+            expect(arc.radius - arc.lineWidth / 2,
+                `The inner shield rim meets rounded hull corner ${index + 1} without extra clearance`)
+                .toBeCloseTo(distance + evidence.hullLineWidth / 2, 6);
+        }
+        expect(arc.start).toBe(0);
+        expect(arc.end).toBeCloseTo(2 * Math.PI, 6);
+        expect(arc.glow, 'The circle is visibly glowing').toBeGreaterThan(0);
+        const imageX = (arc.x - evidence.origin.x) / evidence.periodX;
+        const imageY = (arc.y - evidence.origin.y) / evidence.periodY;
+        expect(imageX, 'Circle is centered on the rotation origin or its toroidal image')
+            .toBeCloseTo(Math.round(imageX), 6);
+        expect(imageY).toBeCloseTo(Math.round(imageY), 6);
+    }
+    const { a, b, c, d } = evidence.transform;
+    expect(Math.hypot(a, b), 'Canvas transforms do not stretch the circle into an ellipse')
+        .toBeCloseTo(Math.hypot(c, d), 6);
+    expect(a * c + b * d, 'Canvas axes remain perpendicular').toBeCloseTo(0, 6);
+}
+
+async function expectShieldMeterLayout(page) {
+    await expectShieldMeter(page);
+    const layout = await page.evaluate(() => {
+        const hud = document.getElementById('shield-hud');
+        const meter = document.getElementById('shield-meter');
+        const fill = document.getElementById('shield-fill');
+        const label = document.getElementById('shield-label');
+        const score = document.getElementById('hud').classList.contains('multiplayer')
+            ? document.getElementById('multiplayer-scores') : document.getElementById('score');
+        const box = hud.getBoundingClientRect();
+        const scoreBox = score.getBoundingClientRect();
+        const meterBox = meter.getBoundingClientRect();
+        const labelBox = label.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        const text = range.getBoundingClientRect();
+        const style = getComputedStyle(meter);
+        const innerWidth = meter.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        const percentage = parseFloat(fill.style.width);
+        return {
+            inViewport: box.left >= 0 && box.top >= 0 && box.right <= window.innerWidth
+                && box.bottom <= window.innerHeight,
+            belowScore: box.top >= scoreBox.bottom,
+            labelFits: text.left >= labelBox.left && text.right <= labelBox.right
+                && text.top >= labelBox.top && text.bottom <= labelBox.bottom,
+            nativeText: getComputedStyle(label).transform === 'none' && getComputedStyle(hud).transform === 'none',
+            outlined: style.borderTopStyle === 'solid' && parseFloat(style.borderTopWidth) > 0,
+            rectangular: style.borderRadius === '0px' && meterBox.width > meterBox.height,
+            fit: hud.scrollWidth <= hud.clientWidth && hud.scrollHeight <= hud.clientHeight,
+            ratio: fill.getBoundingClientRect().width / innerWidth,
+            percentage,
+            progress: Number(meter.getAttribute('aria-valuenow')),
+            live: meter.getAttribute('aria-live'),
+        };
+    });
+    for (const property of ['inViewport', 'belowScore', 'labelFits', 'nativeText', 'outlined', 'rectangular', 'fit']) {
+        expect(layout[property], `Shield HUD ${property} at the actual browser viewport`).toBe(true);
+    }
+    expect(layout.ratio, 'The rectangular fill is proportional, not a stretched label')
+        .toBeCloseTo(layout.percentage / 100, 2);
+    expect(layout.progress).toBe(Math.round(layout.percentage));
+    expect(layout.live, 'Per-frame charge changes are not live announcements').toBeNull();
+}
+
+test('shield Shift holds coexist with steering/fire, exhaust once, and resume only on a fresh press', async ({ players }) => {
+    // Existing configurable spawn protection isolates the gesture/resource test
+    // from random asteroid deaths; shield contact physics has separate coverage.
+    const { page } = await players.open({ path: '/?cfg.INVULNERABILITY_TIME=60000' });
+    await expect(page.locator('#shield-hud')).toBeHidden();
+    await page.locator('#btn-solo').click();
+    await playing(page);
+    const meter = await expectShieldMeter(page);
+    await expect(meter).toHaveAttribute('aria-valuenow', '100');
+    await page.keyboard.down('ShiftLeft');
+    try {
+        await expect.poll(() => page.evaluate(() =>
+            game.ship.shieldActive && game.ship.shieldCharge < 1),
+        { message: 'A single held Shift activates and drains the live shield' }).toBe(true);
+        await expectRenderedShieldCircle(page);
+        for (const key of ['KeyW', 'ArrowRight', 'Space']) await page.keyboard.down(key);
+        try {
+            await expect.poll(() => page.evaluate(() =>
+                game.ship.shieldActive && game.ship.thrusting && game.ship.turnTarget > 0
+                && game.bullets.length > 0),
+            { message: 'Shift plus W, arrow steering and Space still thrusts, turns and fires' }).toBe(true);
+        } finally {
+            for (const key of ['KeyW', 'ArrowRight', 'Space']) await page.keyboard.up(key);
+        }
+        await page.keyboard.down('ShiftRight');
+        await page.keyboard.up('ShiftLeft');
+        expect(await page.evaluate(() => game.ship.shieldActive), 'The other held Shift retains demand').toBe(true);
+        // Zero is one simulation tick before inactive recharge starts; a
+        // browser polling interval must inspect the durable exhaustion latch.
+        await expect.poll(() => page.evaluate(() => ({
+            depleted: shieldInput.depleted, active: game.ship.shieldActive,
+        })), { timeout: 6000, message: 'Default full drain drops and latches the held shield off' })
+            .toEqual({ depleted: true, active: false });
+        const exhaustedState = await page.evaluate(() => game.ship.shieldState);
+        await expect.poll(() => page.evaluate(() => game.ship.shieldCharge),
+            { message: 'An exhausted, still-held shield recharges without auto-activating' }).toBeGreaterThan(0);
+        await page.keyboard.down('ShiftRight');
+        expect(await page.evaluate(() => game.ship.shieldState), 'Native repeated keydown cannot flicker/rearm')
+            .toBe(exhaustedState);
+        await page.keyboard.down('ShiftLeft');
+        await page.keyboard.up('ShiftRight');
+        expect(await page.evaluate(() => game.ship.shieldActive), 'All exhausted demands must release').toBe(false);
+        await page.keyboard.up('ShiftLeft');
+        await page.keyboard.down('ShiftLeft');
+        expect(await page.evaluate(() => game.ship.shieldActive), 'Fresh activation can spend partial charge').toBe(true);
+    } finally {
+        await page.keyboard.up('ShiftLeft');
+        await page.keyboard.up('ShiftRight');
+    }
+    await page.keyboard.press('p');
+    await expect(page.locator('#pause-menu')).toBeVisible();
+    const pausedCharge = await page.evaluate(() => game.ship.shieldCharge);
+    await page.keyboard.down('ShiftLeft');
+    try {
+        await page.waitForTimeout(250);
+        expect(await page.evaluate(() => game.ship.shieldCharge), 'Pause freezes the simulation resource clock')
+            .toBe(pausedCharge);
+        expect(await page.evaluate(() => game.ship.shieldActive), 'A paused ship cannot activate').toBe(false);
+    } finally {
+        await page.keyboard.up('ShiftLeft');
+    }
+    await page.keyboard.press('Enter');
+    await playing(page);
+    await expect.poll(() => page.evaluate(() => game.ship.shieldCharge),
+        { message: 'Live simulation resumes recharge after pause' }).toBeGreaterThan(pausedCharge);
+});
+
+test('shield admin sliders change the live charge cycle and persist only explicitly edited settings', async ({ players, baseURL }) => {
+    const { page, health } = await players.open({ path: '/?cfg.INVULNERABILITY_TIME=60000' });
+    await page.locator('#btn-solo').click();
+    await playing(page);
+    const meter = await expectShieldMeter(page);
+    expect(await page.evaluate(() => localStorage.getItem(AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY)))
+        .toBeNull();
+    // Pause deliberately before changing tabs: solo blur also pauses and
+    // clears held input, and admin tuning must not silently resume gameplay.
+    await page.keyboard.press('p');
+    await expect(page.locator('#pause-menu')).toBeVisible();
+    const admin = await page.context().newPage();
+    admin.on('pageerror', () => health.uncaught++);
+    admin.on('console', message => {
+        if (message.type() === 'error') health.consoleErrors++;
+    });
+    await installOriginGuard(admin, baseURL, health);
+    const tuned = { SHIP_SHIELD_DRAIN_SECONDS: 0.2, SHIP_SHIELD_RECHARGE_SECONDS: 0.6 };
+    try {
+        await admin.goto('/debug/index.html');
+        await admin.bringToFront();
+        const drain = admin.locator('#cfg-SHIP_SHIELD_DRAIN_SECONDS');
+        const recharge = admin.locator('#cfg-SHIP_SHIELD_RECHARGE_SECONDS');
+        await expect(drain).toHaveAttribute('type', 'range');
+        await expect(recharge).toHaveAttribute('type', 'range');
+        expect(await admin.evaluate(() => localStorage.getItem(AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY)),
+            'Empty-storage admin bootstrap does not persist all control defaults').toBeNull();
+        await drain.press('Home');
+        await drain.press('ArrowRight');
+        await expect(drain).toHaveValue(String(tuned.SHIP_SHIELD_DRAIN_SECONDS));
+        expect(await admin.evaluate(() =>
+            JSON.parse(localStorage.getItem(AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY))),
+        'Editing one actual slider persists that key alone')
+            .toEqual({ SHIP_SHIELD_DRAIN_SECONDS: tuned.SHIP_SHIELD_DRAIN_SECONDS });
+        await recharge.press('Home');
+        for (let step = 0; step < 5; step++) await recharge.press('ArrowRight');
+        await expect(recharge).toHaveValue(String(tuned.SHIP_SHIELD_RECHARGE_SECONDS));
+        await expect.poll(() => page.evaluate(() => ({
+            SHIP_SHIELD_DRAIN_SECONDS: CONFIG.SHIP_SHIELD_DRAIN_SECONDS,
+            SHIP_SHIELD_RECHARGE_SECONDS: CONFIG.SHIP_SHIELD_RECHARGE_SECONDS,
+        })), { message: 'Real admin input handlers broadcast both effective shield settings to the game' })
+            .toEqual(tuned);
+        expect(await page.evaluate(() => game.state), 'Admin changes leave the solo game paused').toBe('paused');
+        await page.bringToFront();
+        await page.keyboard.press('Enter');
+        await playing(page);
+        await expect(meter).toHaveAttribute('aria-valuenow', '100');
+        await page.keyboard.down('ShiftLeft');
+        try {
+            expect(await page.evaluate(() => game.ship.shieldActive)).toBe(true);
+            await expect.poll(() => page.evaluate(() => shieldInput.depleted && !game.ship.shieldActive), {
+                intervals: [20, 50, 100], timeout: 1500,
+                message: 'UI-tuned 0.2s drain exhausts well before the default two-second cycle',
+            }).toBe(true);
+            expect(await page.evaluate(() => game.ship.shieldCharge),
+                'The real charge cycle visibly reaches the low-charge part of its recharge').toBeLessThan(0.5);
+            expect(Number(await meter.getAttribute('aria-valuenow'))).toBeLessThan(50);
+        } finally {
+            await page.keyboard.up('ShiftLeft');
+        }
+        await expect.poll(() => page.evaluate(() => game.ship.shieldCharge), {
+            intervals: [20, 50, 100], timeout: 2000,
+            message: 'UI-tuned 0.6s recharge reaches full well before the default ten-second recharge',
+        }).toBe(1);
+        await expect(meter).toHaveAttribute('aria-valuenow', '100');
+        await page.keyboard.press('p');
+        await expect(page.locator('#pause-menu')).toBeVisible();
+        await admin.bringToFront();
+        await admin.reload();
+        await expect(admin.locator('#cfg-SHIP_SHIELD_DRAIN_SECONDS'))
+            .toHaveValue(String(tuned.SHIP_SHIELD_DRAIN_SECONDS));
+        await expect(admin.locator('#cfg-SHIP_SHIELD_RECHARGE_SECONDS'))
+            .toHaveValue(String(tuned.SHIP_SHIELD_RECHARGE_SECONDS));
+        expect(await admin.evaluate(() =>
+            JSON.parse(localStorage.getItem(AstervoidsConfig.DEBUG_CONFIG_STORAGE_KEY))),
+        'Reload retains exactly the two explicit edits, without pinning any unrelated defaults').toEqual(tuned);
+    } finally {
+        await admin.close();
+    }
+});
+
+test('shield held mouse double-click works on the right half and permits movement plus independent fire', async ({ players }) => {
+    const { page } = await players.open({
+        path: '/?cfg.INVULNERABILITY_TIME=60000&cfg.SHIP_SHIELD_DRAIN_SECONDS=8',
+    });
+    await page.locator('#btn-solo').click();
+    await playing(page);
+    const box = await page.locator('#game').boundingBox();
+    const x = box.x + box.width * 0.75;
+    const y = box.y + box.height * 0.7;
+    await page.mouse.click(x, y);
+    expect(await page.evaluate(() => game.ship.shieldActive), 'A single movement click does not shield').toBe(false);
+    await page.mouse.down({ button: 'left' });
+    try {
+        await expect.poll(() => page.evaluate(() => game.ship.shieldActive),
+            { message: 'Holding the second mouse down activates anywhere on the canvas' }).toBe(true);
+        await expectRenderedShieldCircle(page);
+        const charge = await page.evaluate(() => game.ship.shieldCharge);
+        await page.mouse.move(box.x + box.width * 0.55, box.y + box.height * 0.25);
+        await page.mouse.down({ button: 'right' });
+        try {
+            await expect.poll(() => page.evaluate(charge =>
+                game.ship.shieldActive && game.ship.thrusting && game.bullets.length > 0
+                && game.ship.shieldCharge < charge, charge),
+            { message: 'An unrestricted second drag still moves and independent right-mouse fire works' }).toBe(true);
+        } finally {
+            await page.mouse.up({ button: 'right' });
+        }
+        expect(await page.evaluate(() => game.ship.shieldActive), 'Unrelated mouse release retains movement demand')
+            .toBe(true);
+    } finally {
+        await page.mouse.up({ button: 'left' });
+    }
+    await expect.poll(() => page.evaluate(() => game.ship.shieldActive),
+        { message: 'The owning left mouseup ends the shield' }).toBe(false);
+    await expectShieldMeterLayout(page);
+});
+
+for (const viewport of [{ width: 320, height: 568 }, { width: 568, height: 320 }]) {
+    test(`shield touch ownership, cancellation and native meter fit at ${viewport.width}x${viewport.height}`, async ({ players }) => {
+        const { page } = await players.open({
+            viewport, hasTouch: true, isMobile: true,
+            path: '/?cfg.INVULNERABILITY_TIME=60000&cfg.SHIP_SHIELD_DRAIN_SECONDS=8',
+        });
+        await page.locator('#btn-solo').tap();
+        await playing(page);
+        const box = await page.locator('#game').boundingBox();
+        let movement = { x: box.x + box.width * 0.25, y: box.y + box.height * 0.7, id: 11 };
+        const fire = { x: box.x + box.width * 0.75, y: box.y + box.height * 0.7, id: 33 };
+        const cdp = await page.context().newCDPSession(page);
+        let touchesActive = false;
+        async function dispatch(type, touchPoints) {
+            await cdp.send('Input.dispatchTouchEvent', { type, touchPoints });
+            if (type === 'touchStart') touchesActive = true;
+            if (type === 'touchCancel' || (type === 'touchEnd' && touchPoints.length === 0)) touchesActive = false;
+        }
+        try {
+            await dispatch('touchStart', [fire]);
+            await dispatch('touchEnd', []);
+            await dispatch('touchStart', [movement]);
+            expect(await page.evaluate(() => game.ship.shieldActive), 'Right-side firing did not prime a movement shield')
+                .toBe(false);
+            await dispatch('touchEnd', []);
+            movement = { ...movement, id: 22 };
+            await dispatch('touchStart', [movement]);
+            await expect.poll(() => page.evaluate(() => game.ship.shieldActive),
+                { message: 'A changed touch identifier can own the held second tap' }).toBe(true);
+            await expectRenderedShieldCircle(page);
+            movement.y = box.y + box.height * 0.2;
+            await dispatch('touchMove', [movement]);
+            await dispatch('touchStart', [movement, fire]);
+            await expect.poll(() => page.evaluate(() =>
+                game.ship.shieldActive && game.ship.thrusting && game.bullets.length > 0
+                && stickInput.moveTouchId === 22 && stickInput.fireTouchId === 33
+                && game.ship.shieldCharge < 1),
+            { message: 'Held left movement shields while a simultaneous right finger fires' }).toBe(true);
+            await dispatch('touchEnd', [fire]);
+            expect(await page.evaluate(() => ({
+                active: game.ship.shieldActive, movement: stickInput.moveTouchId, fire: stickInput.fireTouchId,
+            })), 'Releasing fire cannot steal the movement owner')
+                .toEqual({ active: true, movement: 22, fire: null });
+            await expectShieldMeterLayout(page);
+            await dispatch('touchCancel', []);
+            await expect.poll(() => page.evaluate(() =>
+                !game.ship.shieldActive && stickInput.moveTouchId === null && stickInput.fireTouchId === null),
+            { message: 'Native touch cancellation releases the shield and both anchors' }).toBe(true);
+        } finally {
+            try {
+                if (touchesActive) await dispatch('touchCancel', []);
+            } finally {
+                await cdp.detach();
+            }
+        }
+        await page.keyboard.press('p');
+        await expect(page.locator('#pause-menu')).toBeVisible();
+        await page.locator('#pause-restart-btn').tap();
+        await expect(page.locator('#start-screen')).toBeVisible();
+        await expect(page.locator('#shield-hud')).toBeHidden();
+    });
+}
+
+for (const mode of ['deterministic', 'buffered']) {
+    test(`shield activation, charge and release reach a real remote renderer (${mode})`, async ({ players }) => {
+        const host = await players.open({
+            path: `/?cfg.SIM_MODE=${mode}&cfg.INVULNERABILITY_TIME=60000&cfg.SHIP_SHIELD_DRAIN_SECONDS=30`,
+        });
+        const watcher = await players.open();
+        const sessionId = await create(host.page);
+        players.ownSession(sessionId);
+        await join(watcher.page, sessionId);
+        await host.page.locator('#btn-start-enter').click();
+        await playing(host.page);
+        const id = await shipId(host.page);
+        await expect.poll(() => watcher.page.evaluate(id =>
+            game.ship === null && game.multiplayer.remoteShips.has(id), id),
+        { message: 'The second real client is a spectator with a rendered remote ship' }).toBe(true);
+        await expect(watcher.page.locator('#shield-hud')).toBeHidden();
+        expect(await watcher.page.evaluate(() => CONFIG.SIM_MODE)).toBe(mode);
+        await host.page.keyboard.down('ShiftRight');
+        try {
+            await expect.poll(() => watcher.page.evaluate(id => {
+                const record = ObjectSync.getObject(id);
+                const replica = game.multiplayer.remoteShips.get(id);
+                return (record?.data.shieldState & 1) === 1 && !!replica?.shieldActive
+                    && record.data.shieldCharge > 0 && record.data.shieldCharge < 1;
+            }, id), { message: 'Real SignalR updates carry durable active state and draining charge' }).toBe(true);
+            await expectRenderedShieldCircle(watcher.page, id);
+            await expectShieldMeterLayout(host.page);
+        } finally {
+            await host.page.keyboard.up('ShiftRight');
+        }
+        await expect.poll(() => watcher.page.evaluate(id => {
+            const record = ObjectSync.getObject(id);
+            return !!record && (record.data.shieldState & 1) === 0
+                && game.multiplayer.remoteShips.get(id)?.shieldActive === false;
+        }, id), { message: 'The owning release reaches both the durable record and remote presentation' }).toBe(true);
+        expect(host.health.hubFrames, 'The owner used the real hub WebSocket').toBeGreaterThan(0);
+        expect(watcher.health.hubFrames, 'The observer received real hub WebSocket frames').toBeGreaterThan(0);
+    });
+}

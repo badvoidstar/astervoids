@@ -392,12 +392,13 @@ test('actual Playwright discovery keeps local coverage, bounds preview layouts a
             inventories.push(inventory);
         }
         const [local, remote] = inventories;
-        assert.equal(local.length, 69);
+        assert.equal(local.length, 76);
         assert.ok(local.every(scenario => scenario.expectedStatus === 'passed'));
         assert.equal(local.filter(scenario => scenario.file === 'origin-guard.spec.mjs').length, 22);
+        assert.equal(local.filter(scenario => scenario.title.startsWith('shield ')).length, 7);
         const faultTitle = 'identity failure and busy states keep their actions accessible in a reduced-height viewport';
         assert.equal(local.filter(scenario => scenario.title === faultTitle).length, 1);
-        assert.equal(remote.length, 47);
+        assert.equal(remote.length, 54);
         assert.deepEqual(remote, local
             .filter(scenario => scenario.file !== 'origin-guard.spec.mjs')
             .map(scenario => scenario.title === faultTitle

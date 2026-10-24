@@ -37,7 +37,8 @@ public class SchemaCrossWireFixturesTests
         ("terminalEpoch", "f64"), ("terminalX", "f64"),
         ("terminalY", "f64"), ("terminalAngle", "f64"),
         ("invulnerabilityRevision", "u32"), ("invulnerableAt", "f64"),
-        ("participantId", "guid"), ("participantTag", "str"));
+        ("participantId", "guid"), ("participantTag", "str"),
+        ("shieldState", "u32"), ("shieldCharge", "q16"));
 
     private static PositionalSchemaCodec.Schema AsteroidSchema() => Schema(2,
         ("type", "str"),
@@ -210,6 +211,54 @@ public class SchemaCrossWireFixturesTests
         Convert.ToInt32(decoded["invulnerable"]).Should().Be(180);
         Convert.ToUInt32(decoded["invulnerabilityRevision"]).Should().Be(7);
         decoded["invulnerableAt"].Should().Be(1000d);
+    }
+
+    [Fact]
+    public void Fixture_ShipShield_AppendsTwoSlotsWithTheSameFourByteMask()
+    {
+        var schema = ShipSchema();
+        schema.Fields.Should().HaveCount(30);
+        schema.BitmaskBytes.Should().Be(4);
+        schema.Fields[26].Should().Be(new PositionalSchemaCodec.FieldSpec("participantId", "guid"));
+        schema.Fields[27].Should().Be(new PositionalSchemaCodec.FieldSpec("participantTag", "str"));
+        schema.Fields[28].Should().Be(new PositionalSchemaCodec.FieldSpec("shieldState", "u32"));
+        schema.Fields[29].Should().Be(new PositionalSchemaCodec.FieldSpec("shieldCharge", "q16"));
+
+        var bytes = PositionalSchemaCodec.Encode(schema, new Dictionary<string, object?>
+        {
+            ["shieldState"] = 7,
+            ["shieldCharge"] = 0.5d
+        });
+        Hex(bytes).Should().Be("00000030" + "07000000" + "0080");
+        bytes.Should().HaveCount(10);
+        var decoded = PositionalSchemaCodec.Decode(schema, bytes);
+        Convert.ToUInt32(decoded["shieldState"]).Should().Be(7);
+        decoded["shieldCharge"].Should().Be(32768d / ushort.MaxValue);
+        PositionalSchemaCodec.Encode(schema, decoded).Should().Equal(bytes);
+    }
+
+    [Theory]
+    [InlineData(0u, 0d, "00000030000000000000")]
+    [InlineData(uint.MaxValue, 1d, "00000030ffffffffffff")]
+    public void Fixture_ShipShield_UInt32AndChargeBoundsSurviveSnapshotReencoding(
+        uint state, double charge, string hex)
+    {
+        var registry = new SyncSchemaRegistry();
+        var sessionId = Guid.NewGuid();
+        registry.SetSessionSchemas(sessionId, [ShipSchema()]);
+        var encoded = SyncPayloadCodec.EncodeDict(1, new Dictionary<string, object?>
+        {
+            ["shieldState"] = state,
+            ["shieldCharge"] = charge
+        }, registry, sessionId);
+
+        encoded.SchemaId.Should().Be(1);
+        Hex(encoded.Data).Should().Be(hex);
+        var decoded = SyncPayloadCodec.DecodeDict(encoded, sessionId, registry);
+        decoded.Should().HaveCount(2);
+        Convert.ToUInt32(decoded["shieldState"]).Should().Be(state);
+        decoded["shieldCharge"].Should().Be(charge);
+        SyncPayloadCodec.EncodeDict(1, decoded, registry, sessionId).Data.Should().Equal(encoded.Data);
     }
 
     [Fact]
